@@ -14,16 +14,31 @@
 
 mod fixture;
 
-use goblin::elf::{header::ET_DYN, Elf};
+use goblin::elf::{
+    header::{EI_CLASS, EI_DATA, ELFCLASS32, ELFDATA2MSB, EM_ARM, EM_RISCV, ET_DYN, ET_EXEC},
+    Elf,
+};
 
 use self::fixture::ElfFixtureBuilder;
+use crate::{
+    ArtifactProfile, ArtifactRequest, ElfClass, ElfReader, Endian, ImageKind, ImageLoader,
+    LoadErrorKind, LoadLimits, SliceElfReader,
+};
+
+fn riscv64_request() -> ArtifactRequest {
+    ArtifactRequest::new(
+        ImageKind::StaticPie,
+        ArtifactProfile::new(ElfClass::Elf64, Endian::Little, EM_RISCV),
+        LoadLimits::default(),
+    )
+}
 
 #[test]
 fn fixture_builder_emits_a_parseable_elf64_header() {
-    let bytes = ElfFixtureBuilder::elf64(goblin::elf::header::EM_RISCV, ET_DYN).build();
+    let bytes = ElfFixtureBuilder::elf64(EM_RISCV, ET_DYN).build();
     let elf = Elf::parse(&bytes).expect("fixture must contain a valid ELF header");
 
-    assert_eq!(elf.header.e_machine, goblin::elf::header::EM_RISCV);
+    assert_eq!(elf.header.e_machine, EM_RISCV);
     assert_eq!(elf.header.e_type, ET_DYN);
     assert!(elf.is_64);
     assert!(elf.little_endian);
@@ -31,9 +46,143 @@ fn fixture_builder_emits_a_parseable_elf64_header() {
 
 #[test]
 fn legacy_loader_rejects_invalid_magic() {
-    let mut bytes = ElfFixtureBuilder::elf64(goblin::elf::header::EM_RISCV, ET_DYN).build();
+    let mut bytes = ElfFixtureBuilder::elf64(EM_RISCV, ET_DYN).build();
     bytes[0] = 0;
     let mut mapper = crate::MemoryMapper::new(None);
 
     assert!(crate::load_elf(&bytes, &mut mapper).is_err());
+}
+
+#[test]
+fn slice_reader_checks_every_requested_range() {
+    let reader = SliceElfReader::new(&[1, 2, 3, 4]);
+    let mut dst = [0; 2];
+
+    reader.read_exact_at(1, &mut dst).unwrap();
+    assert_eq!(dst, [2, 3]);
+    assert_eq!(
+        reader.read_exact_at(3, &mut dst).unwrap_err().kind(),
+        LoadErrorKind::OutOfBounds
+    );
+    assert_eq!(
+        reader.read_exact_at(u64::MAX, &mut dst).unwrap_err().kind(),
+        LoadErrorKind::IntegerOverflow
+    );
+}
+
+#[test]
+fn admit_accepts_matching_elf32_and_elf64_headers() {
+    let riscv = ElfFixtureBuilder::elf64(EM_RISCV, ET_DYN).build();
+    let admitted = ImageLoader::new()
+        .admit(SliceElfReader::new(&riscv), riscv64_request())
+        .unwrap();
+    assert_eq!(admitted.header().class(), ElfClass::Elf64);
+    assert_eq!(admitted.file_len(), riscv.len() as u64);
+
+    let arm = ElfFixtureBuilder::elf32(EM_ARM, ET_DYN).build();
+    let request = ArtifactRequest::new(
+        ImageKind::StaticPie,
+        ArtifactProfile::new(ElfClass::Elf32, Endian::Little, EM_ARM),
+        LoadLimits::default(),
+    );
+    let admitted = ImageLoader::new()
+        .admit(SliceElfReader::new(&arm), request)
+        .unwrap();
+    assert_eq!(admitted.header().class(), ElfClass::Elf32);
+    assert_eq!(admitted.file_len(), arm.len() as u64);
+}
+
+#[test]
+fn admit_rejects_truncated_and_mismatched_headers() {
+    let truncated = [0; 8];
+    assert_eq!(
+        ImageLoader::new()
+            .admit(SliceElfReader::new(&truncated), riscv64_request())
+            .unwrap_err()
+            .kind(),
+        LoadErrorKind::OutOfBounds
+    );
+
+    let wrong_class = ElfFixtureBuilder::elf64(EM_RISCV, ET_DYN)
+        .set_ident(EI_CLASS, ELFCLASS32)
+        .build();
+    assert!(ImageLoader::new()
+        .admit(SliceElfReader::new(&wrong_class), riscv64_request())
+        .is_err());
+
+    let wrong_endian = ElfFixtureBuilder::elf64(EM_RISCV, ET_DYN)
+        .set_ident(EI_DATA, ELFDATA2MSB)
+        .build();
+    assert!(ImageLoader::new()
+        .admit(SliceElfReader::new(&wrong_endian), riscv64_request())
+        .is_err());
+
+    let wrong_machine = ElfFixtureBuilder::elf64(EM_RISCV, ET_DYN)
+        .set_machine(EM_ARM)
+        .build();
+    assert_eq!(
+        ImageLoader::new()
+            .admit(SliceElfReader::new(&wrong_machine), riscv64_request())
+            .unwrap_err()
+            .kind(),
+        LoadErrorKind::UnsupportedByProfile
+    );
+
+    let wrong_type = ElfFixtureBuilder::elf64(EM_RISCV, ET_DYN)
+        .set_type(ET_EXEC)
+        .build();
+    assert_eq!(
+        ImageLoader::new()
+            .admit(SliceElfReader::new(&wrong_type), riscv64_request())
+            .unwrap_err()
+            .kind(),
+        LoadErrorKind::UnsupportedByProfile
+    );
+}
+
+#[test]
+fn admit_rejects_program_header_table_outside_the_file() {
+    let bytes = ElfFixtureBuilder::elf64(EM_RISCV, ET_DYN)
+        .set_program_header_table(64, 1)
+        .build();
+    assert_eq!(
+        ImageLoader::new()
+            .admit(SliceElfReader::new(&bytes), riscv64_request())
+            .unwrap_err()
+            .kind(),
+        LoadErrorKind::OutOfBounds
+    );
+}
+
+#[test]
+fn admit_enforces_file_and_program_header_limits() {
+    let bytes = ElfFixtureBuilder::elf64(EM_RISCV, ET_DYN).build();
+    let file_limit_request = ArtifactRequest::new(
+        ImageKind::StaticPie,
+        ArtifactProfile::new(ElfClass::Elf64, Endian::Little, EM_RISCV),
+        LoadLimits::new(8, 128),
+    );
+    assert_eq!(
+        ImageLoader::new()
+            .admit(SliceElfReader::new(&bytes), file_limit_request)
+            .unwrap_err()
+            .kind(),
+        LoadErrorKind::ResourceLimit
+    );
+
+    let bytes = ElfFixtureBuilder::elf64(EM_RISCV, ET_DYN)
+        .set_program_header_table(64, 1)
+        .build();
+    let ph_limit_request = ArtifactRequest::new(
+        ImageKind::StaticPie,
+        ArtifactProfile::new(ElfClass::Elf64, Endian::Little, EM_RISCV),
+        LoadLimits::new(1024, 0),
+    );
+    assert_eq!(
+        ImageLoader::new()
+            .admit(SliceElfReader::new(&bytes), ph_limit_request)
+            .unwrap_err()
+            .kind(),
+        LoadErrorKind::ResourceLimit
+    );
 }

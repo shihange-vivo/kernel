@@ -47,8 +47,12 @@ if (coverage || profile) {
 build_rust("blueos_loader") {
   crate_type = "rlib"
   sources = [
+    "src/error.rs",
+    "src/identity.rs",
     "src/lib.rs",
+    "src/limits.rs",
     "src/memory_mapper.rs",
+    "src/reader.rs",
   ]
   deps = [
     "//external/vendor/goblin-0.9.3:goblin",
@@ -63,8 +67,12 @@ build_rust("loader_unittest") {
   crate_type = "bin"
   edition = "2021"
   sources = [
+    "src/error.rs",
+    "src/identity.rs",
     "src/lib.rs",
+    "src/limits.rs",
     "src/memory_mapper.rs",
+    "src/reader.rs",
     "src/tests.rs",
     "src/tests/fixture.rs",
   ]

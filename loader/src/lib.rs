@@ -18,14 +18,27 @@
 #[cfg(test)]
 extern crate std;
 
+mod error;
+mod identity;
+mod limits;
 mod memory_mapper;
+mod reader;
+pub use error::{
+    ErrorContext, HeaderField, LimitKind, LoadError, LoadErrorKind, LoadResult, LoadStage,
+};
 use goblin::elf::{
     header::{ET_DYN, ET_EXEC},
     reloc::R_RISCV_RELATIVE,
     Elf, Reloc,
 };
+pub use identity::{
+    AdmittedArtifact, ArtifactProfile, ArtifactRequest, ElfClass, ElfHeaderInfo, Endian, ImageKind,
+    ImageLoader,
+};
+pub use limits::LoadLimits;
 use memory_mapper::MappingModeKind;
 pub use memory_mapper::{MemoryMapper, MemoryPermissions, MemoryRegion};
+pub use reader::{ElfReader, SliceElfReader};
 
 pub type Result = core::result::Result<(), &'static str>;
 
