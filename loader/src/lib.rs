@@ -15,6 +15,9 @@
 #![no_std]
 #![feature(c_size_t)]
 
+#[cfg(test)]
+extern crate std;
+
 mod memory_mapper;
 use goblin::elf::{
     header::{ET_DYN, ET_EXEC},
@@ -119,3 +122,6 @@ pub fn load_elf(buffer: &[u8], mapper: &mut MemoryMapper) -> Result {
         _ => Err("Unsupported ELF type"),
     }
 }
+
+#[cfg(test)]
+mod tests;
