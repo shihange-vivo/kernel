@@ -83,6 +83,66 @@ impl ElfFixtureBuilder {
         self
     }
 
+    #[allow(clippy::too_many_arguments)]
+    pub fn add_program_header(
+        mut self,
+        program_type: u32,
+        file_offset: u64,
+        vaddr: u64,
+        file_size: u64,
+        memory_size: u64,
+        flags: u32,
+        align: u64,
+    ) -> Self {
+        let class = self.bytes[goblin::elf::header::EI_CLASS];
+        let (header_size, entry_size, count_offset) = match class {
+            goblin::elf::header::ELFCLASS32 => (
+                goblin::elf32::header::SIZEOF_EHDR,
+                goblin::elf32::program_header::SIZEOF_PHDR,
+                44,
+            ),
+            goblin::elf::header::ELFCLASS64 => (
+                goblin::elf64::header::SIZEOF_EHDR,
+                goblin::elf64::program_header::SIZEOF_PHDR,
+                56,
+            ),
+            _ => unreachable!(),
+        };
+        let count = u16::from_le_bytes(
+            self.bytes[count_offset..count_offset + 2]
+                .try_into()
+                .unwrap(),
+        );
+        let offset = header_size + usize::from(count) * entry_size;
+        self.bytes.resize(offset + entry_size, 0);
+
+        match class {
+            goblin::elf::header::ELFCLASS32 => {
+                write_u32(&mut self.bytes, offset, program_type);
+                write_u32(&mut self.bytes, offset + 4, file_offset as u32);
+                write_u32(&mut self.bytes, offset + 8, vaddr as u32);
+                write_u32(&mut self.bytes, offset + 16, file_size as u32);
+                write_u32(&mut self.bytes, offset + 20, memory_size as u32);
+                write_u32(&mut self.bytes, offset + 24, flags);
+                write_u32(&mut self.bytes, offset + 28, align as u32);
+                write_u32(&mut self.bytes, 28, header_size as u32);
+            }
+            goblin::elf::header::ELFCLASS64 => {
+                write_u32(&mut self.bytes, offset, program_type);
+                write_u32(&mut self.bytes, offset + 4, flags);
+                write_u64(&mut self.bytes, offset + 8, file_offset);
+                write_u64(&mut self.bytes, offset + 16, vaddr);
+                write_u64(&mut self.bytes, offset + 32, file_size);
+                write_u64(&mut self.bytes, offset + 40, memory_size);
+                write_u64(&mut self.bytes, offset + 48, align);
+                write_u64(&mut self.bytes, 32, header_size as u64);
+            }
+            _ => unreachable!(),
+        }
+        write_u16(&mut self.bytes, count_offset, count + 1);
+        self
+    }
+
     pub fn build(self) -> Vec<u8> {
         self.bytes
     }

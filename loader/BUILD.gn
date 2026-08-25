@@ -47,8 +47,11 @@ if (coverage || profile) {
 build_rust("blueos_loader") {
   crate_type = "rlib"
   sources = [
+    "src/address.rs",
     "src/error.rs",
     "src/identity.rs",
+    "src/image/mod.rs",
+    "src/image/parser.rs",
     "src/lib.rs",
     "src/limits.rs",
     "src/memory_mapper.rs",
@@ -67,8 +70,11 @@ build_rust("loader_unittest") {
   crate_type = "bin"
   edition = "2021"
   sources = [
+    "src/address.rs",
     "src/error.rs",
     "src/identity.rs",
+    "src/image/mod.rs",
+    "src/image/parser.rs",
     "src/lib.rs",
     "src/limits.rs",
     "src/memory_mapper.rs",

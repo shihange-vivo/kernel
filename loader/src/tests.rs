@@ -24,6 +24,9 @@ use crate::{
     ArtifactProfile, ArtifactRequest, ElfClass, ElfReader, Endian, ImageKind, ImageLoader,
     LoadErrorKind, LoadLimits, SliceElfReader,
 };
+use goblin::elf::program_header::{
+    PF_R, PF_W, PF_X, PT_DYNAMIC, PT_GNU_RELRO, PT_GNU_STACK, PT_INTERP, PT_LOAD, PT_TLS,
+};
 
 fn riscv64_request() -> ArtifactRequest {
     ArtifactRequest::new(
@@ -185,4 +188,89 @@ fn admit_enforces_file_and_program_header_limits() {
             .kind(),
         LoadErrorKind::ResourceLimit
     );
+}
+
+#[test]
+fn inspect_builds_an_owned_runtime_program_header_view() {
+    let bytes = ElfFixtureBuilder::elf64(EM_RISCV, ET_DYN)
+        .add_program_header(PT_LOAD, 0, 0x1000, 64, 0x200, PF_R | PF_X, 0x1000)
+        .add_program_header(PT_DYNAMIC, 0, 0x2000, 0, 0x40, PF_R | PF_W, 8)
+        .add_program_header(PT_GNU_RELRO, 0, 0x2080, 0, 0x20, PF_R, 1)
+        .add_program_header(PT_GNU_STACK, 0, 0, 0, 0, PF_R | PF_W, 16)
+        .build();
+    let loader = ImageLoader::new();
+    let admitted = loader
+        .admit(SliceElfReader::new(&bytes), riscv64_request())
+        .unwrap();
+    let parsed = loader.inspect(&admitted).unwrap();
+
+    assert_eq!(parsed.load_segments().len(), 1);
+    assert_eq!(parsed.load_segments()[0].vaddr().get(), 0x1000);
+    assert_eq!(parsed.load_segments()[0].memory_size(), 0x200);
+    assert_eq!(parsed.dynamic().unwrap().vaddr().get(), 0x2000);
+    assert_eq!(parsed.relro().unwrap().start().get(), 0x2080);
+    assert_eq!(parsed.stack_policy(), crate::StackPolicy::NonExecutable);
+}
+
+#[test]
+fn inspect_rejects_file_ranges_outside_the_artifact() {
+    let bytes = ElfFixtureBuilder::elf64(EM_RISCV, ET_DYN)
+        .add_program_header(PT_LOAD, 0x1000, 0, 32, 32, PF_R, 1)
+        .build();
+    let loader = ImageLoader::new();
+    let admitted = loader
+        .admit(SliceElfReader::new(&bytes), riscv64_request())
+        .unwrap();
+
+    assert_eq!(
+        loader.inspect(&admitted).unwrap_err().kind(),
+        LoadErrorKind::OutOfBounds
+    );
+}
+
+#[test]
+fn inspect_rejects_unsupported_runtime_program_headers() {
+    for program_type in [PT_INTERP, PT_TLS] {
+        let bytes = ElfFixtureBuilder::elf64(EM_RISCV, ET_DYN)
+            .add_program_header(program_type, 0, 0, 0, 0, PF_R, 1)
+            .build();
+        let loader = ImageLoader::new();
+        let admitted = loader
+            .admit(SliceElfReader::new(&bytes), riscv64_request())
+            .unwrap();
+        assert_eq!(
+            loader.inspect(&admitted).unwrap_err().kind(),
+            LoadErrorKind::UnsupportedByProfile
+        );
+    }
+
+    let bytes = ElfFixtureBuilder::elf64(EM_RISCV, ET_DYN)
+        .add_program_header(PT_GNU_STACK, 0, 0, 0, 0, PF_R | PF_W | PF_X, 16)
+        .build();
+    let loader = ImageLoader::new();
+    let admitted = loader
+        .admit(SliceElfReader::new(&bytes), riscv64_request())
+        .unwrap();
+    assert_eq!(
+        loader.inspect(&admitted).unwrap_err().kind(),
+        LoadErrorKind::UnsupportedByProfile
+    );
+}
+
+#[test]
+fn inspect_rejects_duplicate_singleton_program_headers() {
+    for program_type in [PT_DYNAMIC, PT_GNU_RELRO, PT_GNU_STACK] {
+        let bytes = ElfFixtureBuilder::elf64(EM_RISCV, ET_DYN)
+            .add_program_header(program_type, 0, 0, 0, 0, PF_R, 1)
+            .add_program_header(program_type, 0, 0, 0, 0, PF_R, 1)
+            .build();
+        let loader = ImageLoader::new();
+        let admitted = loader
+            .admit(SliceElfReader::new(&bytes), riscv64_request())
+            .unwrap();
+        assert_eq!(
+            loader.inspect(&admitted).unwrap_err().kind(),
+            LoadErrorKind::BadElf
+        );
+    }
 }

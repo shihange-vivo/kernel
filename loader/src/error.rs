@@ -30,6 +30,7 @@ pub enum LoadErrorKind {
     OutOfBounds,
     IntegerOverflow,
     ResourceLimit,
+    OutOfMemory,
     Io,
 }
 
@@ -57,6 +58,20 @@ pub enum LimitKind {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[non_exhaustive]
+pub enum ProgramHeaderField {
+    Type,
+    FileRange,
+    VirtualRange,
+    DuplicateDynamic,
+    DuplicateRelro,
+    DuplicateStack,
+    UnsupportedInterpreter,
+    UnsupportedTls,
+    ExecutableStack,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[non_exhaustive]
 pub enum ErrorContext {
     None,
     FileRange {
@@ -66,6 +81,15 @@ pub enum ErrorContext {
     },
     HeaderField {
         field: HeaderField,
+        value: u64,
+    },
+    TargetRange {
+        start: crate::TargetAddr,
+        len: u64,
+    },
+    ProgramHeader {
+        index: u16,
+        field: ProgramHeaderField,
         value: u64,
     },
     Limit {

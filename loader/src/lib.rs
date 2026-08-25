@@ -15,16 +15,22 @@
 #![no_std]
 #![feature(c_size_t)]
 
+extern crate alloc;
+
 #[cfg(test)]
 extern crate std;
 
+mod address;
 mod error;
 mod identity;
+mod image;
 mod limits;
 mod memory_mapper;
 mod reader;
+pub use address::{FileRange, TargetAddr, TargetRange};
 pub use error::{
     ErrorContext, HeaderField, LimitKind, LoadError, LoadErrorKind, LoadResult, LoadStage,
+    ProgramHeaderField,
 };
 use goblin::elf::{
     header::{ET_DYN, ET_EXEC},
@@ -35,6 +41,7 @@ pub use identity::{
     AdmittedArtifact, ArtifactProfile, ArtifactRequest, ElfClass, ElfHeaderInfo, Endian, ImageKind,
     ImageLoader,
 };
+pub use image::{DynamicSegmentInfo, LoadSegmentInfo, ParsedImage, StackPolicy};
 pub use limits::LoadLimits;
 use memory_mapper::MappingModeKind;
 pub use memory_mapper::{MemoryMapper, MemoryPermissions, MemoryRegion};

@@ -382,7 +382,7 @@ fn validate_header(
     Ok(())
 }
 
-fn read_u16(bytes: &[u8], offset: usize, endian: Endian) -> LoadResult<u16> {
+pub(crate) fn read_u16(bytes: &[u8], offset: usize, endian: Endian) -> LoadResult<u16> {
     let raw = read_array::<2>(bytes, offset)?;
     Ok(match endian {
         Endian::Little => u16::from_le_bytes(raw),
@@ -390,7 +390,7 @@ fn read_u16(bytes: &[u8], offset: usize, endian: Endian) -> LoadResult<u16> {
     })
 }
 
-fn read_u32(bytes: &[u8], offset: usize, endian: Endian) -> LoadResult<u32> {
+pub(crate) fn read_u32(bytes: &[u8], offset: usize, endian: Endian) -> LoadResult<u32> {
     let raw = read_array::<4>(bytes, offset)?;
     Ok(match endian {
         Endian::Little => u32::from_le_bytes(raw),
@@ -398,7 +398,7 @@ fn read_u32(bytes: &[u8], offset: usize, endian: Endian) -> LoadResult<u32> {
     })
 }
 
-fn read_u64(bytes: &[u8], offset: usize, endian: Endian) -> LoadResult<u64> {
+pub(crate) fn read_u64(bytes: &[u8], offset: usize, endian: Endian) -> LoadResult<u64> {
     let raw = read_array::<8>(bytes, offset)?;
     Ok(match endian {
         Endian::Little => u64::from_le_bytes(raw),
