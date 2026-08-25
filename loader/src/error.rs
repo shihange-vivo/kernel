@@ -22,6 +22,7 @@ pub enum LoadStage {
     Validate,
     Plan,
     Allocate,
+    Map,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -103,6 +104,11 @@ pub enum ErrorContext {
         base: crate::TargetAddr,
         len: u64,
         align: u64,
+    },
+    MemoryAccess {
+        allocation: crate::AllocationId,
+        offset: u64,
+        len: u64,
     },
     Limit {
         resource: LimitKind,

@@ -43,13 +43,13 @@ pub use identity::{
     ExpectedElfType, ImageLoader,
 };
 pub use image::{
-    DynamicSegmentInfo, ImageLayout, ImageLayoutBuilder, LoadSegmentInfo, ParsedImage,
-    PlannedArtifact, SegmentLayout, SegmentLocation, StackPolicy,
+    DynamicSegmentInfo, ImageLayout, ImageLayoutBuilder, LoadSegmentInfo, LoadedRegion,
+    MappedImage, ParsedImage, PlannedArtifact, SegmentLayout, SegmentLocation, StackPolicy,
 };
 pub use limits::LoadLimits;
 pub use memory::{
     AllocationId, AllocationOwnership, AllocationRequest, ImageAllocation, ImageLoadTransaction,
-    ImageMemory, Placement, ReservedImage,
+    ImageMemory, Placement, ReservedImage, TargetLocation,
 };
 use memory_mapper::MappingModeKind;
 pub use memory_mapper::{MemoryMapper, MemoryPermissions, MemoryRegion};

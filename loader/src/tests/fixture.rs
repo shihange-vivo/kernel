@@ -152,6 +152,13 @@ impl ElfFixtureBuilder {
         self
     }
 
+    pub fn write_bytes(mut self, offset: usize, data: &[u8]) -> Self {
+        let end = offset.checked_add(data.len()).unwrap();
+        self.bytes.resize(core::cmp::max(self.bytes.len(), end), 0);
+        self.bytes[offset..end].copy_from_slice(data);
+        self
+    }
+
     pub fn build(self) -> Vec<u8> {
         self.bytes
     }

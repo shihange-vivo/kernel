@@ -129,6 +129,52 @@ pub trait ImageMemory {
     fn allocate_image(&mut self, request: &AllocationRequest) -> LoadResult<ImageAllocation>;
 
     fn release(&mut self, allocation: AllocationId);
+
+    fn validate_access(
+        &self,
+        location: TargetLocation,
+        len: u64,
+        permissions: crate::MemoryPermissions,
+    ) -> LoadResult<()>;
+
+    fn write(&mut self, location: TargetLocation, data: &[u8]) -> LoadResult<()>;
+
+    fn zero(&mut self, location: TargetLocation, len: u64) -> LoadResult<()>;
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct TargetLocation {
+    allocation: AllocationId,
+    offset: u64,
+}
+
+impl TargetLocation {
+    pub const fn new(allocation: AllocationId, offset: u64) -> Self {
+        Self { allocation, offset }
+    }
+
+    pub const fn allocation(self) -> AllocationId {
+        self.allocation
+    }
+
+    pub const fn offset(self) -> u64 {
+        self.offset
+    }
+
+    pub fn checked_add(self, value: u64) -> LoadResult<Self> {
+        let offset = self.offset.checked_add(value).ok_or_else(|| {
+            LoadError::new(
+                LoadStage::Map,
+                LoadErrorKind::IntegerOverflow,
+                ErrorContext::MemoryAccess {
+                    allocation: self.allocation,
+                    offset: self.offset,
+                    len: value,
+                },
+            )
+        })?;
+        Ok(Self::new(self.allocation, offset))
+    }
 }
 
 #[derive(Debug)]
@@ -159,6 +205,24 @@ impl<R> ReservedImage<R> {
 
     pub const fn load_bias(&self) -> TargetAddr {
         self.load_bias
+    }
+
+    pub(crate) fn into_parts(
+        self,
+    ) -> (
+        AdmittedArtifact<R>,
+        ParsedImage,
+        ImageLayout,
+        ImageAllocation,
+        TargetAddr,
+    ) {
+        (
+            self.artifact,
+            self.parsed,
+            self.layout,
+            self.allocation,
+            self.load_bias,
+        )
     }
 }
 

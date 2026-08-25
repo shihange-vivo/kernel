@@ -24,7 +24,8 @@ use crate::{
     AllocationId, AllocationOwnership, AllocationRequest, ArtifactProfile, ArtifactRequest,
     ElfClass, ElfReader, Endian, ErrorContext, ExpectedElfType, ImageAllocation,
     ImageLoadTransaction, ImageLoader, ImageMemory, LoadError, LoadErrorKind, LoadLimits,
-    LoadResult, LoadStage, Placement, PlannedArtifact, SliceElfReader, TargetAddr,
+    LoadResult, LoadStage, MemoryPermissions, Placement, PlannedArtifact, SliceElfReader,
+    TargetAddr, TargetLocation,
 };
 use goblin::elf::program_header::{
     PF_R, PF_W, PF_X, PT_DYNAMIC, PT_GNU_RELRO, PT_GNU_STACK, PT_INTERP, PT_LOAD, PT_TLS,
@@ -426,15 +427,22 @@ struct FakeMemory {
     fail_allocate: bool,
     requests: std::vec::Vec<AllocationRequest>,
     releases: std::vec::Vec<AllocationId>,
+    bytes: std::vec::Vec<u8>,
+    writes: std::vec::Vec<(TargetLocation, usize)>,
+    zeros: std::vec::Vec<(TargetLocation, u64)>,
 }
 
 impl FakeMemory {
     fn returning(allocation: ImageAllocation) -> Self {
+        let len = usize::try_from(allocation.len()).unwrap();
         Self {
             allocation: Some(allocation),
             fail_allocate: false,
             requests: std::vec::Vec::new(),
             releases: std::vec::Vec::new(),
+            bytes: std::vec![0xa5; len],
+            writes: std::vec::Vec::new(),
+            zeros: std::vec::Vec::new(),
         }
     }
 
@@ -444,6 +452,9 @@ impl FakeMemory {
             fail_allocate: true,
             requests: std::vec::Vec::new(),
             releases: std::vec::Vec::new(),
+            bytes: std::vec::Vec::new(),
+            writes: std::vec::Vec::new(),
+            zeros: std::vec::Vec::new(),
         }
     }
 }
@@ -464,6 +475,55 @@ impl ImageMemory for FakeMemory {
     fn release(&mut self, allocation: AllocationId) {
         self.releases.push(allocation);
     }
+
+    fn validate_access(
+        &self,
+        location: TargetLocation,
+        len: u64,
+        _permissions: MemoryPermissions,
+    ) -> LoadResult<()> {
+        let allocation = self
+            .allocation
+            .ok_or_else(|| fake_access_error(location, len))?;
+        let valid = allocation.id() == location.allocation()
+            && location
+                .offset()
+                .checked_add(len)
+                .is_some_and(|end| end <= allocation.len());
+        if valid {
+            Ok(())
+        } else {
+            Err(fake_access_error(location, len))
+        }
+    }
+
+    fn write(&mut self, location: TargetLocation, data: &[u8]) -> LoadResult<()> {
+        self.validate_access(location, data.len() as u64, MemoryPermissions::WRITE)?;
+        let start = location.offset() as usize;
+        self.bytes[start..start + data.len()].copy_from_slice(data);
+        self.writes.push((location, data.len()));
+        Ok(())
+    }
+
+    fn zero(&mut self, location: TargetLocation, len: u64) -> LoadResult<()> {
+        self.validate_access(location, len, MemoryPermissions::WRITE)?;
+        let start = location.offset() as usize;
+        self.bytes[start..start + len as usize].fill(0);
+        self.zeros.push((location, len));
+        Ok(())
+    }
+}
+
+fn fake_access_error(location: TargetLocation, len: u64) -> LoadError {
+    LoadError::new(
+        LoadStage::Map,
+        LoadErrorKind::Backend,
+        ErrorContext::MemoryAccess {
+            allocation: location.allocation(),
+            offset: location.offset(),
+            len,
+        },
+    )
 }
 
 fn planned_image<'a>(
@@ -617,4 +677,173 @@ fn memory_mapper_rejects_unauthorized_fixed_placement() {
 
     let error = ImageMemory::allocate_image(&mut mapper, &request).unwrap_err();
     assert_eq!(error.kind(), LoadErrorKind::Backend);
+}
+
+fn image_with_bss_and_gap(elf_type: u16) -> (std::vec::Vec<u8>, std::vec::Vec<u8>) {
+    let text: std::vec::Vec<u8> = (0..700).map(|value| value as u8).collect();
+    let bytes = ElfFixtureBuilder::elf64(EM_RISCV, elf_type)
+        .set_entry(0x1010)
+        .add_program_header(
+            PT_LOAD,
+            0x1000,
+            0x1000,
+            text.len() as u64,
+            0x800,
+            PF_R | PF_X,
+            0x1000,
+        )
+        .add_program_header(PT_LOAD, 0x2000, 0x3000, 4, 0x100, PF_R | PF_W, 0x1000)
+        .write_bytes(0x1000, &text)
+        .write_bytes(0x2000, &[1, 2, 3, 4])
+        .build();
+    (bytes, text)
+}
+
+#[test]
+fn copy_and_zero_initializes_owned_et_dyn_memory_in_chunks() {
+    let (bytes, text) = image_with_bss_and_gap(ET_DYN);
+    let planned = planned_image(&bytes, ExpectedElfType::Dyn);
+    let mut memory = FakeMemory::returning(ImageAllocation::new(
+        AllocationId::new(10),
+        TargetAddr::new(0x8000),
+        0x3000,
+        0x1000,
+        AllocationOwnership::Owned,
+    ));
+
+    let transaction = {
+        let mut transaction = ImageLoadTransaction::new(&mut memory);
+        let reserved = ImageLoader::new()
+            .reserve(planned, &mut transaction)
+            .unwrap();
+        let mapped = ImageLoader::new()
+            .copy_and_zero(reserved, &mut transaction)
+            .unwrap();
+        assert_eq!(mapped.entry().get(), 0x8010);
+        assert_eq!(mapped.regions()[0].runtime_range().start().get(), 0x8000);
+        assert_eq!(mapped.regions()[1].runtime_range().start().get(), 0xa000);
+        assert!(mapped
+            .locate_vaddr(TargetAddr::new(0x2000), 1, MemoryPermissions::READ)
+            .is_err());
+        transaction
+    };
+    transaction.disarm_for_test();
+
+    assert_eq!(&memory.bytes[..text.len()], text.as_slice());
+    assert!(memory.bytes[text.len()..0x2000]
+        .iter()
+        .all(|byte| *byte == 0));
+    assert_eq!(&memory.bytes[0x2000..0x2004], &[1, 2, 3, 4]);
+    assert!(memory.bytes[0x2004..].iter().all(|byte| *byte == 0));
+    assert_eq!(
+        memory.zeros,
+        [(TargetLocation::new(AllocationId::new(10), 0), 0x3000)]
+    );
+    assert_eq!(memory.writes.len(), 3);
+    assert_eq!(memory.writes[0].1, 512);
+    assert!(memory.releases.is_empty());
+}
+
+#[test]
+fn copy_and_zero_preserves_fixed_et_exec_gaps() {
+    let (bytes, text) = image_with_bss_and_gap(ET_EXEC);
+    let planned = planned_image(&bytes, ExpectedElfType::Exec);
+    let mut memory = FakeMemory::returning(ImageAllocation::new(
+        AllocationId::new(11),
+        TargetAddr::new(0x1000),
+        0x3000,
+        0x1000,
+        AllocationOwnership::BorrowedFixed,
+    ));
+
+    let transaction = {
+        let mut transaction = ImageLoadTransaction::new(&mut memory);
+        let reserved = ImageLoader::new()
+            .reserve(planned, &mut transaction)
+            .unwrap();
+        ImageLoader::new()
+            .copy_and_zero(reserved, &mut transaction)
+            .unwrap();
+        transaction
+    };
+    transaction.disarm_for_test();
+
+    assert_eq!(&memory.bytes[..text.len()], text.as_slice());
+    assert!(memory.bytes[text.len()..0x800]
+        .iter()
+        .all(|byte| *byte == 0));
+    assert!(memory.bytes[0x800..0x2000].iter().all(|byte| *byte == 0xa5));
+    assert_eq!(&memory.bytes[0x2000..0x2004], &[1, 2, 3, 4]);
+    assert!(memory.bytes[0x2004..0x2100].iter().all(|byte| *byte == 0));
+    assert!(memory.bytes[0x2100..].iter().all(|byte| *byte == 0xa5));
+    assert_eq!(memory.zeros.len(), 2);
+}
+
+struct FaultingReader<'a> {
+    inner: SliceElfReader<'a>,
+    fail_at: u64,
+}
+
+impl<'a> FaultingReader<'a> {
+    fn new(bytes: &'a [u8], fail_at: u64) -> Self {
+        Self {
+            inner: SliceElfReader::new(bytes),
+            fail_at,
+        }
+    }
+}
+
+impl ElfReader for FaultingReader<'_> {
+    fn len(&self) -> LoadResult<u64> {
+        self.inner.len()
+    }
+
+    fn read_exact_at(&self, offset: u64, dst: &mut [u8]) -> LoadResult<()> {
+        if offset >= self.fail_at {
+            return Err(LoadError::new(
+                LoadStage::Read,
+                LoadErrorKind::Io,
+                ErrorContext::FileRange {
+                    offset,
+                    len: dst.len() as u64,
+                    file_len: self.inner.len()?,
+                },
+            ));
+        }
+        self.inner.read_exact_at(offset, dst)
+    }
+}
+
+#[test]
+fn copy_failure_rolls_back_the_owned_allocation() {
+    let (bytes, _) = image_with_bss_and_gap(ET_DYN);
+    let request = ArtifactRequest::new(
+        ExpectedElfType::Dyn,
+        ArtifactProfile::new(ElfClass::Elf64, Endian::Little, EM_RISCV),
+        LoadLimits::default(),
+    );
+    let loader = ImageLoader::new();
+    let admitted = loader
+        .admit(FaultingReader::new(&bytes, 0x1000), request)
+        .unwrap();
+    let planned = loader.plan(admitted).unwrap();
+    let allocation_id = AllocationId::new(12);
+    let mut memory = FakeMemory::returning(ImageAllocation::new(
+        allocation_id,
+        TargetAddr::new(0x8000),
+        0x3000,
+        0x1000,
+        AllocationOwnership::Owned,
+    ));
+
+    {
+        let mut transaction = ImageLoadTransaction::new(&mut memory);
+        let reserved = loader.reserve(planned, &mut transaction).unwrap();
+        let error = loader
+            .copy_and_zero(reserved, &mut transaction)
+            .unwrap_err();
+        assert_eq!(error.kind(), LoadErrorKind::Io);
+    }
+
+    assert_eq!(memory.releases, [allocation_id]);
 }

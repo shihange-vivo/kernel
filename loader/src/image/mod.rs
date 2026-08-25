@@ -13,9 +13,11 @@
 // limitations under the License.
 
 mod layout;
+mod loaded;
 mod parser;
 
 pub use layout::{
     ImageLayout, ImageLayoutBuilder, PlannedArtifact, SegmentLayout, SegmentLocation,
 };
+pub use loaded::{LoadedRegion, MappedImage};
 pub use parser::{DynamicSegmentInfo, LoadSegmentInfo, ParsedImage, StackPolicy};

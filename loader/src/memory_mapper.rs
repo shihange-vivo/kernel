@@ -18,6 +18,7 @@ use core::alloc::Layout;
 use crate::{
     AllocationId, AllocationOwnership, AllocationRequest, ErrorContext, ImageAllocation,
     ImageMemory, LoadError, LoadErrorKind, LoadResult, LoadStage, Placement, TargetAddr,
+    TargetLocation,
 };
 
 const IMAGE_ALLOCATION_ID: AllocationId = AllocationId::new(0);
@@ -86,6 +87,7 @@ pub struct MemoryMapper {
     virtual_end: usize,
     mem: Storage,
     mode: MappingMode,
+    image_allocation: Option<ImageAllocation>,
 }
 
 impl MemoryMapper {
@@ -100,6 +102,7 @@ impl MemoryMapper {
                 Some(regions) => MappingMode::Fixed(regions),
                 None => MappingMode::Allocated,
             },
+            image_allocation: None,
         }
     }
 
@@ -280,6 +283,9 @@ impl MemoryMapper {
 
 impl ImageMemory for MemoryMapper {
     fn allocate_image(&mut self, request: &AllocationRequest) -> LoadResult<ImageAllocation> {
+        if self.image_allocation.is_some() {
+            return Err(allocation_error(request));
+        }
         let size = usize::try_from(request.size()).map_err(|_| allocation_error(request))?;
         let align = usize::try_from(request.align()).map_err(|_| allocation_error(request))?;
 
@@ -315,13 +321,15 @@ impl ImageMemory for MemoryMapper {
                         .map_err(|_| allocation_error(request))?,
                 );
                 self.mem = storage;
-                Ok(ImageAllocation::new(
+                let allocation = ImageAllocation::new(
                     IMAGE_ALLOCATION_ID,
                     target_base,
                     request.size(),
                     request.align(),
                     AllocationOwnership::Owned,
-                ))
+                );
+                self.image_allocation = Some(allocation);
+                Ok(allocation)
             }
             (MappingMode::Fixed(_), Placement::Fixed(range)) => {
                 let start =
@@ -329,24 +337,105 @@ impl ImageMemory for MemoryMapper {
                 let len = usize::try_from(range.len()).map_err(|_| allocation_error(request))?;
                 self.validate_fixed_span(start, len, MemoryPermissions::NONE)
                     .map_err(|_| allocation_error(request))?;
-                Ok(ImageAllocation::new(
+                let allocation = ImageAllocation::new(
                     IMAGE_ALLOCATION_ID,
                     range.start(),
                     range.len(),
                     request.align(),
                     AllocationOwnership::BorrowedFixed,
-                ))
+                );
+                self.image_allocation = Some(allocation);
+                Ok(allocation)
             }
             _ => Err(allocation_error(request)),
         }
     }
 
     fn release(&mut self, allocation: AllocationId) {
-        if allocation == IMAGE_ALLOCATION_ID && matches!(self.mode, MappingMode::Allocated) {
-            self.mem = Storage::default();
-            self.virtual_entry = 0;
-            self.virtual_start = usize::MAX;
-            self.virtual_end = 0;
+        if self
+            .image_allocation
+            .is_some_and(|active| active.id() == allocation)
+        {
+            if matches!(self.mode, MappingMode::Allocated) {
+                self.mem = Storage::default();
+                self.virtual_entry = 0;
+                self.virtual_start = usize::MAX;
+                self.virtual_end = 0;
+            }
+            self.image_allocation = None;
+        }
+    }
+
+    fn validate_access(
+        &self,
+        location: TargetLocation,
+        len: u64,
+        permissions: MemoryPermissions,
+    ) -> LoadResult<()> {
+        self.image_span(location, len, permissions).map(|_| ())
+    }
+
+    fn write(&mut self, location: TargetLocation, data: &[u8]) -> LoadResult<()> {
+        let len = u64::try_from(data.len()).map_err(|_| memory_access_error(location, u64::MAX))?;
+        let target = self.image_span(location, len, MemoryPermissions::WRITE)?;
+        if data.is_empty() {
+            return Ok(());
+        }
+        unsafe { core::ptr::copy_nonoverlapping(data.as_ptr(), target, data.len()) };
+        Ok(())
+    }
+
+    fn zero(&mut self, location: TargetLocation, len: u64) -> LoadResult<()> {
+        let target = self.image_span(location, len, MemoryPermissions::WRITE)?;
+        let len = usize::try_from(len).map_err(|_| memory_access_error(location, len))?;
+        if len != 0 {
+            unsafe { core::ptr::write_bytes(target, 0, len) };
+        }
+        Ok(())
+    }
+}
+
+impl MemoryMapper {
+    fn image_span(
+        &self,
+        location: TargetLocation,
+        len: u64,
+        permissions: MemoryPermissions,
+    ) -> LoadResult<*mut u8> {
+        let allocation = self
+            .image_allocation
+            .filter(|allocation| allocation.id() == location.allocation())
+            .ok_or_else(|| memory_access_error(location, len))?;
+        let end = location
+            .offset()
+            .checked_add(len)
+            .filter(|end| *end <= allocation.len())
+            .ok_or_else(|| memory_access_error(location, len))?;
+        let offset =
+            usize::try_from(location.offset()).map_err(|_| memory_access_error(location, len))?;
+        let end_usize = usize::try_from(end).map_err(|_| memory_access_error(location, len))?;
+
+        match &self.mode {
+            MappingMode::Allocated => {
+                let base = self.mem.base();
+                if base.is_null() || self.mem.size() < end_usize {
+                    return Err(memory_access_error(location, len));
+                }
+                Ok(unsafe { base.add(offset) })
+            }
+            MappingMode::Fixed(_) => {
+                let start = allocation
+                    .target_base()
+                    .get()
+                    .checked_add(location.offset())
+                    .and_then(|value| usize::try_from(value).ok())
+                    .ok_or_else(|| memory_access_error(location, len))?;
+                let len_usize =
+                    usize::try_from(len).map_err(|_| memory_access_error(location, len))?;
+                self.validate_fixed_span(start, len_usize, permissions)
+                    .map_err(|_| memory_access_error(location, len))?;
+                Ok(start as *mut u8)
+            }
         }
     }
 }
@@ -363,6 +452,18 @@ fn allocation_error(request: &AllocationRequest) -> LoadError {
             base,
             len: request.size(),
             align: request.align(),
+        },
+    )
+}
+
+fn memory_access_error(location: TargetLocation, len: u64) -> LoadError {
+    LoadError::new(
+        LoadStage::Map,
+        LoadErrorKind::Backend,
+        ErrorContext::MemoryAccess {
+            allocation: location.allocation(),
+            offset: location.offset(),
+            len,
         },
     )
 }
