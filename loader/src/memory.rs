@@ -15,8 +15,8 @@
 use alloc::vec::Vec;
 
 use crate::{
-    AdmittedArtifact, ErrorContext, ImageLayout, ImageLoader, LoadError, LoadErrorKind, LoadResult,
-    LoadStage, ParsedImage, PlannedArtifact, TargetAddr, TargetRange,
+    AdmittedArtifact, ElfClass, ErrorContext, ImageLayout, ImageLoader, LoadError, LoadErrorKind,
+    LoadResult, LoadStage, ParsedImage, PlannedArtifact, TargetAddr, TargetRange,
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -291,6 +291,11 @@ impl ImageLoader {
         let request = layout.allocation_request(artifact.request().expected_elf_type());
         let allocation = transaction.allocate(&request)?;
         validate_allocation(&allocation, &request)?;
+        validate_target_width(
+            &allocation,
+            request.size(),
+            artifact.request().profile().class(),
+        )?;
         let load_bias = layout.load_bias_for(
             allocation.target_base(),
             artifact.request().expected_elf_type(),
@@ -303,6 +308,31 @@ impl ImageLoader {
             allocation,
             load_bias,
         })
+    }
+}
+
+fn validate_target_width(
+    allocation: &ImageAllocation,
+    image_span: u64,
+    class: ElfClass,
+) -> LoadResult<()> {
+    let end = allocation.target_base().checked_add(image_span)?;
+    let valid = match class {
+        ElfClass::Elf32 => end.get() <= u64::from(u32::MAX) + 1,
+        ElfClass::Elf64 => true,
+    };
+    if valid {
+        Ok(())
+    } else {
+        Err(LoadError::new(
+            LoadStage::Allocate,
+            LoadErrorKind::OutOfBounds,
+            ErrorContext::Allocation {
+                base: allocation.target_base(),
+                len: image_span,
+                align: allocation.align(),
+            },
+        ))
     }
 }
 

@@ -202,6 +202,20 @@ impl ElfFixtureBuilder {
         self
     }
 
+    pub fn write_rel32(mut self, offset: usize, relocations: &[(u32, u32)]) -> Self {
+        let entry_size = 8;
+        self.bytes.resize(
+            core::cmp::max(self.bytes.len(), offset + relocations.len() * entry_size),
+            0,
+        );
+        for (index, &(target, info)) in relocations.iter().enumerate() {
+            let current = offset + index * entry_size;
+            write_u32(&mut self.bytes, current, target);
+            write_u32(&mut self.bytes, current + 4, info);
+        }
+        self
+    }
+
     pub fn build(self) -> Vec<u8> {
         self.bytes
     }

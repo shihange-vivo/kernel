@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+mod arm;
 mod riscv;
 
 use alloc::vec::Vec;
@@ -22,6 +23,7 @@ use crate::{
     RuntimeImage, RuntimeImageMetadata, TargetLocation,
 };
 
+pub use arm::ArmRelocator;
 pub use riscv::Riscv64Relocator;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

@@ -15,15 +15,19 @@
 mod fixture;
 
 use goblin::elf::{
-    dynamic::{DT_DEBUG, DT_FLAGS_1, DT_NEEDED, DT_NULL, DT_RELA, DT_RELAENT, DT_RELASZ},
+    dynamic::{
+        DT_DEBUG, DT_FLAGS_1, DT_NEEDED, DT_NULL, DT_REL, DT_RELA, DT_RELAENT, DT_RELASZ,
+        DT_RELENT, DT_RELSZ,
+    },
     header::{EI_CLASS, EI_DATA, ELFCLASS32, ELFDATA2MSB, EM_ARM, EM_RISCV, ET_DYN, ET_EXEC},
+    reloc::R_ARM_RELATIVE,
     Elf,
 };
 
 use self::fixture::ElfFixtureBuilder;
 use crate::{
-    AllocationId, AllocationOwnership, AllocationRequest, ArtifactProfile, ArtifactRequest,
-    ElfClass, ElfReader, Endian, ErrorContext, ExpectedElfType, ImageAllocation,
+    AllocationId, AllocationOwnership, AllocationRequest, ArmRelocator, ArtifactProfile,
+    ArtifactRequest, ElfClass, ElfReader, Endian, ErrorContext, ExpectedElfType, ImageAllocation,
     ImageLoadTransaction, ImageLoader, ImageMemory, LoadError, LoadErrorKind, LoadLimits,
     LoadResult, LoadStage, MemoryPermissions, Placement, PlannedArtifact, RelocationAddend,
     Riscv64Relocator, RuntimeFeaturePolicy, SliceElfReader, TargetAddr, TargetLocation,
@@ -1140,4 +1144,134 @@ fn riscv64_relocator_checks_target_alignment_permissions_and_overflow() {
             .unwrap_err();
         assert_eq!(error.kind(), expected_kind);
     }
+}
+
+fn arm32_rel_image(implicit_addend: u32) -> std::vec::Vec<u8> {
+    let entries = [
+        (DT_REL, 0x3100),
+        (DT_RELSZ, 8),
+        (DT_RELENT, 8),
+        (DT_NULL, 0),
+    ];
+    ElfFixtureBuilder::elf32(EM_ARM, ET_DYN)
+        .set_entry(0x1001)
+        .add_program_header(PT_LOAD, 0x1000, 0x1000, 0x100, 0x100, PF_R | PF_X, 0x1000)
+        .add_program_header(PT_LOAD, 0x2000, 0x3000, 0x204, 0x300, PF_R | PF_W, 0x1000)
+        .add_program_header(
+            PT_DYNAMIC,
+            0x2000,
+            0x3000,
+            (entries.len() * 8) as u64,
+            (entries.len() * 8) as u64,
+            PF_R | PF_W,
+            4,
+        )
+        .write_dynamic(0x2000, &entries)
+        .write_rel32(0x2100, &[(0x3200, R_ARM_RELATIVE)])
+        .write_bytes(0x2200, &implicit_addend.to_le_bytes())
+        .build()
+}
+
+fn planned_arm32<'a>(bytes: &'a [u8]) -> PlannedArtifact<SliceElfReader<'a>> {
+    let request = ArtifactRequest::new(
+        ExpectedElfType::Dyn,
+        ArtifactProfile::new(ElfClass::Elf32, Endian::Little, EM_ARM),
+        LoadLimits::default(),
+    );
+    let loader = ImageLoader::new();
+    let admitted = loader.admit(SliceElfReader::new(bytes), request).unwrap();
+    loader.plan(admitted).unwrap()
+}
+
+#[test]
+fn arm_relocator_applies_load_bias_to_an_implicit_rel_addend() {
+    let bytes = arm32_rel_image(0x1234);
+    let planned = planned_arm32(&bytes);
+    let allocation_id = AllocationId::new(20);
+    let mut memory = FakeMemory::returning(ImageAllocation::new(
+        allocation_id,
+        TargetAddr::new(0x8000),
+        0x3000,
+        0x1000,
+        AllocationOwnership::Owned,
+    ));
+
+    let transaction = {
+        let mut transaction = ImageLoadTransaction::new(&mut memory);
+        let reserved = ImageLoader::new()
+            .reserve(planned, &mut transaction)
+            .unwrap();
+        let mapped = ImageLoader::new()
+            .copy_and_zero(reserved, &mut transaction)
+            .unwrap();
+        assert_eq!(mapped.entry().get(), 0x8001);
+        assert_eq!(mapped.canonical_entry().get(), 0x8000);
+        let runtime = mapped
+            .decode_runtime(&mut transaction, RuntimeFeaturePolicy::Phase0)
+            .unwrap();
+        assert_eq!(
+            runtime.metadata().relocations()[0].addend(),
+            RelocationAddend::Implicit
+        );
+        runtime.relocate(&mut transaction, &ArmRelocator).unwrap();
+        transaction
+    };
+    transaction.disarm_for_test();
+
+    assert_eq!(
+        u32::from_le_bytes(memory.bytes[0x2200..0x2204].try_into().unwrap()),
+        0x8234
+    );
+    assert!(memory.releases.is_empty());
+}
+
+#[test]
+fn reserve_rejects_an_elf32_image_outside_the_target_address_space() {
+    let bytes = arm32_rel_image(0);
+    let planned = planned_arm32(&bytes);
+    let allocation_id = AllocationId::new(21);
+    let mut memory = FakeMemory::returning(ImageAllocation::new(
+        allocation_id,
+        TargetAddr::new(0xffff_f000),
+        0x3000,
+        0x1000,
+        AllocationOwnership::Owned,
+    ));
+
+    {
+        let mut transaction = ImageLoadTransaction::new(&mut memory);
+        let error = ImageLoader::new()
+            .reserve(planned, &mut transaction)
+            .unwrap_err();
+        assert_eq!(error.kind(), LoadErrorKind::OutOfBounds);
+    }
+    assert_eq!(memory.releases, [allocation_id]);
+}
+
+#[test]
+fn arm_relocator_rejects_a_32_bit_relative_result_overflow() {
+    let bytes = arm32_rel_image(0xffff_f000);
+    let planned = planned_arm32(&bytes);
+    let mut memory = FakeMemory::returning(ImageAllocation::new(
+        AllocationId::new(22),
+        TargetAddr::new(0x8000),
+        0x3000,
+        0x1000,
+        AllocationOwnership::Owned,
+    ));
+    let mut transaction = ImageLoadTransaction::new(&mut memory);
+    let reserved = ImageLoader::new()
+        .reserve(planned, &mut transaction)
+        .unwrap();
+    let mapped = ImageLoader::new()
+        .copy_and_zero(reserved, &mut transaction)
+        .unwrap();
+    let runtime = mapped
+        .decode_runtime(&mut transaction, RuntimeFeaturePolicy::Phase0)
+        .unwrap();
+
+    let error = runtime
+        .relocate(&mut transaction, &ArmRelocator)
+        .unwrap_err();
+    assert_eq!(error.kind(), LoadErrorKind::IntegerOverflow);
 }
