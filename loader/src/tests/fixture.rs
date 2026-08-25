@@ -68,6 +68,15 @@ impl ElfFixtureBuilder {
         self
     }
 
+    pub fn set_entry(mut self, value: u64) -> Self {
+        match self.bytes[goblin::elf::header::EI_CLASS] {
+            goblin::elf::header::ELFCLASS32 => write_u32(&mut self.bytes, 24, value as u32),
+            goblin::elf::header::ELFCLASS64 => write_u64(&mut self.bytes, 24, value),
+            _ => unreachable!(),
+        }
+        self
+    }
+
     pub fn set_program_header_table(mut self, offset: u64, count: u16) -> Self {
         match self.bytes[goblin::elf::header::EI_CLASS] {
             goblin::elf::header::ELFCLASS32 => {

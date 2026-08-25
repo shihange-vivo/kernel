@@ -41,7 +41,10 @@ pub use identity::{
     AdmittedArtifact, ArtifactProfile, ArtifactRequest, ElfClass, ElfHeaderInfo, Endian, ImageKind,
     ImageLoader,
 };
-pub use image::{DynamicSegmentInfo, LoadSegmentInfo, ParsedImage, StackPolicy};
+pub use image::{
+    DynamicSegmentInfo, ImageLayout, ImageLayoutBuilder, LoadSegmentInfo, ParsedImage,
+    PlannedArtifact, SegmentLayout, SegmentLocation, StackPolicy,
+};
 pub use limits::LoadLimits;
 use memory_mapper::MappingModeKind;
 pub use memory_mapper::{MemoryMapper, MemoryPermissions, MemoryRegion};

@@ -18,6 +18,8 @@ use crate::{ErrorContext, LimitKind, LoadError, LoadErrorKind, LoadResult, LoadS
 pub struct LoadLimits {
     max_file_len: u64,
     max_program_headers: u16,
+    max_load_segments: u16,
+    max_image_span: u64,
 }
 
 impl LoadLimits {
@@ -27,7 +29,15 @@ impl LoadLimits {
         Self {
             max_file_len,
             max_program_headers,
+            max_load_segments: 32,
+            max_image_span: 64 * 1024 * 1024,
         }
+    }
+
+    pub const fn with_image_limits(mut self, max_load_segments: u16, max_image_span: u64) -> Self {
+        self.max_load_segments = max_load_segments;
+        self.max_image_span = max_image_span;
+        self
     }
 
     pub(crate) fn check_file_len(&self, actual: u64) -> LoadResult<()> {
@@ -56,6 +66,36 @@ impl LoadLimits {
                 resource: LimitKind::ProgramHeaderCount,
                 actual: u64::from(actual),
                 maximum: u64::from(self.max_program_headers),
+            },
+        ))
+    }
+
+    pub(crate) fn check_load_segment_count(&self, actual: usize) -> LoadResult<()> {
+        if actual <= usize::from(self.max_load_segments) {
+            return Ok(());
+        }
+        Err(LoadError::new(
+            LoadStage::Plan,
+            LoadErrorKind::ResourceLimit,
+            ErrorContext::Limit {
+                resource: LimitKind::LoadSegmentCount,
+                actual: actual as u64,
+                maximum: u64::from(self.max_load_segments),
+            },
+        ))
+    }
+
+    pub(crate) fn check_image_span(&self, actual: u64) -> LoadResult<()> {
+        if actual <= self.max_image_span {
+            return Ok(());
+        }
+        Err(LoadError::new(
+            LoadStage::Plan,
+            LoadErrorKind::ResourceLimit,
+            ErrorContext::Limit {
+                resource: LimitKind::ImageSpan,
+                actual,
+                maximum: self.max_image_span,
             },
         ))
     }

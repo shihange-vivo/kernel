@@ -52,6 +52,39 @@ impl TargetAddr {
             )
         })
     }
+
+    pub fn align_down(self, align: u64) -> LoadResult<Self> {
+        validate_alignment(align)?;
+        Ok(Self(self.0 & !(align - 1)))
+    }
+
+    pub fn align_up(self, align: u64) -> LoadResult<Self> {
+        validate_alignment(align)?;
+        let mask = align - 1;
+        self.0
+            .checked_add(mask)
+            .map(|value| Self(value & !mask))
+            .ok_or_else(|| alignment_error(self.0, align))
+    }
+}
+
+fn validate_alignment(align: u64) -> LoadResult<()> {
+    if align.is_power_of_two() {
+        Ok(())
+    } else {
+        Err(alignment_error(0, align))
+    }
+}
+
+fn alignment_error(value: u64, align: u64) -> LoadError {
+    LoadError::new(
+        LoadStage::Plan,
+        LoadErrorKind::InvalidAlignment,
+        ErrorContext::TargetRange {
+            start: TargetAddr::new(value),
+            len: align,
+        },
+    )
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

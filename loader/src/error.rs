@@ -20,6 +20,7 @@ pub enum LoadStage {
     Read,
     Parse,
     Validate,
+    Plan,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -31,6 +32,8 @@ pub enum LoadErrorKind {
     IntegerOverflow,
     ResourceLimit,
     OutOfMemory,
+    InvalidAlignment,
+    PermissionConflict,
     Io,
 }
 
@@ -54,6 +57,8 @@ pub enum HeaderField {
 pub enum LimitKind {
     FileLength,
     ProgramHeaderCount,
+    LoadSegmentCount,
+    ImageSpan,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

@@ -274,3 +274,146 @@ fn inspect_rejects_duplicate_singleton_program_headers() {
         );
     }
 }
+
+#[test]
+fn plan_supports_nonzero_virtual_bases_and_segment_gaps() {
+    let bytes = ElfFixtureBuilder::elf64(EM_RISCV, ET_DYN)
+        .set_entry(0x1010)
+        .add_program_header(PT_LOAD, 0, 0x1000, 64, 0x100, PF_R | PF_X, 0x1000)
+        .add_program_header(PT_LOAD, 0, 0x3000, 0, 0x100, PF_R | PF_W, 0x1000)
+        .build();
+    let loader = ImageLoader::new();
+    let admitted = loader
+        .admit(SliceElfReader::new(&bytes), riscv64_request())
+        .unwrap();
+    let planned = loader.plan(admitted).unwrap();
+
+    assert_eq!(planned.layout().aligned_min_vaddr().get(), 0x1000);
+    assert_eq!(planned.layout().aligned_max_vaddr().get(), 0x4000);
+    assert_eq!(planned.layout().image_span(), 0x3000);
+    assert_eq!(
+        planned
+            .layout()
+            .load_bias_for(crate::TargetAddr::new(0x8000), ImageKind::StaticPie)
+            .unwrap()
+            .get(),
+        0x7000
+    );
+    assert!(planned
+        .layout()
+        .locate_vaddr_range(
+            crate::TargetAddr::new(0x1010),
+            1,
+            crate::MemoryPermissions::EXECUTE
+        )
+        .is_ok());
+    assert!(planned
+        .layout()
+        .locate_vaddr_range(
+            crate::TargetAddr::new(0x2000),
+            1,
+            crate::MemoryPermissions::READ
+        )
+        .is_err());
+}
+
+#[test]
+fn plan_preserves_arm_thumb_entry_while_validating_its_canonical_address() {
+    let bytes = ElfFixtureBuilder::elf32(EM_ARM, ET_DYN)
+        .set_entry(0x1001)
+        .add_program_header(PT_LOAD, 0, 0x1000, 52, 0x100, PF_R | PF_X, 0x1000)
+        .build();
+    let request = ArtifactRequest::new(
+        ImageKind::StaticPie,
+        ArtifactProfile::new(ElfClass::Elf32, Endian::Little, EM_ARM),
+        LoadLimits::default(),
+    );
+    let loader = ImageLoader::new();
+    let admitted = loader.admit(SliceElfReader::new(&bytes), request).unwrap();
+    let planned = loader.plan(admitted).unwrap();
+
+    assert_eq!(planned.layout().entry_vaddr().get(), 0x1001);
+    assert_eq!(planned.layout().canonical_entry_vaddr().get(), 0x1000);
+}
+
+#[test]
+fn plan_rejects_invalid_segment_shapes_and_permissions() {
+    let cases = [
+        ElfFixtureBuilder::elf64(EM_RISCV, ET_DYN)
+            .set_entry(0x1000)
+            .add_program_header(PT_LOAD, 0, 0x1000, 64, 32, PF_R | PF_X, 1)
+            .build(),
+        ElfFixtureBuilder::elf64(EM_RISCV, ET_DYN)
+            .set_entry(0x1000)
+            .add_program_header(PT_LOAD, 0, 0x1000, 64, 64, PF_R | PF_X, 3)
+            .build(),
+        ElfFixtureBuilder::elf64(EM_RISCV, ET_DYN)
+            .set_entry(0x1000)
+            .add_program_header(PT_LOAD, 0, 0x1000, 64, 64, PF_R | PF_W | PF_X, 1)
+            .build(),
+        ElfFixtureBuilder::elf64(EM_RISCV, ET_DYN)
+            .set_entry(0x1000)
+            .add_program_header(PT_LOAD, 0, 0x1000, 64, 0x200, PF_R | PF_X, 1)
+            .add_program_header(PT_LOAD, 0, 0x1100, 0, 0x200, PF_R | PF_W, 1)
+            .build(),
+    ];
+
+    for bytes in cases {
+        let loader = ImageLoader::new();
+        let admitted = loader
+            .admit(SliceElfReader::new(&bytes), riscv64_request())
+            .unwrap();
+        assert!(loader.plan(admitted).is_err());
+    }
+}
+
+#[test]
+fn plan_rejects_missing_or_non_executable_entries() {
+    let no_load = ElfFixtureBuilder::elf64(EM_RISCV, ET_DYN).build();
+    let loader = ImageLoader::new();
+    let admitted = loader
+        .admit(SliceElfReader::new(&no_load), riscv64_request())
+        .unwrap();
+    assert_eq!(
+        loader.plan(admitted).unwrap_err().kind(),
+        LoadErrorKind::BadElf
+    );
+
+    let entry_in_gap = ElfFixtureBuilder::elf64(EM_RISCV, ET_DYN)
+        .set_entry(0x2000)
+        .add_program_header(PT_LOAD, 0, 0x1000, 64, 0x100, PF_R | PF_X, 1)
+        .add_program_header(PT_LOAD, 0, 0x3000, 0, 0x100, PF_R | PF_W, 1)
+        .build();
+    let admitted = loader
+        .admit(SliceElfReader::new(&entry_in_gap), riscv64_request())
+        .unwrap();
+    assert_eq!(
+        loader.plan(admitted).unwrap_err().kind(),
+        LoadErrorKind::PermissionConflict
+    );
+}
+
+#[test]
+fn plan_enforces_image_span_and_segment_count_limits() {
+    let bytes = ElfFixtureBuilder::elf64(EM_RISCV, ET_DYN)
+        .set_entry(0x1000)
+        .add_program_header(PT_LOAD, 0, 0x1000, 64, 0x100, PF_R | PF_X, 0x1000)
+        .add_program_header(PT_LOAD, 0, 0x9000, 0, 0x100, PF_R | PF_W, 0x1000)
+        .build();
+    for limits in [
+        LoadLimits::new(1024, 16).with_image_limits(1, u64::MAX),
+        LoadLimits::new(1024, 16).with_image_limits(16, 0x1000),
+    ] {
+        let request = ArtifactRequest::new(
+            ImageKind::StaticPie,
+            ArtifactProfile::new(ElfClass::Elf64, Endian::Little, EM_RISCV),
+            limits,
+        );
+        let loader = ImageLoader::new();
+        let admitted = loader.admit(SliceElfReader::new(&bytes), request).unwrap();
+        assert_eq!(
+            loader.plan(admitted).unwrap_err().kind(),
+            LoadErrorKind::ResourceLimit
+        );
+    }
+}
