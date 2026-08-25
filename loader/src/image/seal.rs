@@ -58,11 +58,43 @@ impl SealPlan {
     }
 
     fn build(mapped: &MappedImage) -> LoadResult<Self> {
-        let capacity = mapped.regions().len().checked_mul(3).ok_or_else(seal_oom)?;
+        // Every loaded region can be split into three pieces by RELRO and can
+        // have an inaccessible allocation gap before it.  One final range is
+        // needed for alignment padding after the last region.
+        let capacity = mapped
+            .regions()
+            .len()
+            .checked_mul(4)
+            .and_then(|value| value.checked_add(1))
+            .ok_or_else(seal_oom)?;
         let mut ranges = Vec::new();
         ranges.try_reserve_exact(capacity).map_err(|_| seal_oom())?;
 
+        let mut allocation_cursor = 0;
         for region in mapped.regions() {
+            let region_offset = region
+                .runtime_range()
+                .start()
+                .checked_sub(mapped.allocation().target_base())?;
+            append_allocation_range(
+                mapped,
+                &mut ranges,
+                allocation_cursor,
+                region_offset
+                    .checked_sub(allocation_cursor)
+                    .ok_or_else(|| {
+                        LoadError::new(
+                            LoadStage::Seal,
+                            LoadErrorKind::OutOfBounds,
+                            ErrorContext::TargetRange {
+                                start: region.runtime_range().start(),
+                                len: region.runtime_range().len(),
+                            },
+                        )
+                    })?,
+                MemoryPermissions::NONE,
+            )?;
+
             let source = region.vaddr_range();
             if let Some(relro) = mapped.relro().filter(|relro| relro.overlaps(source)) {
                 let source_end = source.end()?;
@@ -101,7 +133,31 @@ impl SealPlan {
                     region.logical_permissions(),
                 )?;
             }
+            allocation_cursor = region
+                .runtime_range()
+                .end()?
+                .checked_sub(mapped.allocation().target_base())?;
         }
+        append_allocation_range(
+            mapped,
+            &mut ranges,
+            allocation_cursor,
+            mapped
+                .image_span()
+                .checked_sub(allocation_cursor)
+                .ok_or_else(|| {
+                    LoadError::new(
+                        LoadStage::Seal,
+                        LoadErrorKind::OutOfBounds,
+                        ErrorContext::MemoryAccess {
+                            allocation: mapped.allocation().id(),
+                            offset: allocation_cursor,
+                            len: mapped.image_span(),
+                        },
+                    )
+                })?,
+            MemoryPermissions::NONE,
+        )?;
         Ok(Self {
             ranges: ranges.into_boxed_slice(),
         })
@@ -206,6 +262,34 @@ fn append_range(
     let location = mapped.locate_vaddr(vaddr, len, MemoryPermissions::NONE)?;
     let runtime_range = TargetRange::new(mapped.load_bias().checked_add(vaddr.get())?, len);
     runtime_range.end()?;
+
+    append_seal_range(ranges, location, runtime_range, permissions)
+}
+
+fn append_allocation_range(
+    mapped: &MappedImage,
+    ranges: &mut Vec<SealRange>,
+    offset: u64,
+    len: u64,
+    permissions: MemoryPermissions,
+) -> LoadResult<()> {
+    if len == 0 {
+        return Ok(());
+    }
+    let location = TargetLocation::new(mapped.allocation().id(), offset);
+    let runtime_range =
+        TargetRange::new(mapped.allocation().target_base().checked_add(offset)?, len);
+    runtime_range.end()?;
+    append_seal_range(ranges, location, runtime_range, permissions)
+}
+
+fn append_seal_range(
+    ranges: &mut Vec<SealRange>,
+    location: TargetLocation,
+    runtime_range: TargetRange,
+    permissions: MemoryPermissions,
+) -> LoadResult<()> {
+    let len = runtime_range.len();
 
     if let Some(previous) = ranges.last_mut() {
         let previous_location_end = previous

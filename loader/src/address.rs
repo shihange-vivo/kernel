@@ -61,10 +61,7 @@ impl TargetAddr {
     pub fn align_up(self, align: u64) -> LoadResult<Self> {
         validate_alignment(align)?;
         let mask = align - 1;
-        self.0
-            .checked_add(mask)
-            .map(|value| Self(value & !mask))
-            .ok_or_else(|| alignment_error(self.0, align))
+        Ok(Self(self.checked_add(mask)?.0 & !mask))
     }
 }
 
