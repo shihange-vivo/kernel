@@ -235,6 +235,11 @@ fn preflight_targets<M: ImageMemory>(mapped: &MappedImage, memory: &M) -> LoadRe
             region.vaddr_range().len(),
             MemoryPermissions::WRITE,
         )?;
+        memory.validate_access(
+            region.location(mapped.allocation.id()),
+            region.vaddr_range().len(),
+            region.logical_permissions(),
+        )?;
     }
     Ok(())
 }

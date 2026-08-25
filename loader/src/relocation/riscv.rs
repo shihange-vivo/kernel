@@ -17,6 +17,31 @@ use crate::{AddendEncoding, ArchRelocator, ElfClass, WordWidth};
 #[derive(Clone, Copy, Debug, Default)]
 pub struct Riscv64Relocator;
 
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Riscv32Relocator;
+
+impl ArchRelocator for Riscv32Relocator {
+    fn machine(&self) -> u16 {
+        goblin::elf::header::EM_RISCV
+    }
+
+    fn class(&self) -> ElfClass {
+        ElfClass::Elf32
+    }
+
+    fn word_width(&self) -> WordWidth {
+        WordWidth::U32
+    }
+
+    fn relative_type(&self) -> u32 {
+        goblin::elf::reloc::R_RISCV_RELATIVE
+    }
+
+    fn addend_encoding(&self) -> AddendEncoding {
+        AddendEncoding::Explicit
+    }
+}
+
 impl ArchRelocator for Riscv64Relocator {
     fn machine(&self) -> u16 {
         goblin::elf::header::EM_RISCV

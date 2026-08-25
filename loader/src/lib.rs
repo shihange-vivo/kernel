@@ -13,7 +13,6 @@
 // limitations under the License.
 
 #![no_std]
-#![feature(c_size_t)]
 
 extern crate alloc;
 
@@ -36,11 +35,6 @@ pub use error::{
     ErrorContext, HeaderField, LimitKind, LoadError, LoadErrorKind, LoadResult, LoadStage,
     ProgramHeaderField,
 };
-use goblin::elf::{
-    header::{ET_DYN, ET_EXEC},
-    reloc::R_RISCV_RELATIVE,
-    Elf, Reloc,
-};
 pub use identity::{
     AdmittedArtifact, ArtifactProfile, ArtifactRequest, ElfClass, ElfHeaderInfo, Endian,
     ExpectedElfType, ImageLoader,
@@ -56,107 +50,118 @@ pub use memory::{
     AllocationId, AllocationOwnership, AllocationRequest, ImageAllocation, ImageLoadTransaction,
     ImageMemory, Placement, ReservedImage, TargetLocation,
 };
-use memory_mapper::MappingModeKind;
 pub use memory_mapper::{MemoryMapper, MemoryPermissions, MemoryRegion};
 pub use reader::{ElfReader, SliceElfReader};
 pub use relocation::{
-    AddendEncoding, ArchRelocator, ArmRelocator, RelocatedImage, Riscv64Relocator, TargetWord,
-    WordWidth,
+    AddendEncoding, ArchRelocator, ArmRelocator, RelocatedImage, Riscv32Relocator,
+    Riscv64Relocator, TargetWord, WordWidth,
 };
 
 pub type Result = core::result::Result<(), &'static str>;
 
-fn build_memory_layout(binary: &Elf, mapper: &mut MemoryMapper) -> Result {
-    for ph in &binary.program_headers {
-        match ph.p_type {
-            goblin::elf::program_header::PT_LOAD => {
-                // We're assuming loadable segments are compact.
-                mapper
-                    .update_start(ph.p_vaddr as usize)
-                    .update_end((ph.p_vaddr + ph.p_memsz) as usize);
-            }
-            _ => continue,
-        }
-    }
-    mapper.set_entry(binary.entry as usize);
-    Ok(())
+pub fn load_image<R, M, C, A>(
+    reader: R,
+    request: ArtifactRequest,
+    memory: &mut M,
+    cache: &mut C,
+    runtime_policy: RuntimeFeaturePolicy,
+    relocator: &A,
+) -> LoadResult<SealedImage>
+where
+    R: ElfReader,
+    M: ImageMemory,
+    C: CodeCache,
+    A: ArchRelocator + ?Sized,
+{
+    let loader = ImageLoader::new();
+    let admitted = loader.admit(reader, request)?;
+    let planned = loader.plan(admitted)?;
+
+    let mut transaction = ImageLoadTransaction::new(memory);
+    let reserved = loader.reserve(planned, &mut transaction)?;
+    let mapped = loader.copy_and_zero(reserved, &mut transaction)?;
+    let runtime = mapped.decode_runtime(&mut transaction, runtime_policy)?;
+    let relocated = runtime.relocate(&mut transaction, relocator)?;
+    let sealed = relocated.seal(&mut transaction, cache)?;
+    transaction.commit_for(&sealed)?;
+    Ok(sealed)
 }
 
-fn allocate_memory_for_segments(_binary: &Elf, mapper: &mut MemoryMapper) -> Result {
-    mapper.allocate_memory()?;
-    Ok(())
-}
-
-fn copy_content_to_memory(buffer: &[u8], binary: &Elf, mapper: &mut MemoryMapper) -> Result {
-    // FIXME: We are assuming if filesize < memsize, (memsize -
-    // filesize) bits are .bss. I need to read more about ELF spec to
-    // find out exceptions. Currently, it just works.
-    for ph in &binary.program_headers {
-        match ph.p_type {
-            goblin::elf::program_header::PT_LOAD => {
-                let Some(src) =
-                    buffer.get(ph.p_offset as usize..(ph.p_offset + ph.p_filesz) as usize)
-                else {
-                    return Err("Invalid indices to the buffer");
-                };
-                mapper.write_slice_at(ph.p_vaddr as usize, src)?;
-            }
-            _ => continue,
-        }
-    }
-    Ok(())
-}
-
-fn handle_riscv_relative_reloc(mapper: &mut MemoryMapper, reloc: &Reloc) -> Result {
-    let vaddr = reloc.r_offset as usize;
-    let val = mapper.real_start()? + reloc.r_addend.unwrap_or(0) as usize;
-    mapper.write_value_at(vaddr, val)?;
-    Ok(())
-}
-
-#[allow(clippy::single_match)]
-fn relocate(binary: &Elf, mapper: &mut MemoryMapper) -> Result {
-    let reloc_section = &binary.dynrelas;
-    for reloc in reloc_section.iter() {
-        match reloc.r_type {
-            R_RISCV_RELATIVE => {
-                handle_riscv_relative_reloc(mapper, &reloc)?;
-            }
-            _ => {}
-        }
-    }
-    Ok(())
-}
-
-fn load_dyn_elf(buffer: &[u8], binary: &Elf, mapper: &mut MemoryMapper) -> Result {
-    if mapper.mode_kind() != MappingModeKind::Allocated {
-        return Err("ET_DYN requires Allocated mapping mode");
-    }
-    build_memory_layout(binary, mapper)?;
-    allocate_memory_for_segments(binary, mapper)?;
-    copy_content_to_memory(buffer, binary, mapper)?;
-    relocate(binary, mapper)?;
-    mapper.real_entry()?;
-    Ok(())
-}
-
-fn load_exec_elf(buffer: &[u8], binary: &Elf, mapper: &mut MemoryMapper) -> Result {
-    if mapper.mode_kind() != MappingModeKind::Fixed {
-        return Err("ET_EXEC requires Fixed mapping mode");
-    }
-    build_memory_layout(binary, mapper)?;
-    copy_content_to_memory(buffer, binary, mapper)?;
-    mapper.real_entry()?;
-    Ok(())
-}
-
-// FIXME: We should use lseek to parse ELF files to achieve low footprint.
+#[cfg(target_arch = "riscv64")]
 pub fn load_elf(buffer: &[u8], mapper: &mut MemoryMapper) -> Result {
-    let binary = Elf::parse(buffer).map_err(|_| "Unable to parse the buffer")?;
-    match binary.header.e_type {
-        ET_DYN => load_dyn_elf(buffer, &binary, mapper),
-        ET_EXEC => load_exec_elf(buffer, &binary, mapper),
-        _ => Err("Unsupported ELF type"),
+    load_elf_with_relocator(
+        buffer,
+        mapper,
+        ArtifactProfile::new(
+            ElfClass::Elf64,
+            Endian::Little,
+            goblin::elf::header::EM_RISCV,
+        ),
+        &Riscv64Relocator,
+    )
+}
+
+#[cfg(target_arch = "riscv32")]
+pub fn load_elf(buffer: &[u8], mapper: &mut MemoryMapper) -> Result {
+    load_elf_with_relocator(
+        buffer,
+        mapper,
+        ArtifactProfile::new(
+            ElfClass::Elf32,
+            Endian::Little,
+            goblin::elf::header::EM_RISCV,
+        ),
+        &Riscv32Relocator,
+    )
+}
+
+#[cfg(target_arch = "arm")]
+pub fn load_elf(buffer: &[u8], mapper: &mut MemoryMapper) -> Result {
+    load_elf_with_relocator(
+        buffer,
+        mapper,
+        ArtifactProfile::new(ElfClass::Elf32, Endian::Little, goblin::elf::header::EM_ARM),
+        &ArmRelocator,
+    )
+}
+
+#[cfg(not(any(target_arch = "riscv32", target_arch = "riscv64", target_arch = "arm")))]
+pub fn load_elf(_buffer: &[u8], _mapper: &mut MemoryMapper) -> Result {
+    Err("Unsupported loader target architecture")
+}
+
+#[cfg(any(target_arch = "riscv32", target_arch = "riscv64", target_arch = "arm"))]
+fn load_elf_with_relocator<A: ArchRelocator + ?Sized>(
+    buffer: &[u8],
+    mapper: &mut MemoryMapper,
+    profile: ArtifactProfile,
+    relocator: &A,
+) -> Result {
+    let request = ArtifactRequest::new(mapper.expected_elf_type(), profile, LoadLimits::default());
+    let mut cache = ArchitectureCodeCache;
+    let sealed = load_image(
+        SliceElfReader::new(buffer),
+        request,
+        mapper,
+        &mut cache,
+        RuntimeFeaturePolicy::Phase0,
+        relocator,
+    )
+    .map_err(compatibility_error)?;
+    mapper
+        .install_sealed(&sealed)
+        .map_err(compatibility_error)?;
+    Ok(())
+}
+
+#[cfg(any(target_arch = "riscv32", target_arch = "riscv64", target_arch = "arm"))]
+fn compatibility_error(error: LoadError) -> &'static str {
+    match error.kind() {
+        LoadErrorKind::BadElf => "Invalid ELF image",
+        LoadErrorKind::UnsupportedByProfile => "Unsupported ELF feature",
+        LoadErrorKind::OutOfMemory => "Unable to allocate ELF image",
+        LoadErrorKind::Io => "Unable to read ELF image",
+        _ => "Unable to load ELF image",
     }
 }
 

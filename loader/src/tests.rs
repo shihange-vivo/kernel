@@ -1466,3 +1466,59 @@ fn protection_failure_rolls_back_the_owned_allocation() {
     assert_eq!(memory.protects.len(), 1);
     assert_eq!(memory.releases, [allocation_id]);
 }
+
+#[test]
+fn load_image_orchestrates_and_commits_the_phase0_pipeline() {
+    let bytes = riscv_image_with_relro();
+    let request = riscv64_request();
+    let mut memory = FakeMemory::returning(ImageAllocation::new(
+        AllocationId::new(26),
+        TargetAddr::new(0x8000),
+        0x3000,
+        0x1000,
+        AllocationOwnership::Owned,
+    ));
+    let mut cache = FakeCodeCache::default();
+
+    let sealed = crate::load_image(
+        SliceElfReader::new(&bytes),
+        request,
+        &mut memory,
+        &mut cache,
+        RuntimeFeaturePolicy::Phase0,
+        &Riscv64Relocator,
+    )
+    .unwrap();
+
+    assert_eq!(sealed.entry().get(), 0x8000);
+    assert_eq!(sealed.metadata().relocations().len(), 1);
+    assert!(memory.releases.is_empty());
+}
+
+#[test]
+fn load_image_rolls_back_when_the_phase0_policy_rejects_a_dependency() {
+    let entries = [(DT_NEEDED, 1), (DT_NULL, 0)];
+    let bytes = image_with_dynamic_entries(&entries, 3);
+    let allocation_id = AllocationId::new(27);
+    let mut memory = FakeMemory::returning(ImageAllocation::new(
+        allocation_id,
+        TargetAddr::new(0x8000),
+        0x3000,
+        0x1000,
+        AllocationOwnership::Owned,
+    ));
+    let mut cache = FakeCodeCache::default();
+
+    let error = crate::load_image(
+        SliceElfReader::new(&bytes),
+        riscv64_request(),
+        &mut memory,
+        &mut cache,
+        RuntimeFeaturePolicy::Phase0,
+        &Riscv64Relocator,
+    )
+    .unwrap_err();
+
+    assert_eq!(error.kind(), LoadErrorKind::UnsupportedByProfile);
+    assert_eq!(memory.releases, [allocation_id]);
+}

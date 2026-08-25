@@ -24,7 +24,7 @@ use crate::{
 };
 
 pub use arm::ArmRelocator;
-pub use riscv::Riscv64Relocator;
+pub use riscv::{Riscv32Relocator, Riscv64Relocator};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum WordWidth {

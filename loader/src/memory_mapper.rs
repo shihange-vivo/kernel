@@ -16,9 +16,9 @@ use blueos_infra::storage::Storage;
 use core::alloc::Layout;
 
 use crate::{
-    AllocationId, AllocationOwnership, AllocationRequest, ErrorContext, ImageAllocation,
-    ImageMemory, LoadError, LoadErrorKind, LoadResult, LoadStage, Placement, TargetAddr,
-    TargetLocation,
+    AllocationId, AllocationOwnership, AllocationRequest, ErrorContext, ExpectedElfType,
+    ImageAllocation, ImageMemory, LoadError, LoadErrorKind, LoadResult, LoadStage, Placement,
+    SealedImage, TargetAddr, TargetLocation,
 };
 
 const IMAGE_ALLOCATION_ID: AllocationId = AllocationId::new(0);
@@ -72,12 +72,6 @@ impl MemoryRegion {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum MappingModeKind {
-    Allocated,
-    Fixed,
-}
-
 #[derive(Debug)]
 enum MappingMode {
     Allocated,
@@ -86,9 +80,7 @@ enum MappingMode {
 
 #[derive(Debug)]
 pub struct MemoryMapper {
-    virtual_entry: usize,
-    virtual_start: usize,
-    virtual_end: usize,
+    sealed_entry: Option<usize>,
     mem: Storage,
     mode: MappingMode,
     image_allocation: Option<ImageAllocation>,
@@ -98,9 +90,7 @@ impl MemoryMapper {
     #[inline]
     pub fn new(regions: Option<&'static [MemoryRegion]>) -> Self {
         Self {
-            virtual_entry: 0,
-            virtual_start: usize::MAX,
-            virtual_end: 0,
+            sealed_entry: None,
             mem: Storage::default(),
             mode: match regions {
                 Some(regions) => MappingMode::Fixed(regions),
@@ -111,64 +101,11 @@ impl MemoryMapper {
     }
 
     #[inline]
-    pub(crate) fn mode_kind(&self) -> MappingModeKind {
+    pub(crate) fn expected_elf_type(&self) -> ExpectedElfType {
         match &self.mode {
-            MappingMode::Allocated => MappingModeKind::Allocated,
-            MappingMode::Fixed(_) => MappingModeKind::Fixed,
+            MappingMode::Allocated => ExpectedElfType::Dyn,
+            MappingMode::Fixed(_) => ExpectedElfType::Exec,
         }
-    }
-
-    #[inline]
-    pub fn entry(&self) -> usize {
-        self.virtual_entry
-    }
-
-    #[inline]
-    pub fn set_entry(&mut self, entry: usize) -> &mut Self {
-        self.virtual_entry = entry;
-        self
-    }
-
-    #[inline]
-    pub fn start(&self) -> usize {
-        self.virtual_start
-    }
-
-    #[inline]
-    pub fn update_start(&mut self, val: usize) -> &mut Self {
-        self.virtual_start = core::cmp::min(self.virtual_start, val);
-        self
-    }
-
-    #[inline]
-    pub fn update_end(&mut self, val: usize) -> &mut Self {
-        self.virtual_end = core::cmp::max(self.virtual_end, val);
-        self
-    }
-
-    #[inline]
-    pub fn total_size(&self) -> Result<usize> {
-        if self.virtual_end < self.virtual_start {
-            return Err("Illegal memory size");
-        }
-        Ok(self.virtual_end - self.virtual_start)
-    }
-
-    #[inline]
-    pub fn allocate_memory(&mut self) -> Result<usize> {
-        // FIXME: We are not using paging yet, so alignment(usually
-        // 4096) specified in program header is not applied here.
-        // BlueKernel on AArch64 uses MMU by default, which requires aligning to
-        // a page boundary.
-        #[cfg(any(target_arch = "aarch64"))]
-        const ALIGN: usize = 4096;
-        #[cfg(not(any(target_arch = "aarch64")))]
-        const ALIGN: usize = 2 * core::mem::size_of::<usize>();
-        let Ok(layout) = Layout::from_size_align(self.total_size()?, ALIGN) else {
-            return Err("Illegal memory layout");
-        };
-        self.mem = Storage::from_layout(layout);
-        Ok(self.mem.size())
     }
 
     #[inline]
@@ -182,13 +119,30 @@ impl MemoryMapper {
 
     #[inline]
     pub fn real_entry(&self) -> Result<usize> {
-        match &self.mode {
-            MappingMode::Allocated => Ok(self.inner_real_ptr(self.virtual_entry)? as usize),
-            MappingMode::Fixed(_) => {
-                self.validate_fixed_span(self.virtual_entry, 1, MemoryPermissions::EXECUTE)?;
-                Ok(self.virtual_entry)
-            }
+        self.sealed_entry.ok_or("Image has not been sealed")
+    }
+
+    pub(crate) fn install_sealed(&mut self, sealed: &SealedImage) -> LoadResult<()> {
+        let active = self
+            .image_allocation
+            .filter(|allocation| allocation.id() == sealed.allocation().id())
+            .ok_or_else(|| sealed_install_error(sealed))?;
+        let entry =
+            usize::try_from(sealed.entry().get()).map_err(|_| sealed_install_error(sealed))?;
+        let entry_in_allocation = sealed
+            .entry()
+            .get()
+            .checked_sub(active.target_base().get())
+            .is_some_and(|offset| offset < active.len());
+        if !entry_in_allocation {
+            return Err(sealed_install_error(sealed));
         }
+        if matches!(self.mode, MappingMode::Fixed(_)) {
+            self.validate_fixed_span(entry, 1, MemoryPermissions::EXECUTE)
+                .map_err(|_| sealed_install_error(sealed))?;
+        }
+        self.sealed_entry = Some(entry);
+        Ok(())
     }
 
     pub(crate) fn validate_fixed_span(
@@ -211,77 +165,6 @@ impl MemoryMapper {
         } else {
             Err("Address span is outside authorized regions")
         }
-    }
-
-    fn inner_real_offset(&self, vaddr: usize) -> Result<usize> {
-        if vaddr < self.virtual_start || vaddr >= self.virtual_end {
-            return Err("The virtual address is in an illegal memory region");
-        }
-        let total_size = self.total_size()?;
-        let offset = vaddr - self.virtual_start;
-        if offset >= total_size {
-            return Err("The offset is beyond the virtual memory region");
-        }
-        Ok(offset)
-    }
-
-    fn inner_real_ptr(&self, vaddr: usize) -> Result<*mut u8> {
-        match &self.mode {
-            MappingMode::Allocated => {
-                let offset = self.inner_real_offset(vaddr)?;
-                if offset >= self.mem.size() {
-                    return Err("The offset is beyond the allocated memory region");
-                }
-                let base = self.mem.base();
-                if base.is_null() {
-                    return Err("Memory not allocated yet");
-                }
-                Ok(unsafe { base.add(offset) })
-            }
-            MappingMode::Fixed(_) => {
-                self.validate_fixed_span(vaddr, 1, MemoryPermissions::NONE)?;
-                Ok(vaddr as *mut u8)
-            }
-        }
-    }
-
-    fn inner_real_begin(&self, vaddr: usize, size: usize) -> Result<*mut u8> {
-        match &self.mode {
-            MappingMode::Allocated => {
-                if vaddr < self.virtual_start || vaddr + size > self.virtual_end {
-                    return Err("The span of the data is in an illegal memory region");
-                }
-                let real_begin = self.inner_real_ptr(vaddr)?;
-                let _real_end = core::hint::black_box(self.inner_real_ptr(vaddr + size - 1)?);
-                Ok(real_begin)
-            }
-            MappingMode::Fixed(_) => {
-                self.validate_fixed_span(vaddr, size, MemoryPermissions::NONE)?;
-                Ok(vaddr as *mut u8)
-            }
-        }
-    }
-
-    pub fn write_slice_at(&mut self, vaddr: usize, data: &[u8]) -> Result<usize> {
-        let size = data.len();
-        if size == 0 {
-            return Ok(size);
-        }
-        let real_begin = self.inner_real_begin(vaddr, size)?;
-        // FIXME: Is it safe enough to use copy_nonoverlapping?
-        unsafe { core::ptr::copy(data.as_ptr(), real_begin, data.len()) };
-        Ok(size)
-    }
-
-    pub fn write_value_at<T>(&mut self, vaddr: usize, val: T) -> Result<usize>
-    where
-        T: Sized,
-    {
-        let size = core::mem::size_of::<T>();
-        let real_begin = self.inner_real_begin(vaddr, size)?;
-        let val_ptr: *mut T = unsafe { core::mem::transmute(real_begin) };
-        unsafe { val_ptr.write(val) };
-        Ok(size)
     }
 }
 
@@ -362,10 +245,8 @@ impl ImageMemory for MemoryMapper {
         {
             if matches!(self.mode, MappingMode::Allocated) {
                 self.mem = Storage::default();
-                self.virtual_entry = 0;
-                self.virtual_start = usize::MAX;
-                self.virtual_end = 0;
             }
+            self.sealed_entry = None;
             self.image_allocation = None;
         }
     }
@@ -487,6 +368,17 @@ fn memory_access_error(location: TargetLocation, len: u64) -> LoadError {
             allocation: location.allocation(),
             offset: location.offset(),
             len,
+        },
+    )
+}
+
+fn sealed_install_error(sealed: &SealedImage) -> LoadError {
+    LoadError::new(
+        LoadStage::Seal,
+        LoadErrorKind::Backend,
+        ErrorContext::TargetRange {
+            start: sealed.entry(),
+            len: 1,
         },
     )
 }

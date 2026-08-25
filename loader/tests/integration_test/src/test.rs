@@ -221,8 +221,11 @@ mod test_elf_loader {
     #[test]
     fn test_exec_rejects_non_executable_region() {
         let buf = read_all(unsafe { LOADER_TEST_ELF_PATH }).unwrap();
+        let before = unsafe { (TEST_REGION_START as *const u32).read_volatile() };
         let mut mapper = loader::MemoryMapper::new(Some(&NON_EXEC_REGIONS));
         assert!(loader::load_elf(&buf, &mut mapper).is_err());
+        let after = unsafe { (TEST_REGION_START as *const u32).read_volatile() };
+        assert_eq!(after, before);
     }
 }
 
