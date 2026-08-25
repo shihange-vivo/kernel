@@ -36,6 +36,22 @@ static mut ID: i32 = 42;
 // Should be put in .bss section.
 static mut LARGE_ARRAY: [u8; 1024] = [0u8; 1024];
 
+#[cfg(target_arch = "arm")]
+static ARM_RELOCATION_VALUE: u32 = 0x41c6_7a2d;
+
+#[cfg(target_arch = "arm")]
+#[repr(transparent)]
+struct SharedPointer(*const u32);
+
+#[cfg(target_arch = "arm")]
+unsafe impl Sync for SharedPointer {}
+
+// Keeping a link-time address in a data section makes LLD emit the
+// R_ARM_RELATIVE entry that the ARM Phase 0 integration path must consume.
+#[cfg(target_arch = "arm")]
+#[used]
+static ARM_RELOCATION_POINTER: SharedPointer = SharedPointer(&ARM_RELOCATION_VALUE);
+
 struct PosixAllocator;
 
 unsafe impl GlobalAlloc for PosixAllocator {
@@ -76,17 +92,13 @@ fn panic(info: &core::panic::PanicInfo<'_>) -> ! {
 #[no_mangle]
 #[repr(align(8))]
 pub extern "C" fn _start() {
-    // FIXME: Generally we need toolchains able to build static-pie,
-    // thus we have dynamic relocation entres to relocate .got
-    // entries. GNU's ld targeted bare-metal targets failed to
-    // generate static-pie ELF. See https://gcc.gnu.org/bugzilla/show_bug.cgi?id=106356.
-    // That's to say, currently the ELF file
-    // is of type EXEC, however we need it to be DYN.
-    // Also libcore, liballoc should be built with -fpic
-    // enabled. Currently non-riscv targets just passes the test by
-    // luck.
     #[cfg(not(any(target_arch = "arm", target_arch = "aarch64")))]
     assert_eq!(main(42), 42);
+
+    #[cfg(target_arch = "arm")]
+    unsafe {
+        assert_eq!(ptr::read_volatile(ARM_RELOCATION_POINTER.0), 0x41c6_7a2d);
+    }
 }
 
 #[no_mangle]
