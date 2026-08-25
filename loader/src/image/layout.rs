@@ -15,9 +15,9 @@
 use alloc::{boxed::Box, vec::Vec};
 
 use crate::{
-    AdmittedArtifact, ElfReader, ErrorContext, FileRange, ImageKind, ImageLoader, LoadError,
-    LoadErrorKind, LoadLimits, LoadResult, LoadStage, MemoryPermissions, ParsedImage,
-    ProgramHeaderField, TargetAddr, TargetRange,
+    AdmittedArtifact, AllocationRequest, ElfReader, ErrorContext, ExpectedElfType, FileRange,
+    ImageLoader, LoadError, LoadErrorKind, LoadLimits, LoadResult, LoadStage, MemoryPermissions,
+    ParsedImage, Placement, ProgramHeaderField, TargetAddr, TargetRange,
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -99,14 +99,16 @@ impl ImageLayout {
     pub fn load_bias_for(
         &self,
         mapped_base: TargetAddr,
-        kind: ImageKind,
+        expected_elf_type: ExpectedElfType,
     ) -> LoadResult<TargetAddr> {
-        match kind {
-            ImageKind::StaticPie => Ok(TargetAddr::new(
+        match expected_elf_type {
+            ExpectedElfType::Dyn => Ok(TargetAddr::new(
                 mapped_base.checked_sub(self.aligned_min_vaddr)?,
             )),
-            ImageKind::FixedExec if mapped_base == self.aligned_min_vaddr => Ok(TargetAddr::new(0)),
-            ImageKind::FixedExec => Err(LoadError::new(
+            ExpectedElfType::Exec if mapped_base == self.aligned_min_vaddr => {
+                Ok(TargetAddr::new(0))
+            }
+            ExpectedElfType::Exec => Err(LoadError::new(
                 LoadStage::Plan,
                 LoadErrorKind::OutOfBounds,
                 ErrorContext::TargetRange {
@@ -115,6 +117,19 @@ impl ImageLayout {
                 },
             )),
         }
+    }
+
+    pub const fn allocation_request(
+        &self,
+        expected_elf_type: ExpectedElfType,
+    ) -> AllocationRequest {
+        let placement = match expected_elf_type {
+            ExpectedElfType::Dyn => Placement::Anywhere,
+            ExpectedElfType::Exec => {
+                Placement::Fixed(TargetRange::new(self.aligned_min_vaddr, self.image_span))
+            }
+        };
+        AllocationRequest::new(placement, self.image_span, self.max_align)
     }
 
     pub fn locate_vaddr_range(
@@ -182,6 +197,10 @@ impl<R> PlannedArtifact<R> {
 
     pub const fn layout(&self) -> &ImageLayout {
         &self.layout
+    }
+
+    pub(crate) fn into_parts(self) -> (AdmittedArtifact<R>, ParsedImage, ImageLayout) {
+        (self.artifact, self.parsed, self.layout)
     }
 }
 

@@ -25,6 +25,7 @@ mod error;
 mod identity;
 mod image;
 mod limits;
+mod memory;
 mod memory_mapper;
 mod reader;
 pub use address::{FileRange, TargetAddr, TargetRange};
@@ -38,14 +39,18 @@ use goblin::elf::{
     Elf, Reloc,
 };
 pub use identity::{
-    AdmittedArtifact, ArtifactProfile, ArtifactRequest, ElfClass, ElfHeaderInfo, Endian, ImageKind,
-    ImageLoader,
+    AdmittedArtifact, ArtifactProfile, ArtifactRequest, ElfClass, ElfHeaderInfo, Endian,
+    ExpectedElfType, ImageLoader,
 };
 pub use image::{
     DynamicSegmentInfo, ImageLayout, ImageLayoutBuilder, LoadSegmentInfo, ParsedImage,
     PlannedArtifact, SegmentLayout, SegmentLocation, StackPolicy,
 };
 pub use limits::LoadLimits;
+pub use memory::{
+    AllocationId, AllocationOwnership, AllocationRequest, ImageAllocation, ImageLoadTransaction,
+    ImageMemory, Placement, ReservedImage,
+};
 use memory_mapper::MappingModeKind;
 pub use memory_mapper::{MemoryMapper, MemoryPermissions, MemoryRegion};
 pub use reader::{ElfReader, SliceElfReader};

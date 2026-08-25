@@ -41,9 +41,9 @@ pub enum Endian {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum ImageKind {
-    StaticPie,
-    FixedExec,
+pub enum ExpectedElfType {
+    Dyn,
+    Exec,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -77,26 +77,26 @@ impl ArtifactProfile {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ArtifactRequest {
-    expected_kind: ImageKind,
+    expected_elf_type: ExpectedElfType,
     profile: ArtifactProfile,
     limits: LoadLimits,
 }
 
 impl ArtifactRequest {
     pub const fn new(
-        expected_kind: ImageKind,
+        expected_elf_type: ExpectedElfType,
         profile: ArtifactProfile,
         limits: LoadLimits,
     ) -> Self {
         Self {
-            expected_kind,
+            expected_elf_type,
             profile,
             limits,
         }
     }
 
-    pub const fn expected_kind(&self) -> ImageKind {
-        self.expected_kind
+    pub const fn expected_elf_type(&self) -> ExpectedElfType {
+        self.expected_elf_type
     }
 
     pub const fn profile(&self) -> &ArtifactProfile {
@@ -313,9 +313,9 @@ fn validate_header(
     request: &ArtifactRequest,
     file_len: u64,
 ) -> LoadResult<()> {
-    let expected_type = match request.expected_kind {
-        ImageKind::StaticPie => ET_DYN,
-        ImageKind::FixedExec => ET_EXEC,
+    let expected_type = match request.expected_elf_type {
+        ExpectedElfType::Dyn => ET_DYN,
+        ExpectedElfType::Exec => ET_EXEC,
     };
     if header.elf_type != expected_type {
         return Err(unsupported_header(

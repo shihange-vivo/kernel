@@ -55,6 +55,7 @@ build_rust("blueos_loader") {
     "src/image/parser.rs",
     "src/lib.rs",
     "src/limits.rs",
+    "src/memory.rs",
     "src/memory_mapper.rs",
     "src/reader.rs",
   ]
@@ -79,6 +80,7 @@ build_rust("loader_unittest") {
     "src/image/parser.rs",
     "src/lib.rs",
     "src/limits.rs",
+    "src/memory.rs",
     "src/memory_mapper.rs",
     "src/reader.rs",
     "src/tests.rs",

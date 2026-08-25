@@ -15,6 +15,13 @@
 use blueos_infra::storage::Storage;
 use core::alloc::Layout;
 
+use crate::{
+    AllocationId, AllocationOwnership, AllocationRequest, ErrorContext, ImageAllocation,
+    ImageMemory, LoadError, LoadErrorKind, LoadResult, LoadStage, Placement, TargetAddr,
+};
+
+const IMAGE_ALLOCATION_ID: AllocationId = AllocationId::new(0);
+
 pub type Result<T> = core::result::Result<T, &'static str>;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -189,7 +196,7 @@ impl MemoryMapper {
         let valid = regions.iter().any(|region| {
             region.start < region.end
                 && start >= region.start
-                && start + size <= region.end
+                && start.checked_add(size).is_some_and(|end| end <= region.end)
                 && region.permissions.contains(requested)
         });
         if valid {
@@ -269,4 +276,93 @@ impl MemoryMapper {
         unsafe { val_ptr.write(val) };
         Ok(size)
     }
+}
+
+impl ImageMemory for MemoryMapper {
+    fn allocate_image(&mut self, request: &AllocationRequest) -> LoadResult<ImageAllocation> {
+        let size = usize::try_from(request.size()).map_err(|_| allocation_error(request))?;
+        let align = usize::try_from(request.align()).map_err(|_| allocation_error(request))?;
+
+        match (&self.mode, request.placement()) {
+            (MappingMode::Allocated, Placement::Anywhere) => {
+                if !self.mem.base().is_null() {
+                    return Err(allocation_error(request));
+                }
+                let layout = Layout::from_size_align(size, align).map_err(|_| {
+                    LoadError::new(
+                        LoadStage::Allocate,
+                        LoadErrorKind::InvalidAlignment,
+                        ErrorContext::Allocation {
+                            base: TargetAddr::new(0),
+                            len: request.size(),
+                            align: request.align(),
+                        },
+                    )
+                })?;
+                let storage = Storage::try_from_layout(layout).ok_or_else(|| {
+                    LoadError::new(
+                        LoadStage::Allocate,
+                        LoadErrorKind::OutOfMemory,
+                        ErrorContext::Allocation {
+                            base: TargetAddr::new(0),
+                            len: request.size(),
+                            align: request.align(),
+                        },
+                    )
+                })?;
+                let target_base = TargetAddr::new(
+                    u64::try_from(storage.base() as usize)
+                        .map_err(|_| allocation_error(request))?,
+                );
+                self.mem = storage;
+                Ok(ImageAllocation::new(
+                    IMAGE_ALLOCATION_ID,
+                    target_base,
+                    request.size(),
+                    request.align(),
+                    AllocationOwnership::Owned,
+                ))
+            }
+            (MappingMode::Fixed(_), Placement::Fixed(range)) => {
+                let start =
+                    usize::try_from(range.start().get()).map_err(|_| allocation_error(request))?;
+                let len = usize::try_from(range.len()).map_err(|_| allocation_error(request))?;
+                self.validate_fixed_span(start, len, MemoryPermissions::NONE)
+                    .map_err(|_| allocation_error(request))?;
+                Ok(ImageAllocation::new(
+                    IMAGE_ALLOCATION_ID,
+                    range.start(),
+                    range.len(),
+                    request.align(),
+                    AllocationOwnership::BorrowedFixed,
+                ))
+            }
+            _ => Err(allocation_error(request)),
+        }
+    }
+
+    fn release(&mut self, allocation: AllocationId) {
+        if allocation == IMAGE_ALLOCATION_ID && matches!(self.mode, MappingMode::Allocated) {
+            self.mem = Storage::default();
+            self.virtual_entry = 0;
+            self.virtual_start = usize::MAX;
+            self.virtual_end = 0;
+        }
+    }
+}
+
+fn allocation_error(request: &AllocationRequest) -> LoadError {
+    let base = match request.placement() {
+        Placement::Anywhere => TargetAddr::new(0),
+        Placement::Fixed(range) => range.start(),
+    };
+    LoadError::new(
+        LoadStage::Allocate,
+        LoadErrorKind::Backend,
+        ErrorContext::Allocation {
+            base,
+            len: request.size(),
+            align: request.align(),
+        },
+    )
 }

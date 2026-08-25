@@ -21,6 +21,7 @@ pub enum LoadStage {
     Parse,
     Validate,
     Plan,
+    Allocate,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -34,6 +35,7 @@ pub enum LoadErrorKind {
     OutOfMemory,
     InvalidAlignment,
     PermissionConflict,
+    Backend,
     Io,
 }
 
@@ -96,6 +98,11 @@ pub enum ErrorContext {
         index: u16,
         field: ProgramHeaderField,
         value: u64,
+    },
+    Allocation {
+        base: crate::TargetAddr,
+        len: u64,
+        align: u64,
     },
     Limit {
         resource: LimitKind,

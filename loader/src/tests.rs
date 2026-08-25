@@ -21,8 +21,10 @@ use goblin::elf::{
 
 use self::fixture::ElfFixtureBuilder;
 use crate::{
-    ArtifactProfile, ArtifactRequest, ElfClass, ElfReader, Endian, ImageKind, ImageLoader,
-    LoadErrorKind, LoadLimits, SliceElfReader,
+    AllocationId, AllocationOwnership, AllocationRequest, ArtifactProfile, ArtifactRequest,
+    ElfClass, ElfReader, Endian, ErrorContext, ExpectedElfType, ImageAllocation,
+    ImageLoadTransaction, ImageLoader, ImageMemory, LoadError, LoadErrorKind, LoadLimits,
+    LoadResult, LoadStage, Placement, PlannedArtifact, SliceElfReader, TargetAddr,
 };
 use goblin::elf::program_header::{
     PF_R, PF_W, PF_X, PT_DYNAMIC, PT_GNU_RELRO, PT_GNU_STACK, PT_INTERP, PT_LOAD, PT_TLS,
@@ -30,7 +32,7 @@ use goblin::elf::program_header::{
 
 fn riscv64_request() -> ArtifactRequest {
     ArtifactRequest::new(
-        ImageKind::StaticPie,
+        ExpectedElfType::Dyn,
         ArtifactProfile::new(ElfClass::Elf64, Endian::Little, EM_RISCV),
         LoadLimits::default(),
     )
@@ -84,7 +86,7 @@ fn admit_accepts_matching_elf32_and_elf64_headers() {
 
     let arm = ElfFixtureBuilder::elf32(EM_ARM, ET_DYN).build();
     let request = ArtifactRequest::new(
-        ImageKind::StaticPie,
+        ExpectedElfType::Dyn,
         ArtifactProfile::new(ElfClass::Elf32, Endian::Little, EM_ARM),
         LoadLimits::default(),
     );
@@ -161,7 +163,7 @@ fn admit_rejects_program_header_table_outside_the_file() {
 fn admit_enforces_file_and_program_header_limits() {
     let bytes = ElfFixtureBuilder::elf64(EM_RISCV, ET_DYN).build();
     let file_limit_request = ArtifactRequest::new(
-        ImageKind::StaticPie,
+        ExpectedElfType::Dyn,
         ArtifactProfile::new(ElfClass::Elf64, Endian::Little, EM_RISCV),
         LoadLimits::new(8, 128),
     );
@@ -177,7 +179,7 @@ fn admit_enforces_file_and_program_header_limits() {
         .set_program_header_table(64, 1)
         .build();
     let ph_limit_request = ArtifactRequest::new(
-        ImageKind::StaticPie,
+        ExpectedElfType::Dyn,
         ArtifactProfile::new(ElfClass::Elf64, Endian::Little, EM_RISCV),
         LoadLimits::new(1024, 0),
     );
@@ -294,7 +296,7 @@ fn plan_supports_nonzero_virtual_bases_and_segment_gaps() {
     assert_eq!(
         planned
             .layout()
-            .load_bias_for(crate::TargetAddr::new(0x8000), ImageKind::StaticPie)
+            .load_bias_for(crate::TargetAddr::new(0x8000), ExpectedElfType::Dyn)
             .unwrap()
             .get(),
         0x7000
@@ -324,7 +326,7 @@ fn plan_preserves_arm_thumb_entry_while_validating_its_canonical_address() {
         .add_program_header(PT_LOAD, 0, 0x1000, 52, 0x100, PF_R | PF_X, 0x1000)
         .build();
     let request = ArtifactRequest::new(
-        ImageKind::StaticPie,
+        ExpectedElfType::Dyn,
         ArtifactProfile::new(ElfClass::Elf32, Endian::Little, EM_ARM),
         LoadLimits::default(),
     );
@@ -405,7 +407,7 @@ fn plan_enforces_image_span_and_segment_count_limits() {
         LoadLimits::new(1024, 16).with_image_limits(16, 0x1000),
     ] {
         let request = ArtifactRequest::new(
-            ImageKind::StaticPie,
+            ExpectedElfType::Dyn,
             ArtifactProfile::new(ElfClass::Elf64, Endian::Little, EM_RISCV),
             limits,
         );
@@ -416,4 +418,203 @@ fn plan_enforces_image_span_and_segment_count_limits() {
             LoadErrorKind::ResourceLimit
         );
     }
+}
+
+#[derive(Debug)]
+struct FakeMemory {
+    allocation: Option<ImageAllocation>,
+    fail_allocate: bool,
+    requests: std::vec::Vec<AllocationRequest>,
+    releases: std::vec::Vec<AllocationId>,
+}
+
+impl FakeMemory {
+    fn returning(allocation: ImageAllocation) -> Self {
+        Self {
+            allocation: Some(allocation),
+            fail_allocate: false,
+            requests: std::vec::Vec::new(),
+            releases: std::vec::Vec::new(),
+        }
+    }
+
+    fn failing() -> Self {
+        Self {
+            allocation: None,
+            fail_allocate: true,
+            requests: std::vec::Vec::new(),
+            releases: std::vec::Vec::new(),
+        }
+    }
+}
+
+impl ImageMemory for FakeMemory {
+    fn allocate_image(&mut self, request: &AllocationRequest) -> LoadResult<ImageAllocation> {
+        self.requests.push(*request);
+        if self.fail_allocate {
+            return Err(LoadError::new(
+                LoadStage::Allocate,
+                LoadErrorKind::OutOfMemory,
+                ErrorContext::None,
+            ));
+        }
+        Ok(self.allocation.expect("test allocation must be configured"))
+    }
+
+    fn release(&mut self, allocation: AllocationId) {
+        self.releases.push(allocation);
+    }
+}
+
+fn planned_image<'a>(
+    bytes: &'a [u8],
+    expected_elf_type: ExpectedElfType,
+) -> PlannedArtifact<SliceElfReader<'a>> {
+    let request = ArtifactRequest::new(
+        expected_elf_type,
+        ArtifactProfile::new(ElfClass::Elf64, Endian::Little, EM_RISCV),
+        LoadLimits::default(),
+    );
+    let loader = ImageLoader::new();
+    let admitted = loader.admit(SliceElfReader::new(bytes), request).unwrap();
+    loader.plan(admitted).unwrap()
+}
+
+#[test]
+fn reserve_uses_movable_placement_for_any_et_dyn_image() {
+    let bytes = ElfFixtureBuilder::elf64(EM_RISCV, ET_DYN)
+        .set_entry(0x1010)
+        .add_program_header(PT_LOAD, 0, 0x1000, 64, 0x100, PF_R | PF_X, 0x1000)
+        .add_program_header(PT_LOAD, 0, 0x3000, 0, 0x100, PF_R | PF_W, 0x1000)
+        .build();
+    let planned = planned_image(&bytes, ExpectedElfType::Dyn);
+    let allocation_id = AllocationId::new(7);
+    let mut memory = FakeMemory::returning(ImageAllocation::new(
+        allocation_id,
+        TargetAddr::new(0x8000),
+        0x3000,
+        0x1000,
+        AllocationOwnership::Owned,
+    ));
+
+    let transaction = {
+        let mut transaction = ImageLoadTransaction::new(&mut memory);
+        let reserved = ImageLoader::new()
+            .reserve(planned, &mut transaction)
+            .unwrap();
+        assert_eq!(reserved.load_bias().get(), 0x7000);
+        transaction
+    };
+    transaction.disarm_for_test();
+
+    assert_eq!(memory.requests.len(), 1);
+    assert_eq!(memory.requests[0].placement(), Placement::Anywhere);
+    assert_eq!(memory.requests[0].size(), 0x3000);
+    assert!(memory.releases.is_empty());
+}
+
+#[test]
+fn reserve_uses_fixed_placement_only_for_et_exec() {
+    let bytes = ElfFixtureBuilder::elf64(EM_RISCV, ET_EXEC)
+        .set_entry(0x1010)
+        .add_program_header(PT_LOAD, 0, 0x1000, 64, 0x100, PF_R | PF_X, 0x1000)
+        .build();
+    let planned = planned_image(&bytes, ExpectedElfType::Exec);
+    let mut memory = FakeMemory::returning(ImageAllocation::new(
+        AllocationId::new(8),
+        TargetAddr::new(0x1000),
+        0x1000,
+        0x1000,
+        AllocationOwnership::BorrowedFixed,
+    ));
+
+    let transaction = {
+        let mut transaction = ImageLoadTransaction::new(&mut memory);
+        let reserved = ImageLoader::new()
+            .reserve(planned, &mut transaction)
+            .unwrap();
+        assert_eq!(reserved.load_bias().get(), 0);
+        transaction
+    };
+    transaction.disarm_for_test();
+
+    assert_eq!(
+        memory.requests[0].placement(),
+        Placement::Fixed(crate::TargetRange::new(TargetAddr::new(0x1000), 0x1000))
+    );
+    assert!(memory.releases.is_empty());
+}
+
+#[test]
+fn reserve_releases_a_backend_allocation_that_fails_validation() {
+    let bytes = ElfFixtureBuilder::elf64(EM_RISCV, ET_DYN)
+        .set_entry(0x1000)
+        .add_program_header(PT_LOAD, 0, 0x1000, 64, 0x100, PF_R | PF_X, 0x1000)
+        .build();
+    let planned = planned_image(&bytes, ExpectedElfType::Dyn);
+    let allocation_id = AllocationId::new(9);
+    let mut memory = FakeMemory::returning(ImageAllocation::new(
+        allocation_id,
+        TargetAddr::new(0x8001),
+        0x800,
+        1,
+        AllocationOwnership::Owned,
+    ));
+
+    {
+        let mut transaction = ImageLoadTransaction::new(&mut memory);
+        let error = ImageLoader::new()
+            .reserve(planned, &mut transaction)
+            .unwrap_err();
+        assert_eq!(error.kind(), LoadErrorKind::Backend);
+    }
+
+    assert_eq!(memory.releases, [allocation_id]);
+}
+
+#[test]
+fn reserve_does_not_release_when_allocation_itself_fails() {
+    let bytes = ElfFixtureBuilder::elf64(EM_RISCV, ET_DYN)
+        .set_entry(0x1000)
+        .add_program_header(PT_LOAD, 0, 0x1000, 64, 0x100, PF_R | PF_X, 0x1000)
+        .build();
+    let planned = planned_image(&bytes, ExpectedElfType::Dyn);
+    let mut memory = FakeMemory::failing();
+
+    {
+        let mut transaction = ImageLoadTransaction::new(&mut memory);
+        let error = ImageLoader::new()
+            .reserve(planned, &mut transaction)
+            .unwrap_err();
+        assert_eq!(error.kind(), LoadErrorKind::OutOfMemory);
+    }
+
+    assert!(memory.releases.is_empty());
+}
+
+#[test]
+fn memory_mapper_allocates_fallibly_and_releases_owned_storage() {
+    let request = AllocationRequest::new(Placement::Anywhere, 0x2000, 0x1000);
+    let mut mapper = crate::MemoryMapper::new(None);
+
+    let allocation = ImageMemory::allocate_image(&mut mapper, &request).unwrap();
+    assert_eq!(allocation.ownership(), AllocationOwnership::Owned);
+    assert_eq!(allocation.target_base().get() % 0x1000, 0);
+    assert_eq!(allocation.len(), 0x2000);
+
+    ImageMemory::release(&mut mapper, allocation.id());
+    assert!(mapper.real_start().is_err());
+}
+
+#[test]
+fn memory_mapper_rejects_unauthorized_fixed_placement() {
+    let request = AllocationRequest::new(
+        Placement::Fixed(crate::TargetRange::new(TargetAddr::new(0x1000), 0x1000)),
+        0x1000,
+        0x1000,
+    );
+    let mut mapper = crate::MemoryMapper::new(Some(&[]));
+
+    let error = ImageMemory::allocate_image(&mut mapper, &request).unwrap_err();
+    assert_eq!(error.kind(), LoadErrorKind::Backend);
 }
