@@ -23,6 +23,7 @@ pub enum LoadStage {
     Plan,
     Allocate,
     Map,
+    Metadata,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -62,6 +63,8 @@ pub enum LimitKind {
     ProgramHeaderCount,
     LoadSegmentCount,
     ImageSpan,
+    DynamicEntryCount,
+    RelocationCount,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -109,6 +112,15 @@ pub enum ErrorContext {
         allocation: crate::AllocationId,
         offset: u64,
         len: u64,
+    },
+    DynamicTag {
+        tag: u64,
+        value: u64,
+    },
+    Relocation {
+        offset: crate::TargetAddr,
+        raw_type: u32,
+        symbol_index: u32,
     },
     Limit {
         resource: LimitKind,

@@ -44,7 +44,9 @@ pub use identity::{
 };
 pub use image::{
     DynamicSegmentInfo, ImageLayout, ImageLayoutBuilder, LoadSegmentInfo, LoadedRegion,
-    MappedImage, ParsedImage, PlannedArtifact, SegmentLayout, SegmentLocation, StackPolicy,
+    MappedImage, ParsedImage, PlannedArtifact, RelocationAddend, RelocationRecord,
+    RuntimeFeaturePolicy, RuntimeImage, RuntimeImageMetadata, SegmentLayout, SegmentLocation,
+    StackPolicy,
 };
 pub use limits::LoadLimits;
 pub use memory::{

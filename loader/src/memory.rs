@@ -140,6 +140,8 @@ pub trait ImageMemory {
     fn write(&mut self, location: TargetLocation, data: &[u8]) -> LoadResult<()>;
 
     fn zero(&mut self, location: TargetLocation, len: u64) -> LoadResult<()>;
+
+    fn read(&self, location: TargetLocation, dst: &mut [u8]) -> LoadResult<()>;
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

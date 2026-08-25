@@ -159,6 +159,49 @@ impl ElfFixtureBuilder {
         self
     }
 
+    pub fn write_dynamic(mut self, offset: usize, entries: &[(u64, u64)]) -> Self {
+        let class = self.bytes[goblin::elf::header::EI_CLASS];
+        let entry_size = match class {
+            goblin::elf::header::ELFCLASS32 => 8,
+            goblin::elf::header::ELFCLASS64 => 16,
+            _ => unreachable!(),
+        };
+        self.bytes.resize(
+            core::cmp::max(self.bytes.len(), offset + entries.len() * entry_size),
+            0,
+        );
+        for (index, &(tag, value)) in entries.iter().enumerate() {
+            let current = offset + index * entry_size;
+            match class {
+                goblin::elf::header::ELFCLASS32 => {
+                    write_u32(&mut self.bytes, current, tag as u32);
+                    write_u32(&mut self.bytes, current + 4, value as u32);
+                }
+                goblin::elf::header::ELFCLASS64 => {
+                    write_u64(&mut self.bytes, current, tag);
+                    write_u64(&mut self.bytes, current + 8, value);
+                }
+                _ => unreachable!(),
+            }
+        }
+        self
+    }
+
+    pub fn write_rela64(mut self, offset: usize, relocations: &[(u64, u64, i64)]) -> Self {
+        let entry_size = 24;
+        self.bytes.resize(
+            core::cmp::max(self.bytes.len(), offset + relocations.len() * entry_size),
+            0,
+        );
+        for (index, &(target, info, addend)) in relocations.iter().enumerate() {
+            let current = offset + index * entry_size;
+            write_u64(&mut self.bytes, current, target);
+            write_u64(&mut self.bytes, current + 8, info);
+            write_u64(&mut self.bytes, current + 16, addend as u64);
+        }
+        self
+    }
+
     pub fn build(self) -> Vec<u8> {
         self.bytes
     }

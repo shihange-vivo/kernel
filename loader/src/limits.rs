@@ -20,6 +20,8 @@ pub struct LoadLimits {
     max_program_headers: u16,
     max_load_segments: u16,
     max_image_span: u64,
+    max_dynamic_entries: u32,
+    max_relocations: u32,
 }
 
 impl LoadLimits {
@@ -31,12 +33,24 @@ impl LoadLimits {
             max_program_headers,
             max_load_segments: 32,
             max_image_span: 64 * 1024 * 1024,
+            max_dynamic_entries: 1024,
+            max_relocations: 1024 * 1024,
         }
     }
 
     pub const fn with_image_limits(mut self, max_load_segments: u16, max_image_span: u64) -> Self {
         self.max_load_segments = max_load_segments;
         self.max_image_span = max_image_span;
+        self
+    }
+
+    pub const fn with_runtime_limits(
+        mut self,
+        max_dynamic_entries: u32,
+        max_relocations: u32,
+    ) -> Self {
+        self.max_dynamic_entries = max_dynamic_entries;
+        self.max_relocations = max_relocations;
         self
     }
 
@@ -96,6 +110,36 @@ impl LoadLimits {
                 resource: LimitKind::ImageSpan,
                 actual,
                 maximum: self.max_image_span,
+            },
+        ))
+    }
+
+    pub(crate) fn check_dynamic_entry_count(&self, actual: u64) -> LoadResult<()> {
+        if actual <= u64::from(self.max_dynamic_entries) {
+            return Ok(());
+        }
+        Err(LoadError::new(
+            LoadStage::Metadata,
+            LoadErrorKind::ResourceLimit,
+            ErrorContext::Limit {
+                resource: LimitKind::DynamicEntryCount,
+                actual,
+                maximum: u64::from(self.max_dynamic_entries),
+            },
+        ))
+    }
+
+    pub(crate) fn check_relocation_count(&self, actual: u64) -> LoadResult<()> {
+        if actual <= u64::from(self.max_relocations) {
+            return Ok(());
+        }
+        Err(LoadError::new(
+            LoadStage::Metadata,
+            LoadErrorKind::ResourceLimit,
+            ErrorContext::Limit {
+                resource: LimitKind::RelocationCount,
+                actual,
+                maximum: u64::from(self.max_relocations),
             },
         ))
     }

@@ -393,6 +393,15 @@ impl ImageMemory for MemoryMapper {
         }
         Ok(())
     }
+
+    fn read(&self, location: TargetLocation, dst: &mut [u8]) -> LoadResult<()> {
+        let len = u64::try_from(dst.len()).map_err(|_| memory_access_error(location, u64::MAX))?;
+        let source = self.image_span(location, len, MemoryPermissions::READ)?;
+        if !dst.is_empty() {
+            unsafe { core::ptr::copy_nonoverlapping(source, dst.as_mut_ptr(), dst.len()) };
+        }
+        Ok(())
+    }
 }
 
 impl MemoryMapper {

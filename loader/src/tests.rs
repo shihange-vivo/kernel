@@ -15,6 +15,7 @@
 mod fixture;
 
 use goblin::elf::{
+    dynamic::{DT_DEBUG, DT_FLAGS_1, DT_NEEDED, DT_NULL, DT_RELA, DT_RELAENT, DT_RELASZ},
     header::{EI_CLASS, EI_DATA, ELFCLASS32, ELFDATA2MSB, EM_ARM, EM_RISCV, ET_DYN, ET_EXEC},
     Elf,
 };
@@ -24,8 +25,8 @@ use crate::{
     AllocationId, AllocationOwnership, AllocationRequest, ArtifactProfile, ArtifactRequest,
     ElfClass, ElfReader, Endian, ErrorContext, ExpectedElfType, ImageAllocation,
     ImageLoadTransaction, ImageLoader, ImageMemory, LoadError, LoadErrorKind, LoadLimits,
-    LoadResult, LoadStage, MemoryPermissions, Placement, PlannedArtifact, SliceElfReader,
-    TargetAddr, TargetLocation,
+    LoadResult, LoadStage, MemoryPermissions, Placement, PlannedArtifact, RelocationAddend,
+    RuntimeFeaturePolicy, SliceElfReader, TargetAddr, TargetLocation,
 };
 use goblin::elf::program_header::{
     PF_R, PF_W, PF_X, PT_DYNAMIC, PT_GNU_RELRO, PT_GNU_STACK, PT_INTERP, PT_LOAD, PT_TLS,
@@ -512,6 +513,13 @@ impl ImageMemory for FakeMemory {
         self.zeros.push((location, len));
         Ok(())
     }
+
+    fn read(&self, location: TargetLocation, dst: &mut [u8]) -> LoadResult<()> {
+        self.validate_access(location, dst.len() as u64, MemoryPermissions::READ)?;
+        let start = location.offset() as usize;
+        dst.copy_from_slice(&self.bytes[start..start + dst.len()]);
+        Ok(())
+    }
 }
 
 fn fake_access_error(location: TargetLocation, len: u64) -> LoadError {
@@ -846,4 +854,166 @@ fn copy_failure_rolls_back_the_owned_allocation() {
     }
 
     assert_eq!(memory.releases, [allocation_id]);
+}
+
+fn image_with_dynamic_entries(entries: &[(u64, u64)], relocation_info: u64) -> std::vec::Vec<u8> {
+    ElfFixtureBuilder::elf64(EM_RISCV, ET_DYN)
+        .set_entry(0x1000)
+        .add_program_header(PT_LOAD, 0x1000, 0x1000, 0x100, 0x100, PF_R | PF_X, 0x1000)
+        .add_program_header(PT_LOAD, 0x2000, 0x3000, 0x118, 0x300, PF_R | PF_W, 0x1000)
+        .add_program_header(
+            PT_DYNAMIC,
+            0x2000,
+            0x3000,
+            (entries.len() * 16) as u64,
+            (entries.len() * 16) as u64,
+            PF_R | PF_W,
+            8,
+        )
+        .write_dynamic(0x2000, entries)
+        .write_rela64(0x2100, &[(0x3200, relocation_info, -0x20)])
+        .build()
+}
+
+#[test]
+fn decode_runtime_normalizes_bounded_rela_metadata() {
+    let entries = [
+        (DT_RELA, 0x3100),
+        (DT_RELASZ, 24),
+        (DT_RELAENT, 24),
+        (DT_FLAGS_1, 0),
+        (DT_NULL, 0),
+    ];
+    let bytes = image_with_dynamic_entries(&entries, 3);
+    let planned = planned_image(&bytes, ExpectedElfType::Dyn);
+    let mut memory = FakeMemory::returning(ImageAllocation::new(
+        AllocationId::new(13),
+        TargetAddr::new(0x8000),
+        0x3000,
+        0x1000,
+        AllocationOwnership::Owned,
+    ));
+
+    let transaction = {
+        let mut transaction = ImageLoadTransaction::new(&mut memory);
+        let reserved = ImageLoader::new()
+            .reserve(planned, &mut transaction)
+            .unwrap();
+        let mapped = ImageLoader::new()
+            .copy_and_zero(reserved, &mut transaction)
+            .unwrap();
+        let runtime = mapped
+            .decode_runtime(&mut transaction, RuntimeFeaturePolicy::Phase0)
+            .unwrap();
+        let relocation = runtime.metadata().relocations()[0];
+        assert_eq!(runtime.metadata().relocations().len(), 1);
+        assert_eq!(relocation.offset().get(), 0x3200);
+        assert_eq!(relocation.raw_type(), 3);
+        assert_eq!(relocation.symbol_index(), 0);
+        assert_eq!(relocation.addend(), RelocationAddend::Explicit(-0x20));
+        transaction
+    };
+    transaction.disarm_for_test();
+    assert!(memory.releases.is_empty());
+}
+
+#[test]
+fn decode_runtime_rejects_dependencies_instead_of_classifying_et_dyn() {
+    let entries = [(DT_NEEDED, 1), (DT_NULL, 0)];
+    let bytes = image_with_dynamic_entries(&entries, 3);
+    let planned = planned_image(&bytes, ExpectedElfType::Dyn);
+    let allocation_id = AllocationId::new(14);
+    let mut memory = FakeMemory::returning(ImageAllocation::new(
+        allocation_id,
+        TargetAddr::new(0x8000),
+        0x3000,
+        0x1000,
+        AllocationOwnership::Owned,
+    ));
+
+    {
+        let mut transaction = ImageLoadTransaction::new(&mut memory);
+        let reserved = ImageLoader::new()
+            .reserve(planned, &mut transaction)
+            .unwrap();
+        let mapped = ImageLoader::new()
+            .copy_and_zero(reserved, &mut transaction)
+            .unwrap();
+        let error = mapped
+            .decode_runtime(&mut transaction, RuntimeFeaturePolicy::Phase0)
+            .unwrap_err();
+        assert_eq!(error.kind(), LoadErrorKind::UnsupportedByProfile);
+    }
+    assert_eq!(memory.releases, [allocation_id]);
+}
+
+#[test]
+fn decode_runtime_requires_dt_null_and_enforces_entry_limits() {
+    for (entries, limits, expected_kind) in [
+        (
+            std::vec![(DT_DEBUG, 0)],
+            LoadLimits::default(),
+            LoadErrorKind::BadElf,
+        ),
+        (
+            std::vec![(DT_DEBUG, 0), (DT_FLAGS_1, 0), (DT_NULL, 0)],
+            LoadLimits::default().with_runtime_limits(1, 16),
+            LoadErrorKind::ResourceLimit,
+        ),
+    ] {
+        let bytes = image_with_dynamic_entries(&entries, 3);
+        let request = ArtifactRequest::new(
+            ExpectedElfType::Dyn,
+            ArtifactProfile::new(ElfClass::Elf64, Endian::Little, EM_RISCV),
+            limits,
+        );
+        let loader = ImageLoader::new();
+        let admitted = loader.admit(SliceElfReader::new(&bytes), request).unwrap();
+        let planned = loader.plan(admitted).unwrap();
+        let mut memory = FakeMemory::returning(ImageAllocation::new(
+            AllocationId::new(15),
+            TargetAddr::new(0x8000),
+            0x3000,
+            0x1000,
+            AllocationOwnership::Owned,
+        ));
+        let mut transaction = ImageLoadTransaction::new(&mut memory);
+        let reserved = loader.reserve(planned, &mut transaction).unwrap();
+        let mapped = loader.copy_and_zero(reserved, &mut transaction).unwrap();
+        let error = mapped
+            .decode_runtime(&mut transaction, RuntimeFeaturePolicy::Phase0)
+            .unwrap_err();
+        assert_eq!(error.kind(), expected_kind);
+    }
+}
+
+#[test]
+fn decode_runtime_rejects_symbol_based_relocations_in_phase0() {
+    let entries = [
+        (DT_RELA, 0x3100),
+        (DT_RELASZ, 24),
+        (DT_RELAENT, 24),
+        (DT_NULL, 0),
+    ];
+    let bytes = image_with_dynamic_entries(&entries, (1_u64 << 32) | 3);
+    let planned = planned_image(&bytes, ExpectedElfType::Dyn);
+    let mut memory = FakeMemory::returning(ImageAllocation::new(
+        AllocationId::new(16),
+        TargetAddr::new(0x8000),
+        0x3000,
+        0x1000,
+        AllocationOwnership::Owned,
+    ));
+    let mut transaction = ImageLoadTransaction::new(&mut memory);
+    let reserved = ImageLoader::new()
+        .reserve(planned, &mut transaction)
+        .unwrap();
+    let mapped = ImageLoader::new()
+        .copy_and_zero(reserved, &mut transaction)
+        .unwrap();
+
+    let error = mapped
+        .decode_runtime(&mut transaction, RuntimeFeaturePolicy::Phase0)
+        .unwrap_err();
+    assert_eq!(error.kind(), LoadErrorKind::UnsupportedByProfile);
 }

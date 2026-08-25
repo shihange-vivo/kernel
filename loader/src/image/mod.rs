@@ -14,10 +14,14 @@
 
 mod layout;
 mod loaded;
+mod metadata;
 mod parser;
 
 pub use layout::{
     ImageLayout, ImageLayoutBuilder, PlannedArtifact, SegmentLayout, SegmentLocation,
 };
 pub use loaded::{LoadedRegion, MappedImage};
+pub use metadata::{
+    RelocationAddend, RelocationRecord, RuntimeFeaturePolicy, RuntimeImage, RuntimeImageMetadata,
+};
 pub use parser::{DynamicSegmentInfo, LoadSegmentInfo, ParsedImage, StackPolicy};
