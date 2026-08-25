@@ -60,6 +60,8 @@ build_rust("blueos_loader") {
     "src/memory.rs",
     "src/memory_mapper.rs",
     "src/reader.rs",
+    "src/relocation/mod.rs",
+    "src/relocation/riscv.rs",
   ]
   deps = [
     "//external/vendor/goblin-0.9.3:goblin",
@@ -87,6 +89,8 @@ build_rust("loader_unittest") {
     "src/memory.rs",
     "src/memory_mapper.rs",
     "src/reader.rs",
+    "src/relocation/mod.rs",
+    "src/relocation/riscv.rs",
     "src/tests.rs",
     "src/tests/fixture.rs",
   ]

@@ -26,7 +26,7 @@ use crate::{
     ElfClass, ElfReader, Endian, ErrorContext, ExpectedElfType, ImageAllocation,
     ImageLoadTransaction, ImageLoader, ImageMemory, LoadError, LoadErrorKind, LoadLimits,
     LoadResult, LoadStage, MemoryPermissions, Placement, PlannedArtifact, RelocationAddend,
-    RuntimeFeaturePolicy, SliceElfReader, TargetAddr, TargetLocation,
+    Riscv64Relocator, RuntimeFeaturePolicy, SliceElfReader, TargetAddr, TargetLocation,
 };
 use goblin::elf::program_header::{
     PF_R, PF_W, PF_X, PT_DYNAMIC, PT_GNU_RELRO, PT_GNU_STACK, PT_INTERP, PT_LOAD, PT_TLS,
@@ -857,6 +857,15 @@ fn copy_failure_rolls_back_the_owned_allocation() {
 }
 
 fn image_with_dynamic_entries(entries: &[(u64, u64)], relocation_info: u64) -> std::vec::Vec<u8> {
+    image_with_dynamic_relocation(entries, 0x3200, relocation_info, -0x20)
+}
+
+fn image_with_dynamic_relocation(
+    entries: &[(u64, u64)],
+    target: u64,
+    relocation_info: u64,
+    addend: i64,
+) -> std::vec::Vec<u8> {
     ElfFixtureBuilder::elf64(EM_RISCV, ET_DYN)
         .set_entry(0x1000)
         .add_program_header(PT_LOAD, 0x1000, 0x1000, 0x100, 0x100, PF_R | PF_X, 0x1000)
@@ -871,7 +880,7 @@ fn image_with_dynamic_entries(entries: &[(u64, u64)], relocation_info: u64) -> s
             8,
         )
         .write_dynamic(0x2000, entries)
-        .write_rela64(0x2100, &[(0x3200, relocation_info, -0x20)])
+        .write_rela64(0x2100, &[(target, relocation_info, addend)])
         .build()
 }
 
@@ -1016,4 +1025,119 @@ fn decode_runtime_rejects_symbol_based_relocations_in_phase0() {
         .decode_runtime(&mut transaction, RuntimeFeaturePolicy::Phase0)
         .unwrap_err();
     assert_eq!(error.kind(), LoadErrorKind::UnsupportedByProfile);
+}
+
+fn rela_dynamic_entries() -> [(u64, u64); 4] {
+    [
+        (DT_RELA, 0x3100),
+        (DT_RELASZ, 24),
+        (DT_RELAENT, 24),
+        (DT_NULL, 0),
+    ]
+}
+
+#[test]
+fn riscv64_relocator_applies_load_bias_plus_explicit_addend() {
+    let bytes = image_with_dynamic_entries(&rela_dynamic_entries(), 3);
+    let planned = planned_image(&bytes, ExpectedElfType::Dyn);
+    let allocation_id = AllocationId::new(17);
+    let mut memory = FakeMemory::returning(ImageAllocation::new(
+        allocation_id,
+        TargetAddr::new(0x8000),
+        0x3000,
+        0x1000,
+        AllocationOwnership::Owned,
+    ));
+
+    let transaction = {
+        let mut transaction = ImageLoadTransaction::new(&mut memory);
+        let reserved = ImageLoader::new()
+            .reserve(planned, &mut transaction)
+            .unwrap();
+        let mapped = ImageLoader::new()
+            .copy_and_zero(reserved, &mut transaction)
+            .unwrap();
+        let runtime = mapped
+            .decode_runtime(&mut transaction, RuntimeFeaturePolicy::Phase0)
+            .unwrap();
+        let relocated = runtime
+            .relocate(&mut transaction, &Riscv64Relocator)
+            .unwrap();
+        assert_eq!(relocated.metadata().relocations().len(), 1);
+        transaction
+    };
+    transaction.disarm_for_test();
+
+    assert_eq!(
+        u64::from_le_bytes(memory.bytes[0x2200..0x2208].try_into().unwrap()),
+        0x6fe0
+    );
+    assert!(memory.releases.is_empty());
+}
+
+#[test]
+fn riscv64_relocator_rejects_unknown_types_before_writing() {
+    let bytes = image_with_dynamic_entries(&rela_dynamic_entries(), 99);
+    let planned = planned_image(&bytes, ExpectedElfType::Dyn);
+    let allocation_id = AllocationId::new(18);
+    let mut memory = FakeMemory::returning(ImageAllocation::new(
+        allocation_id,
+        TargetAddr::new(0x8000),
+        0x3000,
+        0x1000,
+        AllocationOwnership::Owned,
+    ));
+
+    {
+        let mut transaction = ImageLoadTransaction::new(&mut memory);
+        let reserved = ImageLoader::new()
+            .reserve(planned, &mut transaction)
+            .unwrap();
+        let mapped = ImageLoader::new()
+            .copy_and_zero(reserved, &mut transaction)
+            .unwrap();
+        let runtime = mapped
+            .decode_runtime(&mut transaction, RuntimeFeaturePolicy::Phase0)
+            .unwrap();
+        let error = runtime
+            .relocate(&mut transaction, &Riscv64Relocator)
+            .unwrap_err();
+        assert_eq!(error.kind(), LoadErrorKind::UnsupportedByProfile);
+    }
+
+    assert_eq!(&memory.bytes[0x2200..0x2208], &[0; 8]);
+    assert_eq!(memory.releases, [allocation_id]);
+}
+
+#[test]
+fn riscv64_relocator_checks_target_alignment_permissions_and_overflow() {
+    for (target, addend, expected_kind) in [
+        (0x3201, 0, LoadErrorKind::InvalidAlignment),
+        (0x1000, 0, LoadErrorKind::OutOfBounds),
+        (0x3200, i64::MIN, LoadErrorKind::IntegerOverflow),
+    ] {
+        let bytes = image_with_dynamic_relocation(&rela_dynamic_entries(), target, 3, addend);
+        let planned = planned_image(&bytes, ExpectedElfType::Dyn);
+        let mut memory = FakeMemory::returning(ImageAllocation::new(
+            AllocationId::new(19),
+            TargetAddr::new(0x8000),
+            0x3000,
+            0x1000,
+            AllocationOwnership::Owned,
+        ));
+        let mut transaction = ImageLoadTransaction::new(&mut memory);
+        let reserved = ImageLoader::new()
+            .reserve(planned, &mut transaction)
+            .unwrap();
+        let mapped = ImageLoader::new()
+            .copy_and_zero(reserved, &mut transaction)
+            .unwrap();
+        let runtime = mapped
+            .decode_runtime(&mut transaction, RuntimeFeaturePolicy::Phase0)
+            .unwrap();
+        let error = runtime
+            .relocate(&mut transaction, &Riscv64Relocator)
+            .unwrap_err();
+        assert_eq!(error.kind(), expected_kind);
+    }
 }

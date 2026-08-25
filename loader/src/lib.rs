@@ -28,6 +28,7 @@ mod limits;
 mod memory;
 mod memory_mapper;
 mod reader;
+mod relocation;
 pub use address::{FileRange, TargetAddr, TargetRange};
 pub use error::{
     ErrorContext, HeaderField, LimitKind, LoadError, LoadErrorKind, LoadResult, LoadStage,
@@ -56,6 +57,9 @@ pub use memory::{
 use memory_mapper::MappingModeKind;
 pub use memory_mapper::{MemoryMapper, MemoryPermissions, MemoryRegion};
 pub use reader::{ElfReader, SliceElfReader};
+pub use relocation::{
+    AddendEncoding, ArchRelocator, RelocatedImage, Riscv64Relocator, TargetWord, WordWidth,
+};
 
 pub type Result = core::result::Result<(), &'static str>;
 
