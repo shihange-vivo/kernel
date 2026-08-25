@@ -27,10 +27,11 @@ use goblin::elf::{
 use self::fixture::ElfFixtureBuilder;
 use crate::{
     AllocationId, AllocationOwnership, AllocationRequest, ArmRelocator, ArtifactProfile,
-    ArtifactRequest, ElfClass, ElfReader, Endian, ErrorContext, ExpectedElfType, ImageAllocation,
-    ImageLoadTransaction, ImageLoader, ImageMemory, LoadError, LoadErrorKind, LoadLimits,
-    LoadResult, LoadStage, MemoryPermissions, Placement, PlannedArtifact, RelocationAddend,
-    Riscv64Relocator, RuntimeFeaturePolicy, SliceElfReader, TargetAddr, TargetLocation,
+    ArtifactRequest, CodeCache, ElfClass, ElfReader, Endian, ErrorContext, ExpectedElfType,
+    ImageAllocation, ImageLoadTransaction, ImageLoader, ImageMemory, LoadError, LoadErrorKind,
+    LoadLimits, LoadResult, LoadStage, MemoryPermissions, Placement, PlannedArtifact,
+    ProtectionLevel, RelocationAddend, Riscv64Relocator, RuntimeFeaturePolicy, SliceElfReader,
+    TargetAddr, TargetLocation,
 };
 use goblin::elf::program_header::{
     PF_R, PF_W, PF_X, PT_DYNAMIC, PT_GNU_RELRO, PT_GNU_STACK, PT_INTERP, PT_LOAD, PT_TLS,
@@ -435,6 +436,8 @@ struct FakeMemory {
     bytes: std::vec::Vec<u8>,
     writes: std::vec::Vec<(TargetLocation, usize)>,
     zeros: std::vec::Vec<(TargetLocation, u64)>,
+    protects: std::vec::Vec<(TargetLocation, u64, MemoryPermissions)>,
+    fail_protect_at: Option<usize>,
 }
 
 impl FakeMemory {
@@ -448,6 +451,8 @@ impl FakeMemory {
             bytes: std::vec![0xa5; len],
             writes: std::vec::Vec::new(),
             zeros: std::vec::Vec::new(),
+            protects: std::vec::Vec::new(),
+            fail_protect_at: None,
         }
     }
 
@@ -460,6 +465,8 @@ impl FakeMemory {
             bytes: std::vec::Vec::new(),
             writes: std::vec::Vec::new(),
             zeros: std::vec::Vec::new(),
+            protects: std::vec::Vec::new(),
+            fail_protect_at: None,
         }
     }
 }
@@ -523,6 +530,20 @@ impl ImageMemory for FakeMemory {
         let start = location.offset() as usize;
         dst.copy_from_slice(&self.bytes[start..start + dst.len()]);
         Ok(())
+    }
+
+    fn protect(
+        &mut self,
+        location: TargetLocation,
+        len: u64,
+        permissions: MemoryPermissions,
+    ) -> LoadResult<ProtectionLevel> {
+        self.validate_access(location, len, permissions)?;
+        if self.fail_protect_at == Some(self.protects.len()) {
+            return Err(fake_access_error(location, len));
+        }
+        self.protects.push((location, len, permissions));
+        Ok(ProtectionLevel::LogicalOnly)
     }
 }
 
@@ -1274,4 +1295,174 @@ fn arm_relocator_rejects_a_32_bit_relative_result_overflow() {
         .relocate(&mut transaction, &ArmRelocator)
         .unwrap_err();
     assert_eq!(error.kind(), LoadErrorKind::IntegerOverflow);
+}
+
+#[derive(Default)]
+struct FakeCodeCache {
+    ranges: std::vec::Vec<crate::TargetRange>,
+    fail: bool,
+}
+
+impl CodeCache for FakeCodeCache {
+    fn synchronize(&mut self, runtime_range: crate::TargetRange) -> LoadResult<()> {
+        if self.fail {
+            return Err(LoadError::new(
+                LoadStage::Cache,
+                LoadErrorKind::Backend,
+                ErrorContext::TargetRange {
+                    start: runtime_range.start(),
+                    len: runtime_range.len(),
+                },
+            ));
+        }
+        self.ranges.push(runtime_range);
+        Ok(())
+    }
+}
+
+fn riscv_image_with_relro() -> std::vec::Vec<u8> {
+    let entries = rela_dynamic_entries();
+    ElfFixtureBuilder::elf64(EM_RISCV, ET_DYN)
+        .set_entry(0x1000)
+        .add_program_header(PT_LOAD, 0x1000, 0x1000, 0x100, 0x100, PF_R | PF_X, 0x1000)
+        .add_program_header(PT_LOAD, 0x2000, 0x3000, 0x118, 0x300, PF_R | PF_W, 0x1000)
+        .add_program_header(
+            PT_DYNAMIC,
+            0x2000,
+            0x3000,
+            (entries.len() * 16) as u64,
+            (entries.len() * 16) as u64,
+            PF_R | PF_W,
+            8,
+        )
+        .add_program_header(PT_GNU_RELRO, 0, 0x3180, 0, 0x80, PF_R, 1)
+        .write_dynamic(0x2000, &entries)
+        .write_rela64(0x2100, &[(0x3200, 3, 0x1234)])
+        .build()
+}
+
+#[test]
+fn seal_synchronizes_code_applies_relro_and_commits_the_transaction() {
+    let bytes = riscv_image_with_relro();
+    let planned = planned_image(&bytes, ExpectedElfType::Dyn);
+    let allocation_id = AllocationId::new(23);
+    let mut memory = FakeMemory::returning(ImageAllocation::new(
+        allocation_id,
+        TargetAddr::new(0x8000),
+        0x3000,
+        0x1000,
+        AllocationOwnership::Owned,
+    ));
+    let mut cache = FakeCodeCache::default();
+
+    let mut transaction = ImageLoadTransaction::new(&mut memory);
+    let reserved = ImageLoader::new()
+        .reserve(planned, &mut transaction)
+        .unwrap();
+    let mapped = ImageLoader::new()
+        .copy_and_zero(reserved, &mut transaction)
+        .unwrap();
+    let runtime = mapped
+        .decode_runtime(&mut transaction, RuntimeFeaturePolicy::Phase0)
+        .unwrap();
+    let relocated = runtime
+        .relocate(&mut transaction, &Riscv64Relocator)
+        .unwrap();
+    let sealed = relocated.seal(&mut transaction, &mut cache).unwrap();
+
+    assert_eq!(sealed.entry().get(), 0x8000);
+    assert_eq!(sealed.protection(), ProtectionLevel::LogicalOnly);
+    assert_eq!(sealed.seal_plan().ranges().len(), 4);
+    assert_eq!(
+        cache.ranges,
+        [crate::TargetRange::new(TargetAddr::new(0x8000), 0x100)]
+    );
+    assert_eq!(
+        sealed.seal_plan().ranges()[2].runtime_range().start().get(),
+        0xa180
+    );
+    assert_eq!(sealed.seal_plan().ranges()[2].runtime_range().len(), 0x80);
+    assert_eq!(
+        sealed.seal_plan().ranges()[2].permissions(),
+        MemoryPermissions::READ
+    );
+    transaction.commit_for(&sealed).unwrap();
+
+    assert_eq!(memory.protects.len(), 4);
+    assert!(memory.releases.is_empty());
+}
+
+#[test]
+fn cache_failure_prevents_protection_and_rolls_back() {
+    let bytes = riscv_image_with_relro();
+    let planned = planned_image(&bytes, ExpectedElfType::Dyn);
+    let allocation_id = AllocationId::new(24);
+    let mut memory = FakeMemory::returning(ImageAllocation::new(
+        allocation_id,
+        TargetAddr::new(0x8000),
+        0x3000,
+        0x1000,
+        AllocationOwnership::Owned,
+    ));
+    let mut cache = FakeCodeCache {
+        ranges: std::vec::Vec::new(),
+        fail: true,
+    };
+
+    {
+        let mut transaction = ImageLoadTransaction::new(&mut memory);
+        let reserved = ImageLoader::new()
+            .reserve(planned, &mut transaction)
+            .unwrap();
+        let mapped = ImageLoader::new()
+            .copy_and_zero(reserved, &mut transaction)
+            .unwrap();
+        let runtime = mapped
+            .decode_runtime(&mut transaction, RuntimeFeaturePolicy::Phase0)
+            .unwrap();
+        let relocated = runtime
+            .relocate(&mut transaction, &Riscv64Relocator)
+            .unwrap();
+        let error = relocated.seal(&mut transaction, &mut cache).unwrap_err();
+        assert_eq!(error.stage(), LoadStage::Cache);
+    }
+
+    assert!(memory.protects.is_empty());
+    assert_eq!(memory.releases, [allocation_id]);
+}
+
+#[test]
+fn protection_failure_rolls_back_the_owned_allocation() {
+    let bytes = riscv_image_with_relro();
+    let planned = planned_image(&bytes, ExpectedElfType::Dyn);
+    let allocation_id = AllocationId::new(25);
+    let mut memory = FakeMemory::returning(ImageAllocation::new(
+        allocation_id,
+        TargetAddr::new(0x8000),
+        0x3000,
+        0x1000,
+        AllocationOwnership::Owned,
+    ));
+    memory.fail_protect_at = Some(1);
+    let mut cache = FakeCodeCache::default();
+
+    {
+        let mut transaction = ImageLoadTransaction::new(&mut memory);
+        let reserved = ImageLoader::new()
+            .reserve(planned, &mut transaction)
+            .unwrap();
+        let mapped = ImageLoader::new()
+            .copy_and_zero(reserved, &mut transaction)
+            .unwrap();
+        let runtime = mapped
+            .decode_runtime(&mut transaction, RuntimeFeaturePolicy::Phase0)
+            .unwrap();
+        let relocated = runtime
+            .relocate(&mut transaction, &Riscv64Relocator)
+            .unwrap();
+        assert!(relocated.seal(&mut transaction, &mut cache).is_err());
+    }
+
+    assert_eq!(memory.protects.len(), 1);
+    assert_eq!(memory.releases, [allocation_id]);
 }

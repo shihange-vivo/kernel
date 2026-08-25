@@ -142,6 +142,13 @@ pub trait ImageMemory {
     fn zero(&mut self, location: TargetLocation, len: u64) -> LoadResult<()>;
 
     fn read(&self, location: TargetLocation, dst: &mut [u8]) -> LoadResult<()>;
+
+    fn protect(
+        &mut self,
+        location: TargetLocation,
+        len: u64,
+        permissions: crate::MemoryPermissions,
+    ) -> LoadResult<crate::ProtectionLevel>;
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -264,6 +271,25 @@ impl<'a, M: ImageMemory> ImageLoadTransaction<'a, M> {
     #[cfg(test)]
     pub(crate) fn disarm_for_test(mut self) {
         self.committed = true;
+    }
+
+    pub fn commit_for(mut self, sealed: &crate::SealedImage) -> LoadResult<()> {
+        if self.rollback_allocations.len() == 1
+            && self.rollback_allocations[0] == sealed.allocation().id()
+        {
+            self.committed = true;
+            Ok(())
+        } else {
+            Err(LoadError::new(
+                LoadStage::Seal,
+                LoadErrorKind::Backend,
+                ErrorContext::Allocation {
+                    base: sealed.allocation().target_base(),
+                    len: sealed.allocation().len(),
+                    align: sealed.allocation().align(),
+                },
+            ))
+        }
     }
 }
 

@@ -38,7 +38,11 @@ impl MemoryPermissions {
         Self(self.0 | rhs.0)
     }
 
-    pub(crate) const fn contains(self, requested: Self) -> bool {
+    pub const fn without(self, removed: Self) -> Self {
+        Self(self.0 & !removed.0)
+    }
+
+    pub const fn contains(self, requested: Self) -> bool {
         self.0 & requested.0 == requested.0
     }
 }
@@ -401,6 +405,16 @@ impl ImageMemory for MemoryMapper {
             unsafe { core::ptr::copy_nonoverlapping(source, dst.as_mut_ptr(), dst.len()) };
         }
         Ok(())
+    }
+
+    fn protect(
+        &mut self,
+        location: TargetLocation,
+        len: u64,
+        permissions: MemoryPermissions,
+    ) -> LoadResult<crate::ProtectionLevel> {
+        self.validate_access(location, len, permissions)?;
+        Ok(crate::ProtectionLevel::LogicalOnly)
     }
 }
 

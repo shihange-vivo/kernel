@@ -25,6 +25,8 @@ pub enum LoadStage {
     Map,
     Metadata,
     Relocate,
+    Cache,
+    Seal,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

@@ -16,6 +16,7 @@ mod layout;
 mod loaded;
 mod metadata;
 mod parser;
+mod seal;
 
 pub use layout::{
     ImageLayout, ImageLayoutBuilder, PlannedArtifact, SegmentLayout, SegmentLocation,
@@ -25,3 +26,4 @@ pub use metadata::{
     RelocationAddend, RelocationRecord, RuntimeFeaturePolicy, RuntimeImage, RuntimeImageMetadata,
 };
 pub use parser::{DynamicSegmentInfo, LoadSegmentInfo, ParsedImage, StackPolicy};
+pub use seal::{ProtectionLevel, SealPlan, SealRange, SealedImage};

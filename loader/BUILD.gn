@@ -48,6 +48,7 @@ build_rust("blueos_loader") {
   crate_type = "rlib"
   sources = [
     "src/address.rs",
+    "src/cache.rs",
     "src/error.rs",
     "src/identity.rs",
     "src/image/layout.rs",
@@ -55,6 +56,7 @@ build_rust("blueos_loader") {
     "src/image/metadata.rs",
     "src/image/mod.rs",
     "src/image/parser.rs",
+    "src/image/seal.rs",
     "src/lib.rs",
     "src/limits.rs",
     "src/memory.rs",
@@ -78,6 +80,7 @@ build_rust("loader_unittest") {
   edition = "2021"
   sources = [
     "src/address.rs",
+    "src/cache.rs",
     "src/error.rs",
     "src/identity.rs",
     "src/image/layout.rs",
@@ -85,6 +88,7 @@ build_rust("loader_unittest") {
     "src/image/metadata.rs",
     "src/image/mod.rs",
     "src/image/parser.rs",
+    "src/image/seal.rs",
     "src/lib.rs",
     "src/limits.rs",
     "src/memory.rs",

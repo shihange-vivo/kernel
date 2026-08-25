@@ -21,6 +21,7 @@ extern crate alloc;
 extern crate std;
 
 mod address;
+mod cache;
 mod error;
 mod identity;
 mod image;
@@ -30,6 +31,7 @@ mod memory_mapper;
 mod reader;
 mod relocation;
 pub use address::{FileRange, TargetAddr, TargetRange};
+pub use cache::{ArchitectureCodeCache, CodeCache};
 pub use error::{
     ErrorContext, HeaderField, LimitKind, LoadError, LoadErrorKind, LoadResult, LoadStage,
     ProgramHeaderField,
@@ -45,9 +47,9 @@ pub use identity::{
 };
 pub use image::{
     DynamicSegmentInfo, ImageLayout, ImageLayoutBuilder, LoadSegmentInfo, LoadedRegion,
-    MappedImage, ParsedImage, PlannedArtifact, RelocationAddend, RelocationRecord,
-    RuntimeFeaturePolicy, RuntimeImage, RuntimeImageMetadata, SegmentLayout, SegmentLocation,
-    StackPolicy,
+    MappedImage, ParsedImage, PlannedArtifact, ProtectionLevel, RelocationAddend, RelocationRecord,
+    RuntimeFeaturePolicy, RuntimeImage, RuntimeImageMetadata, SealPlan, SealRange, SealedImage,
+    SegmentLayout, SegmentLocation, StackPolicy,
 };
 pub use limits::LoadLimits;
 pub use memory::{
