@@ -12,40 +12,212 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use alloc::{boxed::Box, vec::Vec};
+
 use crate::{ErrorContext, LoadError, LoadErrorKind, LoadResult, LoadStage, TargetRange};
 
-pub trait CodeCache {
-    fn synchronize(&mut self, runtime_range: TargetRange) -> LoadResult<()>;
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ExecutionScope {
+    CurrentExecutionContext,
+    AllExecutionContexts,
 }
 
-#[derive(Clone, Copy, Debug, Default)]
-pub struct ArchitectureCodeCache;
+impl ExecutionScope {
+    fn covers(self, required: Self) -> bool {
+        matches!(self, Self::AllExecutionContexts) || self == required
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CacheMaintenance {
+    CoherentInstructionCache,
+    InstructionFence,
+    BarrierOnly,
+    CleanAndInvalidate,
+}
+
+/// Cache guarantees required before an image may become executable.
+///
+/// Scope and maintenance are deployment properties rather than facts inferred
+/// from an ELF header. A single-hart board can require local synchronization;
+/// an SMP publisher must require all execution contexts. Boards with caches
+/// should additionally require their exact maintenance implementation.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct CacheRequirements {
+    scope: ExecutionScope,
+    maintenance: Option<CacheMaintenance>,
+}
+
+impl CacheRequirements {
+    pub const CURRENT_EXECUTION_CONTEXT: Self = Self::new(ExecutionScope::CurrentExecutionContext);
+
+    pub const fn new(scope: ExecutionScope) -> Self {
+        Self {
+            scope,
+            maintenance: None,
+        }
+    }
+
+    pub const fn exact(scope: ExecutionScope, maintenance: CacheMaintenance) -> Self {
+        Self {
+            scope,
+            maintenance: Some(maintenance),
+        }
+    }
+
+    pub const fn scope(self) -> ExecutionScope {
+        self.scope
+    }
+
+    pub const fn maintenance(self) -> Option<CacheMaintenance> {
+        self.maintenance
+    }
+
+    pub fn validate(self, prepared: &PreparedCacheSync) -> LoadResult<()> {
+        let scope_valid = prepared.scope().covers(self.scope);
+        let maintenance_valid = self
+            .maintenance
+            .is_none_or(|required| prepared.maintenance() == required);
+        if scope_valid && maintenance_valid {
+            Ok(())
+        } else {
+            Err(cache_capability_error())
+        }
+    }
+}
+
+#[derive(Debug)]
+pub struct PreparedCacheSync {
+    executable_ranges: Box<[TargetRange]>,
+    scope: ExecutionScope,
+    maintenance: CacheMaintenance,
+}
+
+impl PreparedCacheSync {
+    pub fn try_new(
+        executable_ranges: &[TargetRange],
+        scope: ExecutionScope,
+        maintenance: CacheMaintenance,
+    ) -> LoadResult<Self> {
+        let mut ranges = Vec::new();
+        ranges
+            .try_reserve_exact(executable_ranges.len())
+            .map_err(|_| cache_oom())?;
+        for range in executable_ranges {
+            range.end().map_err(|_| cache_error(*range))?;
+            ranges.push(*range);
+        }
+        Ok(Self {
+            executable_ranges: ranges.into_boxed_slice(),
+            scope,
+            maintenance,
+        })
+    }
+
+    pub fn executable_ranges(&self) -> &[TargetRange] {
+        &self.executable_ranges
+    }
+
+    pub const fn scope(&self) -> ExecutionScope {
+        self.scope
+    }
+
+    pub const fn maintenance(&self) -> CacheMaintenance {
+        self.maintenance
+    }
+
+    pub fn complete(self) -> CacheSyncOutcome {
+        CacheSyncOutcome {
+            executable_ranges: self.executable_ranges,
+            scope: self.scope,
+            maintenance: self.maintenance,
+        }
+    }
+}
+
+#[derive(Debug)]
+pub struct CacheSyncOutcome {
+    executable_ranges: Box<[TargetRange]>,
+    scope: ExecutionScope,
+    maintenance: CacheMaintenance,
+}
+
+impl CacheSyncOutcome {
+    pub fn executable_ranges(&self) -> &[TargetRange] {
+        &self.executable_ranges
+    }
+
+    pub const fn scope(&self) -> ExecutionScope {
+        self.scope
+    }
+
+    pub const fn maintenance(&self) -> CacheMaintenance {
+        self.maintenance
+    }
+}
+
+pub trait CodeCache {
+    /// Deployment guarantee required before any prepared range is executable.
+    ///
+    /// Keeping this on the cache/publisher adapter avoids mixing a platform
+    /// execution property into the ELF artifact request. A Phase 0.5 link
+    /// session can therefore share one requirement across every image it
+    /// publishes.
+    fn requirements(&self) -> CacheRequirements;
+
+    fn prepare(&self, executable_ranges: &[TargetRange]) -> LoadResult<PreparedCacheSync>;
+
+    fn synchronize(&mut self, prepared: PreparedCacheSync) -> LoadResult<CacheSyncOutcome>;
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct ArchitectureCodeCache {
+    requirements: CacheRequirements,
+}
+
+impl ArchitectureCodeCache {
+    pub const fn new(requirements: CacheRequirements) -> Self {
+        Self { requirements }
+    }
+}
 
 impl CodeCache for ArchitectureCodeCache {
-    fn synchronize(&mut self, runtime_range: TargetRange) -> LoadResult<()> {
-        runtime_range.end()?;
+    fn requirements(&self) -> CacheRequirements {
+        self.requirements
+    }
+
+    fn prepare(&self, executable_ranges: &[TargetRange]) -> LoadResult<PreparedCacheSync> {
+        let (scope, maintenance) = architecture_cache_capability()?;
+        PreparedCacheSync::try_new(executable_ranges, scope, maintenance)
+    }
+
+    fn synchronize(&mut self, prepared: PreparedCacheSync) -> LoadResult<CacheSyncOutcome> {
+        let (scope, maintenance) = architecture_cache_capability()?;
+        if prepared.scope() != scope || prepared.maintenance() != maintenance {
+            return Err(cache_capability_error());
+        }
+        let Some(first_range) = prepared.executable_ranges().first().copied() else {
+            return Ok(prepared.complete());
+        };
 
         #[cfg(any(target_arch = "riscv32", target_arch = "riscv64"))]
         unsafe {
             core::arch::asm!("fence.i", options(nostack));
-            Ok(())
         }
 
         #[cfg(target_arch = "arm")]
         unsafe {
             core::arch::asm!("dsb", "isb", options(nostack, preserves_flags));
-            Ok(())
         }
 
         #[cfg(target_arch = "aarch64")]
-        unsafe {
-            synchronize_aarch64(runtime_range)
+        for range in prepared.executable_ranges() {
+            unsafe { synchronize_aarch64(*range)? };
         }
 
         #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
         {
             core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
-            Ok(())
         }
 
         #[cfg(not(any(
@@ -56,8 +228,46 @@ impl CodeCache for ArchitectureCodeCache {
             target_arch = "x86",
             target_arch = "x86_64"
         )))]
-        Err(cache_error(runtime_range))
+        return Err(cache_error(first_range));
+
+        Ok(prepared.complete())
     }
+}
+
+fn architecture_cache_capability() -> LoadResult<(ExecutionScope, CacheMaintenance)> {
+    #[cfg(any(target_arch = "riscv32", target_arch = "riscv64"))]
+    return Ok((
+        ExecutionScope::CurrentExecutionContext,
+        CacheMaintenance::InstructionFence,
+    ));
+
+    #[cfg(all(target_arch = "arm", target_board = "qemu_mps2_an385"))]
+    return Ok((
+        ExecutionScope::CurrentExecutionContext,
+        CacheMaintenance::BarrierOnly,
+    ));
+
+    #[cfg(all(target_arch = "arm", not(target_board = "qemu_mps2_an385")))]
+    return Err(cache_capability_error());
+
+    #[cfg(target_arch = "aarch64")]
+    return Ok((
+        ExecutionScope::CurrentExecutionContext,
+        CacheMaintenance::CleanAndInvalidate,
+    ));
+
+    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+    return Ok((
+        ExecutionScope::AllExecutionContexts,
+        CacheMaintenance::CoherentInstructionCache,
+    ));
+
+    #[allow(unreachable_code)]
+    Err(LoadError::new(
+        LoadStage::Cache,
+        LoadErrorKind::UnsupportedByProfile,
+        ErrorContext::None,
+    ))
 }
 
 #[cfg(target_arch = "aarch64")]
@@ -66,9 +276,16 @@ unsafe fn synchronize_aarch64(runtime_range: TargetRange) -> LoadResult<()> {
     core::arch::asm!("mrs {value}, ctr_el0", value = out(reg) ctr_el0, options(nostack));
     let dcache_line = 4_u64 << ((ctr_el0 >> 16) & 0xf);
     let icache_line = 4_u64 << (ctr_el0 & 0xf);
-    let end = runtime_range.end()?.get();
+    let end = runtime_range
+        .end()
+        .map_err(|error| error.at(LoadStage::Cache))?
+        .get();
 
-    let mut address = runtime_range.start().align_down(dcache_line)?.get();
+    let mut address = runtime_range
+        .start()
+        .align_down(dcache_line)
+        .map_err(|error| error.at(LoadStage::Cache))?
+        .get();
     while address < end {
         core::arch::asm!("dc cvau, {address}", address = in(reg) address, options(nostack));
         address = address
@@ -77,7 +294,11 @@ unsafe fn synchronize_aarch64(runtime_range: TargetRange) -> LoadResult<()> {
     }
     core::arch::asm!("dsb ish", options(nostack));
 
-    address = runtime_range.start().align_down(icache_line)?.get();
+    address = runtime_range
+        .start()
+        .align_down(icache_line)
+        .map_err(|error| error.at(LoadStage::Cache))?
+        .get();
     while address < end {
         core::arch::asm!("ic ivau, {address}", address = in(reg) address, options(nostack));
         address = address
@@ -96,5 +317,21 @@ fn cache_error(runtime_range: TargetRange) -> LoadError {
             start: runtime_range.start(),
             len: runtime_range.len(),
         },
+    )
+}
+
+fn cache_oom() -> LoadError {
+    LoadError::new(
+        LoadStage::Cache,
+        LoadErrorKind::OutOfMemory,
+        ErrorContext::None,
+    )
+}
+
+fn cache_capability_error() -> LoadError {
+    LoadError::new(
+        LoadStage::Cache,
+        LoadErrorKind::UnsupportedByProfile,
+        ErrorContext::None,
     )
 }

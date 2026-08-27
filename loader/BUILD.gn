@@ -46,6 +46,7 @@ if (coverage || profile) {
 
 build_rust("blueos_loader") {
   crate_type = "rlib"
+  cfgs = [ "target_board=\"${board}\"" ]
   sources = [
     "src/address.rs",
     "src/cache.rs",

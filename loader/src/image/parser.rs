@@ -24,10 +24,13 @@ use crate::{
     TargetRange,
 };
 
+use super::metadata::ProgramFeatureSummary;
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum StackPolicy {
     NotDeclared,
     NonExecutable,
+    Executable,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -94,6 +97,7 @@ pub struct ParsedImage {
     dynamic: Option<DynamicSegmentInfo>,
     relro: Option<TargetRange>,
     stack_policy: StackPolicy,
+    program_features: ProgramFeatureSummary,
 }
 
 impl ParsedImage {
@@ -116,10 +120,15 @@ impl ParsedImage {
     pub const fn stack_policy(&self) -> StackPolicy {
         self.stack_policy
     }
+
+    pub const fn program_features(&self) -> &ProgramFeatureSummary {
+        &self.program_features
+    }
 }
 
 impl ImageLoader {
     pub fn inspect<R: ElfReader>(&self, artifact: &AdmittedArtifact<R>) -> LoadResult<ParsedImage> {
+        artifact.ensure_snapshot()?;
         let header = artifact.header();
         let count = header.program_header_count();
         let mut load_segments = Vec::new();
@@ -138,6 +147,7 @@ impl ImageLoader {
         let mut dynamic = None;
         let mut relro = None;
         let mut stack_policy = StackPolicy::NotDeclared;
+        let mut program_features = ProgramFeatureSummary::default();
         for index in 0..count {
             let offset = header
                 .program_header_offset()
@@ -152,8 +162,12 @@ impl ImageLoader {
             match ph.program_type {
                 PT_LOAD => {
                     let file_range = FileRange::new(ph.file_offset, ph.file_size);
-                    file_range.validate(artifact.file_len())?;
-                    TargetRange::new(TargetAddr::new(ph.vaddr), ph.memory_size).end()?;
+                    file_range
+                        .validate(artifact.file_len())
+                        .map_err(|error| error.at(LoadStage::Parse))?;
+                    TargetRange::new(TargetAddr::new(ph.vaddr), ph.memory_size)
+                        .end()
+                        .map_err(|error| error.at(LoadStage::Parse))?;
                     load_segments.push(LoadSegmentInfo {
                         index,
                         file_range,
@@ -172,8 +186,12 @@ impl ImageLoader {
                         ));
                     }
                     let file_range = FileRange::new(ph.file_offset, ph.file_size);
-                    file_range.validate(artifact.file_len())?;
-                    TargetRange::new(TargetAddr::new(ph.vaddr), ph.memory_size).end()?;
+                    file_range
+                        .validate(artifact.file_len())
+                        .map_err(|error| error.at(LoadStage::Parse))?;
+                    TargetRange::new(TargetAddr::new(ph.vaddr), ph.memory_size)
+                        .end()
+                        .map_err(|error| error.at(LoadStage::Parse))?;
                     dynamic = Some(DynamicSegmentInfo {
                         file_range,
                         vaddr: TargetAddr::new(ph.vaddr),
@@ -189,7 +207,7 @@ impl ImageLoader {
                         ));
                     }
                     let range = TargetRange::new(TargetAddr::new(ph.vaddr), ph.memory_size);
-                    range.end()?;
+                    range.end().map_err(|error| error.at(LoadStage::Parse))?;
                     relro = Some(range);
                 }
                 PT_GNU_STACK => {
@@ -201,38 +219,63 @@ impl ImageLoader {
                         ));
                     }
                     if ph.flags & PF_X != 0 {
-                        return Err(unsupported_program_header(
-                            index,
-                            ProgramHeaderField::ExecutableStack,
-                            u64::from(ph.flags),
-                        ));
+                        stack_policy = StackPolicy::Executable;
+                        program_features.executable_stack = Some(index);
+                    } else {
+                        stack_policy = StackPolicy::NonExecutable;
                     }
-                    stack_policy = StackPolicy::NonExecutable;
                 }
                 PT_INTERP => {
-                    return Err(unsupported_program_header(
-                        index,
-                        ProgramHeaderField::UnsupportedInterpreter,
-                        ph.program_type.into(),
-                    ));
+                    let range = FileRange::new(ph.file_offset, ph.file_size);
+                    range
+                        .validate(artifact.file_len())
+                        .map_err(|error| error.at(LoadStage::Parse))?;
+                    if program_features
+                        .interpreter
+                        .replace((index, range))
+                        .is_some()
+                    {
+                        return Err(program_header_error(
+                            index,
+                            ProgramHeaderField::UnsupportedInterpreter,
+                            ph.program_type.into(),
+                        ));
+                    }
                 }
                 PT_TLS => {
-                    return Err(unsupported_program_header(
-                        index,
-                        ProgramHeaderField::UnsupportedTls,
-                        ph.program_type.into(),
-                    ));
+                    let file_range = FileRange::new(ph.file_offset, ph.file_size);
+                    file_range
+                        .validate(artifact.file_len())
+                        .map_err(|error| error.at(LoadStage::Parse))?;
+                    if ph.file_size > ph.memory_size {
+                        return Err(program_header_error(
+                            index,
+                            ProgramHeaderField::FileRange,
+                            ph.file_size,
+                        ));
+                    }
+                    let range = TargetRange::new(TargetAddr::new(ph.vaddr), ph.memory_size);
+                    range.end().map_err(|error| error.at(LoadStage::Parse))?;
+                    if program_features.tls.replace((index, range)).is_some() {
+                        return Err(program_header_error(
+                            index,
+                            ProgramHeaderField::UnsupportedTls,
+                            ph.program_type.into(),
+                        ));
+                    }
                 }
                 _ => {}
             }
         }
 
+        artifact.ensure_snapshot()?;
         Ok(ParsedImage {
             header: *header,
             load_segments: load_segments.into_boxed_slice(),
             dynamic,
             relro,
             stack_policy,
+            program_features,
         })
     }
 }
@@ -251,25 +294,33 @@ impl ProgramHeaderFields {
     fn decode(bytes: &[u8], class: ElfClass, endian: Endian) -> LoadResult<Self> {
         Ok(match class {
             ElfClass::Elf32 => Self {
-                program_type: read_u32(bytes, 0, endian)?,
-                file_offset: u64::from(read_u32(bytes, 4, endian)?),
-                vaddr: u64::from(read_u32(bytes, 8, endian)?),
-                file_size: u64::from(read_u32(bytes, 16, endian)?),
-                memory_size: u64::from(read_u32(bytes, 20, endian)?),
-                flags: read_u32(bytes, 24, endian)?,
-                align: u64::from(read_u32(bytes, 28, endian)?),
+                program_type: parse_u32(bytes, 0, endian)?,
+                file_offset: u64::from(parse_u32(bytes, 4, endian)?),
+                vaddr: u64::from(parse_u32(bytes, 8, endian)?),
+                file_size: u64::from(parse_u32(bytes, 16, endian)?),
+                memory_size: u64::from(parse_u32(bytes, 20, endian)?),
+                flags: parse_u32(bytes, 24, endian)?,
+                align: u64::from(parse_u32(bytes, 28, endian)?),
             },
             ElfClass::Elf64 => Self {
-                program_type: read_u32(bytes, 0, endian)?,
-                flags: read_u32(bytes, 4, endian)?,
-                file_offset: read_u64(bytes, 8, endian)?,
-                vaddr: read_u64(bytes, 16, endian)?,
-                file_size: read_u64(bytes, 32, endian)?,
-                memory_size: read_u64(bytes, 40, endian)?,
-                align: read_u64(bytes, 48, endian)?,
+                program_type: parse_u32(bytes, 0, endian)?,
+                flags: parse_u32(bytes, 4, endian)?,
+                file_offset: parse_u64(bytes, 8, endian)?,
+                vaddr: parse_u64(bytes, 16, endian)?,
+                file_size: parse_u64(bytes, 32, endian)?,
+                memory_size: parse_u64(bytes, 40, endian)?,
+                align: parse_u64(bytes, 48, endian)?,
             },
         })
     }
+}
+
+fn parse_u32(bytes: &[u8], offset: usize, endian: Endian) -> LoadResult<u32> {
+    read_u32(bytes, offset, endian).map_err(|error| error.at(LoadStage::Parse))
+}
+
+fn parse_u64(bytes: &[u8], offset: usize, endian: Endian) -> LoadResult<u64> {
+    read_u64(bytes, offset, endian).map_err(|error| error.at(LoadStage::Parse))
 }
 
 fn permissions_from_flags(flags: u32) -> MemoryPermissions {
@@ -290,18 +341,6 @@ fn program_header_error(index: u16, field: ProgramHeaderField, value: u64) -> Lo
     LoadError::new(
         LoadStage::Parse,
         LoadErrorKind::BadElf,
-        ErrorContext::ProgramHeader {
-            index,
-            field,
-            value,
-        },
-    )
-}
-
-fn unsupported_program_header(index: u16, field: ProgramHeaderField, value: u64) -> LoadError {
-    LoadError::new(
-        LoadStage::Validate,
-        LoadErrorKind::UnsupportedByProfile,
         ErrorContext::ProgramHeader {
             index,
             field,

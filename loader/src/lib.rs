@@ -29,104 +29,146 @@ mod memory;
 mod memory_mapper;
 mod reader;
 mod relocation;
-pub use address::{FileRange, TargetAddr, TargetRange};
-pub use cache::{ArchitectureCodeCache, CodeCache};
+pub use address::{FileRange, RangeError, RangeResult, TargetAddr, TargetRange};
+pub use cache::{
+    ArchitectureCodeCache, CacheMaintenance, CacheRequirements, CacheSyncOutcome, CodeCache,
+    ExecutionScope, PreparedCacheSync,
+};
 pub use error::{
     ErrorContext, HeaderField, LimitKind, LoadError, LoadErrorKind, LoadResult, LoadStage,
     ProgramHeaderField,
 };
 pub use identity::{
-    AdmittedArtifact, ArtifactProfile, ArtifactRequest, ElfClass, ElfHeaderInfo, Endian,
-    ExpectedElfType, ImageLoader,
+    AdmittedArtifact, ArtifactProfile, ArtifactRequest, ElfClass, ElfHeaderInfo, Endian, EntryMode,
+    ExpectedElfType, HeaderFlagsPolicy, ImageLoader, RelativeValuePolicy,
 };
 pub use image::{
+    AppliedProtection, AppliedProtectionSet, ArtifactFeaturePolicy, DynamicFeatureSummary,
     DynamicSegmentInfo, ImageLayout, ImageLayoutBuilder, LoadSegmentInfo, LoadedRegion,
-    MappedImage, ParsedImage, PlannedArtifact, ProtectionLevel, RelocationAddend, RelocationRecord,
-    RuntimeFeaturePolicy, RuntimeImage, RuntimeImageMetadata, SealPlan, SealRange, SealedImage,
-    SegmentLayout, SegmentLocation, StackPolicy,
+    MappedImage, MappedState, ParsedImage, Phase0ArtifactPolicy, PlannedArtifact, PreparedImage,
+    PreparedProtectionPlan, ProgramFeatureSummary, ProtectionCapabilities, ProtectionLevel,
+    ReadyImageCommit, RelocationAddend, RelocationRecord, RuntimeImage, RuntimeImageMetadata,
+    RuntimeState, SealPlan, SealRange, SealedState, SegmentLayout, SegmentLocation, StackPolicy,
 };
 pub use limits::LoadLimits;
+pub(crate) use memory::ImageLoadTransaction;
 pub use memory::{
-    AllocationId, AllocationOwnership, AllocationRequest, ImageAllocation, ImageLoadTransaction,
-    ImageMemory, Placement, ReservedImage, TargetLocation,
+    AllocationId, AllocationLease, AllocationOwnership, AllocationRequest, ImageAllocation,
+    ImageCommitMemory, ImageMemory, ImageProtectionMemory, MutationProgress, Placement,
+    ReservedImage, ReservedState, StagedImage, TargetLocation,
 };
 pub use memory_mapper::{MemoryMapper, MemoryPermissions, MemoryRegion};
-pub use reader::{ElfReader, SliceElfReader};
+pub use reader::{ElfReader, SliceElfReader, SourceSnapshot};
 pub use relocation::{
-    AddendEncoding, ArchRelocator, ArmRelocator, RelocatedImage, Riscv32Relocator,
+    AddendEncoding, ArchRelocator, ArmRelocator, RelocatedImage, RelocatedState, Riscv32Relocator,
     Riscv64Relocator, TargetWord, WordWidth,
 };
 
-pub type Result = core::result::Result<(), &'static str>;
+/// Result type retained by the original `load_elf` compatibility entry point.
+pub type CompatibilityResult = core::result::Result<(), &'static str>;
 
-pub fn load_image<R, M, C, A>(
+pub fn prepare_image<'m, R, M, C, A, P>(
+    reader: R,
+    request: ArtifactRequest,
+    memory: &'m mut M,
+    cache: &mut C,
+    policy: &P,
+    relocator: &A,
+) -> LoadResult<PreparedImage<'m, M>>
+where
+    R: ElfReader,
+    M: ImageProtectionMemory,
+    C: CodeCache,
+    A: ArchRelocator + ?Sized,
+    P: ArtifactFeaturePolicy + ?Sized,
+{
+    let loader = ImageLoader::new();
+    let admitted = loader.admit(reader, request)?;
+    let planned = loader.plan_with_policy(admitted, policy)?;
+    let reserved = loader.reserve_staged(planned, memory)?;
+    let mapped = reserved.copy_and_zero()?;
+    let runtime = mapped.decode_runtime(policy)?;
+    let relocated = runtime.relocate(relocator)?;
+    relocated.seal(cache)
+}
+
+pub fn load_image<R, M, C, A, P>(
     reader: R,
     request: ArtifactRequest,
     memory: &mut M,
     cache: &mut C,
-    runtime_policy: RuntimeFeaturePolicy,
+    policy: &P,
     relocator: &A,
-) -> LoadResult<SealedImage>
+) -> LoadResult<M::CommitReceipt>
 where
     R: ElfReader,
-    M: ImageMemory,
+    M: ImageCommitMemory,
     C: CodeCache,
     A: ArchRelocator + ?Sized,
+    P: ArtifactFeaturePolicy + ?Sized,
 {
-    let loader = ImageLoader::new();
-    let admitted = loader.admit(reader, request)?;
-    let planned = loader.plan(admitted)?;
-
-    let mut transaction = ImageLoadTransaction::new(memory);
-    let reserved = loader.reserve(planned, &mut transaction)?;
-    let mapped = loader.copy_and_zero(reserved, &mut transaction)?;
-    let runtime = mapped.decode_runtime(&mut transaction, runtime_policy)?;
-    let relocated = runtime.relocate(&mut transaction, relocator)?;
-    let sealed = relocated.seal(&mut transaction, cache)?;
-    transaction.commit_for(&sealed)?;
-    Ok(sealed)
+    let prepared = prepare_image(reader, request, memory, cache, policy, relocator)?;
+    let ready = prepared.prepare_commit()?;
+    Ok(ready.commit())
 }
 
 #[cfg(target_arch = "riscv64")]
-pub fn load_elf(buffer: &[u8], mapper: &mut MemoryMapper) -> Result {
+pub fn load_elf(buffer: &[u8], mapper: &mut MemoryMapper) -> CompatibilityResult {
     load_elf_with_relocator(
         buffer,
         mapper,
-        ArtifactProfile::new(
-            ElfClass::Elf64,
-            Endian::Little,
-            goblin::elf::header::EM_RISCV,
+        ArtifactProfile::riscv_compressed_soft(ElfClass::Elf64),
+        CacheRequirements::exact(
+            ExecutionScope::CurrentExecutionContext,
+            CacheMaintenance::InstructionFence,
         ),
         &Riscv64Relocator,
     )
 }
 
 #[cfg(target_arch = "riscv32")]
-pub fn load_elf(buffer: &[u8], mapper: &mut MemoryMapper) -> Result {
+pub fn load_elf(buffer: &[u8], mapper: &mut MemoryMapper) -> CompatibilityResult {
     load_elf_with_relocator(
         buffer,
         mapper,
-        ArtifactProfile::new(
-            ElfClass::Elf32,
-            Endian::Little,
-            goblin::elf::header::EM_RISCV,
+        ArtifactProfile::riscv_compressed_soft(ElfClass::Elf32),
+        CacheRequirements::exact(
+            ExecutionScope::CurrentExecutionContext,
+            CacheMaintenance::InstructionFence,
         ),
         &Riscv32Relocator,
     )
 }
 
 #[cfg(target_arch = "arm")]
-pub fn load_elf(buffer: &[u8], mapper: &mut MemoryMapper) -> Result {
+pub fn load_elf(buffer: &[u8], mapper: &mut MemoryMapper) -> CompatibilityResult {
     load_elf_with_relocator(
         buffer,
         mapper,
-        ArtifactProfile::new(ElfClass::Elf32, Endian::Little, goblin::elf::header::EM_ARM),
+        ArtifactProfile::arm_thumb_v7m_soft(),
+        CacheRequirements::exact(
+            ExecutionScope::CurrentExecutionContext,
+            CacheMaintenance::BarrierOnly,
+        ),
         &ArmRelocator,
     )
 }
 
-#[cfg(not(any(target_arch = "riscv32", target_arch = "riscv64", target_arch = "arm")))]
-pub fn load_elf(_buffer: &[u8], _mapper: &mut MemoryMapper) -> Result {
+/// AArch64 relocation and compatibility execution are deliberately outside
+/// the Phase 0 support matrix. The cache primitive remains available to later
+/// linkers, but the single-image compatibility loader must fail explicitly.
+#[cfg(target_arch = "aarch64")]
+pub fn load_elf(_buffer: &[u8], _mapper: &mut MemoryMapper) -> CompatibilityResult {
+    Err("AArch64 is not supported by the Phase 0 loader")
+}
+
+#[cfg(not(any(
+    target_arch = "riscv32",
+    target_arch = "riscv64",
+    target_arch = "arm",
+    target_arch = "aarch64"
+)))]
+pub fn load_elf(_buffer: &[u8], _mapper: &mut MemoryMapper) -> CompatibilityResult {
     Err("Unsupported loader target architecture")
 }
 
@@ -135,22 +177,25 @@ fn load_elf_with_relocator<A: ArchRelocator + ?Sized>(
     buffer: &[u8],
     mapper: &mut MemoryMapper,
     profile: ArtifactProfile,
+    cache_requirements: CacheRequirements,
     relocator: &A,
-) -> Result {
-    let request = ArtifactRequest::new(mapper.expected_elf_type(), profile, LoadLimits::default());
+) -> CompatibilityResult {
+    let request = ArtifactRequest::new(
+        mapper.expected_elf_type(),
+        profile,
+        LoadLimits::phase0_mcu(),
+    )
+    .with_cache_requirements(cache_requirements);
     let mut cache = ArchitectureCodeCache;
-    let sealed = load_image(
+    load_image(
         SliceElfReader::new(buffer),
         request,
         mapper,
         &mut cache,
-        RuntimeFeaturePolicy::Phase0,
+        &Phase0ArtifactPolicy,
         relocator,
     )
     .map_err(compatibility_error)?;
-    mapper
-        .install_sealed(&sealed)
-        .map_err(compatibility_error)?;
     Ok(())
 }
 

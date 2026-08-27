@@ -12,11 +12,10 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use alloc::vec::Vec;
-
 use crate::{
     AdmittedArtifact, ElfClass, ErrorContext, ImageLayout, ImageLoader, LoadError, LoadErrorKind,
-    LoadResult, LoadStage, ParsedImage, PlannedArtifact, TargetAddr, TargetRange,
+    LoadResult, LoadStage, ParsedImage, PlannedArtifact, RangeError, RangeResult, TargetAddr,
+    TargetRange,
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -83,6 +82,42 @@ pub struct ImageAllocation {
     ownership: AllocationOwnership,
 }
 
+/// The unique authority to abort or commit an image allocation.
+///
+/// `ImageAllocation` is intentionally a copyable address descriptor. This
+/// lease is neither `Clone` nor `Copy`, so matching numeric allocation IDs are
+/// never sufficient to transfer ownership.
+#[derive(Debug)]
+#[must_use = "an allocation lease must be committed or aborted exactly once"]
+pub struct AllocationLease {
+    allocation: ImageAllocation,
+}
+
+impl AllocationLease {
+    /// Creates the unique lease for a backend allocation.
+    ///
+    /// # Safety
+    ///
+    /// `allocation` must describe a newly-created, live allocation owned by
+    /// this backend. No other lease may exist for the same allocation, and the
+    /// backend must honor exactly one later `abort_image`, `release_committed`
+    /// or `commit_install` transfer for this lease.
+    pub const unsafe fn from_allocation(allocation: ImageAllocation) -> Self {
+        Self { allocation }
+    }
+
+    pub const fn allocation(&self) -> &ImageAllocation {
+        &self.allocation
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub enum MutationProgress {
+    Reserved,
+    BytesModified,
+    ProtectionModified,
+}
+
 impl ImageAllocation {
     pub const fn new(
         id: AllocationId,
@@ -126,9 +161,17 @@ impl ImageAllocation {
 }
 
 pub trait ImageMemory {
-    fn allocate_image(&mut self, request: &AllocationRequest) -> LoadResult<ImageAllocation>;
+    fn allocate_image(&mut self, request: &AllocationRequest) -> LoadResult<AllocationLease>;
 
-    fn release(&mut self, allocation: AllocationId);
+    /// Abort an unpublished image. Implementations must be allocation-free,
+    /// non-panicking and infallible. Borrowed fixed images that may have been
+    /// modified must be poisoned instead of pretending that bytes were restored.
+    fn abort_image(&mut self, lease: AllocationLease, progress: MutationProgress);
+
+    /// Release a successfully committed image owner. This is distinct from
+    /// abort: a committed fixed image is not poisoned merely because its owner
+    /// is being torn down.
+    fn release_committed(&mut self, lease: AllocationLease);
 
     fn validate_access(
         &self,
@@ -151,6 +194,91 @@ pub trait ImageMemory {
     ) -> LoadResult<crate::ProtectionLevel>;
 }
 
+pub trait ImageProtectionMemory: ImageMemory {
+    fn protection_capabilities(&self) -> crate::ProtectionCapabilities;
+
+    /// Validate backend-specific aliases before cache or protection effects.
+    ///
+    /// A backend that will report `HardwareEnforced` must reject any writable
+    /// alias that would remain for an executable or read-only applied range.
+    /// A backend without hardware enforcement may accept the plan, but every
+    /// applied range must then remain explicitly `LogicalOnly`.
+    fn validate_protection_aliases(
+        &self,
+        allocation: &ImageAllocation,
+        prepared: &crate::PreparedProtectionPlan,
+    ) -> LoadResult<()>;
+
+    fn prepare_protection(
+        &self,
+        allocation: &ImageAllocation,
+        logical: &crate::SealPlan,
+    ) -> LoadResult<crate::PreparedProtectionPlan> {
+        let prepared = crate::PreparedProtectionPlan::build(
+            allocation,
+            logical,
+            self.protection_capabilities(),
+        )?;
+        self.validate_protection_aliases(allocation, &prepared)
+            .map_err(|error| error.with_stage(LoadStage::Seal))?;
+        for range in prepared.ranges() {
+            self.validate_access(
+                range.location(),
+                range.applied_range().len(),
+                range.applied(),
+            )
+                .map_err(|error| error.with_stage(LoadStage::Seal))?;
+        }
+        Ok(prepared)
+    }
+
+    fn apply_protection(
+        &mut self,
+        prepared: crate::PreparedProtectionPlan,
+    ) -> LoadResult<crate::AppliedProtectionSet> {
+        let mut ranges = prepared.into_ranges();
+        for range in ranges.iter_mut() {
+            let level = self
+                .protect(
+                    range.location(),
+                    range.applied_range().len(),
+                    range.applied(),
+                )
+                .map_err(|error| error.with_stage(LoadStage::Seal))?;
+            range.record_level(level);
+        }
+        Ok(crate::AppliedProtectionSet::new(ranges))
+    }
+}
+
+pub trait ImageCommitMemory: ImageProtectionMemory {
+    type PreparedInstall;
+    type CommitReceipt;
+
+    fn prepare_install(
+        &mut self,
+        allocation: &ImageAllocation,
+        sealed: &crate::SealedState,
+    ) -> LoadResult<Self::PreparedInstall>;
+
+    /// Install only state that was fully prepared by `prepare_install` and
+    /// transfer the unique allocation lease to the committed owner.
+    ///
+    /// This method must not allocate, validate, panic or fail.
+    ///
+    /// # Safety
+    ///
+    /// `prepared`, `sealed`, and `lease` must all originate from the same
+    /// backend transaction and describe the same allocation. `lease` must not
+    /// have been transferred or released previously.
+    unsafe fn commit_install(
+        &mut self,
+        prepared: Self::PreparedInstall,
+        sealed: crate::SealedState,
+        lease: AllocationLease,
+    ) -> Self::CommitReceipt;
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct TargetLocation {
     allocation: AllocationId,
@@ -170,10 +298,9 @@ impl TargetLocation {
         self.offset
     }
 
-    pub fn checked_add(self, value: u64) -> LoadResult<Self> {
+    pub fn checked_add(self, value: u64) -> RangeResult<Self> {
         let offset = self.offset.checked_add(value).ok_or_else(|| {
-            LoadError::new(
-                LoadStage::Map,
+            RangeError::new(
                 LoadErrorKind::IntegerOverflow,
                 ErrorContext::MemoryAccess {
                     allocation: self.allocation,
@@ -187,7 +314,7 @@ impl TargetLocation {
 }
 
 #[derive(Debug)]
-pub struct ReservedImage<R> {
+pub struct ReservedState<R> {
     artifact: AdmittedArtifact<R>,
     parsed: ParsedImage,
     layout: ImageLayout,
@@ -195,7 +322,7 @@ pub struct ReservedImage<R> {
     load_bias: TargetAddr,
 }
 
-impl<R> ReservedImage<R> {
+impl<R> ReservedState<R> {
     pub const fn artifact(&self) -> &AdmittedArtifact<R> {
         &self.artifact
     }
@@ -235,32 +362,35 @@ impl<R> ReservedImage<R> {
     }
 }
 
-pub struct ImageLoadTransaction<'a, M: ImageMemory> {
+pub(crate) struct ImageLoadTransaction<'a, M: ImageMemory> {
     memory: &'a mut M,
-    rollback_allocations: Vec<AllocationId>,
-    committed: bool,
+    pending: Option<AllocationLease>,
+    progress: MutationProgress,
 }
 
 impl<'a, M: ImageMemory> ImageLoadTransaction<'a, M> {
-    pub fn new(memory: &'a mut M) -> Self {
+    pub(crate) fn new(memory: &'a mut M) -> Self {
         Self {
             memory,
-            rollback_allocations: Vec::new(),
-            committed: false,
+            pending: None,
+            progress: MutationProgress::Reserved,
         }
     }
 
     fn allocate(&mut self, request: &AllocationRequest) -> LoadResult<ImageAllocation> {
-        let allocation = self.memory.allocate_image(request)?;
-        if self.rollback_allocations.try_reserve_exact(1).is_err() {
-            self.memory.release(allocation.id());
+        if self.pending.is_some() {
             return Err(LoadError::new(
                 LoadStage::Allocate,
-                LoadErrorKind::OutOfMemory,
+                LoadErrorKind::Backend,
                 ErrorContext::None,
             ));
         }
-        self.rollback_allocations.push(allocation.id());
+        let lease = self
+            .memory
+            .allocate_image(request)
+            .map_err(|error| error.with_stage(LoadStage::Allocate))?;
+        let allocation = *lease.allocation();
+        self.pending = Some(lease);
         Ok(allocation)
     }
 
@@ -268,48 +398,91 @@ impl<'a, M: ImageMemory> ImageLoadTransaction<'a, M> {
         self.memory
     }
 
-    #[cfg(test)]
-    pub(crate) fn disarm_for_test(mut self) {
-        self.committed = true;
+    pub(crate) fn memory_ref(&self) -> &M {
+        self.memory
     }
 
-    pub fn commit_for(mut self, sealed: &crate::SealedImage) -> LoadResult<()> {
-        if self.rollback_allocations.len() == 1
-            && self.rollback_allocations[0] == sealed.allocation().id()
-        {
-            self.committed = true;
-            Ok(())
-        } else {
-            Err(LoadError::new(
-                LoadStage::Seal,
-                LoadErrorKind::Backend,
-                ErrorContext::Allocation {
-                    base: sealed.allocation().target_base(),
-                    len: sealed.allocation().len(),
-                    align: sealed.allocation().align(),
-                },
-            ))
-        }
+    pub(crate) fn allocation(&self) -> &ImageAllocation {
+        self.pending
+            .as_ref()
+            .expect("an active image transaction must own a lease")
+            .allocation()
+    }
+
+    pub(crate) fn mark_bytes_modified(&mut self) {
+        self.progress = core::cmp::max(self.progress, MutationProgress::BytesModified);
+    }
+
+    pub(crate) fn mark_protection_modified(&mut self) {
+        self.progress = MutationProgress::ProtectionModified;
+    }
+
+    pub(crate) fn take_lease(&mut self) -> AllocationLease {
+        self.pending
+            .take()
+            .expect("an active image transaction must own a lease")
+    }
+
+    #[cfg(test)]
+    pub(crate) fn disarm_for_test(mut self) {
+        let _lease = self.take_lease();
     }
 }
 
 impl<M: ImageMemory> Drop for ImageLoadTransaction<'_, M> {
     fn drop(&mut self) {
-        if self.committed {
-            return;
-        }
-        for allocation in self.rollback_allocations.drain(..).rev() {
-            self.memory.release(allocation);
+        if let Some(lease) = self.pending.take() {
+            self.memory.abort_image(lease, self.progress);
         }
     }
 }
 
+/// Binds every post-allocation state to the transaction that owns its lease.
+/// Production transitions consume this wrapper, so a state from one backend
+/// cannot be paired with a transaction from another backend.
+#[must_use = "dropping a staged image aborts its unpublished allocation"]
+pub struct StagedImage<'a, M: ImageMemory, S> {
+    transaction: ImageLoadTransaction<'a, M>,
+    state: S,
+}
+
+impl<M: ImageMemory, S: core::fmt::Debug> core::fmt::Debug for StagedImage<'_, M, S> {
+    fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        formatter
+            .debug_struct("StagedImage")
+            .field("state", &self.state)
+            .finish_non_exhaustive()
+    }
+}
+
+impl<'a, M: ImageMemory, S> StagedImage<'a, M, S> {
+    pub(crate) const fn new(transaction: ImageLoadTransaction<'a, M>, state: S) -> Self {
+        Self { transaction, state }
+    }
+
+    /// Borrow the immutable payload proven by this typestate.
+    ///
+    /// The payload constructors remain private, so exposing a shared view does
+    /// not let callers forge a later stage or separate it from rollback
+    /// authority. Phase 0.5 can extend the payloads without opening a second
+    /// transition path.
+    pub const fn state(&self) -> &S {
+        &self.state
+    }
+
+    pub(crate) fn into_parts(self) -> (ImageLoadTransaction<'a, M>, S) {
+        (self.transaction, self.state)
+    }
+}
+
+pub type ReservedImage<'a, M, R> = StagedImage<'a, M, ReservedState<R>>;
+
 impl ImageLoader {
-    pub fn reserve<R, M>(
+    pub(crate) fn reserve<R, M>(
         &self,
         planned: PlannedArtifact<R>,
         transaction: &mut ImageLoadTransaction<'_, M>,
-    ) -> LoadResult<ReservedImage<R>>
+    ) -> LoadResult<ReservedState<R>>
     where
         M: ImageMemory,
     {
@@ -322,18 +495,33 @@ impl ImageLoader {
             request.size(),
             artifact.request().profile().class(),
         )?;
-        let load_bias = layout.load_bias_for(
-            allocation.target_base(),
-            artifact.request().expected_elf_type(),
-        )?;
+        let load_bias = layout
+            .load_bias_for(
+                allocation.target_base(),
+                artifact.request().expected_elf_type(),
+            )
+            .map_err(|error| error.with_stage(LoadStage::Allocate))?;
 
-        Ok(ReservedImage {
+        Ok(ReservedState {
             artifact,
             parsed,
             layout,
             allocation,
             load_bias,
         })
+    }
+
+    pub fn reserve_staged<'a, R, M>(
+        &self,
+        planned: PlannedArtifact<R>,
+        memory: &'a mut M,
+    ) -> LoadResult<ReservedImage<'a, M, R>>
+    where
+        M: ImageMemory,
+    {
+        let mut transaction = ImageLoadTransaction::new(memory);
+        let reserved = self.reserve(planned, &mut transaction)?;
+        Ok(StagedImage::new(transaction, reserved))
     }
 }
 
@@ -342,7 +530,10 @@ fn validate_target_width(
     image_span: u64,
     class: ElfClass,
 ) -> LoadResult<()> {
-    let end = allocation.target_base().checked_add(image_span)?;
+    let end = allocation
+        .target_base()
+        .checked_add(image_span)
+        .map_err(|error| error.at(LoadStage::Allocate))?;
     let valid = match class {
         ElfClass::Elf32 => end.get() <= u64::from(u32::MAX) + 1,
         ElfClass::Elf64 => true,
@@ -366,7 +557,7 @@ fn validate_allocation(
     allocation: &ImageAllocation,
     request: &AllocationRequest,
 ) -> LoadResult<()> {
-    let valid_length = allocation.len() >= request.size();
+    let valid_length = allocation.len() == request.size();
     let valid_alignment = request.align().is_power_of_two()
         && allocation.align() >= request.align()
         && allocation.align().is_power_of_two()
@@ -377,7 +568,7 @@ fn validate_allocation(
         Placement::Fixed(range) => {
             allocation.ownership() == AllocationOwnership::BorrowedFixed
                 && allocation.target_base() == range.start()
-                && allocation.len() >= range.len()
+                && allocation.len() == range.len()
         }
     };
     if valid_length && valid_alignment && valid_end && valid_placement {

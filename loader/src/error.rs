@@ -42,6 +42,7 @@ pub enum LoadErrorKind {
     PermissionConflict,
     Backend,
     Io,
+    SourceChanged,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -54,6 +55,8 @@ pub enum HeaderField {
     OsAbi,
     Type,
     Machine,
+    Flags,
+    Entry,
     HeaderSize,
     ProgramHeaderSize,
     ProgramHeaderTable,
@@ -66,8 +69,12 @@ pub enum LimitKind {
     ProgramHeaderCount,
     LoadSegmentCount,
     ImageSpan,
+    SegmentAlignment,
+    LayoutBytes,
     DynamicEntryCount,
     RelocationCount,
+    RuntimeMetadataBytes,
+    RelocationOperationBytes,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -158,5 +165,10 @@ impl LoadError {
 
     pub const fn context(&self) -> &ErrorContext {
         &self.context
+    }
+
+    pub(crate) const fn with_stage(mut self, stage: LoadStage) -> Self {
+        self.stage = stage;
+        self
     }
 }

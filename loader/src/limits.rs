@@ -20,8 +20,12 @@ pub struct LoadLimits {
     max_program_headers: u16,
     max_load_segments: u16,
     max_image_span: u64,
+    max_segment_alignment: u64,
+    max_layout_bytes: u64,
     max_dynamic_entries: u32,
     max_relocations: u32,
+    max_runtime_metadata_bytes: u64,
+    max_relocation_operation_bytes: u64,
 }
 
 impl LoadLimits {
@@ -33,14 +37,38 @@ impl LoadLimits {
             max_program_headers,
             max_load_segments: 32,
             max_image_span: 64 * 1024 * 1024,
+            max_segment_alignment: 1024 * 1024 * 1024,
+            max_layout_bytes: 1024 * 1024,
             max_dynamic_entries: 1024,
             max_relocations: 1024 * 1024,
+            max_runtime_metadata_bytes: 64 * 1024 * 1024,
+            max_relocation_operation_bytes: 64 * 1024 * 1024,
         }
+    }
+
+    /// Conservative production baseline for current MCU boards. Boards may
+    /// tighten these values further when constructing an artifact request.
+    pub const fn phase0_mcu() -> Self {
+        Self::new(8 * 1024 * 1024, 64)
+            .with_image_limits(16, 4 * 1024 * 1024)
+            .with_layout_limits(64 * 1024, 16 * 1024)
+            .with_runtime_limits(512, 16 * 1024)
+            .with_runtime_memory_limits(512 * 1024, 512 * 1024)
     }
 
     pub const fn with_image_limits(mut self, max_load_segments: u16, max_image_span: u64) -> Self {
         self.max_load_segments = max_load_segments;
         self.max_image_span = max_image_span;
+        self
+    }
+
+    pub const fn with_layout_limits(
+        mut self,
+        max_segment_alignment: u64,
+        max_layout_bytes: u64,
+    ) -> Self {
+        self.max_segment_alignment = max_segment_alignment;
+        self.max_layout_bytes = max_layout_bytes;
         self
     }
 
@@ -51,6 +79,16 @@ impl LoadLimits {
     ) -> Self {
         self.max_dynamic_entries = max_dynamic_entries;
         self.max_relocations = max_relocations;
+        self
+    }
+
+    pub const fn with_runtime_memory_limits(
+        mut self,
+        max_runtime_metadata_bytes: u64,
+        max_relocation_operation_bytes: u64,
+    ) -> Self {
+        self.max_runtime_metadata_bytes = max_runtime_metadata_bytes;
+        self.max_relocation_operation_bytes = max_relocation_operation_bytes;
         self
     }
 
@@ -114,6 +152,24 @@ impl LoadLimits {
         ))
     }
 
+    pub(crate) fn check_segment_alignment(&self, actual: u64) -> LoadResult<()> {
+        check_limit(
+            LoadStage::Plan,
+            LimitKind::SegmentAlignment,
+            actual,
+            self.max_segment_alignment,
+        )
+    }
+
+    pub(crate) fn check_layout_bytes(&self, actual: u64) -> LoadResult<()> {
+        check_limit(
+            LoadStage::Plan,
+            LimitKind::LayoutBytes,
+            actual,
+            self.max_layout_bytes,
+        )
+    }
+
     pub(crate) fn check_dynamic_entry_count(&self, actual: u64) -> LoadResult<()> {
         if actual <= u64::from(self.max_dynamic_entries) {
             return Ok(());
@@ -143,6 +199,39 @@ impl LoadLimits {
             },
         ))
     }
+
+    pub(crate) fn check_runtime_metadata_bytes(&self, actual: u64) -> LoadResult<()> {
+        check_limit(
+            LoadStage::Metadata,
+            LimitKind::RuntimeMetadataBytes,
+            actual,
+            self.max_runtime_metadata_bytes,
+        )
+    }
+
+    pub(crate) fn check_relocation_operation_bytes(&self, actual: u64) -> LoadResult<()> {
+        check_limit(
+            LoadStage::Relocate,
+            LimitKind::RelocationOperationBytes,
+            actual,
+            self.max_relocation_operation_bytes,
+        )
+    }
+}
+
+fn check_limit(stage: LoadStage, resource: LimitKind, actual: u64, maximum: u64) -> LoadResult<()> {
+    if actual <= maximum {
+        return Ok(());
+    }
+    Err(LoadError::new(
+        stage,
+        LoadErrorKind::ResourceLimit,
+        ErrorContext::Limit {
+            resource,
+            actual,
+            maximum,
+        },
+    ))
 }
 
 impl Default for LoadLimits {

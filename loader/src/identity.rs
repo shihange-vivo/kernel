@@ -19,7 +19,7 @@ use goblin::elf::header::{
 
 use crate::{
     ElfReader, ErrorContext, HeaderField, LoadError, LoadErrorKind, LoadLimits, LoadResult,
-    LoadStage,
+    LoadStage, RangeError, RangeResult, SourceSnapshot,
 };
 
 const ELF32_HEADER_SIZE: usize = goblin::elf32::header::SIZEOF_EHDR;
@@ -47,10 +47,117 @@ pub enum ExpectedElfType {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct HeaderFlagsPolicy {
+    allowed_mask: u32,
+    required_mask: u32,
+    required_value: u32,
+}
+
+impl HeaderFlagsPolicy {
+    pub const PERMISSIVE: Self = Self::new(u32::MAX, 0, 0);
+
+    pub const fn new(allowed_mask: u32, required_mask: u32, required_value: u32) -> Self {
+        Self {
+            allowed_mask,
+            required_mask,
+            required_value,
+        }
+    }
+
+    pub const fn exact(value: u32) -> Self {
+        Self::new(value, u32::MAX, value)
+    }
+
+    pub const fn accepts(self, value: u32) -> bool {
+        self.required_value & !self.required_mask == 0
+            && value & !self.allowed_mask == 0
+            && value & self.required_mask == self.required_value
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum EntryMode {
+    Direct { instruction_alignment: u8 },
+    Thumb { instruction_alignment: u8 },
+}
+
+impl EntryMode {
+    pub const fn direct(instruction_alignment: u8) -> Self {
+        Self::Direct {
+            instruction_alignment,
+        }
+    }
+
+    pub const fn thumb(instruction_alignment: u8) -> Self {
+        Self::Thumb {
+            instruction_alignment,
+        }
+    }
+
+    pub const fn instruction_alignment(self) -> u64 {
+        match self {
+            Self::Direct {
+                instruction_alignment,
+            }
+            | Self::Thumb {
+                instruction_alignment,
+            } => instruction_alignment as u64,
+        }
+    }
+
+    pub const fn canonical_entry(self, entry: u64) -> u64 {
+        match self {
+            Self::Direct { .. } => entry,
+            Self::Thumb { .. } => entry & !1,
+        }
+    }
+
+    const fn accepts(self, entry: u64) -> bool {
+        let alignment = self.instruction_alignment();
+        let encoding_valid = match self {
+            Self::Direct { .. } => true,
+            Self::Thumb { .. } => entry & 1 == 1,
+        };
+        encoding_valid
+            && alignment.is_power_of_two()
+            && self.canonical_entry(entry) % alignment == 0
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct RelativeValuePolicy {
+    allow_null: bool,
+    allow_one_past: bool,
+}
+
+impl RelativeValuePolicy {
+    pub const SAME_IMAGE: Self = Self::new(false, false);
+
+    pub const fn new(allow_null: bool, allow_one_past: bool) -> Self {
+        Self {
+            allow_null,
+            allow_one_past,
+        }
+    }
+
+    pub const fn allows_null(self) -> bool {
+        self.allow_null
+    }
+
+    pub const fn allows_one_past(self) -> bool {
+        self.allow_one_past
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ArtifactProfile {
     class: ElfClass,
     endian: Endian,
     machine: u16,
+    header_flags: HeaderFlagsPolicy,
+    entry_mode: EntryMode,
+    minimum_image_alignment: u64,
+    relative_values: RelativeValuePolicy,
 }
 
 impl ArtifactProfile {
@@ -59,7 +166,69 @@ impl ArtifactProfile {
             class,
             endian,
             machine,
+            header_flags: HeaderFlagsPolicy::PERMISSIVE,
+            entry_mode: EntryMode::direct(1),
+            minimum_image_alignment: 1,
+            relative_values: RelativeValuePolicy::SAME_IMAGE,
         }
+    }
+
+    /// RISC-V integer soft-float baseline without compressed instructions or
+    /// any other ELF architecture flags.
+    pub const fn riscv_soft(class: ElfClass) -> Self {
+        Self::new(class, Endian::Little, goblin::elf::header::EM_RISCV)
+            .with_header_flags(HeaderFlagsPolicy::exact(0))
+            .with_entry_mode(EntryMode::direct(4))
+            .with_minimum_image_alignment(4)
+    }
+
+    /// BlueOS RISC-V baseline with the compressed-instruction extension and
+    /// the integer soft-float ABI. Requiring `EF_RISCV_RVC` keeps the entry
+    /// alignment rule coupled to the advertised instruction encoding.
+    pub const fn riscv_compressed_soft(class: ElfClass) -> Self {
+        const EF_RISCV_RVC: u32 = 0x0000_0001;
+
+        Self::new(class, Endian::Little, goblin::elf::header::EM_RISCV)
+            .with_header_flags(HeaderFlagsPolicy::exact(EF_RISCV_RVC))
+            .with_entry_mode(EntryMode::direct(2))
+            .with_minimum_image_alignment(4)
+    }
+
+    /// BlueOS Cortex-M baseline: ARM EABI5, Thumb-only, soft-float calling
+    /// convention, and no unrecognized architecture flag bits.
+    pub const fn arm_thumb_v7m_soft() -> Self {
+        const EF_ARM_EABIMASK: u32 = 0xff00_0000;
+        const EF_ARM_EABI_VER5: u32 = 0x0500_0000;
+        const EF_ARM_ABI_FLOAT_SOFT: u32 = 0x0000_0200;
+
+        Self::new(ElfClass::Elf32, Endian::Little, goblin::elf::header::EM_ARM)
+            .with_header_flags(HeaderFlagsPolicy::new(
+                EF_ARM_EABIMASK | EF_ARM_ABI_FLOAT_SOFT,
+                EF_ARM_EABIMASK,
+                EF_ARM_EABI_VER5,
+            ))
+            .with_entry_mode(EntryMode::thumb(2))
+            .with_minimum_image_alignment(4)
+    }
+
+    pub const fn with_header_flags(mut self, policy: HeaderFlagsPolicy) -> Self {
+        self.header_flags = policy;
+        self
+    }
+
+    pub const fn with_entry_mode(mut self, entry_mode: EntryMode) -> Self {
+        self.entry_mode = entry_mode;
+        self
+    }
+
+    pub const fn with_minimum_image_alignment(mut self, alignment: u64) -> Self {
+        self.minimum_image_alignment = alignment;
+        self
+    }
+
+    pub const fn with_relative_value_policy(mut self, policy: RelativeValuePolicy) -> Self {
+        self.relative_values = policy;
+        self
     }
 
     pub const fn class(&self) -> ElfClass {
@@ -72,6 +241,22 @@ impl ArtifactProfile {
 
     pub const fn machine(&self) -> u16 {
         self.machine
+    }
+
+    pub const fn header_flags(&self) -> HeaderFlagsPolicy {
+        self.header_flags
+    }
+
+    pub const fn entry_mode(&self) -> EntryMode {
+        self.entry_mode
+    }
+
+    pub const fn minimum_image_alignment(&self) -> u64 {
+        self.minimum_image_alignment
+    }
+
+    pub const fn relative_value_policy(&self) -> RelativeValuePolicy {
+        self.relative_values
     }
 }
 
@@ -106,6 +291,7 @@ impl ArtifactRequest {
     pub const fn limits(&self) -> &LoadLimits {
         &self.limits
     }
+
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -165,6 +351,7 @@ pub struct AdmittedArtifact<R> {
     header: ElfHeaderInfo,
     request: ArtifactRequest,
     file_len: u64,
+    snapshot: SourceSnapshot,
 }
 
 impl<R> AdmittedArtifact<R> {
@@ -185,6 +372,20 @@ impl<R> AdmittedArtifact<R> {
     }
 }
 
+impl<R: ElfReader> AdmittedArtifact<R> {
+    pub(crate) fn ensure_snapshot(&self) -> LoadResult<()> {
+        if self.reader.snapshot()? == self.snapshot {
+            Ok(())
+        } else {
+            Err(LoadError::new(
+                LoadStage::Read,
+                LoadErrorKind::SourceChanged,
+                ErrorContext::None,
+            ))
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Default)]
 pub struct ImageLoader;
 
@@ -198,6 +399,7 @@ impl ImageLoader {
         reader: R,
         request: ArtifactRequest,
     ) -> LoadResult<AdmittedArtifact<R>> {
+        let snapshot = reader.snapshot()?;
         let file_len = reader.len()?;
         request.limits.check_file_len(file_len)?;
 
@@ -212,12 +414,20 @@ impl ImageLoader {
         reader.read_exact_at(0, &mut bytes[..header_size])?;
         let header = decode_header(&bytes[..header_size], class, endian)?;
         validate_header(&header, &request, file_len)?;
+        if reader.snapshot()? != snapshot {
+            return Err(LoadError::new(
+                LoadStage::Read,
+                LoadErrorKind::SourceChanged,
+                ErrorContext::None,
+            ));
+        }
 
         Ok(AdmittedArtifact {
             reader,
             header,
             request,
             file_len,
+            snapshot,
         })
     }
 }
@@ -252,29 +462,29 @@ fn validate_ident(ident: &[u8; ELF_IDENT_SIZE]) -> LoadResult<(ElfClass, Endian)
 }
 
 fn decode_header(bytes: &[u8], class: ElfClass, endian: Endian) -> LoadResult<ElfHeaderInfo> {
-    let elf_type = read_u16(bytes, 16, endian)?;
-    let machine = read_u16(bytes, 18, endian)?;
-    let version = read_u32(bytes, 20, endian)?;
+    let elf_type = at_parse(read_u16(bytes, 16, endian))?;
+    let machine = at_parse(read_u16(bytes, 18, endian))?;
+    let version = at_parse(read_u32(bytes, 20, endian))?;
     if version != u32::from(EV_CURRENT) {
         return Err(bad_header(HeaderField::Version, u64::from(version)));
     }
 
     let (entry, program_header_offset, flags, header_size, ph_entry_size, ph_count) = match class {
         ElfClass::Elf32 => (
-            u64::from(read_u32(bytes, 24, endian)?),
-            u64::from(read_u32(bytes, 28, endian)?),
-            read_u32(bytes, 36, endian)?,
-            read_u16(bytes, 40, endian)?,
-            read_u16(bytes, 42, endian)?,
-            read_u16(bytes, 44, endian)?,
+            u64::from(at_parse(read_u32(bytes, 24, endian))?),
+            u64::from(at_parse(read_u32(bytes, 28, endian))?),
+            at_parse(read_u32(bytes, 36, endian))?,
+            at_parse(read_u16(bytes, 40, endian))?,
+            at_parse(read_u16(bytes, 42, endian))?,
+            at_parse(read_u16(bytes, 44, endian))?,
         ),
         ElfClass::Elf64 => (
-            read_u64(bytes, 24, endian)?,
-            read_u64(bytes, 32, endian)?,
-            read_u32(bytes, 48, endian)?,
-            read_u16(bytes, 52, endian)?,
-            read_u16(bytes, 54, endian)?,
-            read_u16(bytes, 56, endian)?,
+            at_parse(read_u64(bytes, 24, endian))?,
+            at_parse(read_u64(bytes, 32, endian))?,
+            at_parse(read_u32(bytes, 48, endian))?,
+            at_parse(read_u16(bytes, 52, endian))?,
+            at_parse(read_u16(bytes, 54, endian))?,
+            at_parse(read_u16(bytes, 56, endian))?,
         ),
     };
     let expected_header_size = match class {
@@ -338,6 +548,15 @@ fn validate_header(
             u64::from(header.machine),
         ));
     }
+    if !request.profile.header_flags.accepts(header.flags) {
+        return Err(unsupported_header(
+            HeaderField::Flags,
+            u64::from(header.flags),
+        ));
+    }
+    if !request.profile.entry_mode.accepts(header.entry) {
+        return Err(unsupported_header(HeaderField::Entry, header.entry));
+    }
     request
         .limits
         .check_program_header_count(header.program_header_count)?;
@@ -382,7 +601,7 @@ fn validate_header(
     Ok(())
 }
 
-pub(crate) fn read_u16(bytes: &[u8], offset: usize, endian: Endian) -> LoadResult<u16> {
+pub(crate) fn read_u16(bytes: &[u8], offset: usize, endian: Endian) -> RangeResult<u16> {
     let raw = read_array::<2>(bytes, offset)?;
     Ok(match endian {
         Endian::Little => u16::from_le_bytes(raw),
@@ -390,7 +609,7 @@ pub(crate) fn read_u16(bytes: &[u8], offset: usize, endian: Endian) -> LoadResul
     })
 }
 
-pub(crate) fn read_u32(bytes: &[u8], offset: usize, endian: Endian) -> LoadResult<u32> {
+pub(crate) fn read_u32(bytes: &[u8], offset: usize, endian: Endian) -> RangeResult<u32> {
     let raw = read_array::<4>(bytes, offset)?;
     Ok(match endian {
         Endian::Little => u32::from_le_bytes(raw),
@@ -398,7 +617,7 @@ pub(crate) fn read_u32(bytes: &[u8], offset: usize, endian: Endian) -> LoadResul
     })
 }
 
-pub(crate) fn read_u64(bytes: &[u8], offset: usize, endian: Endian) -> LoadResult<u64> {
+pub(crate) fn read_u64(bytes: &[u8], offset: usize, endian: Endian) -> RangeResult<u64> {
     let raw = read_array::<8>(bytes, offset)?;
     Ok(match endian {
         Endian::Little => u64::from_le_bytes(raw),
@@ -406,17 +625,19 @@ pub(crate) fn read_u64(bytes: &[u8], offset: usize, endian: Endian) -> LoadResul
     })
 }
 
-fn read_array<const N: usize>(bytes: &[u8], offset: usize) -> LoadResult<[u8; N]> {
+fn read_array<const N: usize>(bytes: &[u8], offset: usize) -> RangeResult<[u8; N]> {
     let end = offset.checked_add(N).ok_or_else(|| {
-        LoadError::new(
-            LoadStage::Parse,
+        RangeError::new(
             LoadErrorKind::IntegerOverflow,
-            ErrorContext::None,
+            ErrorContext::FileRange {
+                offset: offset as u64,
+                len: N as u64,
+                file_len: bytes.len() as u64,
+            },
         )
     })?;
     let src = bytes.get(offset..end).ok_or_else(|| {
-        LoadError::new(
-            LoadStage::Parse,
+        RangeError::new(
             LoadErrorKind::OutOfBounds,
             ErrorContext::FileRange {
                 offset: offset as u64,
@@ -428,6 +649,10 @@ fn read_array<const N: usize>(bytes: &[u8], offset: usize) -> LoadResult<[u8; N]
     let mut raw = [0; N];
     raw.copy_from_slice(src);
     Ok(raw)
+}
+
+fn at_parse<T>(result: RangeResult<T>) -> LoadResult<T> {
+    result.map_err(|error| error.at(LoadStage::Parse))
 }
 
 fn bad_header(field: HeaderField, value: u64) -> LoadError {

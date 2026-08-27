@@ -16,14 +16,15 @@ use blueos_infra::storage::Storage;
 use core::alloc::Layout;
 
 use crate::{
-    AllocationId, AllocationOwnership, AllocationRequest, ErrorContext, ExpectedElfType,
-    ImageAllocation, ImageMemory, LoadError, LoadErrorKind, LoadResult, LoadStage, Placement,
-    SealedImage, TargetAddr, TargetLocation,
+    AllocationId, AllocationLease, AllocationOwnership, AllocationRequest, ErrorContext,
+    ExpectedElfType, ImageAllocation, ImageCommitMemory, ImageMemory, ImageProtectionMemory,
+    LoadError, LoadErrorKind, LoadResult, LoadStage, MutationProgress, Placement,
+    ProtectionCapabilities, SealedState, TargetAddr, TargetLocation,
 };
 
 const IMAGE_ALLOCATION_ID: AllocationId = AllocationId::new(0);
 
-pub type Result<T> = core::result::Result<T, &'static str>;
+type MapperResult<T> = core::result::Result<T, &'static str>;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct MemoryPermissions(u8);
@@ -84,6 +85,14 @@ pub struct MemoryMapper {
     mem: Storage,
     mode: MappingMode,
     image_allocation: Option<ImageAllocation>,
+    installed_lease: Option<AllocationLease>,
+    fixed_poisoned: bool,
+}
+
+#[derive(Debug)]
+pub struct PreparedMapperInstall {
+    allocation: ImageAllocation,
+    entry: usize,
 }
 
 impl MemoryMapper {
@@ -97,6 +106,8 @@ impl MemoryMapper {
                 None => MappingMode::Allocated,
             },
             image_allocation: None,
+            installed_lease: None,
+            fixed_poisoned: false,
         }
     }
 
@@ -109,7 +120,7 @@ impl MemoryMapper {
     }
 
     #[inline]
-    pub fn real_start(&self) -> Result<usize> {
+    pub fn real_start(&self) -> MapperResult<usize> {
         let base = self.mem.base();
         if base.is_null() {
             return Err("Memory not allocated yet");
@@ -118,14 +129,36 @@ impl MemoryMapper {
     }
 
     #[inline]
-    pub fn real_entry(&self) -> Result<usize> {
+    pub fn real_entry(&self) -> MapperResult<usize> {
         self.sealed_entry.ok_or("Image has not been sealed")
     }
 
-    pub(crate) fn install_sealed(&mut self, sealed: &SealedImage) -> LoadResult<()> {
+    #[inline]
+    pub const fn is_fixed_poisoned(&self) -> bool {
+        self.fixed_poisoned
+    }
+
+    /// Clear the fixed-image poison marker after the platform has restored the
+    /// complete authorized range to a known state.
+    ///
+    /// # Safety
+    ///
+    /// The caller must guarantee that no stale entry can execute and that every
+    /// byte and protection attribute potentially modified by the failed load has
+    /// been restored before calling this method.
+    pub unsafe fn reset_fixed_poison(&mut self) {
+        self.fixed_poisoned = false;
+    }
+
+    fn prepare_sealed_install(
+        &self,
+        allocation: &ImageAllocation,
+        sealed: &SealedState,
+    ) -> LoadResult<PreparedMapperInstall> {
         let active = self
             .image_allocation
-            .filter(|allocation| allocation.id() == sealed.allocation().id())
+            .filter(|active| active == allocation && active == sealed.allocation())
+            .filter(|_| self.installed_lease.is_none() && self.sealed_entry.is_none())
             .ok_or_else(|| sealed_install_error(sealed))?;
         let entry =
             usize::try_from(sealed.entry().get()).map_err(|_| sealed_install_error(sealed))?;
@@ -141,8 +174,10 @@ impl MemoryMapper {
             self.validate_fixed_span(entry, 1, MemoryPermissions::EXECUTE)
                 .map_err(|_| sealed_install_error(sealed))?;
         }
-        self.sealed_entry = Some(entry);
-        Ok(())
+        Ok(PreparedMapperInstall {
+            allocation: active,
+            entry,
+        })
     }
 
     pub(crate) fn validate_fixed_span(
@@ -150,7 +185,7 @@ impl MemoryMapper {
         start: usize,
         size: usize,
         requested: MemoryPermissions,
-    ) -> Result<()> {
+    ) -> MapperResult<()> {
         let MappingMode::Fixed(regions) = &self.mode else {
             return Err("Fixed span requires a fixed mapper");
         };
@@ -169,8 +204,11 @@ impl MemoryMapper {
 }
 
 impl ImageMemory for MemoryMapper {
-    fn allocate_image(&mut self, request: &AllocationRequest) -> LoadResult<ImageAllocation> {
-        if self.image_allocation.is_some() {
+    fn allocate_image(&mut self, request: &AllocationRequest) -> LoadResult<AllocationLease> {
+        if self.image_allocation.is_some()
+            || self.installed_lease.is_some()
+            || (matches!(self.mode, MappingMode::Fixed(_)) && self.fixed_poisoned)
+        {
             return Err(allocation_error(request));
         }
         let size = usize::try_from(request.size()).map_err(|_| allocation_error(request))?;
@@ -216,7 +254,9 @@ impl ImageMemory for MemoryMapper {
                     AllocationOwnership::Owned,
                 );
                 self.image_allocation = Some(allocation);
-                Ok(allocation)
+                // SAFETY: this mapper just created the allocation and keeps no
+                // second lease for it.
+                Ok(unsafe { AllocationLease::from_allocation(allocation) })
             }
             (MappingMode::Fixed(_), Placement::Fixed(range)) => {
                 let start =
@@ -232,23 +272,38 @@ impl ImageMemory for MemoryMapper {
                     AllocationOwnership::BorrowedFixed,
                 );
                 self.image_allocation = Some(allocation);
-                Ok(allocation)
+                // SAFETY: this mapper has exclusively reserved the authorized
+                // fixed span and keeps no second lease for it.
+                Ok(unsafe { AllocationLease::from_allocation(allocation) })
             }
             _ => Err(allocation_error(request)),
         }
     }
 
-    fn release(&mut self, allocation: AllocationId) {
-        if self
-            .image_allocation
-            .is_some_and(|active| active.id() == allocation)
-        {
-            if matches!(self.mode, MappingMode::Allocated) {
-                self.mem = Storage::default();
-            }
-            self.sealed_entry = None;
-            self.image_allocation = None;
+    fn abort_image(&mut self, lease: AllocationLease, progress: MutationProgress) {
+        let allocation = *lease.allocation();
+        if self.image_allocation != Some(allocation) {
+            return;
         }
+        if allocation.ownership() == AllocationOwnership::Owned {
+            self.mem = Storage::default();
+        } else if progress >= MutationProgress::BytesModified {
+            self.fixed_poisoned = true;
+        }
+        self.sealed_entry = None;
+        self.image_allocation = None;
+    }
+
+    fn release_committed(&mut self, lease: AllocationLease) {
+        let allocation = *lease.allocation();
+        if self.image_allocation != Some(allocation) {
+            return;
+        }
+        if allocation.ownership() == AllocationOwnership::Owned {
+            self.mem = Storage::default();
+        }
+        self.sealed_entry = None;
+        self.image_allocation = None;
     }
 
     fn validate_access(
@@ -296,6 +351,48 @@ impl ImageMemory for MemoryMapper {
     ) -> LoadResult<crate::ProtectionLevel> {
         self.validate_access(location, len, permissions)?;
         Ok(crate::ProtectionLevel::LogicalOnly)
+    }
+}
+
+impl ImageCommitMemory for MemoryMapper {
+    type PreparedInstall = PreparedMapperInstall;
+    type CommitReceipt = ();
+
+    fn prepare_install(
+        &mut self,
+        allocation: &ImageAllocation,
+        sealed: &SealedState,
+    ) -> LoadResult<Self::PreparedInstall> {
+        self.prepare_sealed_install(allocation, sealed)
+    }
+
+    unsafe fn commit_install(
+        &mut self,
+        prepared: Self::PreparedInstall,
+        sealed: SealedState,
+        lease: AllocationLease,
+    ) -> Self::CommitReceipt {
+        let _ = sealed;
+        self.image_allocation = Some(prepared.allocation);
+        self.sealed_entry = Some(prepared.entry);
+        self.installed_lease = Some(lease);
+    }
+}
+
+impl ImageProtectionMemory for MemoryMapper {
+    fn protection_capabilities(&self) -> ProtectionCapabilities {
+        ProtectionCapabilities::new(1, usize::MAX)
+    }
+
+    fn validate_protection_aliases(
+        &self,
+        _allocation: &ImageAllocation,
+        _prepared: &crate::PreparedProtectionPlan,
+    ) -> LoadResult<()> {
+        // MemoryMapper is a compatibility adapter with no hardware permission
+        // enforcement. `protect()` therefore reports `LogicalOnly` for every
+        // range instead of claiming that writable aliases were removed.
+        Ok(())
     }
 }
 
@@ -372,7 +469,7 @@ fn memory_access_error(location: TargetLocation, len: u64) -> LoadError {
     )
 }
 
-fn sealed_install_error(sealed: &SealedImage) -> LoadError {
+fn sealed_install_error(sealed: &SealedState) -> LoadError {
     LoadError::new(
         LoadStage::Seal,
         LoadErrorKind::Backend,

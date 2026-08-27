@@ -17,8 +17,8 @@ use alloc::{boxed::Box, vec::Vec};
 use crate::{
     AllocationOwnership, ArtifactRequest, DynamicSegmentInfo, ElfReader, ErrorContext, FileRange,
     ImageAllocation, ImageLoadTransaction, ImageLoader, ImageMemory, LoadError, LoadErrorKind,
-    LoadResult, LoadStage, MemoryPermissions, ReservedImage, TargetAddr, TargetLocation,
-    TargetRange,
+    LoadResult, LoadStage, MemoryPermissions, ReservedState, StagedImage, TargetAddr,
+    TargetLocation, TargetRange,
 };
 
 const COPY_BUFFER_SIZE: usize = 512;
@@ -55,7 +55,7 @@ impl LoadedRegion {
 }
 
 #[derive(Debug)]
-pub struct MappedImage {
+pub struct MappedState {
     request: ArtifactRequest,
     allocation: ImageAllocation,
     image_span: u64,
@@ -67,7 +67,21 @@ pub struct MappedImage {
     relro: Option<TargetRange>,
 }
 
-impl MappedImage {
+pub type MappedImage<'a, M> = StagedImage<'a, M, MappedState>;
+
+impl<'a, M, R> StagedImage<'a, M, ReservedState<R>>
+where
+    M: ImageMemory,
+    R: ElfReader,
+{
+    pub fn copy_and_zero(self) -> LoadResult<MappedImage<'a, M>> {
+        let (mut transaction, reserved) = self.into_parts();
+        let mapped = ImageLoader::new().copy_and_zero(reserved, &mut transaction)?;
+        Ok(StagedImage::new(transaction, mapped))
+    }
+}
+
+impl MappedState {
     pub const fn request(&self) -> &ArtifactRequest {
         &self.request
     }
@@ -94,6 +108,16 @@ impl MappedImage {
         len: u64,
         permissions: MemoryPermissions,
     ) -> LoadResult<TargetLocation> {
+        self.locate_vaddr_at(LoadStage::Map, vaddr, len, permissions)
+    }
+
+    pub(crate) fn locate_vaddr_at(
+        &self,
+        stage: LoadStage,
+        vaddr: TargetAddr,
+        len: u64,
+        permissions: MemoryPermissions,
+    ) -> LoadResult<TargetLocation> {
         let region = self
             .regions
             .iter()
@@ -103,13 +127,18 @@ impl MappedImage {
             })
             .ok_or_else(|| {
                 LoadError::new(
-                    LoadStage::Map,
+                    stage,
                     LoadErrorKind::OutOfBounds,
                     ErrorContext::TargetRange { start: vaddr, len },
                 )
             })?;
-        let offset = vaddr.checked_sub(region.vaddr_range.start())?;
-        region.location(self.allocation.id()).checked_add(offset)
+        let offset = vaddr
+            .checked_sub(region.vaddr_range.start())
+            .map_err(|error| error.at(stage))?;
+        region
+            .location(self.allocation.id())
+            .checked_add(offset)
+            .map_err(|error| error.at(stage))
     }
 
     pub fn runtime_address(
@@ -119,7 +148,9 @@ impl MappedImage {
         permissions: MemoryPermissions,
     ) -> LoadResult<TargetAddr> {
         self.locate_vaddr(vaddr, len, permissions)?;
-        self.load_bias.checked_add(vaddr.get())
+        self.load_bias
+            .checked_add(vaddr.get())
+            .map_err(|error| error.at(LoadStage::Map))
     }
 
     pub(crate) const fn entry(&self) -> TargetAddr {
@@ -140,11 +171,11 @@ impl MappedImage {
 }
 
 impl ImageLoader {
-    pub fn copy_and_zero<R, M>(
+    pub(crate) fn copy_and_zero<R, M>(
         &self,
-        reserved: ReservedImage<R>,
+        reserved: ReservedState<R>,
         transaction: &mut ImageLoadTransaction<'_, M>,
-    ) -> LoadResult<MappedImage>
+    ) -> LoadResult<MappedState>
     where
         R: ElfReader,
         M: ImageMemory,
@@ -165,10 +196,15 @@ impl ImageLoader {
             let allocation_offset = segment
                 .vaddr_range()
                 .start()
-                .checked_sub(layout.aligned_min_vaddr())?;
-            let runtime_start = load_bias.checked_add(segment.vaddr_range().start().get())?;
+                .checked_sub(layout.aligned_min_vaddr())
+                .map_err(|error| error.at(LoadStage::Map))?;
+            let runtime_start = load_bias
+                .checked_add(segment.vaddr_range().start().get())
+                .map_err(|error| error.at(LoadStage::Map))?;
             let runtime_range = TargetRange::new(runtime_start, segment.vaddr_range().len());
-            runtime_range.end()?;
+            runtime_range
+                .end()
+                .map_err(|error| error.at(LoadStage::Map))?;
             regions.push(LoadedRegion {
                 vaddr_range: segment.vaddr_range(),
                 runtime_range,
@@ -178,9 +214,13 @@ impl ImageLoader {
             });
         }
 
-        let entry = load_bias.checked_add(layout.entry_vaddr().get())?;
-        let canonical_entry = load_bias.checked_add(layout.canonical_entry_vaddr().get())?;
-        let mapped = MappedImage {
+        let entry = load_bias
+            .checked_add(layout.entry_vaddr().get())
+            .map_err(|error| error.at(LoadStage::Map))?;
+        let canonical_entry = load_bias
+            .checked_add(layout.canonical_entry_vaddr().get())
+            .map_err(|error| error.at(LoadStage::Map))?;
+        let mapped = MappedState {
             request: *artifact.request(),
             allocation,
             image_span: layout.image_span(),
@@ -192,54 +232,84 @@ impl ImageLoader {
             relro: layout.relro(),
         };
 
+        artifact.ensure_snapshot()?;
         preflight_targets(&mapped, transaction.memory())?;
+        transaction.mark_bytes_modified();
         if allocation.ownership() == AllocationOwnership::Owned {
             transaction
                 .memory()
-                .zero(TargetLocation::new(allocation.id(), 0), mapped.image_span())?;
-        } else {
-            for region in mapped.regions() {
-                transaction
-                    .memory()
-                    .zero(region.location(allocation.id()), region.vaddr_range().len())?;
-            }
+                .zero(TargetLocation::new(allocation.id(), 0), mapped.image_span())
+                .map_err(|error| error.with_stage(LoadStage::Map))?;
         }
 
         let mut scratch = [0; COPY_BUFFER_SIZE];
         for region in mapped.regions() {
+            let location = region.location(allocation.id());
             copy_file_range(
                 artifact.reader(),
                 region.file_range(),
-                region.location(allocation.id()),
+                location,
                 transaction.memory(),
                 &mut scratch,
             )?;
+            if allocation.ownership() == AllocationOwnership::BorrowedFixed {
+                let bss_len = region
+                    .vaddr_range()
+                    .len()
+                    .checked_sub(region.file_range().len())
+                    .ok_or_else(|| {
+                        LoadError::new(
+                            LoadStage::Map,
+                            LoadErrorKind::OutOfBounds,
+                            ErrorContext::TargetRange {
+                                start: region.vaddr_range().start(),
+                                len: region.vaddr_range().len(),
+                            },
+                        )
+                    })?;
+                transaction
+                    .memory()
+                    .zero(
+                        location
+                            .checked_add(region.file_range().len())
+                            .map_err(|error| error.at(LoadStage::Map))?,
+                        bss_len,
+                    )
+                    .map_err(|error| error.with_stage(LoadStage::Map))?;
+            }
         }
+        artifact.ensure_snapshot()?;
 
         Ok(mapped)
     }
 }
 
-fn preflight_targets<M: ImageMemory>(mapped: &MappedImage, memory: &M) -> LoadResult<()> {
+fn preflight_targets<M: ImageMemory>(mapped: &MappedState, memory: &M) -> LoadResult<()> {
     if mapped.allocation.ownership() == AllocationOwnership::Owned {
-        return memory.validate_access(
-            TargetLocation::new(mapped.allocation.id(), 0),
-            mapped.image_span(),
-            MemoryPermissions::WRITE,
-        );
+        return memory
+            .validate_access(
+                TargetLocation::new(mapped.allocation.id(), 0),
+                mapped.image_span(),
+                MemoryPermissions::WRITE,
+            )
+            .map_err(|error| error.with_stage(LoadStage::Map));
     }
 
     for region in mapped.regions() {
-        memory.validate_access(
-            region.location(mapped.allocation.id()),
-            region.vaddr_range().len(),
-            MemoryPermissions::WRITE,
-        )?;
-        memory.validate_access(
-            region.location(mapped.allocation.id()),
-            region.vaddr_range().len(),
-            region.logical_permissions(),
-        )?;
+        memory
+            .validate_access(
+                region.location(mapped.allocation.id()),
+                region.vaddr_range().len(),
+                MemoryPermissions::WRITE,
+            )
+            .map_err(|error| error.with_stage(LoadStage::Map))?;
+        memory
+            .validate_access(
+                region.location(mapped.allocation.id()),
+                region.vaddr_range().len(),
+                region.logical_permissions(),
+            )
+            .map_err(|error| error.with_stage(LoadStage::Map))?;
     }
     Ok(())
 }
@@ -269,7 +339,14 @@ fn copy_file_range<R: ElfReader, M: ImageMemory>(
             })?,
             &mut scratch[..chunk_len],
         )?;
-        memory.write(target.checked_add(copied)?, &scratch[..chunk_len])?;
+        memory
+            .write(
+                target
+                    .checked_add(copied)
+                    .map_err(|error| error.at(LoadStage::Map))?,
+                &scratch[..chunk_len],
+            )
+            .map_err(|error| error.with_stage(LoadStage::Map))?;
         copied += chunk_len as u64;
     }
     Ok(())

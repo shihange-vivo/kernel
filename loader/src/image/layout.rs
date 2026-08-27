@@ -15,9 +15,10 @@
 use alloc::{boxed::Box, vec::Vec};
 
 use crate::{
-    AdmittedArtifact, AllocationRequest, ElfReader, ErrorContext, ExpectedElfType, FileRange,
-    ImageLoader, LoadError, LoadErrorKind, LoadLimits, LoadResult, LoadStage, MemoryPermissions,
-    ParsedImage, Placement, ProgramHeaderField, TargetAddr, TargetRange,
+    AdmittedArtifact, AllocationRequest, ArtifactFeaturePolicy, ArtifactProfile, ElfReader,
+    ErrorContext, ExpectedElfType, FileRange, ImageLoader, LoadError, LoadErrorKind, LoadLimits,
+    LoadResult, LoadStage, MemoryPermissions, ParsedImage, Phase0ArtifactPolicy, Placement,
+    ProgramHeaderField, TargetAddr, TargetRange,
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -103,7 +104,9 @@ impl ImageLayout {
     ) -> LoadResult<TargetAddr> {
         match expected_elf_type {
             ExpectedElfType::Dyn => Ok(TargetAddr::new(
-                mapped_base.checked_sub(self.aligned_min_vaddr)?,
+                mapped_base
+                    .checked_sub(self.aligned_min_vaddr)
+                    .map_err(|error| error.at(LoadStage::Plan))?,
             )),
             ExpectedElfType::Exec if mapped_base == self.aligned_min_vaddr => {
                 Ok(TargetAddr::new(0))
@@ -208,8 +211,22 @@ impl<R> PlannedArtifact<R> {
 pub struct ImageLayoutBuilder;
 
 impl ImageLayoutBuilder {
-    pub fn build(parsed: &ParsedImage, limits: &LoadLimits) -> LoadResult<ImageLayout> {
+    pub fn build(
+        parsed: &ParsedImage,
+        profile: &ArtifactProfile,
+        limits: &LoadLimits,
+    ) -> LoadResult<ImageLayout> {
         limits.check_load_segment_count(parsed.load_segments().len())?;
+        let layout_bytes = parsed
+            .load_segments()
+            .len()
+            .checked_mul(
+                core::mem::size_of::<crate::LoadSegmentInfo>()
+                    + core::mem::size_of::<SegmentLayout>(),
+            )
+            .and_then(|bytes| u64::try_from(bytes).ok())
+            .unwrap_or(u64::MAX);
+        limits.check_layout_bytes(layout_bytes)?;
         let mut segments = Vec::new();
         segments
             .try_reserve_exact(parsed.load_segments().len())
@@ -233,6 +250,7 @@ impl ImageLayoutBuilder {
                 continue;
             }
             let align = normalize_alignment(segment.align(), segment.index())?;
+            limits.check_segment_alignment(align)?;
             if segment.file_range().offset() % align != segment.vaddr().get() % align {
                 return Err(program_header_error(
                     segment.index(),
@@ -241,7 +259,9 @@ impl ImageLayoutBuilder {
                 ));
             }
             let vaddr_range = TargetRange::new(segment.vaddr(), segment.memory_size());
-            vaddr_range.end()?;
+            vaddr_range
+                .end()
+                .map_err(|error| error.at(LoadStage::Plan))?;
             if segment.permissions().contains(MemoryPermissions::WRITE)
                 && segment.permissions().contains(MemoryPermissions::EXECUTE)
             {
@@ -282,26 +302,45 @@ impl ImageLayoutBuilder {
             }
         }
 
-        let max_align = segments
+        let segment_max_align = segments
             .iter()
             .map(|segment| segment.align)
             .max()
             .unwrap_or(1);
+        let profile_align = profile.minimum_image_alignment();
+        if !profile_align.is_power_of_two() {
+            return Err(LoadError::new(
+                LoadStage::Plan,
+                LoadErrorKind::InvalidAlignment,
+                ErrorContext::HeaderField {
+                    field: crate::HeaderField::Machine,
+                    value: profile_align,
+                },
+            ));
+        }
+        let max_align = core::cmp::max(segment_max_align, profile_align);
         let min_vaddr = segments[0].vaddr_range.start();
         let max_vaddr = segments
             .iter()
             .map(|segment| segment.vaddr_range.end())
             .try_fold(TargetAddr::new(0), |current, next| {
-                let next = next?;
+                let next = next.map_err(|error| error.at(LoadStage::Plan))?;
                 Ok::<_, LoadError>(core::cmp::max(current, next))
             })?;
-        let aligned_min_vaddr = min_vaddr.align_down(max_align)?;
-        let aligned_max_vaddr = max_vaddr.align_up(max_align)?;
-        let image_span = aligned_max_vaddr.checked_sub(aligned_min_vaddr)?;
+        let aligned_min_vaddr = min_vaddr
+            .align_down(max_align)
+            .map_err(|error| error.at(LoadStage::Plan))?;
+        let aligned_max_vaddr = max_vaddr
+            .align_up(max_align)
+            .map_err(|error| error.at(LoadStage::Plan))?;
+        let image_span = aligned_max_vaddr
+            .checked_sub(aligned_min_vaddr)
+            .map_err(|error| error.at(LoadStage::Plan))?;
         limits.check_image_span(image_span)?;
 
         let entry_vaddr = TargetAddr::new(parsed.header().entry());
-        let canonical_entry_vaddr = canonical_entry(entry_vaddr, parsed.header().machine());
+        let canonical_entry_vaddr =
+            TargetAddr::new(profile.entry_mode().canonical_entry(entry_vaddr.get()));
         let executable = segments.iter().any(|segment| {
             segment.permissions.contains(MemoryPermissions::EXECUTE)
                 && segment.vaddr_range.contains_span(canonical_entry_vaddr, 1)
@@ -354,8 +393,25 @@ impl ImageLoader {
         &self,
         admitted: AdmittedArtifact<R>,
     ) -> LoadResult<PlannedArtifact<R>> {
+        self.plan_with_policy(admitted, &Phase0ArtifactPolicy)
+    }
+
+    pub fn plan_with_policy<R, P>(
+        &self,
+        admitted: AdmittedArtifact<R>,
+        policy: &P,
+    ) -> LoadResult<PlannedArtifact<R>>
+    where
+        R: ElfReader,
+        P: ArtifactFeaturePolicy + ?Sized,
+    {
         let parsed = self.inspect(&admitted)?;
-        let layout = ImageLayoutBuilder::build(&parsed, admitted.request().limits())?;
+        policy.validate_program_features(parsed.program_features())?;
+        let layout = ImageLayoutBuilder::build(
+            &parsed,
+            admitted.request().profile(),
+            admitted.request().limits(),
+        )?;
         Ok(PlannedArtifact {
             artifact: admitted,
             parsed,
@@ -377,14 +433,6 @@ fn normalize_alignment(align: u64, index: u16) -> LoadResult<u64> {
                 value,
             },
         )),
-    }
-}
-
-fn canonical_entry(entry: TargetAddr, machine: u16) -> TargetAddr {
-    if machine == goblin::elf::header::EM_ARM {
-        TargetAddr::new(entry.get() & !1)
-    } else {
-        entry
     }
 }
 

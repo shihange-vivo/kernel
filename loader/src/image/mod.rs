@@ -21,9 +21,13 @@ mod seal;
 pub use layout::{
     ImageLayout, ImageLayoutBuilder, PlannedArtifact, SegmentLayout, SegmentLocation,
 };
-pub use loaded::{LoadedRegion, MappedImage};
+pub use loaded::{LoadedRegion, MappedImage, MappedState};
 pub use metadata::{
-    RelocationAddend, RelocationRecord, RuntimeFeaturePolicy, RuntimeImage, RuntimeImageMetadata,
+    ArtifactFeaturePolicy, DynamicFeatureSummary, ProgramFeatureSummary, RelocationAddend,
+    Phase0ArtifactPolicy, RelocationRecord, RuntimeImage, RuntimeImageMetadata, RuntimeState,
 };
 pub use parser::{DynamicSegmentInfo, LoadSegmentInfo, ParsedImage, StackPolicy};
-pub use seal::{ProtectionLevel, SealPlan, SealRange, SealedImage};
+pub use seal::{
+    AppliedProtection, AppliedProtectionSet, PreparedImage, PreparedProtectionPlan,
+    ProtectionCapabilities, ProtectionLevel, ReadyImageCommit, SealPlan, SealRange, SealedState,
+};

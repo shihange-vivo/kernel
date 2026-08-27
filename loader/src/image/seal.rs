@@ -15,15 +15,113 @@
 use alloc::{boxed::Box, vec::Vec};
 
 use crate::{
-    CodeCache, ErrorContext, ImageAllocation, ImageLoadTransaction, ImageMemory, LoadError,
-    LoadErrorKind, LoadResult, LoadStage, MappedImage, MemoryPermissions, RelocatedImage,
-    RuntimeImageMetadata, TargetAddr, TargetLocation, TargetRange,
+    AllocationLease, CacheSyncOutcome, CodeCache, ErrorContext, ImageAllocation, ImageCommitMemory,
+    ImageLoadTransaction, ImageProtectionMemory, LoadError, LoadErrorKind, LoadResult, LoadStage,
+    MappedState, MemoryPermissions, RangeResult, RelocatedState, RuntimeImageMetadata, StagedImage,
+    TargetAddr, TargetLocation, TargetRange,
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ProtectionLevel {
-    Hardware,
+    HardwareEnforced,
     LogicalOnly,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ProtectionCapabilities {
+    granule: u64,
+    max_ranges: usize,
+}
+
+impl ProtectionCapabilities {
+    pub const fn new(granule: u64, max_ranges: usize) -> Self {
+        Self {
+            granule,
+            max_ranges,
+        }
+    }
+
+    pub const fn granule(self) -> u64 {
+        self.granule
+    }
+
+    pub const fn max_ranges(self) -> usize {
+        self.max_ranges
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct AppliedProtection {
+    location: TargetLocation,
+    requested_range: TargetRange,
+    applied_range: TargetRange,
+    requested: MemoryPermissions,
+    applied: MemoryPermissions,
+    level: ProtectionLevel,
+}
+
+impl AppliedProtection {
+    pub const fn location(&self) -> TargetLocation {
+        self.location
+    }
+
+    pub const fn requested_range(&self) -> TargetRange {
+        self.requested_range
+    }
+
+    pub const fn applied_range(&self) -> TargetRange {
+        self.applied_range
+    }
+
+    pub const fn requested(&self) -> MemoryPermissions {
+        self.requested
+    }
+
+    pub const fn applied(&self) -> MemoryPermissions {
+        self.applied
+    }
+
+    pub const fn level(&self) -> ProtectionLevel {
+        self.level
+    }
+
+    /// Record the enforcement level returned by a trusted protection backend.
+    pub fn record_level(&mut self, level: ProtectionLevel) {
+        self.level = level;
+    }
+}
+
+#[derive(Debug)]
+pub struct AppliedProtectionSet {
+    ranges: Box<[AppliedProtection]>,
+}
+
+impl AppliedProtectionSet {
+    /// Build the result of a backend's completed protection batch.
+    pub const fn new(ranges: Box<[AppliedProtection]>) -> Self {
+        Self { ranges }
+    }
+
+    pub fn ranges(&self) -> &[AppliedProtection] {
+        &self.ranges
+    }
+
+    pub fn level(&self) -> ProtectionLevel {
+        if self
+            .ranges
+            .iter()
+            .all(|range| range.level == ProtectionLevel::HardwareEnforced)
+        {
+            ProtectionLevel::HardwareEnforced
+        } else {
+            ProtectionLevel::LogicalOnly
+        }
+    }
+}
+
+#[derive(Debug)]
+pub struct PreparedProtectionPlan {
+    ranges: Box<[AppliedProtection]>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -57,7 +155,7 @@ impl SealPlan {
         &self.ranges
     }
 
-    fn build(mapped: &MappedImage) -> LoadResult<Self> {
+    fn build(mapped: &MappedState) -> LoadResult<Self> {
         // Every loaded region can be split into three pieces by RELRO and can
         // have an inaccessible allocation gap before it.  One final range is
         // needed for alignment padding after the last region.
@@ -75,7 +173,8 @@ impl SealPlan {
             let region_offset = region
                 .runtime_range()
                 .start()
-                .checked_sub(mapped.allocation().target_base())?;
+                .checked_sub(mapped.allocation().target_base());
+            let region_offset = at_seal(region_offset)?;
             append_allocation_range(
                 mapped,
                 &mut ranges,
@@ -97,22 +196,22 @@ impl SealPlan {
 
             let source = region.vaddr_range();
             if let Some(relro) = mapped.relro().filter(|relro| relro.overlaps(source)) {
-                let source_end = source.end()?;
-                let relro_end = relro.end()?;
+                let source_end = at_seal(source.end())?;
+                let relro_end = at_seal(relro.end())?;
                 let overlap_start = core::cmp::max(source.start(), relro.start());
                 let overlap_end = core::cmp::min(source_end, relro_end);
                 append_range(
                     mapped,
                     &mut ranges,
                     source.start(),
-                    overlap_start.checked_sub(source.start())?,
+                    at_seal(overlap_start.checked_sub(source.start()))?,
                     region.logical_permissions(),
                 )?;
                 append_range(
                     mapped,
                     &mut ranges,
                     overlap_start,
-                    overlap_end.checked_sub(overlap_start)?,
+                    at_seal(overlap_end.checked_sub(overlap_start))?,
                     region
                         .logical_permissions()
                         .without(MemoryPermissions::WRITE),
@@ -121,7 +220,7 @@ impl SealPlan {
                     mapped,
                     &mut ranges,
                     overlap_end,
-                    source_end.checked_sub(overlap_end)?,
+                    at_seal(source_end.checked_sub(overlap_end))?,
                     region.logical_permissions(),
                 )?;
             } else {
@@ -135,8 +234,9 @@ impl SealPlan {
             }
             allocation_cursor = region
                 .runtime_range()
-                .end()?
-                .checked_sub(mapped.allocation().target_base())?;
+                .end()
+                .and_then(|end| end.checked_sub(mapped.allocation().target_base()))
+                .map_err(|error| error.at(LoadStage::Seal))?;
         }
         append_allocation_range(
             mapped,
@@ -164,15 +264,144 @@ impl SealPlan {
     }
 }
 
-#[derive(Debug)]
-pub struct SealedImage {
-    mapped: MappedImage,
-    metadata: RuntimeImageMetadata,
-    seal_plan: SealPlan,
-    protection: ProtectionLevel,
+impl PreparedProtectionPlan {
+    pub(crate) fn build(
+        allocation: &ImageAllocation,
+        logical: &SealPlan,
+        capabilities: ProtectionCapabilities,
+    ) -> LoadResult<Self> {
+        let granule = capabilities.granule();
+        if !granule.is_power_of_two() || logical.ranges().len() > capabilities.max_ranges() {
+            return Err(protection_plan_error(allocation));
+        }
+
+        let mut ranges: Vec<AppliedProtection> = Vec::new();
+        ranges
+            .try_reserve_exact(logical.ranges().len())
+            .map_err(|_| seal_oom())?;
+        let allocation_end = at_seal(allocation.target_base().checked_add(allocation.len()))?;
+
+        for requested in logical.ranges() {
+            let requested_end = at_seal(requested.runtime_range().end())?;
+            let applied_start = at_seal(requested.runtime_range().start().align_down(granule))?;
+            let applied_end = at_seal(requested_end.align_up(granule))?;
+            if applied_start < allocation.target_base() || applied_end > allocation_end {
+                return Err(protection_plan_error(allocation));
+            }
+            let prefix = at_seal(requested.runtime_range().start().checked_sub(applied_start))?;
+            let applied_offset = requested
+                .location()
+                .offset()
+                .checked_sub(prefix)
+                .ok_or_else(|| protection_plan_error(allocation))?;
+            let applied_range = TargetRange::new(
+                applied_start,
+                at_seal(applied_end.checked_sub(applied_start))?,
+            );
+
+            if let Some(previous) = ranges.last() {
+                if previous.applied_range.overlaps(applied_range)
+                    && previous.applied != requested.permissions()
+                {
+                    return Err(LoadError::new(
+                        LoadStage::Seal,
+                        LoadErrorKind::PermissionConflict,
+                        ErrorContext::TargetRange {
+                            start: applied_range.start(),
+                            len: applied_range.len(),
+                        },
+                    ));
+                }
+            }
+
+            ranges.push(AppliedProtection {
+                location: TargetLocation::new(
+                    requested.location().allocation(),
+                    applied_offset,
+                ),
+                requested_range: requested.runtime_range(),
+                applied_range,
+                requested: requested.permissions(),
+                applied: requested.permissions(),
+                level: ProtectionLevel::LogicalOnly,
+            });
+        }
+        Ok(Self {
+            ranges: ranges.into_boxed_slice(),
+        })
+    }
+
+    /// Consume the prepared plan for a backend-specific atomic/batched apply.
+    pub fn into_ranges(self) -> Box<[AppliedProtection]> {
+        self.ranges
+    }
+
+    pub fn ranges(&self) -> &[AppliedProtection] {
+        &self.ranges
+    }
 }
 
-impl SealedImage {
+#[derive(Debug)]
+pub struct SealedState {
+    mapped: MappedState,
+    metadata: RuntimeImageMetadata,
+    seal_plan: SealPlan,
+    protections: AppliedProtectionSet,
+    cache_sync: CacheSyncOutcome,
+}
+
+pub type PreparedImage<'a, M> = StagedImage<'a, M, SealedState>;
+
+#[must_use = "a ready image commit still owns rollback authority"]
+pub struct ReadyImageCommit<'a, M: ImageCommitMemory> {
+    transaction: ImageLoadTransaction<'a, M>,
+    sealed: SealedState,
+    install: M::PreparedInstall,
+}
+
+impl<'a, M: ImageCommitMemory> StagedImage<'a, M, SealedState> {
+    pub fn prepare_commit(self) -> LoadResult<ReadyImageCommit<'a, M>> {
+        let (mut transaction, sealed) = self.into_parts();
+        let allocation = *transaction.allocation();
+        let install = transaction
+            .memory()
+            .prepare_install(&allocation, &sealed)
+            .map_err(|error| error.with_stage(LoadStage::Seal))?;
+        Ok(ReadyImageCommit {
+            transaction,
+            sealed,
+            install,
+        })
+    }
+}
+
+impl<M: ImageCommitMemory> ReadyImageCommit<'_, M> {
+    pub fn commit(mut self) -> M::CommitReceipt {
+        let lease = self.transaction.take_lease();
+        // SAFETY: the ready state can only be built by `prepare_commit`, which
+        // obtains all three values from this same staged transaction. Its
+        // private fields prevent callers from substituting another backend's
+        // prepared state, sealed image, or lease.
+        unsafe {
+            self.transaction
+                .memory()
+                .commit_install(self.install, self.sealed, lease)
+        }
+    }
+}
+
+impl<'a, M: ImageProtectionMemory> StagedImage<'a, M, RelocatedState> {
+    pub fn seal<C>(self, cache: &mut C) -> LoadResult<PreparedImage<'a, M>>
+    where
+        C: CodeCache,
+    {
+        let (mut transaction, relocated) = self.into_parts();
+        let sealed = relocated.seal(&mut transaction, cache)?;
+        Ok(StagedImage::new(transaction, sealed))
+    }
+}
+
+impl SealedState {
     pub const fn allocation(&self) -> &ImageAllocation {
         self.mapped.allocation()
     }
@@ -189,8 +418,16 @@ impl SealedImage {
         self.mapped.load_bias()
     }
 
-    pub const fn protection(&self) -> ProtectionLevel {
-        self.protection
+    pub fn protection(&self) -> ProtectionLevel {
+        self.protections.level()
+    }
+
+    pub const fn protections(&self) -> &AppliedProtectionSet {
+        &self.protections
+    }
+
+    pub const fn cache_sync(&self) -> &CacheSyncOutcome {
+        &self.cache_sync
     }
 
     pub const fn seal_plan(&self) -> &SealPlan {
@@ -202,55 +439,61 @@ impl SealedImage {
     }
 }
 
-impl RelocatedImage {
-    pub fn seal<M, C>(
+impl RelocatedState {
+    pub(crate) fn seal<M, C>(
         self,
         transaction: &mut ImageLoadTransaction<'_, M>,
         cache: &mut C,
-    ) -> LoadResult<SealedImage>
+    ) -> LoadResult<SealedState>
     where
-        M: ImageMemory,
+        M: ImageProtectionMemory,
         C: CodeCache,
     {
         let (mapped, metadata) = self.into_parts();
         let seal_plan = SealPlan::build(&mapped)?;
 
-        for range in seal_plan.ranges() {
-            transaction.memory().validate_access(
-                range.location(),
-                range.runtime_range().len(),
-                range.permissions(),
-            )?;
-        }
+        let prepared_protection = transaction
+            .memory_ref()
+            .prepare_protection(mapped.allocation(), &seal_plan)
+            .map_err(|error| error.with_stage(LoadStage::Seal))?;
+        let mut executable_ranges = Vec::new();
         for range in seal_plan.ranges() {
             if range.permissions().contains(MemoryPermissions::EXECUTE) {
-                cache.synchronize(range.runtime_range())?;
+                executable_ranges.try_reserve(1).map_err(|_| seal_oom())?;
+                executable_ranges.push(range.runtime_range());
             }
         }
+        let prepared_cache = cache
+            .prepare(&executable_ranges)
+            .map_err(|error| error.with_stage(LoadStage::Cache))?;
+        mapped
+            .request()
+            .cache_requirements()
+            .validate(&prepared_cache)?;
+        let cache_sync = cache
+            .synchronize(prepared_cache)
+            .map_err(|error| error.with_stage(LoadStage::Cache))?;
 
-        let mut protection = ProtectionLevel::Hardware;
-        for range in seal_plan.ranges() {
-            let level = transaction.memory().protect(
-                range.location(),
-                range.runtime_range().len(),
-                range.permissions(),
-            )?;
-            if level == ProtectionLevel::LogicalOnly {
-                protection = ProtectionLevel::LogicalOnly;
-            }
+        if !seal_plan.ranges().is_empty() {
+            transaction.mark_protection_modified();
         }
+        let protections = transaction
+            .memory()
+            .apply_protection(prepared_protection)
+            .map_err(|error| error.with_stage(LoadStage::Seal))?;
 
-        Ok(SealedImage {
+        Ok(SealedState {
             mapped,
             metadata,
             seal_plan,
-            protection,
+            protections,
+            cache_sync,
         })
     }
 }
 
 fn append_range(
-    mapped: &MappedImage,
+    mapped: &MappedState,
     ranges: &mut Vec<SealRange>,
     vaddr: TargetAddr,
     len: u64,
@@ -259,15 +502,16 @@ fn append_range(
     if len == 0 {
         return Ok(());
     }
-    let location = mapped.locate_vaddr(vaddr, len, MemoryPermissions::NONE)?;
-    let runtime_range = TargetRange::new(mapped.load_bias().checked_add(vaddr.get())?, len);
-    runtime_range.end()?;
+    let location = mapped.locate_vaddr_at(LoadStage::Seal, vaddr, len, MemoryPermissions::NONE)?;
+    let runtime_range =
+        TargetRange::new(at_seal(mapped.load_bias().checked_add(vaddr.get()))?, len);
+    at_seal(runtime_range.end())?;
 
     append_seal_range(ranges, location, runtime_range, permissions)
 }
 
 fn append_allocation_range(
-    mapped: &MappedImage,
+    mapped: &MappedState,
     ranges: &mut Vec<SealRange>,
     offset: u64,
     len: u64,
@@ -277,9 +521,11 @@ fn append_allocation_range(
         return Ok(());
     }
     let location = TargetLocation::new(mapped.allocation().id(), offset);
-    let runtime_range =
-        TargetRange::new(mapped.allocation().target_base().checked_add(offset)?, len);
-    runtime_range.end()?;
+    let runtime_range = TargetRange::new(
+        at_seal(mapped.allocation().target_base().checked_add(offset))?,
+        len,
+    );
+    at_seal(runtime_range.end())?;
     append_seal_range(ranges, location, runtime_range, permissions)
 }
 
@@ -296,7 +542,7 @@ fn append_seal_range(
             .location
             .offset()
             .checked_add(previous.runtime_range.len());
-        let previous_runtime_end = previous.runtime_range.end()?;
+        let previous_runtime_end = at_seal(previous.runtime_range.end())?;
         if previous.permissions == permissions
             && previous.location.allocation() == location.allocation()
             && previous_location_end == Some(location.offset())
@@ -325,5 +571,21 @@ fn seal_oom() -> LoadError {
         LoadStage::Seal,
         LoadErrorKind::OutOfMemory,
         ErrorContext::None,
+    )
+}
+
+fn at_seal<T>(result: RangeResult<T>) -> LoadResult<T> {
+    result.map_err(|error| error.at(LoadStage::Seal))
+}
+
+fn protection_plan_error(allocation: &ImageAllocation) -> LoadError {
+    LoadError::new(
+        LoadStage::Seal,
+        LoadErrorKind::Backend,
+        ErrorContext::Allocation {
+            base: allocation.target_base(),
+            len: allocation.len(),
+            align: allocation.align(),
+        },
     )
 }

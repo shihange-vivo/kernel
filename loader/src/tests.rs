@@ -21,8 +21,9 @@ use std::{
 
 use goblin::elf::{
     dynamic::{
-        DF_TEXTREL, DT_DEBUG, DT_FLAGS, DT_FLAGS_1, DT_JMPREL, DT_NEEDED, DT_NULL, DT_PLTREL,
-        DT_REL, DT_RELA, DT_RELAENT, DT_RELASZ, DT_RELENT, DT_RELSZ, DT_TEXTREL,
+        DF_1_NOW, DF_1_PIE, DF_BIND_NOW, DF_TEXTREL, DT_DEBUG, DT_FLAGS, DT_FLAGS_1, DT_JMPREL,
+        DT_NEEDED, DT_NULL, DT_PLTREL, DT_REL, DT_RELA, DT_RELAENT, DT_RELASZ, DT_RELENT, DT_RELSZ,
+        DT_TEXTREL,
     },
     header::{EI_CLASS, EI_DATA, ELFCLASS32, ELFDATA2MSB, EM_ARM, EM_RISCV, ET_DYN, ET_EXEC},
     reloc::{R_ARM_ABS32, R_ARM_GLOB_DAT, R_ARM_JUMP_SLOT, R_ARM_RELATIVE},
@@ -31,12 +32,13 @@ use goblin::elf::{
 
 use self::fixture::ElfFixtureBuilder;
 use crate::{
-    AllocationId, AllocationOwnership, AllocationRequest, ArmRelocator, ArtifactProfile,
-    ArtifactRequest, CodeCache, ElfClass, ElfReader, Endian, ErrorContext, ExpectedElfType,
-    ImageAllocation, ImageLoadTransaction, ImageLoader, ImageMemory, LoadError, LoadErrorKind,
-    LoadLimits, LoadResult, LoadStage, MemoryPermissions, Placement, PlannedArtifact,
-    ProtectionLevel, RelocationAddend, Riscv64Relocator, RuntimeFeaturePolicy, SliceElfReader,
-    TargetAddr, TargetLocation,
+    AllocationId, AllocationLease, AllocationOwnership, AllocationRequest, ArmRelocator,
+    ArtifactProfile, ArtifactRequest, CodeCache, ElfClass, ElfReader, Endian, ErrorContext,
+    ExpectedElfType, ImageAllocation, ImageCommitMemory, ImageLoadTransaction, ImageLoader,
+    ImageMemory, ImageProtectionMemory, LoadError, LoadErrorKind, LoadLimits, LoadResult,
+    LoadStage, MemoryPermissions, MutationProgress, Placement, PlannedArtifact,
+    ProtectionCapabilities, ProtectionLevel, RelocationAddend, Riscv64Relocator,
+    Phase0ArtifactPolicy, SealedState, SliceElfReader, SourceSnapshot, TargetAddr, TargetLocation,
 };
 use goblin::elf::program_header::{
     PF_R, PF_W, PF_X, PT_DYNAMIC, PT_GNU_RELRO, PT_GNU_STACK, PT_INTERP, PT_LOAD, PT_TLS,
@@ -87,6 +89,24 @@ fn slice_reader_checks_every_requested_range() {
     );
 }
 
+#[test]
+fn range_errors_are_stage_neutral_until_consumed() {
+    let range_error = TargetAddr::new(u64::MAX).checked_add(1).unwrap_err();
+    assert_eq!(range_error.kind(), LoadErrorKind::IntegerOverflow);
+
+    for stage in [
+        LoadStage::Parse,
+        LoadStage::Plan,
+        LoadStage::Map,
+        LoadStage::Metadata,
+        LoadStage::Relocate,
+        LoadStage::Cache,
+        LoadStage::Seal,
+    ] {
+        assert_eq!(range_error.at(stage).stage(), stage);
+    }
+}
+
 #[derive(Clone, Copy, Debug)]
 enum InjectedReadFailure {
     ShortRead,
@@ -124,6 +144,10 @@ impl<'a> RecordingReader<'a> {
 }
 
 impl ElfReader for RecordingReader<'_> {
+    fn snapshot(&self) -> LoadResult<SourceSnapshot> {
+        self.inner.snapshot()
+    }
+
     fn len(&self) -> LoadResult<u64> {
         self.inner.len()
     }
@@ -173,6 +197,85 @@ fn admit_records_read_at_requests_and_propagates_each_reader_failure() {
     assert_eq!(log.reads.borrow().as_slice(), [(0, 16), (0, 64)]);
 }
 
+#[derive(Debug)]
+struct VersionedReader<'a> {
+    inner: SliceElfReader<'a>,
+    version: Rc<Cell<u64>>,
+}
+
+impl ElfReader for VersionedReader<'_> {
+    fn snapshot(&self) -> LoadResult<SourceSnapshot> {
+        Ok(SourceSnapshot::new(self.version.get()))
+    }
+
+    fn len(&self) -> LoadResult<u64> {
+        self.inner.len()
+    }
+
+    fn read_exact_at(&self, offset: u64, dst: &mut [u8]) -> LoadResult<()> {
+        self.inner.read_exact_at(offset, dst)
+    }
+}
+
+#[test]
+fn source_version_change_is_rejected_before_allocation() {
+    let bytes = ElfFixtureBuilder::elf64(EM_RISCV, ET_DYN)
+        .set_entry(0x1000)
+        .add_program_header(PT_LOAD, 0, 0x1000, 64, 0x100, PF_R | PF_X, 0x1000)
+        .build();
+    let version = Rc::new(Cell::new(7));
+    let reader = VersionedReader {
+        inner: SliceElfReader::new(&bytes),
+        version: Rc::clone(&version),
+    };
+    let loader = ImageLoader::new();
+    let admitted = loader.admit(reader, riscv64_request()).unwrap();
+    version.set(8);
+
+    let error = loader.plan(admitted).unwrap_err();
+    assert_eq!(error.stage(), LoadStage::Read);
+    assert_eq!(error.kind(), LoadErrorKind::SourceChanged);
+}
+
+#[test]
+fn source_version_change_before_copy_aborts_without_modifying_the_target() {
+    let bytes = ElfFixtureBuilder::elf64(EM_RISCV, ET_DYN)
+        .set_entry(0x1000)
+        .add_program_header(PT_LOAD, 0, 0x1000, 64, 0x100, PF_R | PF_X, 0x1000)
+        .build();
+    let version = Rc::new(Cell::new(1));
+    let reader = VersionedReader {
+        inner: SliceElfReader::new(&bytes),
+        version: Rc::clone(&version),
+    };
+    let loader = ImageLoader::new();
+    let admitted = loader.admit(reader, riscv64_request()).unwrap();
+    let planned = loader.plan(admitted).unwrap();
+    version.set(2);
+    let allocation_id = AllocationId::new(308);
+    let mut memory = FakeMemory::returning(ImageAllocation::new(
+        allocation_id,
+        TargetAddr::new(0x8000),
+        0x1000,
+        0x1000,
+        AllocationOwnership::Owned,
+    ));
+
+    {
+        let mut transaction = ImageLoadTransaction::new(&mut memory);
+        let reserved = loader.reserve(planned, &mut transaction).unwrap();
+        let error = loader
+            .copy_and_zero(reserved, &mut transaction)
+            .unwrap_err();
+        assert_eq!(error.kind(), LoadErrorKind::SourceChanged);
+    }
+
+    assert!(memory.writes.is_empty());
+    assert!(memory.zeros.is_empty());
+    assert_eq!(memory.releases, [allocation_id]);
+    assert_eq!(memory.abort_progress, [MutationProgress::Reserved]);
+}
+
 #[test]
 fn admit_accepts_matching_elf32_and_elf64_headers() {
     let riscv = ElfFixtureBuilder::elf64(EM_RISCV, ET_DYN).build();
@@ -193,6 +296,90 @@ fn admit_accepts_matching_elf32_and_elf64_headers() {
         .unwrap();
     assert_eq!(admitted.header().class(), ElfClass::Elf32);
     assert_eq!(admitted.file_len(), arm.len() as u64);
+}
+
+#[test]
+fn admit_enforces_profile_header_flags_and_entry_mode() {
+    const EF_ARM_EABI_VER5: u32 = 0x0500_0000;
+    const EF_ARM_ABI_FLOAT_SOFT: u32 = 0x0000_0200;
+    const EF_ARM_ABI_FLOAT_HARD: u32 = 0x0000_0400;
+
+    let arm_request = ArtifactRequest::new(
+        ExpectedElfType::Dyn,
+        ArtifactProfile::arm_thumb_v7m_soft(),
+        LoadLimits::default(),
+    );
+    let valid_arm = ElfFixtureBuilder::elf32(EM_ARM, ET_DYN)
+        .set_flags(EF_ARM_EABI_VER5 | EF_ARM_ABI_FLOAT_SOFT)
+        .set_entry(0x1001)
+        .build();
+    ImageLoader::new()
+        .admit(SliceElfReader::new(&valid_arm), arm_request)
+        .unwrap();
+
+    for (flags, entry) in [
+        (0, 0x1001),
+        (EF_ARM_EABI_VER5 | EF_ARM_ABI_FLOAT_HARD, 0x1001),
+        (EF_ARM_EABI_VER5 | EF_ARM_ABI_FLOAT_SOFT, 0x1000),
+    ] {
+        let bytes = ElfFixtureBuilder::elf32(EM_ARM, ET_DYN)
+            .set_flags(flags)
+            .set_entry(entry)
+            .build();
+        assert_eq!(
+            ImageLoader::new()
+                .admit(SliceElfReader::new(&bytes), arm_request)
+                .unwrap_err()
+                .kind(),
+            LoadErrorKind::UnsupportedByProfile
+        );
+    }
+
+    let riscv_request = ArtifactRequest::new(
+        ExpectedElfType::Dyn,
+        ArtifactProfile::riscv_soft(ElfClass::Elf64),
+        LoadLimits::default(),
+    );
+    for (flags, entry) in [(1, 0x1000), (0, 0x1002)] {
+        let bytes = ElfFixtureBuilder::elf64(EM_RISCV, ET_DYN)
+            .set_flags(flags)
+            .set_entry(entry)
+            .build();
+        assert_eq!(
+            ImageLoader::new()
+                .admit(SliceElfReader::new(&bytes), riscv_request)
+                .unwrap_err()
+                .kind(),
+            LoadErrorKind::UnsupportedByProfile
+        );
+    }
+
+    let compressed_riscv_request = ArtifactRequest::new(
+        ExpectedElfType::Dyn,
+        ArtifactProfile::riscv_compressed_soft(ElfClass::Elf64),
+        LoadLimits::default(),
+    );
+    let compressed = ElfFixtureBuilder::elf64(EM_RISCV, ET_DYN)
+        .set_flags(1)
+        .set_entry(0x1002)
+        .build();
+    ImageLoader::new()
+        .admit(SliceElfReader::new(&compressed), compressed_riscv_request)
+        .unwrap();
+
+    for (flags, entry) in [(0, 0x1002), (3, 0x1002), (1, 0x1001)] {
+        let bytes = ElfFixtureBuilder::elf64(EM_RISCV, ET_DYN)
+            .set_flags(flags)
+            .set_entry(entry)
+            .build();
+        assert_eq!(
+            ImageLoader::new()
+                .admit(SliceElfReader::new(&bytes), compressed_riscv_request)
+                .unwrap_err()
+                .kind(),
+            LoadErrorKind::UnsupportedByProfile
+        );
+    }
 }
 
 #[test]
@@ -340,7 +527,7 @@ fn inspect_rejects_file_ranges_outside_the_artifact() {
 }
 
 #[test]
-fn inspect_rejects_unsupported_runtime_program_headers() {
+fn parser_records_program_features_before_phase0_policy_rejects_them() {
     for program_type in [PT_INTERP, PT_TLS] {
         let bytes = ElfFixtureBuilder::elf64(EM_RISCV, ET_DYN)
             .add_program_header(program_type, 0, 0, 0, 0, PF_R, 1)
@@ -349,8 +536,14 @@ fn inspect_rejects_unsupported_runtime_program_headers() {
         let admitted = loader
             .admit(SliceElfReader::new(&bytes), riscv64_request())
             .unwrap();
+        let parsed = loader.inspect(&admitted).unwrap();
+        match program_type {
+            PT_INTERP => assert!(parsed.program_features().interpreter().is_some()),
+            PT_TLS => assert!(parsed.program_features().tls().is_some()),
+            _ => unreachable!(),
+        }
         assert_eq!(
-            loader.inspect(&admitted).unwrap_err().kind(),
+            loader.plan(admitted).unwrap_err().kind(),
             LoadErrorKind::UnsupportedByProfile
         );
     }
@@ -362,10 +555,69 @@ fn inspect_rejects_unsupported_runtime_program_headers() {
     let admitted = loader
         .admit(SliceElfReader::new(&bytes), riscv64_request())
         .unwrap();
+    let parsed = loader.inspect(&admitted).unwrap();
+    assert!(parsed.program_features().has_executable_stack());
     assert_eq!(
-        loader.inspect(&admitted).unwrap_err().kind(),
+        loader.plan(admitted).unwrap_err().kind(),
         LoadErrorKind::UnsupportedByProfile
     );
+}
+
+#[derive(Clone, Copy)]
+struct AcceptAllFeatures;
+
+impl crate::ArtifactFeaturePolicy for AcceptAllFeatures {
+    fn validate_program_features(
+        &self,
+        _features: &crate::ProgramFeatureSummary,
+    ) -> LoadResult<()> {
+        Ok(())
+    }
+
+    fn validate_dynamic_features(
+        &self,
+        _features: &crate::DynamicFeatureSummary,
+    ) -> LoadResult<()> {
+        Ok(())
+    }
+}
+
+#[test]
+fn alternate_policy_reuses_the_structural_program_and_dynamic_parsers() {
+    let program = ElfFixtureBuilder::elf64(EM_RISCV, ET_DYN)
+        .set_entry(0x1000)
+        .add_program_header(PT_LOAD, 0, 0x1000, 64, 0x100, PF_R | PF_X, 0x1000)
+        .add_program_header(PT_INTERP, 0, 0, 0, 0, PF_R, 1)
+        .build();
+    let loader = ImageLoader::new();
+    let admitted = loader
+        .admit(SliceElfReader::new(&program), riscv64_request())
+        .unwrap();
+    loader
+        .plan_with_policy(admitted, &AcceptAllFeatures)
+        .unwrap();
+
+    let entries = [(DT_NEEDED, 7), (DT_NULL, 0)];
+    let dynamic = image_with_dynamic_entries(&entries, 3);
+    let planned = planned_image(&dynamic, ExpectedElfType::Dyn);
+    let mut memory = FakeMemory::returning(ImageAllocation::new(
+        AllocationId::new(309),
+        TargetAddr::new(0x8000),
+        0x3000,
+        0x1000,
+        AllocationOwnership::Owned,
+    ));
+    let mut transaction = ImageLoadTransaction::new(&mut memory);
+    let reserved = loader.reserve(planned, &mut transaction).unwrap();
+    let mapped = loader.copy_and_zero(reserved, &mut transaction).unwrap();
+    let runtime = mapped
+        .decode_runtime(&mut transaction, &AcceptAllFeatures)
+        .unwrap();
+    assert_eq!(
+        runtime.metadata().features().first_extended_tag(),
+        Some((DT_NEEDED, 7))
+    );
+    transaction.disarm_for_test();
 }
 
 #[test]
@@ -431,12 +683,13 @@ fn plan_supports_nonzero_virtual_bases_and_segment_gaps() {
 #[test]
 fn plan_preserves_arm_thumb_entry_while_validating_its_canonical_address() {
     let bytes = ElfFixtureBuilder::elf32(EM_ARM, ET_DYN)
+        .set_flags(0x0500_0200)
         .set_entry(0x1001)
         .add_program_header(PT_LOAD, 0, 0x1000, 52, 0x100, PF_R | PF_X, 0x1000)
         .build();
     let request = ArtifactRequest::new(
         ExpectedElfType::Dyn,
-        ArtifactProfile::new(ElfClass::Elf32, Endian::Little, EM_ARM),
+        ArtifactProfile::arm_thumb_v7m_soft(),
         LoadLimits::default(),
     );
     let loader = ImageLoader::new();
@@ -492,10 +745,9 @@ fn plan_rejects_virtual_range_and_alignment_overflow() {
     let admitted = loader
         .admit(SliceElfReader::new(&range_overflow), riscv64_request())
         .unwrap();
-    assert_eq!(
-        loader.plan(admitted).unwrap_err().kind(),
-        LoadErrorKind::IntegerOverflow
-    );
+    let error = loader.plan(admitted).unwrap_err();
+    assert_eq!(error.kind(), LoadErrorKind::IntegerOverflow);
+    assert_eq!(error.stage(), LoadStage::Parse);
 
     let alignment_overflow = ElfFixtureBuilder::elf64(EM_RISCV, ET_DYN)
         .set_entry(0x1000)
@@ -505,10 +757,9 @@ fn plan_rejects_virtual_range_and_alignment_overflow() {
     let admitted = loader
         .admit(SliceElfReader::new(&alignment_overflow), riscv64_request())
         .unwrap();
-    assert_eq!(
-        loader.plan(admitted).unwrap_err().kind(),
-        LoadErrorKind::IntegerOverflow
-    );
+    let error = loader.plan(admitted).unwrap_err();
+    assert_eq!(error.kind(), LoadErrorKind::IntegerOverflow);
+    assert_eq!(error.stage(), LoadStage::Plan);
 }
 
 #[test]
@@ -547,6 +798,8 @@ fn plan_enforces_image_span_and_segment_count_limits() {
     for limits in [
         LoadLimits::new(1024, 16).with_image_limits(1, u64::MAX),
         LoadLimits::new(1024, 16).with_image_limits(16, 0x1000),
+        LoadLimits::new(1024, 16).with_layout_limits(0x800, u64::MAX),
+        LoadLimits::new(1024, 16).with_layout_limits(u64::MAX, 0),
     ] {
         let request = ArtifactRequest::new(
             ExpectedElfType::Dyn,
@@ -566,8 +819,16 @@ fn plan_enforces_image_span_and_segment_count_limits() {
 struct FakeMemory {
     allocation: Option<ImageAllocation>,
     fail_allocate: bool,
+    fail_prepare_install: bool,
+    protection_granule: u64,
+    max_protection_ranges: usize,
+    fail_alias_preflight: bool,
+    fixed_poisoned: bool,
     requests: std::vec::Vec<AllocationRequest>,
     releases: std::vec::Vec<AllocationId>,
+    committed_releases: std::vec::Vec<AllocationId>,
+    abort_progress: std::vec::Vec<MutationProgress>,
+    installed_lease: Option<AllocationLease>,
     bytes: std::vec::Vec<u8>,
     writes: std::vec::Vec<(TargetLocation, usize)>,
     zeros: std::vec::Vec<(TargetLocation, u64)>,
@@ -585,8 +846,16 @@ impl FakeMemory {
         Self {
             allocation: Some(allocation),
             fail_allocate: false,
+            fail_prepare_install: false,
+            protection_granule: 1,
+            max_protection_ranges: usize::MAX,
+            fail_alias_preflight: false,
+            fixed_poisoned: false,
             requests: std::vec::Vec::new(),
             releases: std::vec::Vec::new(),
+            committed_releases: std::vec::Vec::new(),
+            abort_progress: std::vec::Vec::new(),
+            installed_lease: None,
             bytes: std::vec![0xa5; len],
             writes: std::vec::Vec::new(),
             zeros: std::vec::Vec::new(),
@@ -603,8 +872,16 @@ impl FakeMemory {
         Self {
             allocation: None,
             fail_allocate: true,
+            fail_prepare_install: false,
+            protection_granule: 1,
+            max_protection_ranges: usize::MAX,
+            fail_alias_preflight: false,
+            fixed_poisoned: false,
             requests: std::vec::Vec::new(),
             releases: std::vec::Vec::new(),
+            committed_releases: std::vec::Vec::new(),
+            abort_progress: std::vec::Vec::new(),
+            installed_lease: None,
             bytes: std::vec::Vec::new(),
             writes: std::vec::Vec::new(),
             zeros: std::vec::Vec::new(),
@@ -619,7 +896,7 @@ impl FakeMemory {
 }
 
 impl ImageMemory for FakeMemory {
-    fn allocate_image(&mut self, request: &AllocationRequest) -> LoadResult<ImageAllocation> {
+    fn allocate_image(&mut self, request: &AllocationRequest) -> LoadResult<AllocationLease> {
         self.requests.push(*request);
         if self.fail_allocate {
             return Err(LoadError::new(
@@ -628,11 +905,27 @@ impl ImageMemory for FakeMemory {
                 ErrorContext::None,
             ));
         }
-        Ok(self.allocation.expect("test allocation must be configured"))
+        // SAFETY: FakeMemory returns one fresh lease for its configured test
+        // allocation and the transaction consumes it exactly once.
+        Ok(unsafe {
+            AllocationLease::from_allocation(
+                self.allocation.expect("test allocation must be configured"),
+            )
+        })
     }
 
-    fn release(&mut self, allocation: AllocationId) {
-        self.releases.push(allocation);
+    fn abort_image(&mut self, lease: AllocationLease, progress: MutationProgress) {
+        if lease.allocation().ownership() == AllocationOwnership::BorrowedFixed
+            && progress >= MutationProgress::BytesModified
+        {
+            self.fixed_poisoned = true;
+        }
+        self.releases.push(lease.allocation().id());
+        self.abort_progress.push(progress);
+    }
+
+    fn release_committed(&mut self, lease: AllocationLease) {
+        self.committed_releases.push(lease.allocation().id());
     }
 
     fn validate_access(
@@ -705,6 +998,90 @@ impl ImageMemory for FakeMemory {
     }
 }
 
+#[derive(Debug)]
+struct FakePreparedInstall {
+    allocation: ImageAllocation,
+    entry: TargetAddr,
+    relocation_count: usize,
+}
+
+#[derive(Debug)]
+struct FakeCommitReceipt {
+    entry: TargetAddr,
+    relocation_count: usize,
+}
+
+impl ImageCommitMemory for FakeMemory {
+    type PreparedInstall = FakePreparedInstall;
+    type CommitReceipt = FakeCommitReceipt;
+
+    fn prepare_install(
+        &mut self,
+        allocation: &ImageAllocation,
+        sealed: &SealedState,
+    ) -> LoadResult<Self::PreparedInstall> {
+        if self.fail_prepare_install
+            || self.allocation != Some(*allocation)
+            || sealed.allocation() != allocation
+        {
+            return Err(LoadError::new(
+                LoadStage::Seal,
+                LoadErrorKind::Backend,
+                ErrorContext::Allocation {
+                    base: allocation.target_base(),
+                    len: allocation.len(),
+                    align: allocation.align(),
+                },
+            ));
+        }
+        Ok(FakePreparedInstall {
+            allocation: *allocation,
+            entry: sealed.entry(),
+            relocation_count: sealed.metadata().relocations().len(),
+        })
+    }
+
+    unsafe fn commit_install(
+        &mut self,
+        prepared: Self::PreparedInstall,
+        _sealed: SealedState,
+        lease: AllocationLease,
+    ) -> Self::CommitReceipt {
+        self.allocation = Some(prepared.allocation);
+        self.installed_lease = Some(lease);
+        FakeCommitReceipt {
+            entry: prepared.entry,
+            relocation_count: prepared.relocation_count,
+        }
+    }
+}
+
+impl ImageProtectionMemory for FakeMemory {
+    fn protection_capabilities(&self) -> ProtectionCapabilities {
+        ProtectionCapabilities::new(self.protection_granule, self.max_protection_ranges)
+    }
+
+    fn validate_protection_aliases(
+        &self,
+        allocation: &ImageAllocation,
+        _prepared: &crate::PreparedProtectionPlan,
+    ) -> LoadResult<()> {
+        if self.fail_alias_preflight {
+            Err(LoadError::new(
+                LoadStage::Seal,
+                LoadErrorKind::PermissionConflict,
+                ErrorContext::Allocation {
+                    base: allocation.target_base(),
+                    len: allocation.len(),
+                    align: allocation.align(),
+                },
+            ))
+        } else {
+            Ok(())
+        }
+    }
+}
+
 fn fake_access_error(location: TargetLocation, len: u64) -> LoadError {
     LoadError::new(
         LoadStage::Map,
@@ -726,6 +1103,13 @@ fn planned_image<'a>(
         ArtifactProfile::new(ElfClass::Elf64, Endian::Little, EM_RISCV),
         LoadLimits::default(),
     );
+    planned_image_with_request(bytes, request)
+}
+
+fn planned_image_with_request(
+    bytes: &[u8],
+    request: ArtifactRequest,
+) -> PlannedArtifact<SliceElfReader<'_>> {
     let loader = ImageLoader::new();
     let admitted = loader.admit(SliceElfReader::new(bytes), request).unwrap();
     loader.plan(admitted).unwrap()
@@ -807,6 +1191,13 @@ fn reserve_releases_a_backend_allocation_that_fails_validation() {
             AllocationId::new(90),
             TargetAddr::new(0x8000),
             0x800,
+            0x1000,
+            AllocationOwnership::Owned,
+        ),
+        ImageAllocation::new(
+            AllocationId::new(95),
+            TargetAddr::new(0x8000),
+            0x2000,
             0x1000,
             AllocationOwnership::Owned,
         ),
@@ -893,13 +1284,54 @@ fn memory_mapper_allocates_fallibly_and_releases_owned_storage() {
     let request = AllocationRequest::new(Placement::Anywhere, 0x2000, 0x1000);
     let mut mapper = crate::MemoryMapper::new(None);
 
-    let allocation = ImageMemory::allocate_image(&mut mapper, &request).unwrap();
+    let lease = ImageMemory::allocate_image(&mut mapper, &request).unwrap();
+    let allocation = *lease.allocation();
     assert_eq!(allocation.ownership(), AllocationOwnership::Owned);
     assert_eq!(allocation.target_base().get() % 0x1000, 0);
     assert_eq!(allocation.len(), 0x2000);
 
-    ImageMemory::release(&mut mapper, allocation.id());
+    ImageMemory::abort_image(&mut mapper, lease, MutationProgress::Reserved);
     assert!(mapper.real_start().is_err());
+}
+
+#[test]
+fn memory_mapper_poison_blocks_fixed_reuse_until_platform_reset() {
+    let buffer = std::boxed::Box::leak(std::vec![0u8; 0x1000].into_boxed_slice());
+    let start = buffer.as_mut_ptr() as usize;
+    let regions = std::boxed::Box::leak(std::boxed::Box::new([unsafe {
+        crate::MemoryRegion::new(
+            start,
+            start + buffer.len(),
+            MemoryPermissions::READ.bitor(MemoryPermissions::WRITE),
+        )
+    }]));
+    let request = AllocationRequest::new(
+        Placement::Fixed(crate::TargetRange::new(
+            TargetAddr::new(start as u64),
+            buffer.len() as u64,
+        )),
+        buffer.len() as u64,
+        1,
+    );
+    let mut mapper = crate::MemoryMapper::new(Some(regions));
+
+    let lease = ImageMemory::allocate_image(&mut mapper, &request).unwrap();
+    ImageMemory::abort_image(&mut mapper, lease, MutationProgress::BytesModified);
+    assert!(mapper.is_fixed_poisoned());
+    assert_eq!(
+        ImageMemory::allocate_image(&mut mapper, &request)
+            .unwrap_err()
+            .kind(),
+        LoadErrorKind::Backend
+    );
+
+    // SAFETY: this test has exclusive access to the backing buffer and no
+    // entry point was published. Filling it restores the complete range.
+    buffer.fill(0);
+    unsafe { mapper.reset_fixed_poison() };
+    let lease = ImageMemory::allocate_image(&mut mapper, &request).unwrap();
+    ImageMemory::abort_image(&mut mapper, lease, MutationProgress::Reserved);
+    assert!(!mapper.is_fixed_poisoned());
 }
 
 #[test]
@@ -1030,6 +1462,10 @@ impl<'a> FaultingReader<'a> {
 }
 
 impl ElfReader for FaultingReader<'_> {
+    fn snapshot(&self) -> LoadResult<SourceSnapshot> {
+        self.inner.snapshot()
+    }
+
     fn len(&self) -> LoadResult<u64> {
         self.inner.len()
     }
@@ -1135,9 +1571,10 @@ fn copy_rolls_back_at_every_zero_and_write_failure() {
         let reserved = ImageLoader::new()
             .reserve(planned, &mut transaction)
             .unwrap();
-        assert!(ImageLoader::new()
+        let error = ImageLoader::new()
             .copy_and_zero(reserved, &mut transaction)
-            .is_err());
+            .unwrap_err();
+        assert_eq!(error.stage(), LoadStage::Map);
     }
     assert_eq!(memory.releases, [zero_allocation]);
     assert!(memory.writes.is_empty());
@@ -1158,9 +1595,10 @@ fn copy_rolls_back_at_every_zero_and_write_failure() {
             let reserved = ImageLoader::new()
                 .reserve(planned, &mut transaction)
                 .unwrap();
-            assert!(ImageLoader::new()
+            let error = ImageLoader::new()
                 .copy_and_zero(reserved, &mut transaction)
-                .is_err());
+                .unwrap_err();
+            assert_eq!(error.stage(), LoadStage::Map);
         }
         assert_eq!(memory.writes.len(), failure_call);
         assert_eq!(memory.releases, [allocation_id]);
@@ -1223,7 +1661,7 @@ fn decode_runtime_normalizes_bounded_rela_metadata() {
             .copy_and_zero(reserved, &mut transaction)
             .unwrap();
         let runtime = mapped
-            .decode_runtime(&mut transaction, RuntimeFeaturePolicy::Phase0)
+            .decode_runtime(&mut transaction, &Phase0ArtifactPolicy)
             .unwrap();
         let relocation = runtime.metadata().relocations()[0];
         assert_eq!(runtime.metadata().relocations().len(), 1);
@@ -1260,7 +1698,7 @@ fn decode_runtime_rejects_dependencies_instead_of_classifying_et_dyn() {
             .copy_and_zero(reserved, &mut transaction)
             .unwrap();
         let error = mapped
-            .decode_runtime(&mut transaction, RuntimeFeaturePolicy::Phase0)
+            .decode_runtime(&mut transaction, &Phase0ArtifactPolicy)
             .unwrap_err();
         assert_eq!(error.kind(), LoadErrorKind::UnsupportedByProfile);
     }
@@ -1301,7 +1739,7 @@ fn decode_runtime_requires_dt_null_and_enforces_entry_limits() {
         let reserved = loader.reserve(planned, &mut transaction).unwrap();
         let mapped = loader.copy_and_zero(reserved, &mut transaction).unwrap();
         let error = mapped
-            .decode_runtime(&mut transaction, RuntimeFeaturePolicy::Phase0)
+            .decode_runtime(&mut transaction, &Phase0ArtifactPolicy)
             .unwrap_err();
         assert_eq!(error.kind(), expected_kind);
     }
@@ -1333,7 +1771,7 @@ fn decode_runtime_rejects_symbol_based_relocations_in_phase0() {
         .unwrap();
 
     let error = mapped
-        .decode_runtime(&mut transaction, RuntimeFeaturePolicy::Phase0)
+        .decode_runtime(&mut transaction, &Phase0ArtifactPolicy)
         .unwrap_err();
     assert_eq!(error.kind(), LoadErrorKind::UnsupportedByProfile);
 }
@@ -1358,7 +1796,7 @@ fn decode_runtime_for_test(entries: &[(u64, u64)], limits: LoadLimits) -> LoadRe
     let mut transaction = ImageLoadTransaction::new(&mut memory);
     let reserved = loader.reserve(planned, &mut transaction)?;
     let mapped = loader.copy_and_zero(reserved, &mut transaction)?;
-    let runtime = mapped.decode_runtime(&mut transaction, RuntimeFeaturePolicy::Phase0)?;
+    let runtime = mapped.decode_runtime(&mut transaction, &Phase0ArtifactPolicy)?;
     let relocation_count = runtime.metadata().relocations().len();
     transaction.disarm_for_test();
     Ok(relocation_count)
@@ -1426,6 +1864,15 @@ fn decode_runtime_rejects_relocation_tables_outside_readable_segments() {
         .kind(),
         LoadErrorKind::ResourceLimit
     );
+    assert_eq!(
+        decode_runtime_for_test(
+            &rela_dynamic_entries(),
+            LoadLimits::default().with_runtime_memory_limits(0, u64::MAX),
+        )
+        .unwrap_err()
+        .kind(),
+        LoadErrorKind::ResourceLimit
+    );
 }
 
 #[test]
@@ -1438,6 +1885,8 @@ fn phase0_policy_rejects_every_unsupported_dynamic_feature() {
         (DT_PLTREL, DT_RELA),
         (DT_RELR_FOR_TEST, 0x3100),
         (DT_FLAGS, DF_TEXTREL),
+        (DT_FLAGS, 1 << 63),
+        (DT_FLAGS_1, 1 << 63),
         (0x6fff_f123, 0),
     ] {
         let entries = [(tag, value), (DT_NULL, 0)];
@@ -1446,6 +1895,19 @@ fn phase0_policy_rejects_every_unsupported_dynamic_feature() {
                 .unwrap_err()
                 .kind(),
             LoadErrorKind::UnsupportedByProfile
+        );
+    }
+}
+
+#[test]
+fn phase0_policy_accepts_only_the_explicit_dynamic_flag_baseline() {
+    for entries in [
+        [(DT_FLAGS, DF_BIND_NOW), (DT_NULL, 0)],
+        [(DT_FLAGS_1, DF_1_NOW | DF_1_PIE), (DT_NULL, 0)],
+    ] {
+        assert_eq!(
+            decode_runtime_for_test(&entries, LoadLimits::default()).unwrap(),
+            0
         );
     }
 }
@@ -1469,7 +1931,7 @@ fn images_without_pt_dynamic_have_empty_runtime_metadata() {
         .copy_and_zero(reserved, &mut transaction)
         .unwrap();
     let runtime = mapped
-        .decode_runtime(&mut transaction, RuntimeFeaturePolicy::Phase0)
+        .decode_runtime(&mut transaction, &Phase0ArtifactPolicy)
         .unwrap();
     assert!(runtime.metadata().relocations().is_empty());
     transaction.disarm_for_test();
@@ -1486,7 +1948,7 @@ fn rela_dynamic_entries() -> [(u64, u64); 4] {
 
 #[test]
 fn riscv64_relocator_applies_load_bias_plus_explicit_addend() {
-    let bytes = image_with_dynamic_entries(&rela_dynamic_entries(), 3);
+    let bytes = image_with_dynamic_relocation(&rela_dynamic_entries(), 0x3200, 3, 0x1020);
     let planned = planned_image(&bytes, ExpectedElfType::Dyn);
     let allocation_id = AllocationId::new(17);
     let mut memory = FakeMemory::returning(ImageAllocation::new(
@@ -1506,7 +1968,7 @@ fn riscv64_relocator_applies_load_bias_plus_explicit_addend() {
             .copy_and_zero(reserved, &mut transaction)
             .unwrap();
         let runtime = mapped
-            .decode_runtime(&mut transaction, RuntimeFeaturePolicy::Phase0)
+            .decode_runtime(&mut transaction, &Phase0ArtifactPolicy)
             .unwrap();
         let relocated = runtime
             .relocate(&mut transaction, &Riscv64Relocator)
@@ -1518,9 +1980,108 @@ fn riscv64_relocator_applies_load_bias_plus_explicit_addend() {
 
     assert_eq!(
         u64::from_le_bytes(memory.bytes[0x2200..0x2208].try_into().unwrap()),
-        0x6fe0
+        0x8020
     );
     assert!(memory.releases.is_empty());
+}
+
+#[test]
+fn riscv64_relocator_rejects_out_of_image_values_and_duplicate_targets_before_writing() {
+    let duplicate_entries = [
+        (DT_RELA, 0x3100),
+        (DT_RELASZ, 48),
+        (DT_RELAENT, 24),
+        (DT_NULL, 0),
+    ];
+    let duplicate = ElfFixtureBuilder::elf64(EM_RISCV, ET_DYN)
+        .set_entry(0x1000)
+        .add_program_header(PT_LOAD, 0x1000, 0x1000, 0x100, 0x100, PF_R | PF_X, 0x1000)
+        .add_program_header(PT_LOAD, 0x2000, 0x3000, 0x130, 0x300, PF_R | PF_W, 0x1000)
+        .add_program_header(
+            PT_DYNAMIC,
+            0x2000,
+            0x3000,
+            (duplicate_entries.len() * 16) as u64,
+            (duplicate_entries.len() * 16) as u64,
+            PF_R | PF_W,
+            8,
+        )
+        .write_dynamic(0x2000, &duplicate_entries)
+        .write_rela64(0x2100, &[(0x3200, 3, 0x1020), (0x3200, 3, 0x1030)])
+        .build();
+    let outside = image_with_dynamic_entries(&rela_dynamic_entries(), 3);
+
+    for (index, (bytes, expected_kind)) in [
+        (outside, LoadErrorKind::OutOfBounds),
+        (duplicate, LoadErrorKind::BadElf),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let planned = planned_image(&bytes, ExpectedElfType::Dyn);
+        let mut memory = FakeMemory::returning(ImageAllocation::new(
+            AllocationId::new(300 + index as u32),
+            TargetAddr::new(0x8000),
+            0x3000,
+            0x1000,
+            AllocationOwnership::Owned,
+        ));
+        let mut transaction = ImageLoadTransaction::new(&mut memory);
+        let reserved = ImageLoader::new()
+            .reserve(planned, &mut transaction)
+            .unwrap();
+        let mapped = ImageLoader::new()
+            .copy_and_zero(reserved, &mut transaction)
+            .unwrap();
+        let runtime = mapped
+            .decode_runtime(&mut transaction, &Phase0ArtifactPolicy)
+            .unwrap();
+        assert_eq!(
+            runtime
+                .relocate(&mut transaction, &Riscv64Relocator)
+                .unwrap_err()
+                .kind(),
+            expected_kind
+        );
+        transaction.disarm_for_test();
+        assert_eq!(memory.writes.len(), 2);
+    }
+}
+
+#[test]
+fn relocation_operation_byte_budget_is_checked_before_planning_writes() {
+    let bytes = image_with_dynamic_relocation(&rela_dynamic_entries(), 0x3200, 3, 0x1020);
+    let request = ArtifactRequest::new(
+        ExpectedElfType::Dyn,
+        ArtifactProfile::new(ElfClass::Elf64, Endian::Little, EM_RISCV),
+        LoadLimits::default().with_runtime_memory_limits(u64::MAX, 0),
+    );
+    let loader = ImageLoader::new();
+    let admitted = loader.admit(SliceElfReader::new(&bytes), request).unwrap();
+    let planned = loader.plan(admitted).unwrap();
+    let mut memory = FakeMemory::returning(ImageAllocation::new(
+        AllocationId::new(302),
+        TargetAddr::new(0x8000),
+        0x3000,
+        0x1000,
+        AllocationOwnership::Owned,
+    ));
+    let mut transaction = ImageLoadTransaction::new(&mut memory);
+    let reserved = loader.reserve(planned, &mut transaction).unwrap();
+    let mapped = loader.copy_and_zero(reserved, &mut transaction).unwrap();
+    let runtime = mapped
+        .decode_runtime(&mut transaction, &Phase0ArtifactPolicy)
+        .unwrap();
+
+    assert_eq!(
+        runtime
+            .relocate(&mut transaction, &Riscv64Relocator)
+            .unwrap_err()
+            .kind(),
+        LoadErrorKind::ResourceLimit
+    );
+    transaction.disarm_for_test();
+    assert_eq!(memory.writes.len(), 2);
 }
 
 #[test]
@@ -1545,7 +2106,7 @@ fn riscv64_relocator_rejects_unknown_types_before_writing() {
             .copy_and_zero(reserved, &mut transaction)
             .unwrap();
         let runtime = mapped
-            .decode_runtime(&mut transaction, RuntimeFeaturePolicy::Phase0)
+            .decode_runtime(&mut transaction, &Phase0ArtifactPolicy)
             .unwrap();
         let error = runtime
             .relocate(&mut transaction, &Riscv64Relocator)
@@ -1581,7 +2142,7 @@ fn riscv64_relocator_checks_target_alignment_permissions_and_overflow() {
             .copy_and_zero(reserved, &mut transaction)
             .unwrap();
         let runtime = mapped
-            .decode_runtime(&mut transaction, RuntimeFeaturePolicy::Phase0)
+            .decode_runtime(&mut transaction, &Phase0ArtifactPolicy)
             .unwrap();
         let error = runtime
             .relocate(&mut transaction, &Riscv64Relocator)
@@ -1602,6 +2163,7 @@ fn arm32_rel_image_at(implicit_addend: u32, target: u32) -> std::vec::Vec<u8> {
         (DT_NULL, 0),
     ];
     ElfFixtureBuilder::elf32(EM_ARM, ET_DYN)
+        .set_flags(0x0500_0200)
         .set_entry(0x1001)
         .add_program_header(PT_LOAD, 0x1000, 0x1000, 0x100, 0x100, PF_R | PF_X, 0x1000)
         .add_program_header(PT_LOAD, 0x2000, 0x3000, 0x204, 0x300, PF_R | PF_W, 0x1000)
@@ -1623,7 +2185,7 @@ fn arm32_rel_image_at(implicit_addend: u32, target: u32) -> std::vec::Vec<u8> {
 fn planned_arm32<'a>(bytes: &'a [u8]) -> PlannedArtifact<SliceElfReader<'a>> {
     let request = ArtifactRequest::new(
         ExpectedElfType::Dyn,
-        ArtifactProfile::new(ElfClass::Elf32, Endian::Little, EM_ARM),
+        ArtifactProfile::arm_thumb_v7m_soft(),
         LoadLimits::default(),
     );
     let loader = ImageLoader::new();
@@ -1655,7 +2217,7 @@ fn arm_relocator_applies_load_bias_to_an_implicit_rel_addend() {
         assert_eq!(mapped.entry().get(), 0x8001);
         assert_eq!(mapped.canonical_entry().get(), 0x8000);
         let runtime = mapped
-            .decode_runtime(&mut transaction, RuntimeFeaturePolicy::Phase0)
+            .decode_runtime(&mut transaction, &Phase0ArtifactPolicy)
             .unwrap();
         assert_eq!(
             runtime.metadata().relocations()[0].addend(),
@@ -1683,6 +2245,7 @@ fn arm_relocator_rejects_symbol_relocations_before_writing() {
             (DT_NULL, 0),
         ];
         let bytes = ElfFixtureBuilder::elf32(EM_ARM, ET_DYN)
+            .set_flags(0x0500_0200)
             .set_entry(0x1001)
             .add_program_header(PT_LOAD, 0x1000, 0x1000, 0x100, 0x100, PF_R | PF_X, 0x1000)
             .add_program_header(PT_LOAD, 0x2000, 0x3000, 0x204, 0x300, PF_R | PF_W, 0x1000)
@@ -1718,7 +2281,7 @@ fn arm_relocator_rejects_symbol_relocations_before_writing() {
                 .copy_and_zero(reserved, &mut transaction)
                 .unwrap();
             let runtime = mapped
-                .decode_runtime(&mut transaction, RuntimeFeaturePolicy::Phase0)
+                .decode_runtime(&mut transaction, &Phase0ArtifactPolicy)
                 .unwrap();
             let error = runtime
                 .relocate(&mut transaction, &ArmRelocator)
@@ -1776,7 +2339,7 @@ fn arm_relocator_rejects_a_32_bit_relative_result_overflow() {
         .copy_and_zero(reserved, &mut transaction)
         .unwrap();
     let runtime = mapped
-        .decode_runtime(&mut transaction, RuntimeFeaturePolicy::Phase0)
+        .decode_runtime(&mut transaction, &Phase0ArtifactPolicy)
         .unwrap();
 
     let error = runtime
@@ -1809,7 +2372,7 @@ fn arm_relocator_rejects_unaligned_and_read_only_targets() {
             .copy_and_zero(reserved, &mut transaction)
             .unwrap();
         let runtime = mapped
-            .decode_runtime(&mut transaction, RuntimeFeaturePolicy::Phase0)
+            .decode_runtime(&mut transaction, &Phase0ArtifactPolicy)
             .unwrap();
         assert_eq!(
             runtime
@@ -1825,11 +2388,34 @@ fn arm_relocator_rejects_unaligned_and_read_only_targets() {
 struct FakeCodeCache {
     ranges: std::vec::Vec<crate::TargetRange>,
     fail: bool,
+    scope: Option<crate::ExecutionScope>,
+    maintenance: Option<crate::CacheMaintenance>,
 }
 
 impl CodeCache for FakeCodeCache {
-    fn synchronize(&mut self, runtime_range: crate::TargetRange) -> LoadResult<()> {
+    fn prepare(
+        &self,
+        executable_ranges: &[crate::TargetRange],
+    ) -> LoadResult<crate::PreparedCacheSync> {
+        crate::PreparedCacheSync::try_new(
+            executable_ranges,
+            self.scope
+                .unwrap_or(crate::ExecutionScope::CurrentExecutionContext),
+            self.maintenance
+                .unwrap_or(crate::CacheMaintenance::InstructionFence),
+        )
+    }
+
+    fn synchronize(
+        &mut self,
+        prepared: crate::PreparedCacheSync,
+    ) -> LoadResult<crate::CacheSyncOutcome> {
         if self.fail {
+            let runtime_range = prepared
+                .executable_ranges()
+                .first()
+                .copied()
+                .unwrap_or(crate::TargetRange::new(TargetAddr::new(0), 0));
             return Err(LoadError::new(
                 LoadStage::Cache,
                 LoadErrorKind::Backend,
@@ -1839,8 +2425,8 @@ impl CodeCache for FakeCodeCache {
                 },
             ));
         }
-        self.ranges.push(runtime_range);
-        Ok(())
+        self.ranges.extend_from_slice(prepared.executable_ranges());
+        Ok(prepared.complete())
     }
 }
 
@@ -1887,7 +2473,7 @@ fn seal_synchronizes_code_applies_relro_and_commits_the_transaction() {
         .copy_and_zero(reserved, &mut transaction)
         .unwrap();
     let runtime = mapped
-        .decode_runtime(&mut transaction, RuntimeFeaturePolicy::Phase0)
+        .decode_runtime(&mut transaction, &Phase0ArtifactPolicy)
         .unwrap();
     let relocated = runtime
         .relocate(&mut transaction, &Riscv64Relocator)
@@ -1897,6 +2483,27 @@ fn seal_synchronizes_code_applies_relro_and_commits_the_transaction() {
     assert_eq!(sealed.entry().get(), 0x8000);
     assert_eq!(sealed.protection(), ProtectionLevel::LogicalOnly);
     assert_eq!(sealed.seal_plan().ranges().len(), 6);
+    assert_eq!(sealed.protections().ranges().len(), 6);
+    for (requested, applied) in sealed
+        .seal_plan()
+        .ranges()
+        .iter()
+        .zip(sealed.protections().ranges())
+    {
+        assert_eq!(applied.requested_range(), requested.runtime_range());
+        assert_eq!(applied.applied_range(), requested.runtime_range());
+        assert_eq!(applied.requested(), requested.permissions());
+        assert_eq!(applied.applied(), requested.permissions());
+        assert_eq!(applied.level(), ProtectionLevel::LogicalOnly);
+    }
+    assert_eq!(
+        sealed.cache_sync().scope(),
+        crate::ExecutionScope::CurrentExecutionContext
+    );
+    assert_eq!(
+        sealed.cache_sync().maintenance(),
+        crate::CacheMaintenance::InstructionFence
+    );
     assert_eq!(
         cache.ranges,
         [crate::TargetRange::new(TargetAddr::new(0x8000), 0x100)]
@@ -1920,7 +2527,7 @@ fn seal_synchronizes_code_applies_relro_and_commits_the_transaction() {
         MemoryPermissions::NONE
     );
     assert_eq!(sealed.seal_plan().ranges()[5].runtime_range().len(), 0xd00);
-    transaction.commit_for(&sealed).unwrap();
+    transaction.disarm_for_test();
 
     assert_eq!(memory.protects.len(), 6);
     assert!(memory.releases.is_empty());
@@ -1951,7 +2558,7 @@ fn seal_merges_adjacent_ranges_with_identical_permissions() {
         .copy_and_zero(reserved, &mut transaction)
         .unwrap();
     let runtime = mapped
-        .decode_runtime(&mut transaction, RuntimeFeaturePolicy::Phase0)
+        .decode_runtime(&mut transaction, &Phase0ArtifactPolicy)
         .unwrap();
     let relocated = runtime
         .relocate(&mut transaction, &Riscv64Relocator)
@@ -1964,7 +2571,7 @@ fn seal_merges_adjacent_ranges_with_identical_permissions() {
         cache.ranges,
         [sealed.seal_plan().ranges()[0].runtime_range()]
     );
-    transaction.commit_for(&sealed).unwrap();
+    transaction.disarm_for_test();
 }
 
 #[test]
@@ -1982,6 +2589,7 @@ fn cache_failure_prevents_protection_and_rolls_back() {
     let mut cache = FakeCodeCache {
         ranges: std::vec::Vec::new(),
         fail: true,
+        ..FakeCodeCache::default()
     };
 
     {
@@ -1993,7 +2601,7 @@ fn cache_failure_prevents_protection_and_rolls_back() {
             .copy_and_zero(reserved, &mut transaction)
             .unwrap();
         let runtime = mapped
-            .decode_runtime(&mut transaction, RuntimeFeaturePolicy::Phase0)
+            .decode_runtime(&mut transaction, &Phase0ArtifactPolicy)
             .unwrap();
         let relocated = runtime
             .relocate(&mut transaction, &Riscv64Relocator)
@@ -2004,6 +2612,146 @@ fn cache_failure_prevents_protection_and_rolls_back() {
 
     assert!(memory.protects.is_empty());
     assert_eq!(memory.releases, [allocation_id]);
+}
+
+#[test]
+fn cache_requirements_reject_insufficient_scope_and_wrong_maintenance_before_sync() {
+    let bytes = riscv_image_with_relro();
+    let requirements = [
+        crate::CacheRequirements::exact(
+            crate::ExecutionScope::AllExecutionContexts,
+            crate::CacheMaintenance::InstructionFence,
+        ),
+        crate::CacheRequirements::exact(
+            crate::ExecutionScope::CurrentExecutionContext,
+            crate::CacheMaintenance::CleanAndInvalidate,
+        ),
+    ];
+
+    for (index, requirements) in requirements.into_iter().enumerate() {
+        let request = ArtifactRequest::new(
+            ExpectedElfType::Dyn,
+            ArtifactProfile::new(ElfClass::Elf64, Endian::Little, EM_RISCV),
+            LoadLimits::default(),
+        )
+        .with_cache_requirements(requirements);
+        let planned = planned_image_with_request(&bytes, request);
+        let allocation_id = AllocationId::new(310 + index as u32);
+        let mut memory = FakeMemory::returning(ImageAllocation::new(
+            allocation_id,
+            TargetAddr::new(0x8000),
+            0x3000,
+            0x1000,
+            AllocationOwnership::Owned,
+        ));
+        let mut cache = FakeCodeCache::default();
+
+        {
+            let mut transaction = ImageLoadTransaction::new(&mut memory);
+            let reserved = ImageLoader::new()
+                .reserve(planned, &mut transaction)
+                .unwrap();
+            let mapped = ImageLoader::new()
+                .copy_and_zero(reserved, &mut transaction)
+                .unwrap();
+            let runtime = mapped
+                .decode_runtime(&mut transaction, &Phase0ArtifactPolicy)
+                .unwrap();
+            let relocated = runtime
+                .relocate(&mut transaction, &Riscv64Relocator)
+                .unwrap();
+            let error = relocated.seal(&mut transaction, &mut cache).unwrap_err();
+            assert_eq!(error.stage(), LoadStage::Cache);
+            assert_eq!(error.kind(), LoadErrorKind::UnsupportedByProfile);
+        }
+
+        assert!(cache.ranges.is_empty());
+        assert!(memory.protects.is_empty());
+        assert_eq!(memory.releases, [allocation_id]);
+        assert_eq!(memory.abort_progress, [MutationProgress::BytesModified]);
+    }
+}
+
+#[test]
+fn protection_batch_rejects_granule_conflicts_and_region_shortage_before_cache_side_effects() {
+    let bytes = riscv_image_with_relro();
+    for (index, granule, max_ranges, expected_kind) in [
+        (0, 0x1000, usize::MAX, LoadErrorKind::PermissionConflict),
+        (1, 1, 5, LoadErrorKind::Backend),
+    ] {
+        let planned = planned_image(&bytes, ExpectedElfType::Dyn);
+        let allocation_id = AllocationId::new(305 + index);
+        let mut memory = FakeMemory::returning(ImageAllocation::new(
+            allocation_id,
+            TargetAddr::new(0x8000),
+            0x3000,
+            0x1000,
+            AllocationOwnership::Owned,
+        ));
+        memory.protection_granule = granule;
+        memory.max_protection_ranges = max_ranges;
+        let mut cache = FakeCodeCache::default();
+
+        {
+            let mut transaction = ImageLoadTransaction::new(&mut memory);
+            let reserved = ImageLoader::new()
+                .reserve(planned, &mut transaction)
+                .unwrap();
+            let mapped = ImageLoader::new()
+                .copy_and_zero(reserved, &mut transaction)
+                .unwrap();
+            let runtime = mapped
+                .decode_runtime(&mut transaction, &Phase0ArtifactPolicy)
+                .unwrap();
+            let relocated = runtime
+                .relocate(&mut transaction, &Riscv64Relocator)
+                .unwrap();
+            assert_eq!(
+                relocated
+                    .seal(&mut transaction, &mut cache)
+                    .unwrap_err()
+                    .kind(),
+                expected_kind
+            );
+        }
+
+        assert!(cache.ranges.is_empty());
+        assert!(memory.protects.is_empty());
+        assert_eq!(memory.releases, [allocation_id]);
+        assert_eq!(memory.abort_progress, [MutationProgress::BytesModified]);
+    }
+}
+
+#[test]
+fn protection_alias_conflict_fails_before_cache_and_protection_side_effects() {
+    let bytes = riscv_image_with_relro();
+    let allocation_id = AllocationId::new(312);
+    let mut memory = FakeMemory::returning(ImageAllocation::new(
+        allocation_id,
+        TargetAddr::new(0x8000),
+        0x3000,
+        0x1000,
+        AllocationOwnership::Owned,
+    ));
+    memory.fail_alias_preflight = true;
+    let mut cache = FakeCodeCache::default();
+
+    let error = crate::prepare_image(
+        SliceElfReader::new(&bytes),
+        riscv64_request(),
+        &mut memory,
+        &mut cache,
+        &Phase0ArtifactPolicy,
+        &Riscv64Relocator,
+    )
+    .unwrap_err();
+
+    assert_eq!(error.stage(), LoadStage::Seal);
+    assert_eq!(error.kind(), LoadErrorKind::PermissionConflict);
+    assert!(cache.ranges.is_empty());
+    assert!(memory.protects.is_empty());
+    assert_eq!(memory.releases, [allocation_id]);
+    assert_eq!(memory.abort_progress, [MutationProgress::BytesModified]);
 }
 
 #[test]
@@ -2031,7 +2779,7 @@ fn protection_failure_rolls_back_the_owned_allocation() {
                 .copy_and_zero(reserved, &mut transaction)
                 .unwrap();
             let runtime = mapped
-                .decode_runtime(&mut transaction, RuntimeFeaturePolicy::Phase0)
+                .decode_runtime(&mut transaction, &Phase0ArtifactPolicy)
                 .unwrap();
             let relocated = runtime
                 .relocate(&mut transaction, &Riscv64Relocator)
@@ -2041,7 +2789,48 @@ fn protection_failure_rolls_back_the_owned_allocation() {
 
         assert_eq!(memory.protects.len(), failure_call);
         assert_eq!(memory.releases, [allocation_id]);
+        assert_eq!(
+            memory.abort_progress,
+            [MutationProgress::ProtectionModified]
+        );
     }
+}
+
+#[test]
+fn partial_protection_apply_poisons_a_fixed_image() {
+    let (bytes, _) = image_with_bss_and_gap(ET_EXEC);
+    let allocation_id = AllocationId::new(307);
+    let mut memory = FakeMemory::returning(ImageAllocation::new(
+        allocation_id,
+        TargetAddr::new(0x1000),
+        0x3000,
+        0x1000,
+        AllocationOwnership::BorrowedFixed,
+    ));
+    memory.fail_protect_at = Some(1);
+    let mut cache = FakeCodeCache::default();
+    let request = ArtifactRequest::new(
+        ExpectedElfType::Exec,
+        ArtifactProfile::new(ElfClass::Elf64, Endian::Little, EM_RISCV),
+        LoadLimits::default(),
+    );
+
+    assert!(crate::load_image(
+        SliceElfReader::new(&bytes),
+        request,
+        &mut memory,
+        &mut cache,
+        &Phase0ArtifactPolicy,
+        &Riscv64Relocator,
+    )
+    .is_err());
+    assert_eq!(memory.protects.len(), 1);
+    assert_eq!(memory.releases, [allocation_id]);
+    assert_eq!(
+        memory.abort_progress,
+        [MutationProgress::ProtectionModified]
+    );
+    assert!(memory.fixed_poisoned);
 }
 
 #[test]
@@ -2059,15 +2848,16 @@ fn runtime_reads_and_relocation_write_failures_roll_back() {
         ));
         memory.fail_read_at = Some(failure_call);
         let mut cache = FakeCodeCache::default();
-        assert!(crate::load_image(
+        let error = crate::load_image(
             SliceElfReader::new(&bytes),
             riscv64_request(),
             &mut memory,
             &mut cache,
-            RuntimeFeaturePolicy::Phase0,
+            &Phase0ArtifactPolicy,
             &Riscv64Relocator,
         )
-        .is_err());
+        .unwrap_err();
+        assert_eq!(error.stage(), LoadStage::Metadata);
         assert_eq!(memory.reads.borrow().len(), failure_call);
         assert_eq!(memory.releases, [allocation_id]);
     }
@@ -2083,15 +2873,16 @@ fn runtime_reads_and_relocation_write_failures_roll_back() {
     // The two segment-copy writes succeed; the relocation write fails.
     memory.fail_write_at = Some(2);
     let mut cache = FakeCodeCache::default();
-    assert!(crate::load_image(
+    let error = crate::load_image(
         SliceElfReader::new(&bytes),
         riscv64_request(),
         &mut memory,
         &mut cache,
-        RuntimeFeaturePolicy::Phase0,
+        &Phase0ArtifactPolicy,
         &Riscv64Relocator,
     )
-    .is_err());
+    .unwrap_err();
+    assert_eq!(error.stage(), LoadStage::Relocate);
     assert_eq!(memory.writes.len(), 2);
     assert_eq!(memory.releases, [allocation_id]);
 }
@@ -2109,19 +2900,87 @@ fn load_image_orchestrates_and_commits_the_phase0_pipeline() {
     ));
     let mut cache = FakeCodeCache::default();
 
-    let sealed = crate::load_image(
+    let receipt = crate::load_image(
         SliceElfReader::new(&bytes),
         request,
         &mut memory,
         &mut cache,
-        RuntimeFeaturePolicy::Phase0,
+        &Phase0ArtifactPolicy,
         &Riscv64Relocator,
     )
     .unwrap();
 
-    assert_eq!(sealed.entry().get(), 0x8000);
-    assert_eq!(sealed.metadata().relocations().len(), 1);
+    assert_eq!(receipt.entry.get(), 0x8000);
+    assert_eq!(receipt.relocation_count, 1);
     assert!(memory.releases.is_empty());
+    assert!(memory.installed_lease.is_some());
+}
+
+#[test]
+fn dropping_a_prepared_image_aborts_the_same_lease_once() {
+    let bytes = riscv_image_with_relro();
+    let allocation_id = AllocationId::new(28);
+    let mut memory = FakeMemory::returning(ImageAllocation::new(
+        allocation_id,
+        TargetAddr::new(0x8000),
+        0x3000,
+        0x1000,
+        AllocationOwnership::Owned,
+    ));
+    let mut cache = FakeCodeCache::default();
+
+    {
+        let prepared = crate::prepare_image(
+            SliceElfReader::new(&bytes),
+            riscv64_request(),
+            &mut memory,
+            &mut cache,
+            &Phase0ArtifactPolicy,
+            &Riscv64Relocator,
+        )
+        .unwrap();
+        drop(prepared);
+    }
+
+    assert_eq!(memory.releases, [allocation_id]);
+    assert_eq!(
+        memory.abort_progress,
+        [MutationProgress::ProtectionModified]
+    );
+    assert!(memory.installed_lease.is_none());
+}
+
+#[test]
+fn prepare_install_failure_keeps_rollback_armed() {
+    let bytes = riscv_image_with_relro();
+    let allocation_id = AllocationId::new(29);
+    let mut memory = FakeMemory::returning(ImageAllocation::new(
+        allocation_id,
+        TargetAddr::new(0x8000),
+        0x3000,
+        0x1000,
+        AllocationOwnership::Owned,
+    ));
+    memory.fail_prepare_install = true;
+    let mut cache = FakeCodeCache::default();
+
+    let error = crate::load_image(
+        SliceElfReader::new(&bytes),
+        riscv64_request(),
+        &mut memory,
+        &mut cache,
+        &Phase0ArtifactPolicy,
+        &Riscv64Relocator,
+    )
+    .unwrap_err();
+
+    assert_eq!(error.kind(), LoadErrorKind::Backend);
+    assert_eq!(memory.releases, [allocation_id]);
+    assert_eq!(
+        memory.abort_progress,
+        [MutationProgress::ProtectionModified]
+    );
+    assert!(memory.installed_lease.is_none());
 }
 
 #[test]
@@ -2143,7 +3002,7 @@ fn load_image_rolls_back_when_the_phase0_policy_rejects_a_dependency() {
         riscv64_request(),
         &mut memory,
         &mut cache,
-        RuntimeFeaturePolicy::Phase0,
+        &Phase0ArtifactPolicy,
         &Riscv64Relocator,
     )
     .unwrap_err();

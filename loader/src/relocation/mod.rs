@@ -19,8 +19,8 @@ use alloc::vec::Vec;
 
 use crate::{
     ElfClass, Endian, ErrorContext, ImageLoadTransaction, ImageMemory, LoadError, LoadErrorKind,
-    LoadResult, LoadStage, MappedImage, MemoryPermissions, RelocationAddend, RelocationRecord,
-    RuntimeImage, RuntimeImageMetadata, TargetLocation,
+    LoadResult, LoadStage, MappedState, MemoryPermissions, RelocationAddend, RelocationRecord,
+    RuntimeImageMetadata, RuntimeState, StagedImage, TargetLocation,
 };
 
 pub use arm::ArmRelocator;
@@ -88,7 +88,9 @@ impl TargetWord {
     pub fn read<M: ImageMemory>(self, memory: &M, location: TargetLocation) -> LoadResult<u64> {
         let mut bytes = [0; 8];
         let len = self.width.bytes() as usize;
-        memory.read(location, &mut bytes[..len])?;
+        memory
+            .read(location, &mut bytes[..len])
+            .map_err(|error| error.with_stage(LoadStage::Relocate))?;
         Ok(match (self.width, self.endian) {
             (WordWidth::U32, Endian::Little) => {
                 u64::from(u32::from_le_bytes(bytes[..4].try_into().unwrap()))
@@ -130,18 +132,33 @@ impl TargetWord {
             (WordWidth::U64, Endian::Little) => bytes.copy_from_slice(&value.to_le_bytes()),
             (WordWidth::U64, Endian::Big) => bytes.copy_from_slice(&value.to_be_bytes()),
         }
-        memory.write(location, &bytes[..len])
+        memory
+            .write(location, &bytes[..len])
+            .map_err(|error| error.with_stage(LoadStage::Relocate))
     }
 }
 
 #[derive(Debug)]
-pub struct RelocatedImage {
-    mapped: MappedImage,
+pub struct RelocatedState {
+    mapped: MappedState,
     metadata: RuntimeImageMetadata,
 }
 
-impl RelocatedImage {
-    pub const fn mapped(&self) -> &MappedImage {
+pub type RelocatedImage<'a, M> = StagedImage<'a, M, RelocatedState>;
+
+impl<'a, M: ImageMemory> StagedImage<'a, M, RuntimeState> {
+    pub fn relocate<A>(self, relocator: &A) -> LoadResult<RelocatedImage<'a, M>>
+    where
+        A: ArchRelocator + ?Sized,
+    {
+        let (mut transaction, runtime) = self.into_parts();
+        let relocated = runtime.relocate(&mut transaction, relocator)?;
+        Ok(StagedImage::new(transaction, relocated))
+    }
+}
+
+impl RelocatedState {
+    pub const fn mapped(&self) -> &MappedState {
         &self.mapped
     }
 
@@ -149,17 +166,17 @@ impl RelocatedImage {
         &self.metadata
     }
 
-    pub(crate) fn into_parts(self) -> (MappedImage, RuntimeImageMetadata) {
+    pub(crate) fn into_parts(self) -> (MappedState, RuntimeImageMetadata) {
         (self.mapped, self.metadata)
     }
 }
 
-impl RuntimeImage {
-    pub fn relocate<M, A>(
+impl RuntimeState {
+    pub(crate) fn relocate<M, A>(
         self,
         transaction: &mut ImageLoadTransaction<'_, M>,
         relocator: &A,
-    ) -> LoadResult<RelocatedImage>
+    ) -> LoadResult<RelocatedState>
     where
         M: ImageMemory,
         A: ArchRelocator + ?Sized,
@@ -169,6 +186,16 @@ impl RuntimeImage {
         let target_word =
             TargetWord::new(relocator.word_width(), mapped.request().profile().endian());
         let mut operations = Vec::new();
+        let operation_bytes = metadata
+            .relocations()
+            .len()
+            .checked_mul(core::mem::size_of::<RelocationOperation>())
+            .and_then(|bytes| u64::try_from(bytes).ok())
+            .unwrap_or(u64::MAX);
+        mapped
+            .request()
+            .limits()
+            .check_relocation_operation_bytes(operation_bytes)?;
         operations
             .try_reserve_exact(metadata.relocations().len())
             .map_err(|_| {
@@ -188,11 +215,22 @@ impl RuntimeImage {
                 transaction.memory(),
             )?);
         }
+        operations.sort_unstable_by_key(|operation| operation.location.offset());
+        for pair in operations.windows(2) {
+            let end = pair[0]
+                .location
+                .offset()
+                .checked_add(target_word.width().bytes())
+                .ok_or_else(|| relocation_error(pair[0].record, LoadErrorKind::IntegerOverflow))?;
+            if pair[1].location.offset() < end {
+                return Err(relocation_error(pair[1].record, LoadErrorKind::BadElf));
+            }
+        }
         for operation in operations {
             target_word.write(transaction.memory(), operation.location, operation.value)?;
         }
 
-        Ok(RelocatedImage { mapped, metadata })
+        Ok(RelocatedState { mapped, metadata })
     }
 }
 
@@ -200,10 +238,11 @@ impl RuntimeImage {
 struct RelocationOperation {
     location: TargetLocation,
     value: u64,
+    record: RelocationRecord,
 }
 
 fn validate_relocator<A: ArchRelocator + ?Sized>(
-    mapped: &MappedImage,
+    mapped: &MappedState,
     relocator: &A,
 ) -> LoadResult<()> {
     let profile = mapped.request().profile();
@@ -229,7 +268,7 @@ fn validate_relocator<A: ArchRelocator + ?Sized>(
 }
 
 fn preflight_relative<M, A>(
-    mapped: &MappedImage,
+    mapped: &MappedState,
     record: RelocationRecord,
     relocator: &A,
     target_word: TargetWord,
@@ -263,14 +302,37 @@ where
         .checked_add(addend)
         .filter(|value| *value >= 0 && *value <= i128::from(target_word.width.maximum()))
         .ok_or_else(|| relocation_error(record, LoadErrorKind::IntegerOverflow))?;
+    let value = result as u64;
+    validate_relative_value(mapped, record, value)?;
     Ok(RelocationOperation {
         location,
-        value: result as u64,
+        value,
+        record,
     })
 }
 
+fn validate_relative_value(
+    mapped: &MappedState,
+    record: RelocationRecord,
+    value: u64,
+) -> LoadResult<()> {
+    let base = mapped.allocation().target_base().get();
+    let end = base
+        .checked_add(mapped.image_span())
+        .ok_or_else(|| relocation_error(record, LoadErrorKind::IntegerOverflow))?;
+    let policy = mapped.request().profile().relative_value_policy();
+    let in_image = value >= base && value < end;
+    let allowed_exception =
+        (value == 0 && policy.allows_null()) || (value == end && policy.allows_one_past());
+    if in_image || allowed_exception {
+        Ok(())
+    } else {
+        Err(relocation_error(record, LoadErrorKind::OutOfBounds))
+    }
+}
+
 fn checked_target<M: ImageMemory>(
-    mapped: &MappedImage,
+    mapped: &MappedState,
     record: RelocationRecord,
     target_word: TargetWord,
     memory: &M,

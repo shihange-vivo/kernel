@@ -12,7 +12,38 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::{ErrorContext, LoadError, LoadErrorKind, LoadResult, LoadStage};
+use crate::{ErrorContext, LoadError, LoadErrorKind, LoadStage};
+
+pub type RangeResult<T> = core::result::Result<T, RangeError>;
+
+/// An address or range failure before a pipeline stage has claimed it.
+///
+/// Low-level checked arithmetic is shared by admission, mapping, relocation,
+/// cache maintenance and sealing. Keeping it stage-neutral lets the caller
+/// report the stage that actually consumed the untrusted value.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct RangeError {
+    kind: LoadErrorKind,
+    context: ErrorContext,
+}
+
+impl RangeError {
+    pub const fn new(kind: LoadErrorKind, context: ErrorContext) -> Self {
+        Self { kind, context }
+    }
+
+    pub const fn at(self, stage: LoadStage) -> LoadError {
+        LoadError::new(stage, self.kind, self.context)
+    }
+
+    pub const fn kind(&self) -> LoadErrorKind {
+        self.kind
+    }
+
+    pub const fn context(&self) -> &ErrorContext {
+        &self.context
+    }
+}
 
 #[repr(transparent)]
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
@@ -27,10 +58,9 @@ impl TargetAddr {
         self.0
     }
 
-    pub fn checked_add(self, value: u64) -> LoadResult<Self> {
+    pub fn checked_add(self, value: u64) -> RangeResult<Self> {
         self.0.checked_add(value).map(Self).ok_or_else(|| {
-            LoadError::new(
-                LoadStage::Validate,
+            RangeError::new(
                 LoadErrorKind::IntegerOverflow,
                 ErrorContext::TargetRange {
                     start: self,
@@ -40,10 +70,9 @@ impl TargetAddr {
         })
     }
 
-    pub fn checked_sub(self, other: Self) -> LoadResult<u64> {
+    pub fn checked_sub(self, other: Self) -> RangeResult<u64> {
         self.0.checked_sub(other.0).ok_or_else(|| {
-            LoadError::new(
-                LoadStage::Validate,
+            RangeError::new(
                 LoadErrorKind::IntegerOverflow,
                 ErrorContext::TargetRange {
                     start: other,
@@ -53,19 +82,19 @@ impl TargetAddr {
         })
     }
 
-    pub fn align_down(self, align: u64) -> LoadResult<Self> {
+    pub fn align_down(self, align: u64) -> RangeResult<Self> {
         validate_alignment(align)?;
         Ok(Self(self.0 & !(align - 1)))
     }
 
-    pub fn align_up(self, align: u64) -> LoadResult<Self> {
+    pub fn align_up(self, align: u64) -> RangeResult<Self> {
         validate_alignment(align)?;
         let mask = align - 1;
         Ok(Self(self.checked_add(mask)?.0 & !mask))
     }
 }
 
-fn validate_alignment(align: u64) -> LoadResult<()> {
+fn validate_alignment(align: u64) -> RangeResult<()> {
     if align.is_power_of_two() {
         Ok(())
     } else {
@@ -73,9 +102,8 @@ fn validate_alignment(align: u64) -> LoadResult<()> {
     }
 }
 
-fn alignment_error(value: u64, align: u64) -> LoadError {
-    LoadError::new(
-        LoadStage::Plan,
+fn alignment_error(value: u64, align: u64) -> RangeError {
+    RangeError::new(
         LoadErrorKind::InvalidAlignment,
         ErrorContext::TargetRange {
             start: TargetAddr::new(value),
@@ -107,7 +135,7 @@ impl TargetRange {
         self.len == 0
     }
 
-    pub fn end(self) -> LoadResult<TargetAddr> {
+    pub fn end(self) -> RangeResult<TargetAddr> {
         self.start.checked_add(self.len)
     }
 
@@ -155,10 +183,9 @@ impl FileRange {
         self.len == 0
     }
 
-    pub fn end(self) -> LoadResult<u64> {
+    pub fn end(self) -> RangeResult<u64> {
         self.offset.checked_add(self.len).ok_or_else(|| {
-            LoadError::new(
-                LoadStage::Validate,
+            RangeError::new(
                 LoadErrorKind::IntegerOverflow,
                 ErrorContext::FileRange {
                     offset: self.offset,
@@ -169,12 +196,11 @@ impl FileRange {
         })
     }
 
-    pub fn validate(self, file_len: u64) -> LoadResult<()> {
+    pub fn validate(self, file_len: u64) -> RangeResult<()> {
         if self.end()? <= file_len {
             return Ok(());
         }
-        Err(LoadError::new(
-            LoadStage::Validate,
+        Err(RangeError::new(
             LoadErrorKind::OutOfBounds,
             ErrorContext::FileRange {
                 offset: self.offset,
