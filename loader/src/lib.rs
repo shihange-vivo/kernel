@@ -15,6 +15,8 @@
 #![no_std]
 #![feature(c_size_t)]
 
+mod address;
+mod error;
 mod memory_mapper;
 
 use goblin::elf::{
