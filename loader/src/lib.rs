@@ -16,12 +16,14 @@
 #![feature(c_size_t)]
 
 mod memory_mapper;
+
 use goblin::elf::{
     header::{ET_DYN, ET_EXEC},
     reloc::R_RISCV_RELATIVE,
     Elf, Reloc,
 };
 use memory_mapper::MappingModeKind;
+
 pub use memory_mapper::{MemoryMapper, MemoryPermissions, MemoryRegion};
 
 pub type Result = core::result::Result<(), &'static str>;
@@ -119,3 +121,9 @@ pub fn load_elf(buffer: &[u8], mapper: &mut MemoryMapper) -> Result {
         _ => Err("Unsupported ELF type"),
     }
 }
+
+#[cfg(test)]
+extern crate std;
+
+#[cfg(test)]
+mod tests;
