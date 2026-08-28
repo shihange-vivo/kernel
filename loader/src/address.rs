@@ -15,7 +15,7 @@
 use crate::error::{ErrorContext, LoadError, LoadErrorKind, LoadResult};
 
 #[non_exhaustive]
-#[derive(PartialEq, PartialOrd, Clone, Copy, Debug)]
+#[derive(PartialEq, PartialOrd, Clone, Copy, Debug, Eq, Ord)]
 pub(crate) struct TargetAddress(u64);
 
 impl TargetAddress {

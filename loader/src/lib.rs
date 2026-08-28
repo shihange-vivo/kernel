@@ -14,6 +14,7 @@
 
 #![no_std]
 #![feature(c_size_t)]
+#![feature(let_chains)]
 
 extern crate alloc;
 

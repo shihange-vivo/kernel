@@ -22,7 +22,7 @@ use crate::{
     address::{FileRange, TargetAddress, TargetRange},
     elf::{DynamicSegmentInfo, ElfHeaderInfo, LoadSegmentInfo, ProgramHeaderInfo},
     error::{ErrorContext, LoadError, LoadErrorKind, LoadResult, LoadStage, ProgramHeaderField},
-    identity::LoadRequest,
+    identity::{LoadRequest, LOADPOLICY},
     image::inspect::{InspectedImage, StackKind},
     reader::ElfReader,
     MemoryPermissions,
@@ -199,11 +199,62 @@ impl<R: ElfReader> AdmittedImage<R> {
                         .map_err(|e| e.at_stage(LoadStage::Inspect))?;
                     tls = Some(target_range)
                 }
-                _ => {}
+                t => {
+                    if !LOADPOLICY.allow_unknown_program_headers {
+                        return Err(LoadError::new(
+                            LoadErrorKind::UnsupportedByProfile,
+                            ErrorContext::ProgramHeader {
+                                index,
+                                field: ProgramHeaderField::UnknownField,
+                                value: t.into(),
+                            },
+                        )
+                        .at_stage(LoadStage::Inspect));
+                    }
+                }
             }
         }
+        if !LOADPOLICY.allow_executable_stack && stack == StackKind::Executable {
+            return Err(LoadError::new(
+                LoadErrorKind::UnsupportedByProfile,
+                ErrorContext::ProgramHeader {
+                    index: 0,
+                    field: ProgramHeaderField::ExecutableStack,
+                    value: 0,
+                },
+            )
+            .at_stage(LoadStage::Inspect));
+        }
+        if !LOADPOLICY.allow_interpreter
+            && let Some(x) = interpreter
+        {
+            return Err(LoadError::new(
+                LoadErrorKind::UnsupportedByProfile,
+                ErrorContext::ProgramHeader {
+                    index: 0,
+                    field: ProgramHeaderField::UnsupportedInterpreter,
+                    value: 0,
+                },
+            )
+            .at_stage(LoadStage::Inspect));
+        }
+        if !LOADPOLICY.allow_tls
+            && let Some(x) = tls
+        {
+            return Err(LoadError::new(
+                LoadErrorKind::UnsupportedByProfile,
+                ErrorContext::ProgramHeader {
+                    index: 0,
+                    field: ProgramHeaderField::UnsupportedTls,
+                    value: 0,
+                },
+            )
+            .at_stage(LoadStage::Inspect));
+        }
+
         Ok(InspectedImage::new(
             self.reader,
+            self.request,
             self.header,
             load_segments.into_boxed_slice(),
             dynamic,
@@ -229,7 +280,7 @@ fn permissions_from_flags(flags: u32) -> MemoryPermissions {
     permissions
 }
 
-fn program_header_error(index: u16, field: ProgramHeaderField, value: u64) -> LoadError {
+pub(crate) fn program_header_error(index: u16, field: ProgramHeaderField, value: u64) -> LoadError {
     LoadError::new(
         LoadErrorKind::BadElf,
         ErrorContext::ProgramHeader {
