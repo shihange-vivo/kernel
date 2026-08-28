@@ -13,9 +13,13 @@
 // limitations under the License.
 
 mod header;
+mod program_header;
+mod segment;
 
 use goblin::{elf32, elf64};
 pub(crate) use header::ElfHeaderInfo;
+pub(crate) use program_header::ProgramHeaderInfo;
+pub(crate) use segment::{DynamicSegmentInfo, LoadSegmentInfo};
 
 pub(crate) const ELF32_HEADER_SIZE: usize = elf32::header::SIZEOF_EHDR;
 pub(crate) const ELF64_HEADER_SIZE: usize = elf64::header::SIZEOF_EHDR;

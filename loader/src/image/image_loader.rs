@@ -28,34 +28,38 @@ use crate::{
     reader::ElfReader,
 };
 
-pub(crate) struct ImageLoader;
+pub(crate) struct ImageLoader<R: ElfReader> {
+    reader: R,
+    request: LoadRequest,
+}
 
-impl ImageLoader {
+impl<R: ElfReader> ImageLoader<R> {
     #[inline]
-    pub const fn new() -> Self {
-        Self
+    pub const fn new(reader: R, request: LoadRequest) -> Self {
+        Self { reader, request }
     }
 
-    pub fn admit<R: ElfReader>(
-        &self,
-        reader: R,
-        request: LoadRequest,
-    ) -> LoadResult<AdmittedImage<R>> {
-        let file_len = reader.len()?;
-        request.limits().check_file_len(file_len)?;
+    pub fn admit(self) -> LoadResult<AdmittedImage<R>> {
+        let file_len = self.reader.len()?;
+        self.request.limits().check_file_len(file_len)?;
 
         let mut ident = [0; ELF_IDENT_SIZE];
-        reader.read_exact_at(0, &mut ident)?;
+        self.reader.read_exact_at(0, &mut ident)?;
         let (class, endian) = validate_ident(&ident)?;
         let header_size = match class {
             ElfClass::Elf32 => ELF32_HEADER_SIZE,
             ElfClass::Elf64 => ELF64_HEADER_SIZE,
         };
         let mut bytes = [0; ELF64_HEADER_SIZE];
-        reader.read_exact_at(0, &mut bytes[..header_size])?;
+        self.reader.read_exact_at(0, &mut bytes[..header_size])?;
         let header = decode_header(&bytes[..header_size], class, endian)?;
-        validate_header(&header, &request, file_len)?;
-        Ok(AdmittedImage::new(reader, header, request, file_len))
+        validate_header(&header, &self.request, file_len)?;
+        Ok(AdmittedImage::new(
+            self.reader,
+            header,
+            self.request,
+            file_len,
+        ))
     }
 }
 
@@ -195,6 +199,7 @@ fn validate_header(header: &ElfHeaderInfo, request: &LoadRequest, file_len: u64)
     request
         .limits()
         .check_program_header_count(header.program_header_count())?;
+
     let table_len = u64::from(header.program_header_entry_size())
         .checked_mul(u64::from(header.program_header_count()))
         .ok_or_else(|| {

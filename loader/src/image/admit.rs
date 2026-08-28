@@ -12,7 +12,21 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::{elf::ElfHeaderInfo, identity::LoadRequest, reader::ElfReader};
+use alloc::vec::Vec;
+use goblin::{
+    elf::program_header::{PF_R, PF_W, PF_X, PT_DYNAMIC, PT_GNU_RELRO, PT_INTERP, PT_LOAD, PT_TLS},
+    elf64,
+};
+
+use crate::{
+    address::{FileRange, TargetAddress, TargetRange},
+    elf::{DynamicSegmentInfo, ElfHeaderInfo, LoadSegmentInfo, ProgramHeaderInfo},
+    error::{ErrorContext, LoadError, LoadErrorKind, LoadResult, LoadStage, ProgramHeaderField},
+    identity::LoadRequest,
+    image::inspect::{InspectedImage, StackKind},
+    reader::ElfReader,
+    MemoryPermissions,
+};
 
 pub(crate) struct AdmittedImage<R: ElfReader> {
     reader: R,
@@ -37,23 +51,191 @@ impl<R: ElfReader> AdmittedImage<R> {
         }
     }
 
-    #[inline]
-    pub const fn reader(&self) -> &R {
-        &self.reader
-    }
+    pub fn inspect(self) -> LoadResult<InspectedImage<R>> {
+        let count = self.header.program_header_count();
+        self.request
+            .limits()
+            .check_load_segment_count(count.into())?;
+        let mut load_segments = Vec::new();
+        load_segments
+            .try_reserve_exact(usize::from(count))
+            .map_err(|_| {
+                LoadError::new(LoadErrorKind::OutOfMemory, ErrorContext::None)
+                    .at_stage(LoadStage::Inspect)
+            })?;
 
-    #[inline]
-    pub const fn header(&self) -> &ElfHeaderInfo {
-        &self.header
-    }
+        let entry_size = usize::from(self.header.program_header_entry_size());
+        let mut raw = [0; elf64::program_header::SIZEOF_PHDR];
+        let mut dynamic = None;
+        let mut relro = None;
+        let mut stack = StackKind::NotDeclared;
+        let mut interpreter = None;
+        let mut tls = None;
 
-    #[inline]
-    pub const fn request(&self) -> &LoadRequest {
-        &self.request
-    }
+        for index in 0..count {
+            let offset = self
+                .header
+                .program_header_offset()
+                .checked_add(u64::from(index) * u64::from(self.header.program_header_entry_size()))
+                .ok_or_else(|| {
+                    program_header_error(index, ProgramHeaderField::FileRange, 0)
+                        .at_stage(LoadStage::Inspect)
+                })?;
+            self.reader.read_exact_at(offset, &mut raw[..entry_size])?;
+            let program_header = ProgramHeaderInfo::decode(
+                &raw[..entry_size],
+                self.request.profile().class(),
+                self.request.profile().endian(),
+            )
+            .map_err(|e| e.at_stage(LoadStage::Inspect))?;
 
-    #[inline]
-    pub const fn file_len(&self) -> u64 {
-        self.file_len
+            match program_header.r#type() {
+                PT_LOAD => {
+                    if program_header.file_size() > program_header.memory_size() {
+                        return Err(program_header_error(
+                            index,
+                            ProgramHeaderField::FileRange,
+                            program_header.file_size(),
+                        )
+                        .at_stage(LoadStage::Inspect));
+                    }
+                    let file_range =
+                        FileRange::new(program_header.file_offset(), program_header.file_size());
+                    file_range
+                        .validate(self.file_len)
+                        .map_err(|e| e.at_stage(LoadStage::Inspect))?;
+                    TargetRange::new(program_header.vaddr(), program_header.memory_size())
+                        .end()
+                        .map_err(|e| e.at_stage(LoadStage::Inspect))?;
+                    load_segments.push(LoadSegmentInfo::new(
+                        index,
+                        file_range,
+                        program_header.vaddr(),
+                        program_header.memory_size(),
+                        program_header.align(),
+                        permissions_from_flags(program_header.flags()),
+                    ));
+                }
+                PT_DYNAMIC => {
+                    if dynamic.is_some() {
+                        return Err(program_header_error(
+                            index,
+                            ProgramHeaderField::DuplicateDynamic,
+                            program_header.r#type().into(),
+                        )
+                        .at_stage(LoadStage::Inspect));
+                    }
+                    let file_range =
+                        FileRange::new(program_header.file_offset(), program_header.file_size());
+                    file_range
+                        .validate(self.file_len)
+                        .map_err(|e| e.at_stage(LoadStage::Inspect))?;
+                    TargetRange::new(program_header.vaddr(), program_header.memory_size())
+                        .end()
+                        .map_err(|e| e.at_stage(LoadStage::Inspect))?;
+                    dynamic = Some(DynamicSegmentInfo::new(
+                        file_range,
+                        program_header.vaddr(),
+                        program_header.memory_size(),
+                    ))
+                }
+                PT_GNU_RELRO => {
+                    if stack != StackKind::NotDeclared {
+                        return Err(program_header_error(
+                            index,
+                            ProgramHeaderField::DuplicateStack,
+                            program_header.r#type().into(),
+                        )
+                        .at_stage(LoadStage::Inspect));
+                    }
+                    if program_header.flags() & PF_X != 0 {
+                        stack = StackKind::Executable;
+                    } else {
+                        stack = StackKind::NonExecutable
+                    }
+                }
+                PT_INTERP => {
+                    if interpreter.is_some() {
+                        return Err(program_header_error(
+                            index,
+                            ProgramHeaderField::DuplicateInterpreter,
+                            program_header.r#type().into(),
+                        )
+                        .at_stage(LoadStage::Inspect));
+                    }
+                    let file_range =
+                        FileRange::new(program_header.file_offset(), program_header.file_size());
+                    file_range
+                        .validate(self.file_len)
+                        .map_err(|e| e.at_stage(LoadStage::Inspect))?;
+                    interpreter = Some(file_range);
+                }
+                PT_TLS => {
+                    if tls.is_some() {
+                        return Err(program_header_error(
+                            index,
+                            ProgramHeaderField::DuplicateTls,
+                            program_header.r#type().into(),
+                        )
+                        .at_stage(LoadStage::Inspect));
+                    }
+                    if program_header.file_size() > program_header.memory_size() {
+                        return Err(program_header_error(
+                            index,
+                            ProgramHeaderField::FileRange,
+                            program_header.file_size(),
+                        )
+                        .at_stage(LoadStage::Inspect));
+                    }
+                    let file_range =
+                        FileRange::new(program_header.file_offset(), program_header.file_size());
+                    file_range
+                        .validate(self.file_len)
+                        .map_err(|e| e.at_stage(LoadStage::Inspect))?;
+                    let target_range =
+                        TargetRange::new(program_header.vaddr(), program_header.memory_size());
+                    target_range
+                        .end()
+                        .map_err(|e| e.at_stage(LoadStage::Inspect))?;
+                    tls = Some(target_range)
+                }
+                _ => {}
+            }
+        }
+        Ok(InspectedImage::new(
+            self.reader,
+            self.header,
+            load_segments.into_boxed_slice(),
+            dynamic,
+            relro,
+            stack,
+            interpreter,
+            tls,
+        ))
     }
+}
+
+fn permissions_from_flags(flags: u32) -> MemoryPermissions {
+    let mut permissions = MemoryPermissions::NONE;
+    if flags & PF_R != 0 {
+        permissions = permissions.bitor(MemoryPermissions::READ);
+    }
+    if flags & PF_W != 0 {
+        permissions = permissions.bitor(MemoryPermissions::WRITE);
+    }
+    if flags & PF_X != 0 {
+        permissions = permissions.bitor(MemoryPermissions::EXECUTE);
+    }
+    permissions
+}
+
+fn program_header_error(index: u16, field: ProgramHeaderField, value: u64) -> LoadError {
+    LoadError::new(
+        LoadErrorKind::BadElf,
+        ErrorContext::ProgramHeader {
+            index,
+            field,
+            value,
+        },
+    )
 }
