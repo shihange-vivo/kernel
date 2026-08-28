@@ -134,7 +134,6 @@ pub(crate) struct LoadLimits {
     max_load_segments: u16,
     max_image_span: u64,
     max_segment_alignment: u64,
-    max_layout_bytes: u64,
     max_dynamic_entries: u64,
     max_relocations: u64,
     max_runtime_metadata_bytes: u64,
@@ -148,7 +147,6 @@ impl LoadLimits {
         32,
         64 * 1024 * 1024,
         1024 * 1024 * 1024,
-        1024 * 1024,
         1024,
         1024 * 1024,
         64 * 1024 * 1024,
@@ -162,7 +160,6 @@ impl LoadLimits {
         max_load_segments: u16,
         max_image_span: u64,
         max_segment_alignment: u64,
-        max_layout_bytes: u64,
         max_dynamic_entries: u64,
         max_relocations: u64,
         max_runtime_metadata_bytes: u64,
@@ -174,7 +171,6 @@ impl LoadLimits {
             max_load_segments,
             max_image_span,
             max_segment_alignment,
-            max_layout_bytes,
             max_dynamic_entries,
             max_relocations,
             max_runtime_metadata_bytes,
@@ -224,10 +220,6 @@ impl LoadLimits {
             actual,
             self.max_segment_alignment,
         )
-    }
-
-    pub fn check_layout_bytes(&self, actual: u64) -> LoadResult<()> {
-        check_limit(LimitKind::LayoutBytes, actual, self.max_layout_bytes)
     }
 
     pub fn check_dynamic_entry_count(&self, actual: u64) -> LoadResult<()> {
@@ -296,19 +288,19 @@ impl LoadRequest {
 }
 
 pub(crate) struct LoadPolicy {
-    allow_interpreter: Option<()>,
-    allow_tls: Option<()>,
-    allow_executable_stack: Option<()>,
-    allow_unknown_program_headers: Option<()>,
+    pub allow_interpreter: bool,
+    pub allow_tls: bool,
+    pub allow_executable_stack: bool,
+    pub allow_unknown_program_headers: bool,
 }
 
 impl LoadPolicy {
     #[inline]
     pub const fn new(
-        allow_interpreter: Option<()>,
-        allow_tls: Option<()>,
-        allow_executable_stack: Option<()>,
-        allow_unknown_program_headers: Option<()>,
+        allow_interpreter: bool,
+        allow_tls: bool,
+        allow_executable_stack: bool,
+        allow_unknown_program_headers: bool,
     ) -> Self {
         Self {
             allow_interpreter,
@@ -319,4 +311,4 @@ impl LoadPolicy {
     }
 }
 
-pub(crate) const LOADPOLICY: LoadPolicy = LoadPolicy::new(None, None, None, None);
+pub(crate) const LOADPOLICY: LoadPolicy = LoadPolicy::new(false, false, false, false);

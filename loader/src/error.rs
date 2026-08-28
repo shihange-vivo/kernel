@@ -89,6 +89,8 @@ pub(crate) enum ProgramHeaderField {
     UnsupportedInterpreter,
     UnsupportedTls,
     ExecutableStack,
+    Align,
+    UnknownField,
 }
 
 #[non_exhaustive]
