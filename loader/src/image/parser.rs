@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use alloc::{boxed::Box, vec::Vec};
+use alloc::vec::Vec;
 use goblin::elf::program_header::{
     PF_R, PF_W, PF_X, PT_DYNAMIC, PT_GNU_RELRO, PT_GNU_STACK, PT_INTERP, PT_LOAD, PT_TLS,
 };
@@ -71,12 +71,17 @@ impl LoadSegmentInfo {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct DynamicSegmentInfo {
+    index: u16,
     file_range: FileRange,
     vaddr: TargetAddr,
     memory_size: u64,
 }
 
 impl DynamicSegmentInfo {
+    pub const fn index(&self) -> u16 {
+        self.index
+    }
+
     pub const fn file_range(&self) -> FileRange {
         self.file_range
     }
@@ -93,7 +98,7 @@ impl DynamicSegmentInfo {
 #[derive(Debug)]
 pub struct ParsedImage {
     header: crate::ElfHeaderInfo,
-    load_segments: Box<[LoadSegmentInfo]>,
+    load_segments: Vec<LoadSegmentInfo>,
     dynamic: Option<DynamicSegmentInfo>,
     relro: Option<TargetRange>,
     stack_policy: StackPolicy,
@@ -128,7 +133,9 @@ impl ParsedImage {
 
 impl ImageLoader {
     pub fn inspect<R: ElfReader>(&self, artifact: &AdmittedArtifact<R>) -> LoadResult<ParsedImage> {
-        artifact.ensure_snapshot()?;
+        artifact
+            .ensure_snapshot()
+            .map_err(|error| error.with_stage(LoadStage::Parse))?;
         let header = artifact.header();
         let count = header.program_header_count();
         let mut load_segments = Vec::new();
@@ -155,7 +162,8 @@ impl ImageLoader {
                 .ok_or_else(|| program_header_error(index, ProgramHeaderField::FileRange, 0))?;
             artifact
                 .reader()
-                .read_exact_at(offset, &mut raw[..entry_size])?;
+                .read_exact_at(offset, &mut raw[..entry_size])
+                .map_err(|error| error.with_stage(LoadStage::Parse))?;
             let ph =
                 ProgramHeaderFields::decode(&raw[..entry_size], header.class(), header.endian())?;
 
@@ -193,6 +201,7 @@ impl ImageLoader {
                         .end()
                         .map_err(|error| error.at(LoadStage::Parse))?;
                     dynamic = Some(DynamicSegmentInfo {
+                        index,
                         file_range,
                         vaddr: TargetAddr::new(ph.vaddr),
                         memory_size: ph.memory_size,
@@ -268,10 +277,12 @@ impl ImageLoader {
             }
         }
 
-        artifact.ensure_snapshot()?;
+        artifact
+            .ensure_snapshot()
+            .map_err(|error| error.with_stage(LoadStage::Parse))?;
         Ok(ParsedImage {
             header: *header,
-            load_segments: load_segments.into_boxed_slice(),
+            load_segments,
             dynamic,
             relro,
             stack_policy,
@@ -326,13 +337,13 @@ fn parse_u64(bytes: &[u8], offset: usize, endian: Endian) -> LoadResult<u64> {
 fn permissions_from_flags(flags: u32) -> MemoryPermissions {
     let mut permissions = MemoryPermissions::NONE;
     if flags & PF_R != 0 {
-        permissions = permissions.bitor(MemoryPermissions::READ);
+        permissions = permissions.union(MemoryPermissions::READ);
     }
     if flags & PF_W != 0 {
-        permissions = permissions.bitor(MemoryPermissions::WRITE);
+        permissions = permissions.union(MemoryPermissions::WRITE);
     }
     if flags & PF_X != 0 {
-        permissions = permissions.bitor(MemoryPermissions::EXECUTE);
+        permissions = permissions.union(MemoryPermissions::EXECUTE);
     }
     permissions
 }

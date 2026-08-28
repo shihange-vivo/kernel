@@ -68,12 +68,11 @@ pub use relocation::{
 /// Result type retained by the original `load_elf` compatibility entry point.
 pub type CompatibilityResult = core::result::Result<(), &'static str>;
 
-pub fn prepare_image<'m, R, M, C, A, P>(
+pub fn prepare_image<'m, R, M, C, A>(
     reader: R,
     request: ArtifactRequest,
     memory: &'m mut M,
     cache: &mut C,
-    policy: &P,
     relocator: &A,
 ) -> LoadResult<PreparedImage<'m, M>>
 where
@@ -81,24 +80,22 @@ where
     M: ImageProtectionMemory,
     C: CodeCache,
     A: ArchRelocator + ?Sized,
-    P: ArtifactFeaturePolicy + ?Sized,
 {
     let loader = ImageLoader::new();
     let admitted = loader.admit(reader, request)?;
-    let planned = loader.plan_with_policy(admitted, policy)?;
+    let planned = loader.plan(admitted)?;
     let reserved = loader.reserve_staged(planned, memory)?;
     let mapped = reserved.copy_and_zero()?;
-    let runtime = mapped.decode_runtime(policy)?;
+    let runtime = mapped.decode_runtime(&Phase0ArtifactPolicy)?;
     let relocated = runtime.relocate(relocator)?;
     relocated.seal(cache)
 }
 
-pub fn load_image<R, M, C, A, P>(
+pub fn load_image<R, M, C, A>(
     reader: R,
     request: ArtifactRequest,
     memory: &mut M,
     cache: &mut C,
-    policy: &P,
     relocator: &A,
 ) -> LoadResult<M::CommitReceipt>
 where
@@ -106,9 +103,8 @@ where
     M: ImageCommitMemory,
     C: CodeCache,
     A: ArchRelocator + ?Sized,
-    P: ArtifactFeaturePolicy + ?Sized,
 {
-    let prepared = prepare_image(reader, request, memory, cache, policy, relocator)?;
+    let prepared = prepare_image(reader, request, memory, cache, relocator)?;
     let ready = prepared.prepare_commit()?;
     Ok(ready.commit())
 }
@@ -192,7 +188,6 @@ fn load_elf_with_relocator<A: ArchRelocator + ?Sized>(
         request,
         mapper,
         &mut cache,
-        &Phase0ArtifactPolicy,
         relocator,
     )
     .map_err(compatibility_error)?;

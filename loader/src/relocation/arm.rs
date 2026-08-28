@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::{AddendEncoding, ArchRelocator, ElfClass, WordWidth};
+use crate::{AddendEncoding, ArchRelocator, ElfClass};
 
 #[derive(Clone, Copy, Debug, Default)]
 pub struct ArmRelocator;
@@ -24,10 +24,6 @@ impl ArchRelocator for ArmRelocator {
 
     fn class(&self) -> ElfClass {
         ElfClass::Elf32
-    }
-
-    fn word_width(&self) -> WordWidth {
-        WordWidth::U32
     }
 
     fn relative_type(&self) -> u32 {

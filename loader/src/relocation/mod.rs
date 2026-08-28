@@ -33,6 +33,13 @@ pub enum WordWidth {
 }
 
 impl WordWidth {
+    pub const fn for_elf_class(class: ElfClass) -> Self {
+        match class {
+            ElfClass::Elf32 => Self::U32,
+            ElfClass::Elf64 => Self::U64,
+        }
+    }
+
     pub const fn bytes(self) -> u64 {
         match self {
             Self::U32 => 4,
@@ -58,8 +65,6 @@ pub trait ArchRelocator {
     fn machine(&self) -> u16;
 
     fn class(&self) -> ElfClass;
-
-    fn word_width(&self) -> WordWidth;
 
     fn relative_type(&self) -> u32;
 
@@ -180,8 +185,10 @@ impl RuntimeState {
     {
         let (mapped, metadata) = self.into_parts();
         validate_relocator(&mapped, relocator)?;
-        let target_word =
-            TargetWord::new(relocator.word_width(), mapped.request().profile().endian());
+        let target_word = TargetWord::new(
+            WordWidth::for_elf_class(mapped.request().profile().class()),
+            mapped.request().profile().endian(),
+        );
         let mut operations = Vec::new();
         let operation_bytes = metadata
             .relocations()
@@ -243,23 +250,21 @@ fn validate_relocator<A: ArchRelocator + ?Sized>(
     relocator: &A,
 ) -> LoadResult<()> {
     let profile = mapped.request().profile();
-    let expected_width = match profile.class() {
-        ElfClass::Elf32 => WordWidth::U32,
-        ElfClass::Elf64 => WordWidth::U64,
-    };
-    if relocator.machine() == profile.machine()
-        && relocator.class() == profile.class()
-        && relocator.word_width() == expected_width
-    {
+    if relocator.machine() == profile.machine() && relocator.class() == profile.class() {
         Ok(())
     } else {
+        let (field, value) = if relocator.machine() != profile.machine() {
+            (crate::HeaderField::Machine, u64::from(relocator.machine()))
+        } else {
+            (
+                crate::HeaderField::Class,
+                u64::from(relocator.class().elf_class_encoding()),
+            )
+        };
         Err(LoadError::new(
             LoadStage::Relocate,
             LoadErrorKind::UnsupportedByProfile,
-            ErrorContext::HeaderField {
-                field: crate::HeaderField::Machine,
-                value: u64::from(profile.machine()),
-            },
+            ErrorContext::HeaderField { field, value },
         ))
     }
 }
@@ -346,7 +351,7 @@ fn checked_target<M: ImageMemory>(
         )
         .map_err(|_| relocation_error(record, LoadErrorKind::OutOfBounds))?;
     let permissions = if read {
-        MemoryPermissions::READ.bitor(MemoryPermissions::WRITE)
+        MemoryPermissions::READ.union(MemoryPermissions::WRITE)
     } else {
         MemoryPermissions::WRITE
     };

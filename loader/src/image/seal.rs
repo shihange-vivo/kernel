@@ -12,13 +12,13 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use alloc::{boxed::Box, vec::Vec};
+use alloc::vec::Vec;
 
 use crate::{
     AllocationLease, CacheSyncOutcome, CodeCache, ErrorContext, ImageAllocation, ImageCommitMemory,
-    ImageLoadTransaction, ImageProtectionMemory, LoadError, LoadErrorKind, LoadResult, LoadStage,
-    MappedState, MemoryPermissions, RangeResult, RelocatedState, RuntimeImageMetadata, StagedImage,
-    TargetAddr, TargetLocation, TargetRange,
+    ImageLoadTransaction, ImageProtectionMemory, LimitKind, LoadError, LoadErrorKind, LoadResult,
+    LoadStage, MappedState, MemoryPermissions, RangeResult, RelocatedState, RuntimeImageMetadata,
+    StagedImage, TargetAddr, TargetLocation, TargetRange,
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -60,8 +60,7 @@ pub struct ProtectionRecord {
     location: TargetLocation,
     requested_range: TargetRange,
     applied_range: TargetRange,
-    requested: MemoryPermissions,
-    applied: MemoryPermissions,
+    permissions: MemoryPermissions,
     level: ProtectionLevel,
 }
 
@@ -78,12 +77,8 @@ impl ProtectionRecord {
         self.applied_range
     }
 
-    pub const fn requested(&self) -> MemoryPermissions {
-        self.requested
-    }
-
-    pub const fn applied(&self) -> MemoryPermissions {
-        self.applied
+    pub const fn permissions(&self) -> MemoryPermissions {
+        self.permissions
     }
 
     pub const fn level(&self) -> ProtectionLevel {
@@ -124,12 +119,12 @@ impl<'a> ProtectionBatch<'a> {
 
 #[derive(Debug)]
 pub struct AppliedProtectionSet {
-    ranges: Box<[ProtectionRecord]>,
+    ranges: Vec<ProtectionRecord>,
 }
 
 impl AppliedProtectionSet {
     /// Seal the core-owned result slots after a backend completed the batch.
-    pub(crate) const fn new(ranges: Box<[ProtectionRecord]>) -> Self {
+    pub(crate) const fn new(ranges: Vec<ProtectionRecord>) -> Self {
         Self { ranges }
     }
 
@@ -152,7 +147,7 @@ impl AppliedProtectionSet {
 
 #[derive(Debug)]
 pub struct PreparedProtectionPlan {
-    ranges: Box<[ProtectionRecord]>,
+    ranges: Vec<ProtectionRecord>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -178,7 +173,7 @@ impl SealRange {
 
 #[derive(Debug)]
 pub struct SealPlan {
-    ranges: Box<[SealRange]>,
+    ranges: Vec<SealRange>,
 }
 
 impl SealPlan {
@@ -289,21 +284,51 @@ impl SealPlan {
                 })?,
             MemoryPermissions::NONE,
         )?;
-        Ok(Self {
-            ranges: ranges.into_boxed_slice(),
-        })
+        Ok(Self { ranges })
     }
 }
 
 impl PreparedProtectionPlan {
-    pub(crate) fn build(
+    pub(crate) fn prepare<M: ImageProtectionMemory>(
+        memory: &M,
+        allocation: &ImageAllocation,
+        logical: &SealPlan,
+    ) -> LoadResult<Self> {
+        let prepared = Self::build(allocation, logical, memory.protection_capabilities())?;
+        memory
+            .validate_protection_aliases(allocation, &prepared)
+            .map_err(|error| error.with_stage(LoadStage::Seal))?;
+        for range in prepared.ranges() {
+            memory
+                .validate_access(
+                    range.location(),
+                    range.applied_range().len(),
+                    range.permissions(),
+                )
+                .map_err(|error| error.at(LoadStage::Seal))?;
+        }
+        Ok(prepared)
+    }
+
+    fn build(
         allocation: &ImageAllocation,
         logical: &SealPlan,
         capabilities: ProtectionCapabilities,
     ) -> LoadResult<Self> {
         let granule = capabilities.granule();
-        if !granule.is_power_of_two() || logical.ranges().len() > capabilities.max_ranges() {
-            return Err(protection_plan_error(allocation));
+        if !granule.is_power_of_two() {
+            return Err(protection_backend_error(allocation));
+        }
+        if logical.ranges().len() > capabilities.max_ranges() {
+            return Err(LoadError::new(
+                LoadStage::Seal,
+                LoadErrorKind::ResourceLimit,
+                ErrorContext::Limit {
+                    resource: LimitKind::ProtectionRangeCount,
+                    actual: logical.ranges().len() as u64,
+                    maximum: capabilities.max_ranges() as u64,
+                },
+            ));
         }
 
         let mut ranges: Vec<ProtectionRecord> = Vec::new();
@@ -317,14 +342,14 @@ impl PreparedProtectionPlan {
             let applied_start = at_seal(requested.runtime_range().start().align_down(granule))?;
             let applied_end = at_seal(requested_end.align_up(granule))?;
             if applied_start < allocation.target_base() || applied_end > allocation_end {
-                return Err(protection_plan_error(allocation));
+                return Err(protection_backend_error(allocation));
             }
             let prefix = at_seal(requested.runtime_range().start().checked_sub(applied_start))?;
             let applied_offset = requested
                 .location()
                 .offset()
                 .checked_sub(prefix)
-                .ok_or_else(|| protection_plan_error(allocation))?;
+                .ok_or_else(|| protection_backend_error(allocation))?;
             let applied_range = TargetRange::new(
                 applied_start,
                 at_seal(applied_end.checked_sub(applied_start))?,
@@ -332,7 +357,7 @@ impl PreparedProtectionPlan {
 
             if let Some(previous) = ranges.last() {
                 if previous.applied_range.overlaps(applied_range)
-                    && previous.applied != requested.permissions()
+                    && previous.permissions != requested.permissions()
                 {
                     return Err(LoadError::new(
                         LoadStage::Seal,
@@ -349,18 +374,15 @@ impl PreparedProtectionPlan {
                 location: TargetLocation::new(requested.location().allocation(), applied_offset),
                 requested_range: requested.runtime_range(),
                 applied_range,
-                requested: requested.permissions(),
-                applied: requested.permissions(),
+                permissions: requested.permissions(),
                 level: ProtectionLevel::LogicalOnly,
             });
         }
-        Ok(Self {
-            ranges: ranges.into_boxed_slice(),
-        })
+        Ok(Self { ranges })
     }
 
     /// Move the preallocated result slots into the core sealing transaction.
-    pub(crate) fn into_ranges(self) -> Box<[ProtectionRecord]> {
+    pub(crate) fn into_ranges(self) -> Vec<ProtectionRecord> {
         self.ranges
     }
 
@@ -442,6 +464,14 @@ impl SealedState {
         self.mapped.canonical_entry()
     }
 
+    pub const fn entry_instruction_span(&self) -> u64 {
+        self.mapped
+            .request()
+            .profile()
+            .entry_mode()
+            .minimum_instruction_size()
+    }
+
     pub const fn load_bias(&self) -> TargetAddr {
         self.mapped.load_bias()
     }
@@ -480,10 +510,11 @@ impl RelocatedState {
         let (mapped, metadata) = self.into_parts();
         let seal_plan = SealPlan::build(&mapped)?;
 
-        let prepared_protection = transaction
-            .memory_ref()
-            .prepare_protection(mapped.allocation(), &seal_plan)
-            .map_err(|error| error.with_stage(LoadStage::Seal))?;
+        let prepared_protection = PreparedProtectionPlan::prepare(
+            transaction.memory_ref(),
+            mapped.allocation(),
+            &seal_plan,
+        )?;
         let mut executable_ranges = Vec::new();
         for range in seal_plan.ranges() {
             if range.permissions().contains(MemoryPermissions::EXECUTE) {
@@ -609,7 +640,7 @@ fn at_seal<T>(result: RangeResult<T>) -> LoadResult<T> {
     result.map_err(|error| error.at(LoadStage::Seal))
 }
 
-fn protection_plan_error(allocation: &ImageAllocation) -> LoadError {
+fn protection_backend_error(allocation: &ImageAllocation) -> LoadError {
     LoadError::new(
         LoadStage::Seal,
         LoadErrorKind::Backend,

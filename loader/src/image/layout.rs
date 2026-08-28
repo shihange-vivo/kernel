@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use alloc::{boxed::Box, vec::Vec};
+use alloc::vec::Vec;
 
 use crate::{
     AdmittedArtifact, AllocationRequest, ArtifactFeaturePolicy, ArtifactProfile, ElfReader,
@@ -60,7 +60,7 @@ pub struct ImageLayout {
     max_align: u64,
     entry_vaddr: TargetAddr,
     canonical_entry_vaddr: TargetAddr,
-    segments: Box<[SegmentLayout]>,
+    segments: Vec<SegmentLayout>,
     relro: Option<TargetRange>,
 }
 
@@ -254,7 +254,7 @@ impl ImageLayoutBuilder {
             if segment.file_range().offset() % align != segment.vaddr().get() % align {
                 return Err(program_header_error(
                     segment.index(),
-                    ProgramHeaderField::VirtualRange,
+                    ProgramHeaderField::Alignment,
                     align,
                 ));
             }
@@ -312,9 +312,10 @@ impl ImageLayoutBuilder {
             return Err(LoadError::new(
                 LoadStage::Plan,
                 LoadErrorKind::InvalidAlignment,
-                ErrorContext::HeaderField {
-                    field: crate::HeaderField::Machine,
-                    value: profile_align,
+                ErrorContext::Allocation {
+                    base: TargetAddr::new(0),
+                    len: 0,
+                    align: profile_align,
                 },
             ));
         }
@@ -341,17 +342,20 @@ impl ImageLayoutBuilder {
         let entry_vaddr = TargetAddr::new(parsed.header().entry());
         let canonical_entry_vaddr =
             TargetAddr::new(profile.entry_mode().canonical_entry(entry_vaddr.get()));
+        let entry_span = profile.entry_mode().minimum_instruction_size();
         let executable = segments.iter().any(|segment| {
             segment.permissions.contains(MemoryPermissions::EXECUTE)
-                && segment.vaddr_range.contains_span(canonical_entry_vaddr, 1)
+                && segment
+                    .vaddr_range
+                    .contains_span(canonical_entry_vaddr, entry_span)
         });
         if !executable {
             return Err(LoadError::new(
                 LoadStage::Plan,
                 LoadErrorKind::PermissionConflict,
                 ErrorContext::TargetRange {
-                    start: entry_vaddr,
-                    len: 1,
+                    start: canonical_entry_vaddr,
+                    len: entry_span,
                 },
             ));
         }
@@ -374,6 +378,9 @@ impl ImageLayoutBuilder {
                 ));
             }
         }
+        if let Some(dynamic) = parsed.dynamic() {
+            validate_dynamic_segment(dynamic, &segments)?;
+        }
 
         Ok(ImageLayout {
             aligned_min_vaddr,
@@ -382,7 +389,7 @@ impl ImageLayoutBuilder {
             max_align,
             entry_vaddr,
             canonical_entry_vaddr,
-            segments: segments.into_boxed_slice(),
+            segments,
             relro: parsed.relro(),
         })
     }
@@ -406,7 +413,9 @@ impl ImageLoader {
         P: ArtifactFeaturePolicy + ?Sized,
     {
         let parsed = self.inspect(&admitted)?;
-        policy.validate_program_features(parsed.program_features())?;
+        policy
+            .validate_program_features(parsed.program_features())
+            .map_err(|error| error.with_stage(LoadStage::Plan))?;
         let layout = ImageLayoutBuilder::build(
             &parsed,
             admitted.request().profile(),
@@ -420,6 +429,57 @@ impl ImageLoader {
     }
 }
 
+fn validate_dynamic_segment(
+    dynamic: crate::DynamicSegmentInfo,
+    segments: &[SegmentLayout],
+) -> LoadResult<()> {
+    if dynamic.file_range().is_empty() || dynamic.file_range().len() > dynamic.memory_size() {
+        return Err(program_header_error(
+            dynamic.index(),
+            ProgramHeaderField::FileRange,
+            dynamic.file_range().len(),
+        ));
+    }
+
+    let segment = segments.iter().find(|segment| {
+        segment.permissions().contains(MemoryPermissions::READ)
+            && segment
+                .vaddr_range()
+                .contains_span(dynamic.vaddr(), dynamic.memory_size())
+    });
+    let Some(segment) = segment else {
+        return Err(LoadError::new(
+            LoadStage::Plan,
+            LoadErrorKind::OutOfBounds,
+            ErrorContext::ProgramHeader {
+                index: dynamic.index(),
+                field: ProgramHeaderField::VirtualRange,
+                value: dynamic.vaddr().get(),
+            },
+        ));
+    };
+    let offset = dynamic
+        .vaddr()
+        .checked_sub(segment.vaddr_range().start())
+        .map_err(|error| error.at(LoadStage::Plan))?;
+    let expected_file_offset = segment.file_range().offset().checked_add(offset);
+    let file_end = offset.checked_add(dynamic.file_range().len());
+    if expected_file_offset != Some(dynamic.file_range().offset())
+        || file_end.is_none_or(|end| end > segment.file_range().len())
+    {
+        return Err(LoadError::new(
+            LoadStage::Plan,
+            LoadErrorKind::OutOfBounds,
+            ErrorContext::ProgramHeader {
+                index: dynamic.index(),
+                field: ProgramHeaderField::FileRange,
+                value: dynamic.file_range().offset(),
+            },
+        ));
+    }
+    Ok(())
+}
+
 fn normalize_alignment(align: u64, index: u16) -> LoadResult<u64> {
     match align {
         0 | 1 => Ok(1),
@@ -429,7 +489,7 @@ fn normalize_alignment(align: u64, index: u16) -> LoadResult<u64> {
             LoadErrorKind::InvalidAlignment,
             ErrorContext::ProgramHeader {
                 index,
-                field: ProgramHeaderField::VirtualRange,
+                field: ProgramHeaderField::Alignment,
                 value,
             },
         )),

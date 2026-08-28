@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use alloc::{boxed::Box, vec::Vec};
+use alloc::vec::Vec;
 
 use crate::{ErrorContext, LoadError, LoadErrorKind, LoadResult, LoadStage, TargetRange};
 
@@ -95,7 +95,7 @@ impl CacheRequirements {
 
 #[derive(Debug)]
 pub struct PreparedCacheSync {
-    executable_ranges: Box<[TargetRange]>,
+    executable_ranges: Vec<TargetRange>,
     scope: ExecutionScope,
     maintenance: CacheMaintenance,
 }
@@ -115,7 +115,7 @@ impl PreparedCacheSync {
             ranges.push(*range);
         }
         Ok(Self {
-            executable_ranges: ranges.into_boxed_slice(),
+            executable_ranges: ranges,
             scope,
             maintenance,
         })
@@ -144,7 +144,7 @@ impl PreparedCacheSync {
 
 #[derive(Debug)]
 pub struct CacheSyncOutcome {
-    executable_ranges: Box<[TargetRange]>,
+    executable_ranges: Vec<TargetRange>,
     scope: ExecutionScope,
     maintenance: CacheMaintenance,
 }

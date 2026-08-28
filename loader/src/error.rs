@@ -54,6 +54,7 @@ pub enum HeaderField {
     Endian,
     Version,
     OsAbi,
+    AbiVersion,
     Type,
     Machine,
     Flags,
@@ -76,6 +77,7 @@ pub enum LimitKind {
     RelocationCount,
     RuntimeMetadataBytes,
     RelocationOperationBytes,
+    ProtectionRangeCount,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -84,6 +86,7 @@ pub enum ProgramHeaderField {
     Type,
     FileRange,
     VirtualRange,
+    Alignment,
     DuplicateDynamic,
     DuplicateRelro,
     DuplicateStack,

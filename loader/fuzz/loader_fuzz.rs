@@ -22,8 +22,8 @@ use blueos_loader::{
     CacheRequirements, ElfClass, ErrorContext, ExecutionScope, ExpectedElfType, ImageAllocation,
     ImageMemory, ImageProtectionMemory, LoadError, LoadErrorKind, LoadLimits, LoadResult,
     LoadStage, MemoryError, MemoryPermissions, MemoryResult, MutationProgress,
-    Phase0ArtifactPolicy, PreparedProtectionPlan, ProtectionCapabilities, ProtectionLevel,
-    Riscv32Relocator, Riscv64Relocator, SliceElfReader, TargetAddr, TargetLocation,
+    PreparedProtectionPlan, ProtectionCapabilities, ProtectionLevel, Riscv32Relocator,
+    Riscv64Relocator, SliceElfReader, TargetAddr, TargetLocation,
 };
 
 const CORPUS: &[&[u8]] = &[
@@ -173,7 +173,6 @@ fn exercise_profile<A: ArchRelocator + ?Sized>(
         request,
         &mut memory,
         &mut cache,
-        &Phase0ArtifactPolicy,
         relocator,
     );
     result.map(|_| ())
@@ -181,24 +180,22 @@ fn exercise_profile<A: ArchRelocator + ?Sized>(
 
 fn exercise_one_input(input: &[u8]) {
     let bytes = decode_hex_corpus(input);
-    exercise_profile(
+    let _ = exercise_profile(
         &bytes,
         ArtifactProfile::riscv_compressed_soft(ElfClass::Elf64),
         &Riscv64Relocator,
     );
-    exercise_profile(
+    let _ = exercise_profile(
         &bytes,
         ArtifactProfile::riscv_compressed_soft(ElfClass::Elf32),
         &Riscv32Relocator,
     );
-    exercise_profile(&bytes, ArtifactProfile::arm_thumb_v7m_soft(), &ArmRelocator);
+    let _ = exercise_profile(&bytes, ArtifactProfile::arm_thumb_v7m_soft(), &ArmRelocator);
 }
 
 fn decode_hex_corpus(input: &[u8]) -> Cow<'_, [u8]> {
-    let input = input
-        .strip_suffix(b"\n")
-        .and_then(|value| value.strip_suffix(b"\r").or(Some(value)))
-        .unwrap_or(input);
+    let input = input.strip_suffix(b"\n").unwrap_or(input);
+    let input = input.strip_suffix(b"\r").unwrap_or(input);
     if input.len() % 2 != 0 || !input.iter().all(u8::is_ascii_hexdigit) {
         return Cow::Borrowed(input);
     }

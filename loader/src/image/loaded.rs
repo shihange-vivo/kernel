@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use alloc::{boxed::Box, vec::Vec};
+use alloc::vec::Vec;
 
 use crate::{
     AllocationOwnership, ArtifactRequest, DynamicSegmentInfo, ElfReader, ErrorContext, FileRange,
@@ -61,7 +61,7 @@ pub struct MappedState {
     load_bias: TargetAddr,
     entry: TargetAddr,
     canonical_entry: TargetAddr,
-    regions: Box<[LoadedRegion]>,
+    regions: Vec<LoadedRegion>,
     dynamic: Option<DynamicSegmentInfo>,
     relro: Option<TargetRange>,
 }
@@ -225,12 +225,14 @@ impl ImageLoader {
             load_bias,
             entry,
             canonical_entry,
-            regions: regions.into_boxed_slice(),
+            regions,
             dynamic: parsed.dynamic(),
             relro: layout.relro(),
         };
 
-        artifact.ensure_snapshot()?;
+        artifact
+            .ensure_snapshot()
+            .map_err(|error| error.with_stage(LoadStage::Map))?;
         preflight_targets(&mapped, transaction.memory())?;
         transaction.mark_bytes_modified();
         if allocation.ownership() == AllocationOwnership::Owned {
@@ -276,7 +278,9 @@ impl ImageLoader {
                     .map_err(|error| error.at(LoadStage::Map))?;
             }
         }
-        artifact.ensure_snapshot()?;
+        artifact
+            .ensure_snapshot()
+            .map_err(|error| error.with_stage(LoadStage::Map))?;
 
         Ok(mapped)
     }
@@ -323,20 +327,22 @@ fn copy_file_range<R: ElfReader, M: ImageMemory>(
     while copied < file_range.len() {
         let remaining = file_range.len() - copied;
         let chunk_len = core::cmp::min(remaining, COPY_BUFFER_SIZE as u64) as usize;
-        reader.read_exact_at(
-            file_range.offset().checked_add(copied).ok_or_else(|| {
-                LoadError::new(
-                    LoadStage::Map,
-                    LoadErrorKind::IntegerOverflow,
-                    ErrorContext::FileRange {
-                        offset: file_range.offset(),
-                        len: file_range.len(),
-                        file_len: 0,
-                    },
-                )
-            })?,
-            &mut scratch[..chunk_len],
-        )?;
+        reader
+            .read_exact_at(
+                file_range.offset().checked_add(copied).ok_or_else(|| {
+                    LoadError::new(
+                        LoadStage::Map,
+                        LoadErrorKind::IntegerOverflow,
+                        ErrorContext::FileRange {
+                            offset: file_range.offset(),
+                            len: file_range.len(),
+                            file_len: 0,
+                        },
+                    )
+                })?,
+                &mut scratch[..chunk_len],
+            )
+            .map_err(|error| error.with_stage(LoadStage::Map))?;
         memory
             .write(
                 target

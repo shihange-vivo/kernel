@@ -35,8 +35,8 @@ impl MemoryPermissions {
     pub const WRITE: Self = Self(1 << 1);
     pub const EXECUTE: Self = Self(1 << 2);
 
-    pub const fn bitor(self, rhs: Self) -> Self {
-        Self(self.0 | rhs.0)
+    pub const fn union(self, other: Self) -> Self {
+        Self(self.0 | other.0)
     }
 
     pub const fn without(self, removed: Self) -> Self {
@@ -162,16 +162,22 @@ impl MemoryMapper {
             .ok_or_else(|| sealed_install_error(sealed))?;
         let entry =
             usize::try_from(sealed.entry().get()).map_err(|_| sealed_install_error(sealed))?;
-        let entry_in_allocation = sealed
-            .entry()
+        let canonical_entry = sealed.canonical_entry();
+        let entry_span = sealed.entry_instruction_span();
+        let entry_in_allocation = canonical_entry
             .get()
             .checked_sub(active.target_base().get())
-            .is_some_and(|offset| offset < active.len());
+            .and_then(|offset| offset.checked_add(entry_span))
+            .is_some_and(|end| end <= active.len());
         if !entry_in_allocation {
             return Err(sealed_install_error(sealed));
         }
         if matches!(self.mode, MappingMode::Fixed(_)) {
-            self.validate_fixed_span(entry, 1, MemoryPermissions::EXECUTE)
+            let canonical_entry =
+                usize::try_from(canonical_entry.get()).map_err(|_| sealed_install_error(sealed))?;
+            let entry_span =
+                usize::try_from(entry_span).map_err(|_| sealed_install_error(sealed))?;
+            self.validate_fixed_span(canonical_entry, entry_span, MemoryPermissions::EXECUTE)
                 .map_err(|_| sealed_install_error(sealed))?;
         }
         Ok(PreparedMapperInstall {
@@ -481,8 +487,8 @@ fn sealed_install_error(sealed: &SealedState) -> LoadError {
         LoadStage::Publish,
         LoadErrorKind::Backend,
         ErrorContext::TargetRange {
-            start: sealed.entry(),
-            len: 1,
+            start: sealed.canonical_entry(),
+            len: sealed.entry_instruction_span(),
         },
     )
 }

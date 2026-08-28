@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use alloc::{boxed::Box, vec::Vec};
+use alloc::vec::Vec;
 use goblin::elf::dynamic::*;
 
 use crate::{
@@ -171,7 +171,7 @@ impl RelocationRecord {
 
 #[derive(Debug)]
 pub struct RuntimeImageMetadata {
-    relocations: Box<[RelocationRecord]>,
+    relocations: Vec<RelocationRecord>,
     features: DynamicFeatureSummary,
 }
 
@@ -232,7 +232,9 @@ impl MappedState {
         let mut features = DynamicFeatureSummary::default();
         if let Some(dynamic) = self.dynamic() {
             let tags = decode_dynamic_tags(&self, dynamic, transaction.memory())?;
-            policy.validate_dynamic_features(&tags.features)?;
+            policy
+                .validate_dynamic_features(&tags.features)
+                .map_err(|error| error.with_stage(LoadStage::Metadata))?;
             features = tags.features;
             decode_relocation_table(
                 &self,
@@ -253,7 +255,7 @@ impl MappedState {
         Ok(RuntimeState {
             mapped: self,
             metadata: RuntimeImageMetadata {
-                relocations: relocations.into_boxed_slice(),
+                relocations,
                 features,
             },
         })
@@ -466,13 +468,13 @@ fn decode_relocation_table<M: ImageMemory>(
         return Err(dynamic_error(tag, entry_size));
     }
     let count = byte_len / entry_size;
-    let total = (records.len() as u64)
+    let existing = u64::try_from(records.len()).map_err(|_| dynamic_error(tag, count))?;
+    let total = existing
         .checked_add(count)
         .ok_or_else(|| dynamic_error(tag, count))?;
+    let record_size = u64::try_from(core::mem::size_of::<RelocationRecord>()).unwrap_or(u64::MAX);
     mapped.request().limits().check_relocation_count(total)?;
-    let metadata_bytes = total
-        .checked_mul(core::mem::size_of::<RelocationRecord>() as u64)
-        .unwrap_or(u64::MAX);
+    let metadata_bytes = total.checked_mul(record_size).unwrap_or(u64::MAX);
     mapped
         .request()
         .limits()

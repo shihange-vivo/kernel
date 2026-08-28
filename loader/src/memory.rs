@@ -241,29 +241,6 @@ pub trait ImageProtectionMemory: ImageMemory {
         prepared: &crate::PreparedProtectionPlan,
     ) -> LoadResult<()>;
 
-    fn prepare_protection(
-        &self,
-        allocation: &ImageAllocation,
-        logical: &crate::SealPlan,
-    ) -> LoadResult<crate::PreparedProtectionPlan> {
-        let prepared = crate::PreparedProtectionPlan::build(
-            allocation,
-            logical,
-            self.protection_capabilities(),
-        )?;
-        self.validate_protection_aliases(allocation, &prepared)
-            .map_err(|error| error.with_stage(LoadStage::Seal))?;
-        for range in prepared.ranges() {
-            self.validate_access(
-                range.location(),
-                range.applied_range().len(),
-                range.applied(),
-            )
-            .map_err(|error| error.at(LoadStage::Seal))?;
-        }
-        Ok(prepared)
-    }
-
     /// Apply every request in a core-owned, fixed-length batch.
     ///
     /// Implementations may perform an atomic platform batch instead of using
@@ -277,7 +254,7 @@ pub trait ImageProtectionMemory: ImageMemory {
                 .protect(
                     record.location(),
                     record.applied_range().len(),
-                    record.applied(),
+                    record.permissions(),
                 )
                 .map_err(|error| error.at(LoadStage::Seal))?;
             let _recorded = batch.record_level(index, level);

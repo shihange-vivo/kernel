@@ -42,7 +42,10 @@ pub trait ElfReader {
     fn len(&self) -> LoadResult<u64>;
 
     fn is_empty(&self) -> LoadResult<bool> {
-        Ok(self.len()? == 0)
+        Ok(self
+            .len()
+            .map_err(|error| error.with_stage(LoadStage::Read))?
+            == 0)
     }
 
     fn read_exact_at(&self, offset: u64, dst: &mut [u8]) -> LoadResult<()>;
