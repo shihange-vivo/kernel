@@ -18,8 +18,8 @@ use core::alloc::Layout;
 use crate::{
     AllocationId, AllocationLease, AllocationOwnership, AllocationRequest, ErrorContext,
     ExpectedElfType, ImageAllocation, ImageCommitMemory, ImageMemory, ImageProtectionMemory,
-    LoadError, LoadErrorKind, LoadResult, LoadStage, MutationProgress, Placement,
-    ProtectionCapabilities, SealedState, TargetAddr, TargetLocation,
+    LoadError, LoadErrorKind, LoadResult, LoadStage, MemoryError, MemoryResult, MutationProgress,
+    Placement, ProtectionCapabilities, SealedState, TargetAddr, TargetLocation,
 };
 
 const IMAGE_ALLOCATION_ID: AllocationId = AllocationId::new(0);
@@ -203,6 +203,14 @@ impl MemoryMapper {
     }
 }
 
+impl Drop for MemoryMapper {
+    fn drop(&mut self) {
+        if let Some(lease) = self.installed_lease.take() {
+            self.release_committed(lease);
+        }
+    }
+}
+
 impl ImageMemory for MemoryMapper {
     fn allocate_image(&mut self, request: &AllocationRequest) -> LoadResult<AllocationLease> {
         if self.image_allocation.is_some()
@@ -311,11 +319,11 @@ impl ImageMemory for MemoryMapper {
         location: TargetLocation,
         len: u64,
         permissions: MemoryPermissions,
-    ) -> LoadResult<()> {
+    ) -> MemoryResult<()> {
         self.image_span(location, len, permissions).map(|_| ())
     }
 
-    fn write(&mut self, location: TargetLocation, data: &[u8]) -> LoadResult<()> {
+    fn write(&mut self, location: TargetLocation, data: &[u8]) -> MemoryResult<()> {
         let len = u64::try_from(data.len()).map_err(|_| memory_access_error(location, u64::MAX))?;
         let target = self.image_span(location, len, MemoryPermissions::WRITE)?;
         if data.is_empty() {
@@ -325,7 +333,7 @@ impl ImageMemory for MemoryMapper {
         Ok(())
     }
 
-    fn zero(&mut self, location: TargetLocation, len: u64) -> LoadResult<()> {
+    fn zero(&mut self, location: TargetLocation, len: u64) -> MemoryResult<()> {
         let target = self.image_span(location, len, MemoryPermissions::WRITE)?;
         let len = usize::try_from(len).map_err(|_| memory_access_error(location, len))?;
         if len != 0 {
@@ -334,7 +342,7 @@ impl ImageMemory for MemoryMapper {
         Ok(())
     }
 
-    fn read(&self, location: TargetLocation, dst: &mut [u8]) -> LoadResult<()> {
+    fn read(&self, location: TargetLocation, dst: &mut [u8]) -> MemoryResult<()> {
         let len = u64::try_from(dst.len()).map_err(|_| memory_access_error(location, u64::MAX))?;
         let source = self.image_span(location, len, MemoryPermissions::READ)?;
         if !dst.is_empty() {
@@ -348,7 +356,7 @@ impl ImageMemory for MemoryMapper {
         location: TargetLocation,
         len: u64,
         permissions: MemoryPermissions,
-    ) -> LoadResult<crate::ProtectionLevel> {
+    ) -> MemoryResult<crate::ProtectionLevel> {
         self.validate_access(location, len, permissions)?;
         Ok(crate::ProtectionLevel::LogicalOnly)
     }
@@ -402,7 +410,7 @@ impl MemoryMapper {
         location: TargetLocation,
         len: u64,
         permissions: MemoryPermissions,
-    ) -> LoadResult<*mut u8> {
+    ) -> MemoryResult<*mut u8> {
         let allocation = self
             .image_allocation
             .filter(|allocation| allocation.id() == location.allocation())
@@ -457,9 +465,8 @@ fn allocation_error(request: &AllocationRequest) -> LoadError {
     )
 }
 
-fn memory_access_error(location: TargetLocation, len: u64) -> LoadError {
-    LoadError::new(
-        LoadStage::Map,
+fn memory_access_error(location: TargetLocation, len: u64) -> MemoryError {
+    MemoryError::new(
         LoadErrorKind::Backend,
         ErrorContext::MemoryAccess {
             allocation: location.allocation(),
@@ -471,7 +478,7 @@ fn memory_access_error(location: TargetLocation, len: u64) -> LoadError {
 
 fn sealed_install_error(sealed: &SealedState) -> LoadError {
     LoadError::new(
-        LoadStage::Seal,
+        LoadStage::Publish,
         LoadErrorKind::Backend,
         ErrorContext::TargetRange {
             start: sealed.entry(),

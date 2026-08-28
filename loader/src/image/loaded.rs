@@ -58,7 +58,6 @@ impl LoadedRegion {
 pub struct MappedState {
     request: ArtifactRequest,
     allocation: ImageAllocation,
-    image_span: u64,
     load_bias: TargetAddr,
     entry: TargetAddr,
     canonical_entry: TargetAddr,
@@ -91,7 +90,7 @@ impl MappedState {
     }
 
     pub const fn image_span(&self) -> u64 {
-        self.image_span
+        self.allocation.len()
     }
 
     pub const fn load_bias(&self) -> TargetAddr {
@@ -223,7 +222,6 @@ impl ImageLoader {
         let mapped = MappedState {
             request: *artifact.request(),
             allocation,
-            image_span: layout.image_span(),
             load_bias,
             entry,
             canonical_entry,
@@ -239,7 +237,7 @@ impl ImageLoader {
             transaction
                 .memory()
                 .zero(TargetLocation::new(allocation.id(), 0), mapped.image_span())
-                .map_err(|error| error.with_stage(LoadStage::Map))?;
+                .map_err(|error| error.at(LoadStage::Map))?;
         }
 
         let mut scratch = [0; COPY_BUFFER_SIZE];
@@ -275,7 +273,7 @@ impl ImageLoader {
                             .map_err(|error| error.at(LoadStage::Map))?,
                         bss_len,
                     )
-                    .map_err(|error| error.with_stage(LoadStage::Map))?;
+                    .map_err(|error| error.at(LoadStage::Map))?;
             }
         }
         artifact.ensure_snapshot()?;
@@ -292,7 +290,7 @@ fn preflight_targets<M: ImageMemory>(mapped: &MappedState, memory: &M) -> LoadRe
                 mapped.image_span(),
                 MemoryPermissions::WRITE,
             )
-            .map_err(|error| error.with_stage(LoadStage::Map));
+            .map_err(|error| error.at(LoadStage::Map));
     }
 
     for region in mapped.regions() {
@@ -302,14 +300,14 @@ fn preflight_targets<M: ImageMemory>(mapped: &MappedState, memory: &M) -> LoadRe
                 region.vaddr_range().len(),
                 MemoryPermissions::WRITE,
             )
-            .map_err(|error| error.with_stage(LoadStage::Map))?;
+            .map_err(|error| error.at(LoadStage::Map))?;
         memory
             .validate_access(
                 region.location(mapped.allocation.id()),
                 region.vaddr_range().len(),
                 region.logical_permissions(),
             )
-            .map_err(|error| error.with_stage(LoadStage::Map))?;
+            .map_err(|error| error.at(LoadStage::Map))?;
     }
     Ok(())
 }
@@ -346,7 +344,7 @@ fn copy_file_range<R: ElfReader, M: ImageMemory>(
                     .map_err(|error| error.at(LoadStage::Map))?,
                 &scratch[..chunk_len],
             )
-            .map_err(|error| error.with_stage(LoadStage::Map))?;
+            .map_err(|error| error.at(LoadStage::Map))?;
         copied += chunk_len as u64;
     }
     Ok(())

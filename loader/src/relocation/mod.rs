@@ -90,14 +90,11 @@ impl TargetWord {
         let len = self.width.bytes() as usize;
         memory
             .read(location, &mut bytes[..len])
-            .map_err(|error| error.with_stage(LoadStage::Relocate))?;
+            .map_err(|error| error.at(LoadStage::Relocate))?;
+        let word32 = [bytes[0], bytes[1], bytes[2], bytes[3]];
         Ok(match (self.width, self.endian) {
-            (WordWidth::U32, Endian::Little) => {
-                u64::from(u32::from_le_bytes(bytes[..4].try_into().unwrap()))
-            }
-            (WordWidth::U32, Endian::Big) => {
-                u64::from(u32::from_be_bytes(bytes[..4].try_into().unwrap()))
-            }
+            (WordWidth::U32, Endian::Little) => u64::from(u32::from_le_bytes(word32)),
+            (WordWidth::U32, Endian::Big) => u64::from(u32::from_be_bytes(word32)),
             (WordWidth::U64, Endian::Little) => u64::from_le_bytes(bytes),
             (WordWidth::U64, Endian::Big) => u64::from_be_bytes(bytes),
         })
@@ -134,7 +131,7 @@ impl TargetWord {
         }
         memory
             .write(location, &bytes[..len])
-            .map_err(|error| error.with_stage(LoadStage::Relocate))
+            .map_err(|error| error.at(LoadStage::Relocate))
     }
 }
 

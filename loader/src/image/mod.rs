@@ -23,11 +23,12 @@ pub use layout::{
 };
 pub use loaded::{LoadedRegion, MappedImage, MappedState};
 pub use metadata::{
-    ArtifactFeaturePolicy, DynamicFeatureSummary, ProgramFeatureSummary, RelocationAddend,
-    Phase0ArtifactPolicy, RelocationRecord, RuntimeImage, RuntimeImageMetadata, RuntimeState,
+    ArtifactFeaturePolicy, DynamicFeatureSummary, Phase0ArtifactPolicy, ProgramFeatureSummary,
+    RelocationAddend, RelocationRecord, RuntimeImage, RuntimeImageMetadata, RuntimeState,
 };
 pub use parser::{DynamicSegmentInfo, LoadSegmentInfo, ParsedImage, StackPolicy};
 pub use seal::{
-    AppliedProtection, AppliedProtectionSet, PreparedImage, PreparedProtectionPlan,
-    ProtectionCapabilities, ProtectionLevel, ReadyImageCommit, SealPlan, SealRange, SealedState,
+    AppliedProtectionSet, PreparedImage, PreparedProtectionPlan, ProtectionBatch,
+    ProtectionCapabilities, ProtectionLevel, ProtectionRecord, ReadyImageCommit, SealPlan,
+    SealRange, SealedState,
 };

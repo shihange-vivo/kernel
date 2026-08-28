@@ -43,19 +43,20 @@ pub use identity::{
     ExpectedElfType, HeaderFlagsPolicy, ImageLoader, RelativeValuePolicy,
 };
 pub use image::{
-    AppliedProtection, AppliedProtectionSet, ArtifactFeaturePolicy, DynamicFeatureSummary,
-    DynamicSegmentInfo, ImageLayout, ImageLayoutBuilder, LoadSegmentInfo, LoadedRegion,
-    MappedImage, MappedState, ParsedImage, Phase0ArtifactPolicy, PlannedArtifact, PreparedImage,
-    PreparedProtectionPlan, ProgramFeatureSummary, ProtectionCapabilities, ProtectionLevel,
-    ReadyImageCommit, RelocationAddend, RelocationRecord, RuntimeImage, RuntimeImageMetadata,
-    RuntimeState, SealPlan, SealRange, SealedState, SegmentLayout, SegmentLocation, StackPolicy,
+    AppliedProtectionSet, ArtifactFeaturePolicy, DynamicFeatureSummary, DynamicSegmentInfo,
+    ImageLayout, ImageLayoutBuilder, LoadSegmentInfo, LoadedRegion, MappedImage, MappedState,
+    ParsedImage, Phase0ArtifactPolicy, PlannedArtifact, PreparedImage, PreparedProtectionPlan,
+    ProgramFeatureSummary, ProtectionBatch, ProtectionCapabilities, ProtectionLevel,
+    ProtectionRecord, ReadyImageCommit, RelocationAddend, RelocationRecord, RuntimeImage,
+    RuntimeImageMetadata, RuntimeState, SealPlan, SealRange, SealedState, SegmentLayout,
+    SegmentLocation, StackPolicy,
 };
 pub use limits::LoadLimits;
 pub(crate) use memory::ImageLoadTransaction;
 pub use memory::{
     AllocationId, AllocationLease, AllocationOwnership, AllocationRequest, ImageAllocation,
-    ImageCommitMemory, ImageMemory, ImageProtectionMemory, MutationProgress, Placement,
-    ReservedImage, ReservedState, StagedImage, TargetLocation,
+    ImageCommitMemory, ImageMemory, ImageProtectionMemory, MemoryError, MemoryResult,
+    MutationProgress, Placement, ReservedImage, ReservedState, StagedImage, TargetLocation,
 };
 pub use memory_mapper::{MemoryMapper, MemoryPermissions, MemoryRegion};
 pub use reader::{ElfReader, SliceElfReader, SourceSnapshot};
@@ -184,9 +185,8 @@ fn load_elf_with_relocator<A: ArchRelocator + ?Sized>(
         mapper.expected_elf_type(),
         profile,
         LoadLimits::phase0_mcu(),
-    )
-    .with_cache_requirements(cache_requirements);
-    let mut cache = ArchitectureCodeCache;
+    );
+    let mut cache = ArchitectureCodeCache::new(cache_requirements);
     load_image(
         SliceElfReader::new(buffer),
         request,

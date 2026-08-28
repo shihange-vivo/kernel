@@ -260,6 +260,10 @@ impl ArtifactProfile {
     }
 }
 
+/// ELF admission profile and resource limits for one artifact.
+///
+/// Deployment properties such as instruction-cache publication scope belong
+/// to the cache/publisher adapter, not this source identity request.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ArtifactRequest {
     expected_elf_type: ExpectedElfType,
@@ -291,7 +295,6 @@ impl ArtifactRequest {
     pub const fn limits(&self) -> &LoadLimits {
         &self.limits
     }
-
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

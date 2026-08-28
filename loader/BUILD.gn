@@ -18,6 +18,7 @@ import("//build/toolchain/blueos.gni")
 group("check_loader") {
   testonly = true
   deps = [
+    ":run_loader_corpus(//build/toolchain:host)",
     ":run_loader_unittest(//build/toolchain:host)",
     "tests:run_loader_integration_test",
   ]
@@ -25,7 +26,10 @@ group("check_loader") {
 
 group("check_loader_host") {
   testonly = true
-  deps = [ ":run_loader_unittest" ]
+  deps = [
+    ":run_loader_corpus(//build/toolchain:host)",
+    ":run_loader_unittest(//build/toolchain:host)",
+  ]
 }
 
 group("inputs") {
@@ -112,6 +116,33 @@ run_host("run_loader_unittest") {
   runner = ":loader_unittest"
 }
 
+# This host binary is both a deterministic CI corpus runner and the source for
+# a libFuzzer-compatible `LLVMFuzzerTestOneInput` entry when built with
+# `--cfg fuzzing` and a sanitizer-enabled host toolchain.
+build_rust("loader_fuzz") {
+  testonly = true
+  crate_type = "bin"
+  sources = [ "fuzz/loader_fuzz.rs" ]
+  inputs = [
+    "fuzz/corpus/empty.hex",
+    "fuzz/corpus/truncated_magic.hex",
+    "fuzz/corpus/valid_arm32.hex",
+    "fuzz/corpus/valid_riscv64.hex",
+    "fuzz/corpus/valid_riscv64_rela.hex",
+  ]
+  deps = [ ":blueos_loader" ]
+}
+
+run_host("run_loader_corpus") {
+  testonly = true
+  runner = ":loader_fuzz"
+}
+
+run_clippy("loader_fuzz_clippy") {
+  testonly = true
+  deps = [ ":loader_fuzz" ]
+}
+
 run_clippy("blueos_loader_clippy") {
   deps = [ ":blueos_loader" ]
 }
@@ -120,6 +151,7 @@ group("check_loader_by_clippy") {
   testonly = true
   deps = [
     ":blueos_loader_clippy",
+    ":loader_fuzz_clippy(//build/toolchain:host)",
     "tests/integration_test:loader_integration_test_clippy",
   ]
   if (coverage || profile) {

@@ -36,9 +36,10 @@ use crate::{
     ArtifactProfile, ArtifactRequest, CodeCache, ElfClass, ElfReader, Endian, ErrorContext,
     ExpectedElfType, ImageAllocation, ImageCommitMemory, ImageLoadTransaction, ImageLoader,
     ImageMemory, ImageProtectionMemory, LoadError, LoadErrorKind, LoadLimits, LoadResult,
-    LoadStage, MemoryPermissions, MutationProgress, Placement, PlannedArtifact,
-    ProtectionCapabilities, ProtectionLevel, RelocationAddend, Riscv64Relocator,
-    Phase0ArtifactPolicy, SealedState, SliceElfReader, SourceSnapshot, TargetAddr, TargetLocation,
+    LoadStage, MemoryError, MemoryPermissions, MemoryResult, MutationProgress,
+    Phase0ArtifactPolicy, Placement, PlannedArtifact, ProtectionCapabilities, ProtectionLevel,
+    RelocationAddend, Riscv64Relocator, SealedState, SliceElfReader, SourceSnapshot, TargetAddr,
+    TargetLocation,
 };
 use goblin::elf::program_header::{
     PF_R, PF_W, PF_X, PT_DYNAMIC, PT_GNU_RELRO, PT_GNU_STACK, PT_INTERP, PT_LOAD, PT_TLS,
@@ -64,7 +65,7 @@ fn fixture_builder_emits_a_parseable_elf64_header() {
 }
 
 #[test]
-fn legacy_loader_rejects_invalid_magic() {
+fn compatibility_loader_rejects_invalid_magic() {
     let mut bytes = ElfFixtureBuilder::elf64(EM_RISCV, ET_DYN).build();
     bytes[0] = 0;
     let mut mapper = crate::MemoryMapper::new(None);
@@ -94,6 +95,11 @@ fn range_errors_are_stage_neutral_until_consumed() {
     let range_error = TargetAddr::new(u64::MAX).checked_add(1).unwrap_err();
     assert_eq!(range_error.kind(), LoadErrorKind::IntegerOverflow);
 
+    let byte_error = crate::identity::read_u64(&[0; 7], 0, Endian::Little).unwrap_err();
+    assert_eq!(byte_error.kind(), LoadErrorKind::OutOfBounds);
+    let memory_error = fake_access_error(TargetLocation::new(AllocationId::new(1), 2), 4);
+    assert_eq!(memory_error.kind(), LoadErrorKind::Backend);
+
     for stage in [
         LoadStage::Parse,
         LoadStage::Plan,
@@ -102,8 +108,11 @@ fn range_errors_are_stage_neutral_until_consumed() {
         LoadStage::Relocate,
         LoadStage::Cache,
         LoadStage::Seal,
+        LoadStage::Publish,
     ] {
         assert_eq!(range_error.at(stage).stage(), stage);
+        assert_eq!(byte_error.at(stage).stage(), stage);
+        assert_eq!(memory_error.at(stage).stage(), stage);
     }
 }
 
@@ -893,6 +902,12 @@ impl FakeMemory {
             fail_protect_at: None,
         }
     }
+
+    fn release_installed(&mut self) {
+        if let Some(lease) = self.installed_lease.take() {
+            self.release_committed(lease);
+        }
+    }
 }
 
 impl ImageMemory for FakeMemory {
@@ -933,7 +948,7 @@ impl ImageMemory for FakeMemory {
         location: TargetLocation,
         len: u64,
         _permissions: MemoryPermissions,
-    ) -> LoadResult<()> {
+    ) -> MemoryResult<()> {
         let allocation = self
             .allocation
             .ok_or_else(|| fake_access_error(location, len))?;
@@ -949,7 +964,7 @@ impl ImageMemory for FakeMemory {
         }
     }
 
-    fn write(&mut self, location: TargetLocation, data: &[u8]) -> LoadResult<()> {
+    fn write(&mut self, location: TargetLocation, data: &[u8]) -> MemoryResult<()> {
         self.validate_access(location, data.len() as u64, MemoryPermissions::WRITE)?;
         if self.fail_write_at == Some(self.writes.len()) {
             return Err(fake_access_error(location, data.len() as u64));
@@ -960,7 +975,7 @@ impl ImageMemory for FakeMemory {
         Ok(())
     }
 
-    fn zero(&mut self, location: TargetLocation, len: u64) -> LoadResult<()> {
+    fn zero(&mut self, location: TargetLocation, len: u64) -> MemoryResult<()> {
         self.validate_access(location, len, MemoryPermissions::WRITE)?;
         if self.fail_zero_at == Some(self.zeros.len()) {
             return Err(fake_access_error(location, len));
@@ -971,7 +986,7 @@ impl ImageMemory for FakeMemory {
         Ok(())
     }
 
-    fn read(&self, location: TargetLocation, dst: &mut [u8]) -> LoadResult<()> {
+    fn read(&self, location: TargetLocation, dst: &mut [u8]) -> MemoryResult<()> {
         self.validate_access(location, dst.len() as u64, MemoryPermissions::READ)?;
         let read_index = self.reads.borrow().len();
         if self.fail_read_at == Some(read_index) {
@@ -988,7 +1003,7 @@ impl ImageMemory for FakeMemory {
         location: TargetLocation,
         len: u64,
         permissions: MemoryPermissions,
-    ) -> LoadResult<ProtectionLevel> {
+    ) -> MemoryResult<ProtectionLevel> {
         self.validate_access(location, len, permissions)?;
         if self.fail_protect_at == Some(self.protects.len()) {
             return Err(fake_access_error(location, len));
@@ -1025,7 +1040,7 @@ impl ImageCommitMemory for FakeMemory {
             || sealed.allocation() != allocation
         {
             return Err(LoadError::new(
-                LoadStage::Seal,
+                LoadStage::Publish,
                 LoadErrorKind::Backend,
                 ErrorContext::Allocation {
                     base: allocation.target_base(),
@@ -1082,9 +1097,8 @@ impl ImageProtectionMemory for FakeMemory {
     }
 }
 
-fn fake_access_error(location: TargetLocation, len: u64) -> LoadError {
-    LoadError::new(
-        LoadStage::Map,
+fn fake_access_error(location: TargetLocation, len: u64) -> MemoryError {
+    MemoryError::new(
         LoadErrorKind::Backend,
         ErrorContext::MemoryAccess {
             allocation: location.allocation(),
@@ -1113,6 +1127,48 @@ fn planned_image_with_request(
     let loader = ImageLoader::new();
     let admitted = loader.admit(SliceElfReader::new(bytes), request).unwrap();
     loader.plan(admitted).unwrap()
+}
+
+fn reserved_stage<'m, 'r>(
+    bytes: &'r [u8],
+    memory: &'m mut FakeMemory,
+) -> crate::ReservedImage<'m, FakeMemory, SliceElfReader<'r>> {
+    ImageLoader::new()
+        .reserve_staged(planned_image(bytes, ExpectedElfType::Dyn), memory)
+        .unwrap()
+}
+
+fn mapped_stage<'m>(
+    bytes: &[u8],
+    memory: &'m mut FakeMemory,
+) -> crate::MappedImage<'m, FakeMemory> {
+    reserved_stage(bytes, memory).copy_and_zero().unwrap()
+}
+
+fn runtime_stage<'m>(
+    bytes: &[u8],
+    memory: &'m mut FakeMemory,
+) -> crate::RuntimeImage<'m, FakeMemory> {
+    mapped_stage(bytes, memory)
+        .decode_runtime(&Phase0ArtifactPolicy)
+        .unwrap()
+}
+
+fn relocated_stage<'m>(
+    bytes: &[u8],
+    memory: &'m mut FakeMemory,
+) -> crate::RelocatedImage<'m, FakeMemory> {
+    runtime_stage(bytes, memory)
+        .relocate(&Riscv64Relocator)
+        .unwrap()
+}
+
+fn prepared_stage<'m>(
+    bytes: &[u8],
+    memory: &'m mut FakeMemory,
+    cache: &mut FakeCodeCache,
+) -> crate::PreparedImage<'m, FakeMemory> {
+    relocated_stage(bytes, memory).seal(cache).unwrap()
 }
 
 #[test]
@@ -2388,15 +2444,28 @@ fn arm_relocator_rejects_unaligned_and_read_only_targets() {
 struct FakeCodeCache {
     ranges: std::vec::Vec<crate::TargetRange>,
     fail: bool,
+    omit_prepared_ranges: bool,
+    misreport_completed_ranges: bool,
+    requirements: Option<crate::CacheRequirements>,
     scope: Option<crate::ExecutionScope>,
     maintenance: Option<crate::CacheMaintenance>,
 }
 
 impl CodeCache for FakeCodeCache {
+    fn requirements(&self) -> crate::CacheRequirements {
+        self.requirements
+            .unwrap_or(crate::CacheRequirements::CURRENT_EXECUTION_CONTEXT)
+    }
+
     fn prepare(
         &self,
         executable_ranges: &[crate::TargetRange],
     ) -> LoadResult<crate::PreparedCacheSync> {
+        let executable_ranges = if self.omit_prepared_ranges {
+            &[]
+        } else {
+            executable_ranges
+        };
         crate::PreparedCacheSync::try_new(
             executable_ranges,
             self.scope
@@ -2426,6 +2495,14 @@ impl CodeCache for FakeCodeCache {
             ));
         }
         self.ranges.extend_from_slice(prepared.executable_ranges());
+        if self.misreport_completed_ranges {
+            return Ok(crate::PreparedCacheSync::try_new(
+                &[],
+                prepared.scope(),
+                prepared.maintenance(),
+            )?
+            .complete());
+        }
         Ok(prepared.complete())
     }
 }
@@ -2490,6 +2567,7 @@ fn seal_synchronizes_code_applies_relro_and_commits_the_transaction() {
         .iter()
         .zip(sealed.protections().ranges())
     {
+        assert_eq!(applied.location(), requested.location());
         assert_eq!(applied.requested_range(), requested.runtime_range());
         assert_eq!(applied.applied_range(), requested.runtime_range());
         assert_eq!(applied.requested(), requested.permissions());
@@ -2633,8 +2711,7 @@ fn cache_requirements_reject_insufficient_scope_and_wrong_maintenance_before_syn
             ExpectedElfType::Dyn,
             ArtifactProfile::new(ElfClass::Elf64, Endian::Little, EM_RISCV),
             LoadLimits::default(),
-        )
-        .with_cache_requirements(requirements);
+        );
         let planned = planned_image_with_request(&bytes, request);
         let allocation_id = AllocationId::new(310 + index as u32);
         let mut memory = FakeMemory::returning(ImageAllocation::new(
@@ -2644,7 +2721,10 @@ fn cache_requirements_reject_insufficient_scope_and_wrong_maintenance_before_syn
             0x1000,
             AllocationOwnership::Owned,
         ));
-        let mut cache = FakeCodeCache::default();
+        let mut cache = FakeCodeCache {
+            requirements: Some(requirements),
+            ..FakeCodeCache::default()
+        };
 
         {
             let mut transaction = ImageLoadTransaction::new(&mut memory);
@@ -2720,6 +2800,74 @@ fn protection_batch_rejects_granule_conflicts_and_region_shortage_before_cache_s
         assert_eq!(memory.releases, [allocation_id]);
         assert_eq!(memory.abort_progress, [MutationProgress::BytesModified]);
     }
+}
+
+#[test]
+fn cache_prepare_must_preserve_every_executable_range_before_sync() {
+    let bytes = riscv_image_with_relro();
+    let allocation_id = AllocationId::new(312);
+    let mut memory = FakeMemory::returning(ImageAllocation::new(
+        allocation_id,
+        TargetAddr::new(0x8000),
+        0x3000,
+        0x1000,
+        AllocationOwnership::Owned,
+    ));
+    let mut cache = FakeCodeCache {
+        omit_prepared_ranges: true,
+        ..FakeCodeCache::default()
+    };
+
+    let error = crate::prepare_image(
+        SliceElfReader::new(&bytes),
+        riscv64_request(),
+        &mut memory,
+        &mut cache,
+        &Phase0ArtifactPolicy,
+        &Riscv64Relocator,
+    )
+    .unwrap_err();
+
+    assert_eq!(error.stage(), LoadStage::Cache);
+    assert_eq!(error.kind(), LoadErrorKind::Backend);
+    assert!(cache.ranges.is_empty());
+    assert!(memory.protects.is_empty());
+    assert_eq!(memory.releases, [allocation_id]);
+    assert_eq!(memory.abort_progress, [MutationProgress::BytesModified]);
+}
+
+#[test]
+fn cache_completion_must_match_the_validated_prepared_token() {
+    let bytes = riscv_image_with_relro();
+    let allocation_id = AllocationId::new(313);
+    let mut memory = FakeMemory::returning(ImageAllocation::new(
+        allocation_id,
+        TargetAddr::new(0x8000),
+        0x3000,
+        0x1000,
+        AllocationOwnership::Owned,
+    ));
+    let mut cache = FakeCodeCache {
+        misreport_completed_ranges: true,
+        ..FakeCodeCache::default()
+    };
+
+    let error = crate::prepare_image(
+        SliceElfReader::new(&bytes),
+        riscv64_request(),
+        &mut memory,
+        &mut cache,
+        &Phase0ArtifactPolicy,
+        &Riscv64Relocator,
+    )
+    .unwrap_err();
+
+    assert_eq!(error.stage(), LoadStage::Cache);
+    assert_eq!(error.kind(), LoadErrorKind::Backend);
+    assert_eq!(cache.ranges.len(), 1);
+    assert!(memory.protects.is_empty());
+    assert_eq!(memory.releases, [allocation_id]);
+    assert_eq!(memory.abort_progress, [MutationProgress::BytesModified]);
 }
 
 #[test]
@@ -2914,40 +3062,59 @@ fn load_image_orchestrates_and_commits_the_phase0_pipeline() {
     assert_eq!(receipt.relocation_count, 1);
     assert!(memory.releases.is_empty());
     assert!(memory.installed_lease.is_some());
+
+    memory.release_installed();
+    assert!(memory.releases.is_empty());
+    assert_eq!(memory.committed_releases, [AllocationId::new(26)]);
+    assert!(memory.installed_lease.is_none());
 }
 
 #[test]
-fn dropping_a_prepared_image_aborts_the_same_lease_once() {
+fn dropping_every_public_stage_aborts_exactly_once_with_the_latest_progress() {
     let bytes = riscv_image_with_relro();
-    let allocation_id = AllocationId::new(28);
-    let mut memory = FakeMemory::returning(ImageAllocation::new(
-        allocation_id,
-        TargetAddr::new(0x8000),
-        0x3000,
-        0x1000,
-        AllocationOwnership::Owned,
-    ));
+    let new_memory = |id| {
+        FakeMemory::returning(ImageAllocation::new(
+            AllocationId::new(id),
+            TargetAddr::new(0x8000),
+            0x3000,
+            0x1000,
+            AllocationOwnership::Owned,
+        ))
+    };
+    let assert_aborted = |memory: &FakeMemory, id, progress| {
+        assert_eq!(memory.releases, [AllocationId::new(id)]);
+        assert_eq!(memory.abort_progress, [progress]);
+        assert!(memory.installed_lease.is_none());
+    };
+
+    let mut memory = new_memory(320);
+    drop(reserved_stage(&bytes, &mut memory));
+    assert_aborted(&memory, 320, MutationProgress::Reserved);
+
+    let mut memory = new_memory(321);
+    drop(mapped_stage(&bytes, &mut memory));
+    assert_aborted(&memory, 321, MutationProgress::BytesModified);
+
+    let mut memory = new_memory(322);
+    drop(runtime_stage(&bytes, &mut memory));
+    assert_aborted(&memory, 322, MutationProgress::BytesModified);
+
+    let mut memory = new_memory(323);
+    drop(relocated_stage(&bytes, &mut memory));
+    assert_aborted(&memory, 323, MutationProgress::BytesModified);
+
+    let mut memory = new_memory(324);
     let mut cache = FakeCodeCache::default();
+    drop(prepared_stage(&bytes, &mut memory, &mut cache));
+    assert_aborted(&memory, 324, MutationProgress::ProtectionModified);
 
-    {
-        let prepared = crate::prepare_image(
-            SliceElfReader::new(&bytes),
-            riscv64_request(),
-            &mut memory,
-            &mut cache,
-            &Phase0ArtifactPolicy,
-            &Riscv64Relocator,
-        )
+    let mut memory = new_memory(325);
+    let mut cache = FakeCodeCache::default();
+    let ready = prepared_stage(&bytes, &mut memory, &mut cache)
+        .prepare_commit()
         .unwrap();
-        drop(prepared);
-    }
-
-    assert_eq!(memory.releases, [allocation_id]);
-    assert_eq!(
-        memory.abort_progress,
-        [MutationProgress::ProtectionModified]
-    );
-    assert!(memory.installed_lease.is_none());
+    drop(ready);
+    assert_aborted(&memory, 325, MutationProgress::ProtectionModified);
 }
 
 #[test]
@@ -2975,6 +3142,7 @@ fn prepare_install_failure_keeps_rollback_armed() {
     .unwrap_err();
 
     assert_eq!(error.kind(), LoadErrorKind::Backend);
+    assert_eq!(error.stage(), LoadStage::Publish);
     assert_eq!(memory.releases, [allocation_id]);
     assert_eq!(
         memory.abort_progress,

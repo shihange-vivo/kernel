@@ -118,6 +118,37 @@ pub enum MutationProgress {
     ProtectionModified,
 }
 
+pub type MemoryResult<T> = core::result::Result<T, MemoryError>;
+
+/// A reusable memory-backend failure before a pipeline stage has claimed it.
+///
+/// Memory access helpers are consumed by mapping, metadata decoding,
+/// relocation and sealing. Requiring the caller to bind the stage prevents a
+/// backend's default label from leaking into an unrelated later phase.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct MemoryError {
+    kind: LoadErrorKind,
+    context: ErrorContext,
+}
+
+impl MemoryError {
+    pub const fn new(kind: LoadErrorKind, context: ErrorContext) -> Self {
+        Self { kind, context }
+    }
+
+    pub const fn at(self, stage: LoadStage) -> LoadError {
+        LoadError::new(stage, self.kind, self.context)
+    }
+
+    pub const fn kind(&self) -> LoadErrorKind {
+        self.kind
+    }
+
+    pub const fn context(&self) -> &ErrorContext {
+        &self.context
+    }
+}
+
 impl ImageAllocation {
     pub const fn new(
         id: AllocationId,
@@ -170,7 +201,8 @@ pub trait ImageMemory {
 
     /// Release a successfully committed image owner. This is distinct from
     /// abort: a committed fixed image is not poisoned merely because its owner
-    /// is being torn down.
+    /// is being torn down. Implementations must be allocation-free,
+    /// non-panicking and infallible because owner Drop may invoke it.
     fn release_committed(&mut self, lease: AllocationLease);
 
     fn validate_access(
@@ -178,20 +210,20 @@ pub trait ImageMemory {
         location: TargetLocation,
         len: u64,
         permissions: crate::MemoryPermissions,
-    ) -> LoadResult<()>;
+    ) -> MemoryResult<()>;
 
-    fn write(&mut self, location: TargetLocation, data: &[u8]) -> LoadResult<()>;
+    fn write(&mut self, location: TargetLocation, data: &[u8]) -> MemoryResult<()>;
 
-    fn zero(&mut self, location: TargetLocation, len: u64) -> LoadResult<()>;
+    fn zero(&mut self, location: TargetLocation, len: u64) -> MemoryResult<()>;
 
-    fn read(&self, location: TargetLocation, dst: &mut [u8]) -> LoadResult<()>;
+    fn read(&self, location: TargetLocation, dst: &mut [u8]) -> MemoryResult<()>;
 
     fn protect(
         &mut self,
         location: TargetLocation,
         len: u64,
         permissions: crate::MemoryPermissions,
-    ) -> LoadResult<crate::ProtectionLevel>;
+    ) -> MemoryResult<crate::ProtectionLevel>;
 }
 
 pub trait ImageProtectionMemory: ImageMemory {
@@ -227,27 +259,30 @@ pub trait ImageProtectionMemory: ImageMemory {
                 range.applied_range().len(),
                 range.applied(),
             )
-                .map_err(|error| error.with_stage(LoadStage::Seal))?;
+            .map_err(|error| error.at(LoadStage::Seal))?;
         }
         Ok(prepared)
     }
 
-    fn apply_protection(
-        &mut self,
-        prepared: crate::PreparedProtectionPlan,
-    ) -> LoadResult<crate::AppliedProtectionSet> {
-        let mut ranges = prepared.into_ranges();
-        for range in ranges.iter_mut() {
+    /// Apply every request in a core-owned, fixed-length batch.
+    ///
+    /// Implementations may perform an atomic platform batch instead of using
+    /// the default loop, but may only inspect requests and record levels by
+    /// index. They must return an error on partial failure and must not retain
+    /// references to the batch after returning.
+    fn apply_protection(&mut self, mut batch: crate::ProtectionBatch<'_>) -> LoadResult<()> {
+        for index in 0..batch.records().len() {
+            let record = batch.records()[index];
             let level = self
                 .protect(
-                    range.location(),
-                    range.applied_range().len(),
-                    range.applied(),
+                    record.location(),
+                    record.applied_range().len(),
+                    record.applied(),
                 )
-                .map_err(|error| error.with_stage(LoadStage::Seal))?;
-            range.record_level(level);
+                .map_err(|error| error.at(LoadStage::Seal))?;
+            let _recorded = batch.record_level(index, level);
         }
-        Ok(crate::AppliedProtectionSet::new(ranges))
+        Ok(())
     }
 }
 
@@ -265,6 +300,8 @@ pub trait ImageCommitMemory: ImageProtectionMemory {
     /// transfer the unique allocation lease to the committed owner.
     ///
     /// This method must not allocate, validate, panic or fail.
+    /// The installed owner must retain the lease for the image lifetime and
+    /// pass it to `release_committed` exactly once when that lifetime ends.
     ///
     /// # Safety
     ///
@@ -362,6 +399,7 @@ impl<R> ReservedState<R> {
     }
 }
 
+#[must_use = "dropping an active image transaction aborts its allocation"]
 pub(crate) struct ImageLoadTransaction<'a, M: ImageMemory> {
     memory: &'a mut M,
     pending: Option<AllocationLease>,
@@ -458,16 +496,6 @@ impl<M: ImageMemory, S: core::fmt::Debug> core::fmt::Debug for StagedImage<'_, M
 impl<'a, M: ImageMemory, S> StagedImage<'a, M, S> {
     pub(crate) const fn new(transaction: ImageLoadTransaction<'a, M>, state: S) -> Self {
         Self { transaction, state }
-    }
-
-    /// Borrow the immutable payload proven by this typestate.
-    ///
-    /// The payload constructors remain private, so exposing a shared view does
-    /// not let callers forge a later stage or separate it from rollback
-    /// authority. Phase 0.5 can extend the payloads without opening a second
-    /// transition path.
-    pub const fn state(&self) -> &S {
-        &self.state
     }
 
     pub(crate) fn into_parts(self) -> (ImageLoadTransaction<'a, M>, S) {

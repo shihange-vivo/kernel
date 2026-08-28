@@ -73,7 +73,14 @@ impl CacheRequirements {
         self.maintenance
     }
 
-    pub fn validate(self, prepared: &PreparedCacheSync) -> LoadResult<()> {
+    pub fn validate_prepared(
+        self,
+        executable_ranges: &[TargetRange],
+        prepared: &PreparedCacheSync,
+    ) -> LoadResult<()> {
+        if prepared.executable_ranges() != executable_ranges {
+            return Err(cache_contract_error(executable_ranges));
+        }
         let scope_valid = prepared.scope().covers(self.scope);
         let maintenance_valid = self
             .maintenance
@@ -154,6 +161,22 @@ impl CacheSyncOutcome {
     pub const fn maintenance(&self) -> CacheMaintenance {
         self.maintenance
     }
+
+    pub(crate) fn validate_completion(
+        &self,
+        executable_ranges: &[TargetRange],
+        prepared_scope: ExecutionScope,
+        prepared_maintenance: CacheMaintenance,
+    ) -> LoadResult<()> {
+        if self.executable_ranges() == executable_ranges
+            && self.scope() == prepared_scope
+            && self.maintenance() == prepared_maintenance
+        {
+            Ok(())
+        } else {
+            Err(cache_contract_error(executable_ranges))
+        }
+    }
 }
 
 pub trait CodeCache {
@@ -165,8 +188,12 @@ pub trait CodeCache {
     /// publishes.
     fn requirements(&self) -> CacheRequirements;
 
+    /// Prepare an allocation-owning token that exactly preserves every range
+    /// and reports the capability that `synchronize` will actually provide.
     fn prepare(&self, executable_ranges: &[TargetRange]) -> LoadResult<PreparedCacheSync>;
 
+    /// Perform cache effects and return an outcome identical to the consumed
+    /// token. The core validates that identity before applying protection.
     fn synchronize(&mut self, prepared: PreparedCacheSync) -> LoadResult<CacheSyncOutcome>;
 }
 
@@ -333,5 +360,20 @@ fn cache_capability_error() -> LoadError {
         LoadStage::Cache,
         LoadErrorKind::UnsupportedByProfile,
         ErrorContext::None,
+    )
+}
+
+fn cache_contract_error(executable_ranges: &[TargetRange]) -> LoadError {
+    let range = executable_ranges
+        .first()
+        .copied()
+        .unwrap_or(TargetRange::new(crate::TargetAddr::new(0), 0));
+    LoadError::new(
+        LoadStage::Cache,
+        LoadErrorKind::Backend,
+        ErrorContext::TargetRange {
+            start: range.start(),
+            len: range.len(),
+        },
     )
 }

@@ -299,7 +299,7 @@ fn decode_dynamic_tags<M: ImageMemory>(
             dynamic.file_range().len(),
             MemoryPermissions::READ,
         )
-        .map_err(|error| error.with_stage(LoadStage::Metadata))?;
+        .map_err(|error| error.at(LoadStage::Metadata))?;
 
     let limits = mapped.request().limits();
     let entry_count = dynamic.file_range().len() / entry_size;
@@ -322,7 +322,7 @@ fn decode_dynamic_tags<M: ImageMemory>(
             .map_err(|error| error.at(LoadStage::Metadata))?;
         memory
             .read(current, &mut raw[..entry_size as usize])
-            .map_err(|error| error.with_stage(LoadStage::Metadata))?;
+            .map_err(|error| error.at(LoadStage::Metadata))?;
         let (tag, value) = decode_dynamic_entry(
             &raw[..entry_size as usize],
             mapped.request().profile().class(),
@@ -498,7 +498,7 @@ fn decode_relocation_table<M: ImageMemory>(
     )?;
     memory
         .validate_access(location, byte_len, MemoryPermissions::READ)
-        .map_err(|error| error.with_stage(LoadStage::Metadata))?;
+        .map_err(|error| error.at(LoadStage::Metadata))?;
     let mut raw = [0; 24];
     for index in 0..count {
         let entry_location = location
@@ -506,7 +506,7 @@ fn decode_relocation_table<M: ImageMemory>(
             .map_err(|error| error.at(LoadStage::Metadata))?;
         memory
             .read(entry_location, &mut raw[..entry_size as usize])
-            .map_err(|error| error.with_stage(LoadStage::Metadata))?;
+            .map_err(|error| error.at(LoadStage::Metadata))?;
         let record = decode_relocation_entry(
             &raw[..entry_size as usize],
             mapped.request().profile().class(),

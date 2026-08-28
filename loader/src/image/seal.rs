@@ -50,8 +50,13 @@ impl ProtectionCapabilities {
     }
 }
 
+/// Preallocated protection plan entry and result slot.
+///
+/// A prepared plan initializes `level` conservatively to `LogicalOnly`. The
+/// backend updates it in place only after the corresponding protection change
+/// succeeds, so sealing adds no allocation failure after side effects begin.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct AppliedProtection {
+pub struct ProtectionRecord {
     location: TargetLocation,
     requested_range: TargetRange,
     applied_range: TargetRange,
@@ -60,7 +65,7 @@ pub struct AppliedProtection {
     level: ProtectionLevel,
 }
 
-impl AppliedProtection {
+impl ProtectionRecord {
     pub const fn location(&self) -> TargetLocation {
         self.location
     }
@@ -85,24 +90,50 @@ impl AppliedProtection {
         self.level
     }
 
-    /// Record the enforcement level returned by a trusted protection backend.
-    pub fn record_level(&mut self, level: ProtectionLevel) {
+    fn record_level(&mut self, level: ProtectionLevel) {
         self.level = level;
+    }
+}
+
+/// Opaque, fixed-length view used while applying a prepared protection plan.
+///
+/// The backend can inspect every request and record its enforcement level, but
+/// cannot replace, remove, duplicate or extend the core-owned result records.
+pub struct ProtectionBatch<'a> {
+    records: &'a mut [ProtectionRecord],
+}
+
+impl<'a> ProtectionBatch<'a> {
+    pub(crate) const fn new(records: &'a mut [ProtectionRecord]) -> Self {
+        Self { records }
+    }
+
+    pub const fn records(&self) -> &[ProtectionRecord] {
+        self.records
+    }
+
+    /// Record the result for one request, returning false for an invalid index.
+    pub fn record_level(&mut self, index: usize, level: ProtectionLevel) -> bool {
+        let Some(record) = self.records.get_mut(index) else {
+            return false;
+        };
+        record.record_level(level);
+        true
     }
 }
 
 #[derive(Debug)]
 pub struct AppliedProtectionSet {
-    ranges: Box<[AppliedProtection]>,
+    ranges: Box<[ProtectionRecord]>,
 }
 
 impl AppliedProtectionSet {
-    /// Build the result of a backend's completed protection batch.
-    pub const fn new(ranges: Box<[AppliedProtection]>) -> Self {
+    /// Seal the core-owned result slots after a backend completed the batch.
+    pub(crate) const fn new(ranges: Box<[ProtectionRecord]>) -> Self {
         Self { ranges }
     }
 
-    pub fn ranges(&self) -> &[AppliedProtection] {
+    pub fn ranges(&self) -> &[ProtectionRecord] {
         &self.ranges
     }
 
@@ -121,7 +152,7 @@ impl AppliedProtectionSet {
 
 #[derive(Debug)]
 pub struct PreparedProtectionPlan {
-    ranges: Box<[AppliedProtection]>,
+    ranges: Box<[ProtectionRecord]>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -275,7 +306,7 @@ impl PreparedProtectionPlan {
             return Err(protection_plan_error(allocation));
         }
 
-        let mut ranges: Vec<AppliedProtection> = Vec::new();
+        let mut ranges: Vec<ProtectionRecord> = Vec::new();
         ranges
             .try_reserve_exact(logical.ranges().len())
             .map_err(|_| seal_oom())?;
@@ -314,11 +345,8 @@ impl PreparedProtectionPlan {
                 }
             }
 
-            ranges.push(AppliedProtection {
-                location: TargetLocation::new(
-                    requested.location().allocation(),
-                    applied_offset,
-                ),
+            ranges.push(ProtectionRecord {
+                location: TargetLocation::new(requested.location().allocation(), applied_offset),
                 requested_range: requested.runtime_range(),
                 applied_range,
                 requested: requested.permissions(),
@@ -331,12 +359,12 @@ impl PreparedProtectionPlan {
         })
     }
 
-    /// Consume the prepared plan for a backend-specific atomic/batched apply.
-    pub fn into_ranges(self) -> Box<[AppliedProtection]> {
+    /// Move the preallocated result slots into the core sealing transaction.
+    pub(crate) fn into_ranges(self) -> Box<[ProtectionRecord]> {
         self.ranges
     }
 
-    pub fn ranges(&self) -> &[AppliedProtection] {
+    pub fn ranges(&self) -> &[ProtectionRecord] {
         &self.ranges
     }
 }
@@ -366,7 +394,7 @@ impl<'a, M: ImageCommitMemory> StagedImage<'a, M, SealedState> {
         let install = transaction
             .memory()
             .prepare_install(&allocation, &sealed)
-            .map_err(|error| error.with_stage(LoadStage::Seal))?;
+            .map_err(|error| error.with_stage(LoadStage::Publish))?;
         Ok(ReadyImageCommit {
             transaction,
             sealed,
@@ -463,24 +491,27 @@ impl RelocatedState {
                 executable_ranges.push(range.runtime_range());
             }
         }
+        let cache_requirements = cache.requirements();
         let prepared_cache = cache
             .prepare(&executable_ranges)
             .map_err(|error| error.with_stage(LoadStage::Cache))?;
-        mapped
-            .request()
-            .cache_requirements()
-            .validate(&prepared_cache)?;
+        cache_requirements.validate_prepared(&executable_ranges, &prepared_cache)?;
+        let prepared_scope = prepared_cache.scope();
+        let prepared_maintenance = prepared_cache.maintenance();
         let cache_sync = cache
             .synchronize(prepared_cache)
             .map_err(|error| error.with_stage(LoadStage::Cache))?;
+        cache_sync.validate_completion(&executable_ranges, prepared_scope, prepared_maintenance)?;
 
         if !seal_plan.ranges().is_empty() {
             transaction.mark_protection_modified();
         }
-        let protections = transaction
+        let mut protection_records = prepared_protection.into_ranges();
+        transaction
             .memory()
-            .apply_protection(prepared_protection)
+            .apply_protection(ProtectionBatch::new(&mut protection_records))
             .map_err(|error| error.with_stage(LoadStage::Seal))?;
+        let protections = AppliedProtectionSet::new(protection_records);
 
         Ok(SealedState {
             mapped,
