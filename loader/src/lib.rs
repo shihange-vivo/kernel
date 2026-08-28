@@ -15,6 +15,8 @@
 #![no_std]
 #![feature(c_size_t)]
 
+extern crate alloc;
+
 mod address;
 mod elf;
 mod error;

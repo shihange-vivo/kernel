@@ -84,6 +84,8 @@ pub(crate) enum ProgramHeaderField {
     DuplicateDynamic,
     DuplicateRelro,
     DuplicateStack,
+    DuplicateInterpreter,
+    DuplicateTls,
     UnsupportedInterpreter,
     UnsupportedTls,
     ExecutableStack,

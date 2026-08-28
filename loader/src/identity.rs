@@ -294,3 +294,29 @@ impl LoadRequest {
         &self.limits
     }
 }
+
+pub(crate) struct LoadPolicy {
+    allow_interpreter: Option<()>,
+    allow_tls: Option<()>,
+    allow_executable_stack: Option<()>,
+    allow_unknown_program_headers: Option<()>,
+}
+
+impl LoadPolicy {
+    #[inline]
+    pub const fn new(
+        allow_interpreter: Option<()>,
+        allow_tls: Option<()>,
+        allow_executable_stack: Option<()>,
+        allow_unknown_program_headers: Option<()>,
+    ) -> Self {
+        Self {
+            allow_interpreter,
+            allow_tls,
+            allow_executable_stack,
+            allow_unknown_program_headers,
+        }
+    }
+}
+
+pub(crate) const LOADPOLICY: LoadPolicy = LoadPolicy::new(None, None, None, None);
