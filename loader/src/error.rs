@@ -12,26 +12,26 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use core::fmt::Debug;
+
 use crate::address::TargetAddress;
 
 pub type LoadResult<T> = core::result::Result<T, LoadError>;
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug)]
 pub(crate) enum LoadStage {
-    Unknown,
-    Read,
-    Parse,
-    Validate,
+    Admit,
+    Inspect,
     Plan,
     Allocate,
     Map,
-    Metadata,
+    Decode,
     Relocate,
     Cache,
     Seal,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug)]
 pub(crate) enum LoadErrorKind {
     BadElf,
     UnsupportedByProfile,
@@ -45,6 +45,8 @@ pub(crate) enum LoadErrorKind {
     Io,
     SourceChanged,
 }
+
+#[derive(Debug)]
 pub(crate) enum HeaderField {
     Magic,
     Class,
@@ -59,6 +61,8 @@ pub(crate) enum HeaderField {
     ProgramHeaderSize,
     ProgramHeaderTable,
 }
+
+#[derive(Debug)]
 pub(crate) enum LimitKind {
     FileLength,
     ProgramHeaderCount,
@@ -71,6 +75,8 @@ pub(crate) enum LimitKind {
     RuntimeMetadataBytes,
     RelocationOperationBytes,
 }
+
+#[derive(Debug)]
 pub(crate) enum ProgramHeaderField {
     Type,
     FileRange,
@@ -83,6 +89,8 @@ pub(crate) enum ProgramHeaderField {
     ExecutableStack,
 }
 
+#[non_exhaustive]
+#[derive(Debug)]
 pub(crate) enum ErrorContext {
     None,
     FileRange {
@@ -109,32 +117,48 @@ pub(crate) enum ErrorContext {
         len: u64,
         align: u64,
     },
+    DynamicTag {
+        tag: u64,
+        len: u64,
+    },
+    Relocation {
+        offset: TargetAddress,
+        raw_type: u32,
+        symbol_index: u32,
+    },
+    Limit {
+        resource: LimitKind,
+        actual: u64,
+        maximum: u64,
+    },
 }
 
 pub(crate) struct LoadError {
-    stage: LoadStage,
+    stage: Option<LoadStage>,
     kind: LoadErrorKind,
     context: ErrorContext,
 }
 
 impl LoadError {
     #[inline]
-    pub const fn new_without_stage(kind: LoadErrorKind, context: ErrorContext) -> Self {
+    pub const fn new(kind: LoadErrorKind, context: ErrorContext) -> Self {
         Self {
-            stage: LoadStage::Unknown,
+            stage: None,
             kind,
             context,
         }
     }
 
     #[inline]
-    pub const fn with_stage(mut self, stage: LoadStage) -> Self {
-        self.stage = stage;
+    pub const fn at_stage(mut self, stage: LoadStage) -> Self {
+        if self.stage.is_none() {
+            self.stage = Some(stage)
+        }
         self
     }
 
     #[inline]
-    pub const fn stage(&self) -> LoadStage {
+    pub const fn stage(&self) -> Option<LoadStage> {
         self.stage
     }
 
@@ -146,5 +170,25 @@ impl LoadError {
     #[inline]
     pub const fn context(&self) -> &ErrorContext {
         &self.context
+    }
+}
+
+impl Debug for LoadError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        let mut debug = f.debug_struct("LoadError");
+
+        match self.stage {
+            Some(stage) => {
+                debug.field("stage", &stage);
+            }
+            None => {
+                debug.field("stage", &"<stage not attached>");
+            }
+        }
+
+        debug
+            .field("kind", &self.kind)
+            .field("context", &self.context)
+            .finish()
     }
 }

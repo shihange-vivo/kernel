@@ -15,6 +15,7 @@
 use crate::error::{ErrorContext, LoadError, LoadErrorKind, LoadResult};
 
 #[non_exhaustive]
+#[derive(PartialEq, PartialOrd, Clone, Copy, Debug)]
 pub(crate) struct TargetAddress(u64);
 
 impl TargetAddress {
@@ -30,7 +31,7 @@ impl TargetAddress {
 
     pub fn checked_add(self, value: u64) -> LoadResult<Self> {
         self.0.checked_add(value).map(Self).ok_or_else(|| {
-            LoadError::new_without_stage(
+            LoadError::new(
                 LoadErrorKind::IntegerOverflow,
                 ErrorContext::TargetRange {
                     start: self,
@@ -43,7 +44,7 @@ impl TargetAddress {
 
     pub fn checked_sub(self, other: Self) -> LoadResult<u64> {
         self.0.checked_sub(other.0).ok_or_else(|| {
-            LoadError::new_without_stage(
+            LoadError::new(
                 LoadErrorKind::IntegerOverflow,
                 ErrorContext::TargetRange {
                     start: other,
@@ -56,7 +57,7 @@ impl TargetAddress {
 
     pub fn align_down(self, align: u64) -> LoadResult<Self> {
         if !align.is_power_of_two() {
-            return Err(LoadError::new_without_stage(
+            return Err(LoadError::new(
                 LoadErrorKind::InvalidAlignment,
                 ErrorContext::TargetRange {
                     start: self,
@@ -70,7 +71,7 @@ impl TargetAddress {
 
     pub fn align_up(self, align: u64) -> LoadResult<Self> {
         if !align.is_power_of_two() {
-            return Err(LoadError::new_without_stage(
+            return Err(LoadError::new(
                 LoadErrorKind::InvalidAlignment,
                 ErrorContext::TargetRange {
                     start: self,
@@ -84,6 +85,7 @@ impl TargetAddress {
     }
 }
 
+#[derive(Clone, Copy)]
 pub(crate) struct TargetRange {
     start: TargetAddress,
     len: u64,
@@ -134,6 +136,8 @@ impl TargetRange {
         self.start < other_end && other.start < self_end
     }
 }
+
+#[derive(Clone, Copy)]
 pub(crate) struct FileRange {
     offset: u64,
     len: u64,
@@ -162,7 +166,7 @@ impl FileRange {
 
     pub fn end(self) -> LoadResult<u64> {
         self.offset.checked_add(self.len).ok_or_else(|| {
-            LoadError::new_without_stage(
+            LoadError::new(
                 LoadErrorKind::IntegerOverflow,
                 ErrorContext::FileRange {
                     offset: self.offset,
@@ -177,7 +181,7 @@ impl FileRange {
         if self.end()? <= file_len {
             return Ok(());
         }
-        Err(LoadError::new_without_stage(
+        Err(LoadError::new(
             LoadErrorKind::OutOfBounds,
             ErrorContext::FileRange {
                 offset: self.offset,

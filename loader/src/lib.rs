@@ -16,8 +16,12 @@
 #![feature(c_size_t)]
 
 mod address;
+mod elf;
 mod error;
+mod identity;
+mod image;
 mod memory_mapper;
+mod reader;
 
 use goblin::elf::{
     header::{ET_DYN, ET_EXEC},
