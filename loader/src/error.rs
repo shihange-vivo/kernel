@@ -132,7 +132,7 @@ pub(crate) enum ErrorContext {
     },
     DynamicTag {
         tag: u64,
-        len: u64,
+        value: u64,
     },
     Relocation {
         offset: TargetAddress,

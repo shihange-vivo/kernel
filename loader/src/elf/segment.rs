@@ -77,6 +77,7 @@ impl LoadSegmentInfo {
     }
 }
 
+#[derive(Clone)]
 pub(crate) struct DynamicSegmentInfo {
     file_range: FileRange,
     vaddr: TargetAddress,
