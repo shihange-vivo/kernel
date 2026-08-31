@@ -133,6 +133,9 @@ impl<R: ElfReader> PlannedImage<R> {
         Ok(AllocatedImage::new(
             self.reader,
             memory,
+            self.aligned_min_vaddr,
+            self.aligned_max_vaddr,
+            self.max_align,
             load_bias,
             self.request,
             self.entry_vaddr,
