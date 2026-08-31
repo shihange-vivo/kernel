@@ -26,3 +26,7 @@ pub(crate) const ELF64_HEADER_SIZE: usize = elf64::header::SIZEOF_EHDR;
 pub(crate) const ELF_IDENT_SIZE: usize = 16;
 pub(crate) const ELF32_PROGRAM_HEADER_SIZE: usize = elf32::program_header::SIZEOF_PHDR;
 pub(crate) const ELF64_PROGRAM_HEADER_SIZE: usize = elf64::program_header::SIZEOF_PHDR;
+
+pub(crate) const DT_RELRSZ: u64 = 32;
+pub(crate) const DT_RELR: u64 = 36;
+pub(crate) const DT_RELRENT: u64 = 37;
