@@ -86,6 +86,22 @@ impl AllocationOffset {
     pub const fn value(&self) -> u64 {
         self.0
     }
+
+    pub fn checked_add(self, value: u64) -> LoadResult<Self> {
+        let offset = self.0.checked_add(value).ok_or_else(|| {
+            LoadError::new(
+                LoadErrorKind::IntegerOverflow,
+                ErrorContext::MemoryAccess {
+                    allocation_base: TargetAddress::new(0),
+                    allocation_len: 0,
+                    allocation_align: 0,
+                    offset: self.0,
+                    len: value,
+                },
+            )
+        })?;
+        Ok(Self::new(offset))
+    }
 }
 
 pub trait ImageMemory {
