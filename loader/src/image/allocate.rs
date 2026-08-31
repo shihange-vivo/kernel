@@ -11,11 +11,3 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 // See the License for the specific language governing permissions and
 // limitations under the License.
-
-mod admit;
-mod allocate;
-mod image_loader;
-mod inspect;
-mod plan;
-
-pub(crate) use image_loader::{read_u16, read_u32, read_u64};
