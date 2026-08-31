@@ -11,3 +11,62 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 // See the License for the specific language governing permissions and
 // limitations under the License.
+
+use alloc::boxed::Box;
+
+use crate::{
+    address::{FileRange, TargetAddress, TargetRange},
+    elf::{DynamicSegmentInfo, LoadSegmentInfo},
+    identity::LoadRequest,
+    image::inspect::StackKind,
+    memory::ImageMemory,
+    reader::ElfReader,
+};
+
+pub(crate) struct AllocatedImage<R: ElfReader, M: ImageMemory> {
+    reader: R,
+    memory: M,
+    load_bias: TargetAddress,
+    request: LoadRequest,
+    entry_vaddr: TargetAddress,
+    canonical_entry_vaddr: TargetAddress,
+    load_segments: Box<[LoadSegmentInfo]>,
+    dynamic: Option<DynamicSegmentInfo>,
+    relro: Option<TargetRange>,
+    stack: StackKind,
+    interpreter: Option<FileRange>,
+    tls: Option<TargetRange>,
+}
+
+impl<R: ElfReader, M: ImageMemory> AllocatedImage<R, M> {
+    #[inline]
+    pub fn new(
+        reader: R,
+        memory: M,
+        load_bias: TargetAddress,
+        request: LoadRequest,
+        entry_vaddr: TargetAddress,
+        canonical_entry_vaddr: TargetAddress,
+        load_segments: Box<[LoadSegmentInfo]>,
+        dynamic: Option<DynamicSegmentInfo>,
+        relro: Option<TargetRange>,
+        stack: StackKind,
+        interpreter: Option<FileRange>,
+        tls: Option<TargetRange>,
+    ) -> Self {
+        Self {
+            reader,
+            memory,
+            load_bias,
+            request,
+            entry_vaddr,
+            canonical_entry_vaddr,
+            load_segments,
+            dynamic,
+            relro,
+            stack,
+            interpreter,
+            tls,
+        }
+    }
+}
