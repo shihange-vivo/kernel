@@ -21,30 +21,15 @@ use crate::{
 };
 
 #[derive(Clone, Copy)]
-pub(crate) enum Placement {
-    Anywhere,
-    Fixed(TargetAddress),
-}
-
 pub(crate) struct AllocationRequest {
-    placement: Placement,
     size: u64,
     align: u64,
 }
 
 impl AllocationRequest {
     #[inline]
-    pub const fn new(placement: Placement, size: u64, align: u64) -> Self {
-        Self {
-            placement,
-            size,
-            align,
-        }
-    }
-
-    #[inline]
-    pub const fn placement(&self) -> Placement {
-        self.placement
+    pub const fn new(size: u64, align: u64) -> Self {
+        Self { size, align }
     }
 
     #[inline]
@@ -58,63 +43,22 @@ impl AllocationRequest {
     }
 }
 
-#[repr(transparent)]
-#[derive(Clone, Copy, Debug)]
-pub(crate) struct AllocationId(u32);
-
-impl AllocationId {
-    #[inline]
-    pub const fn new(value: u32) -> Self {
-        Self(value)
-    }
-
-    #[inline]
-    pub const fn get(self) -> u32 {
-        self.0
-    }
-}
-
-#[derive(Clone, Copy, Debug)]
-pub(crate) enum AllocationOwnership {
-    Owned,
-    BorrowedFixed,
-}
-
-#[derive(Debug)]
-pub(crate) struct AllocationImageMemory {
-    id: AllocationId,
-    target_base: TargetAddress,
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct ImageAllocation {
+    base: TargetAddress,
     len: u64,
     align: u64,
-    ownership: AllocationOwnership,
 }
 
-impl AllocationImageMemory {
+impl ImageAllocation {
     #[inline]
-    pub const fn new(
-        id: AllocationId,
-        target_base: TargetAddress,
-        len: u64,
-        align: u64,
-        ownership: AllocationOwnership,
-    ) -> Self {
-        Self {
-            id,
-            target_base,
-            len,
-            align,
-            ownership,
-        }
+    pub const fn new(base: TargetAddress, len: u64, align: u64) -> Self {
+        Self { base, len, align }
     }
 
     #[inline]
-    pub const fn id(&self) -> AllocationId {
-        self.id
-    }
-
-    #[inline]
-    pub const fn target_base(&self) -> TargetAddress {
-        self.target_base
+    pub const fn base(&self) -> TargetAddress {
+        self.base
     }
 
     #[inline]
@@ -126,55 +70,34 @@ impl AllocationImageMemory {
     pub const fn align(&self) -> u64 {
         self.align
     }
-
-    #[inline]
-    pub const fn ownership(&self) -> AllocationOwnership {
-        self.ownership
-    }
 }
 
-pub(crate) struct AllocationLocation {
-    id: AllocationId,
-    offset: u64,
-}
+#[repr(transparent)]
+#[derive(Clone, Copy)]
+pub(crate) struct AllocationOffset(u64);
 
-impl AllocationLocation {
+impl AllocationOffset {
     #[inline]
-    pub const fn new(id: AllocationId, offset: u64) -> Self {
-        Self { id, offset }
+    pub const fn new(offset: u64) -> Self {
+        Self(offset)
     }
 
     #[inline]
-    pub const fn id(&self) -> AllocationId {
-        self.id
-    }
-
-    #[inline]
-    pub const fn offset(&self) -> u64 {
-        self.offset
-    }
-
-    pub fn checked_add(self, value: u64) -> LoadResult<Self> {
-        let offset = self.offset.checked_add(value).ok_or_else(|| {
-            LoadError::new(
-                LoadErrorKind::IntegerOverflow,
-                ErrorContext::MemoryAccess {
-                    id: self.id,
-                    offset: self.offset,
-                    len: value,
-                },
-            )
-        })?;
-        Ok(Self::new(self.id, offset))
+    pub const fn value(&self) -> u64 {
+        self.0
     }
 }
 
 pub trait ImageMemory {
-    fn allocate_image(&mut self, request: &AllocationRequest) -> LoadResult<AllocationImageMemory>;
+    fn allocate_image(&mut self, request: AllocationRequest) -> LoadResult<()>;
 
-    fn write(&mut self, location: AllocationLocation, data: &[u8]) -> LoadResult<()>;
+    fn allocation(&self) -> LoadResult<&ImageAllocation>;
 
-    fn zero(&mut self, location: AllocationLocation, len: u64) -> LoadResult<()>;
+    fn image_span(&self, offset: AllocationOffset, len: u64) -> LoadResult<*mut u8>;
 
-    fn read(&self, location: AllocationLocation, dst: &mut [u8]) -> LoadResult<()>;
+    fn write(&mut self, offset: AllocationOffset, data: &[u8]) -> LoadResult<()>;
+
+    fn zero(&mut self, offset: AllocationOffset, len: u64) -> LoadResult<()>;
+
+    fn read(&self, offset: AllocationOffset, dst: &mut [u8]) -> LoadResult<()>;
 }

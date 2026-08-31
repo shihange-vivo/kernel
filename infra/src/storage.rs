@@ -13,7 +13,10 @@
 // limitations under the License.
 
 extern crate alloc;
-use core::alloc::Layout;
+use core::{
+    alloc::Layout,
+    option::Option::{self, Some},
+};
 
 #[derive(Debug)]
 pub enum Storage {
@@ -30,8 +33,17 @@ impl Default for Storage {
 impl Storage {
     #[inline]
     pub fn from_layout(layout: Layout) -> Self {
+        Self::try_from_layout(layout).unwrap_or_else(|| alloc::alloc::handle_alloc_error(layout))
+    }
+
+    #[inline]
+    pub fn try_from_layout(layout: Layout) -> Option<Self> {
         let base = unsafe { alloc::alloc::alloc(layout) };
-        Storage::Alloc(base, layout)
+        if base.is_null() {
+            None
+        } else {
+            Some(Storage::Alloc(base, layout))
+        }
     }
 
     // This API is designed to be used by memory allocated by FFI, so

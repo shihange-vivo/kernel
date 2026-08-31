@@ -17,8 +17,10 @@ use alloc::boxed::Box;
 use crate::{
     address::{FileRange, TargetAddress, TargetRange},
     elf::{DynamicSegmentInfo, LoadSegmentInfo},
-    identity::LoadRequest,
-    image::inspect::StackKind,
+    error::{ErrorContext, LoadError, LoadErrorKind, LoadResult, LoadStage},
+    identity::{ElfClass, ElfType, LoadRequest},
+    image::{allocate::AllocatedImage, inspect::StackKind},
+    memory::{AllocationRequest, ImageAllocation, ImageMemory},
     reader::ElfReader,
 };
 
@@ -74,4 +76,104 @@ impl<R: ElfReader> PlannedImage<R> {
             tls,
         }
     }
+
+    fn allocation_request(&self) -> LoadResult<AllocationRequest> {
+        if self.request.profile().r#type() != ElfType::Dyn {
+            return Err(
+                LoadError::new(LoadErrorKind::UnsupportedByProfile, ErrorContext::None)
+                    .at_stage(LoadStage::Allocate),
+            );
+        }
+
+        let size = self.image_span;
+        let align = self.max_align;
+        if size == 0 {
+            return Err(LoadError::new(
+                LoadErrorKind::IncorrectLayout,
+                ErrorContext::TargetRange {
+                    start: self.aligned_min_vaddr,
+                    len: size,
+                    align,
+                },
+            )
+            .at_stage(LoadStage::Allocate));
+        }
+        if !align.is_power_of_two() {
+            return Err(LoadError::new(
+                LoadErrorKind::InvalidAlignment,
+                ErrorContext::TargetRange {
+                    start: self.aligned_min_vaddr,
+                    len: size,
+                    align,
+                },
+            )
+            .at_stage(LoadStage::Allocate));
+        }
+        Ok(AllocationRequest::new(size, align))
+    }
+
+    pub fn allocate<M>(self, mut memory: M) -> LoadResult<AllocatedImage<R, M>>
+    where
+        M: ImageMemory,
+    {
+        let request = self.allocation_request()?;
+        memory
+            .allocate_image(request)
+            .map_err(|error| error.at_stage(LoadStage::Allocate))?;
+
+        let allocation = memory.allocation()?;
+
+        validate_allocation(allocation, &request, self.request.profile().class())?;
+        let load_bias = TargetAddress::new(
+            allocation
+                .base()
+                .checked_sub(self.aligned_min_vaddr)
+                .map_err(|error| error.at_stage(LoadStage::Allocate))?,
+        );
+        Ok(AllocatedImage::new(
+            self.reader,
+            memory,
+            load_bias,
+            self.request,
+            self.entry_vaddr,
+            self.canonical_entry_vaddr,
+            self.load_segments,
+            self.dynamic,
+            self.relro,
+            self.stack,
+            self.interpreter,
+            self.tls,
+        ))
+    }
+}
+
+fn validate_allocation(
+    allocation: &ImageAllocation,
+    request: &AllocationRequest,
+    class: ElfClass,
+) -> LoadResult<()> {
+    let base = allocation.base();
+    let aligned = base.get() % request.align() == 0;
+    let end = base.checked_add(allocation.len());
+    let target_width_valid = end.as_ref().is_ok_and(|end| match class {
+        ElfClass::Elf32 => end.get() <= u64::from(u32::MAX),
+        ElfClass::Elf64 => true,
+    });
+
+    if allocation.len() == request.size()
+        && allocation.align() == request.align()
+        && aligned
+        && target_width_valid
+    {
+        return Ok(());
+    }
+    Err(LoadError::new(
+        LoadErrorKind::Backend,
+        ErrorContext::Allocation {
+            base,
+            len: allocation.len(),
+            align: allocation.align(),
+        },
+    )
+    .at_stage(LoadStage::Allocate))
 }
