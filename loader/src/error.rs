@@ -14,7 +14,7 @@
 
 use core::fmt::Debug;
 
-use crate::address::TargetAddress;
+use crate::{address::TargetAddress, memory::AllocationId};
 
 pub type LoadResult<T> = core::result::Result<T, LoadError>;
 
@@ -44,6 +44,7 @@ pub(crate) enum LoadErrorKind {
     Backend,
     Io,
     SourceChanged,
+    IncorrectLayout,
 }
 
 #[derive(Debug)]
@@ -120,6 +121,11 @@ pub(crate) enum ErrorContext {
         base: TargetAddress,
         len: u64,
         align: u64,
+    },
+    MemoryAccess {
+        id: AllocationId,
+        offset: u64,
+        len: u64,
     },
     DynamicTag {
         tag: u64,

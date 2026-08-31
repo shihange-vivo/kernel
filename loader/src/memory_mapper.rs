@@ -12,8 +12,17 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use alloc::vec::Vec;
 use blueos_infra::storage::Storage;
 use core::alloc::Layout;
+
+use crate::{
+    address::TargetAddress,
+    error::{ErrorContext, LoadError, LoadErrorKind},
+    memory::{
+        AllocationImageMemory, AllocationLocation, AllocationRequest, ImageMemory, Placement,
+    },
+};
 
 pub type Result<T> = core::result::Result<T, &'static str>;
 
@@ -79,6 +88,7 @@ pub struct MemoryMapper {
     virtual_end: usize,
     mem: Storage,
     mode: MappingMode,
+    image_allocation: Option<AllocationImageMemory>,
 }
 
 impl MemoryMapper {
@@ -93,6 +103,7 @@ impl MemoryMapper {
                 Some(regions) => MappingMode::Fixed(regions),
                 None => MappingMode::Allocated,
             },
+            image_allocation: None,
         }
     }
 
@@ -269,4 +280,62 @@ impl MemoryMapper {
         unsafe { val_ptr.write(val) };
         Ok(size)
     }
+}
+
+impl ImageMemory for MemoryMapper {
+    fn allocate_image(
+        &mut self,
+        request: &AllocationRequest,
+    ) -> crate::error::LoadResult<AllocationImageMemory> {
+        if self.image_allocation.is_some() {
+            return Err(allocation_error(request));
+        }
+
+        let size = usize::try_from(request.size()).map_err(|_| allocation_error(request))?;
+        let align = usize::try_from(request.align()).map_err(|_| allocation_error(request))?;
+
+        match (&self.mode, request.placement()) {
+            (MappingMode::Allocated, Placement::Anywhere) => {
+                if !self.mem.base().is_null() {
+                    return Err(allocation_error(request));
+                }
+                let layout = Layout::from_size_align(size, align).map_err(|_| {
+                    LoadError::new(
+                        LoadErrorKind::IncorrectLayout,
+                        ErrorContext::Allocation {
+                            base: TargetAddress::new(0),
+                            len: request.size(),
+                            align: request.align(),
+                        },
+                    )
+                })?;
+            }
+        }
+    }
+}
+
+fn allocation_error(request: &AllocationRequest) -> LoadError {
+    let base = match request.placement() {
+        Placement::Anywhere => TargetAddress::new(0),
+        Placement::Fixed(address) => address,
+    };
+    LoadError::new(
+        LoadErrorKind::Backend,
+        ErrorContext::Allocation {
+            base,
+            len: request.size(),
+            align: request.align(),
+        },
+    )
+}
+
+fn memory_access_error(location: AllocationLocation, len: u64) -> LoadError {
+    LoadError::new(
+        LoadErrorKind::Backend,
+        ErrorContext::MemoryAccess {
+            id: location.id(),
+            offset: location.offset(),
+            len,
+        },
+    )
 }

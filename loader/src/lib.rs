@@ -23,6 +23,7 @@ mod elf;
 mod error;
 mod identity;
 mod image;
+mod memory;
 mod memory_mapper;
 mod reader;
 
