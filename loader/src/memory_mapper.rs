@@ -18,8 +18,11 @@ use core::alloc::Layout;
 
 use crate::{
     address::TargetAddress,
-    error::{ErrorContext, LoadError, LoadErrorKind, LoadResult},
-    memory::{AllocationOffset, AllocationRequest, ImageAllocation, ImageMemory},
+    error::{ErrorContext, LoadError, LoadErrorKind, LoadResult, LoadStage},
+    image::{PreparedProtectionPlan, ProtectionCapabilities, ProtectionLevel},
+    memory::{
+        AllocationOffset, AllocationRequest, ImageAllocation, ImageMemory, ImageProtectionMemory,
+    },
 };
 
 pub type Result<T> = core::result::Result<T, &'static str>;
@@ -35,6 +38,10 @@ impl MemoryPermissions {
 
     pub const fn bitor(self, rhs: Self) -> Self {
         Self(self.0 | rhs.0)
+    }
+
+    pub(crate) const fn without(self, removed: Self) -> Self {
+        Self(self.0 & !removed.0)
     }
 
     pub(crate) const fn contains(self, requested: Self) -> bool {
@@ -387,6 +394,37 @@ impl ImageMemory for MemoryMapper {
     }
 }
 
+impl ImageProtectionMemory for MemoryMapper {
+    fn protect(
+        &mut self,
+        offset: AllocationOffset,
+        len: u64,
+        _permissions: MemoryPermissions,
+    ) -> LoadResult<ProtectionLevel> {
+        self.image_span(offset, len)?;
+        Ok(ProtectionLevel::LogicalOnly)
+    }
+
+    fn protection_capabilities(&self) -> ProtectionCapabilities {
+        ProtectionCapabilities::new(1, usize::MAX)
+    }
+
+    fn validate_protection_aliases(
+        &self,
+        allocation: &ImageAllocation,
+        _prepared: &PreparedProtectionPlan,
+    ) -> LoadResult<()> {
+        let actual = self
+            .allocation()
+            .map_err(|error| error.at_stage(LoadStage::Seal))?;
+        if actual == allocation {
+            Ok(())
+        } else {
+            Err(protection_backend_error(allocation))
+        }
+    }
+}
+
 fn allocation_error(request: &AllocationRequest) -> LoadError {
     LoadError::new(
         LoadErrorKind::Backend,
@@ -413,4 +451,16 @@ fn memory_access_error(
             len,
         },
     )
+}
+
+fn protection_backend_error(allocation: &ImageAllocation) -> LoadError {
+    LoadError::new(
+        LoadErrorKind::Backend,
+        ErrorContext::Allocation {
+            base: allocation.base(),
+            len: allocation.len(),
+            align: allocation.align(),
+        },
+    )
+    .at_stage(LoadStage::Seal)
 }

@@ -18,9 +18,17 @@ use crate::{
     address::{FileRange, TargetAddress, TargetRange},
     cache::CacheSyncOutcome,
     elf::{DynamicSegmentInfo, LoadSegmentInfo},
+    error::{LoadResult, LoadStage},
     identity::LoadRequest,
-    image::{inspect::StackKind, map::LoadedRegion, RelocationRecord},
-    memory::ImageMemory,
+    image::{
+        inspect::StackKind,
+        map::LoadedRegion,
+        seal::{
+            AppliedProtectionSet, PreparedProtectionPlan, ProtectionBatch, SealPlan, SealedImage,
+        },
+        RelocationRecord,
+    },
+    memory::{ImageMemory, ImageProtectionMemory},
     reader::ElfReader,
 };
 
@@ -83,5 +91,51 @@ impl<R: ElfReader, M: ImageMemory> CachedImage<R, M> {
     #[inline]
     pub const fn cache_sync(&self) -> &CacheSyncOutcome {
         &self.cache_sync
+    }
+
+    pub fn seal(mut self) -> LoadResult<SealedImage<R, M>>
+    where
+        M: ImageProtectionMemory,
+    {
+        let allocation = *self
+            .memory
+            .allocation()
+            .map_err(|error| error.at_stage(LoadStage::Seal))?;
+        let seal_plan = SealPlan::build(
+            &allocation,
+            self.load_bias,
+            self.request.profile().class(),
+            &self.load_segments,
+            &self.regions,
+            self.relro,
+            &self.stack,
+            &self.relocations,
+        )?;
+        let prepared = PreparedProtectionPlan::prepare(&self.memory, &allocation, &seal_plan)?;
+        let mut protection_records = prepared.into_ranges();
+        self.memory
+            .apply_protection(ProtectionBatch::new(&mut protection_records))
+            .map_err(|error| error.at_stage(LoadStage::Seal))?;
+        let protections = AppliedProtectionSet::new(protection_records);
+
+        Ok(SealedImage::new(
+            self.reader,
+            self.memory,
+            self.load_bias,
+            self.request,
+            self.entry_vaddr,
+            self.canonical_entry_vaddr,
+            self.load_segments,
+            self.regions,
+            self.dynamic,
+            self.relocations,
+            self.relro,
+            self.stack,
+            self.interpreter,
+            self.tls,
+            self.cache_sync,
+            seal_plan,
+            protections,
+        ))
     }
 }

@@ -76,6 +76,7 @@ pub(crate) enum LimitKind {
     RelocationCount,
     RuntimeMetadataBytes,
     RelocationOperationBytes,
+    ProtectionRangeCount,
 }
 
 #[derive(Debug)]
