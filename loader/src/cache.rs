@@ -269,13 +269,13 @@ fn architecture_cache_capability() -> LoadResult<(ExecutionScope, CacheMaintenan
         CacheMaintenance::InstructionFence,
     ));
 
-    #[cfg(all(target_arch = "arm", target_board = "qemu_mps2_an385"))]
+    #[cfg(all(target_arch = "arm", cortex_m))]
     return Ok((
         ExecutionScope::CurrentExecutionContext,
         CacheMaintenance::BarrierOnly,
     ));
 
-    #[cfg(all(target_arch = "arm", not(target_board = "qemu_mps2_an385")))]
+    #[cfg(all(target_arch = "arm", not(cortex_m)))]
     return Err(cache_capability_error());
 
     #[cfg(target_arch = "aarch64")]
