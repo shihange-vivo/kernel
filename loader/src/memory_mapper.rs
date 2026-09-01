@@ -120,6 +120,31 @@ impl MemoryMapper {
         }
     }
 
+    pub(crate) fn can_load_dynamic_image(&self) -> bool {
+        matches!(self.mode, MappingMode::Allocated)
+            && self.mem.base().is_null()
+            && self.allocattion.is_none()
+    }
+
+    pub(crate) fn install_dynamic_image(
+        &mut self,
+        load_bias: TargetAddress,
+        runtime_entry: TargetAddress,
+    ) -> LoadResult<()> {
+        let allocation = *self.allocation()?;
+        let virtual_start = allocation.base().checked_sub(load_bias)?;
+        let virtual_end = TargetAddress::new(virtual_start).checked_add(allocation.len())?;
+        let virtual_entry = runtime_entry.checked_sub(load_bias)?;
+
+        self.virtual_start =
+            usize::try_from(virtual_start).map_err(|_| compatibility_install_error(allocation))?;
+        self.virtual_end = usize::try_from(virtual_end.get())
+            .map_err(|_| compatibility_install_error(allocation))?;
+        self.virtual_entry =
+            usize::try_from(virtual_entry).map_err(|_| compatibility_install_error(allocation))?;
+        Ok(())
+    }
+
     #[inline]
     pub fn entry(&self) -> usize {
         self.virtual_entry
@@ -318,6 +343,7 @@ impl ImageMemory for MemoryMapper {
             u64::try_from(storage.base() as usize).map_err(|_| allocation_error(&request))?,
         );
         let allocation = ImageAllocation::new(base, request.size(), request.align());
+        self.mem = storage;
         self.allocattion = Some(allocation);
         Ok(())
     }
@@ -463,4 +489,15 @@ fn protection_backend_error(allocation: &ImageAllocation) -> LoadError {
         },
     )
     .at_stage(LoadStage::Seal)
+}
+
+fn compatibility_install_error(allocation: ImageAllocation) -> LoadError {
+    LoadError::new(
+        LoadErrorKind::Backend,
+        ErrorContext::Allocation {
+            base: allocation.base(),
+            len: allocation.len(),
+            align: allocation.align(),
+        },
+    )
 }

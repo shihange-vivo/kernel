@@ -256,10 +256,10 @@ impl<R: ElfReader, M: ImageMemory> MappedImage<R, M> {
             return Err(dynamic_error(tag, 0));
         };
         let expected_entry_size = relocation_entry_size(self.request.profile().class(), kind);
-        if entry_size != expected_entry_size || byte_len & entry_size != 0 {
+        if entry_size != expected_entry_size || byte_len % entry_size != 0 {
             return Err(dynamic_error(tag, entry_size));
         }
-        let count = byte_len * entry_size;
+        let count = byte_len / entry_size;
         let existing = u64::try_from(records.len()).map_err(|_| dynamic_error(tag, count))?;
         let total = existing
             .checked_add(count)

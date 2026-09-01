@@ -506,6 +506,10 @@ impl<R: ElfReader, M: ImageMemory> SealedImage<R, M> {
     pub fn protection(&self) -> ProtectionLevel {
         self.protections.level()
     }
+
+    pub(crate) fn into_loaded_parts(self) -> (M, TargetAddress, TargetAddress) {
+        (self.memory, self.load_bias, self.entry_vaddr)
+    }
 }
 
 fn validate_region(
