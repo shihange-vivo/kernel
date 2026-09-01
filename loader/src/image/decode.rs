@@ -222,7 +222,8 @@ impl<R: ElfReader, M: ImageMemory> DecodedImage<R, M> {
             .unwrap_or(u64::MAX);
         self.request
             .limits()
-            .check_relocation_operation_bytes(operation_bytes)?;
+            .check_relocation_operation_bytes(operation_bytes)
+            .map_err(|error| error.at_stage(LoadStage::Relocate))?;
         operations
             .try_reserve_exact(self.relocations.len())
             .map_err(|_| {
@@ -231,20 +232,29 @@ impl<R: ElfReader, M: ImageMemory> DecodedImage<R, M> {
             })?;
 
         for record in self.relocations.iter() {
-            operations.push(self.preflight_relative(*record, &relocator, target_word)?);
+            operations.push(
+                self.preflight_relative(*record, &relocator, target_word)
+                    .map_err(|error| error.at_stage(LoadStage::Relocate))?,
+            );
         }
         operations.sort_unstable_by_key(|operation| operation.offset().value());
         for pair in operations.windows(2) {
             let end = pair[0]
                 .offset()
                 .checked_add(target_word.width().bytes())
-                .map_err(|_| relocation_error(pair[0].record(), LoadErrorKind::IntegerOverflow))?;
+                .map_err(|_| {
+                    relocation_error(pair[0].record(), LoadErrorKind::IntegerOverflow)
+                        .at_stage(LoadStage::Relocate)
+                })?;
             if pair[1].offset() < end {
-                return Err(relocation_error(pair[1].record(), LoadErrorKind::BadElf));
+                return Err(relocation_error(pair[1].record(), LoadErrorKind::BadElf)
+                    .at_stage(LoadStage::Relocate));
             }
         }
         for operation in operations {
-            target_word.write(&mut self.memory, operation.offset(), operation.value())?;
+            target_word
+                .write(&mut self.memory, operation.offset(), operation.value())
+                .map_err(|error| error.at_stage(LoadStage::Relocate))?;
         }
         Ok(RelocatedImage::new(
             self.reader,

@@ -14,6 +14,7 @@
 
 mod admit;
 mod allocate;
+mod cache;
 mod decode;
 mod image_loader;
 mod inspect;
