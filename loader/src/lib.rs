@@ -29,12 +29,20 @@ mod memory_mapper;
 mod reader;
 mod relocation;
 
+use cache::{ArchitectureCodeCache, CacheRequirements};
+use error::{LoadError, LoadErrorKind};
 use goblin::elf::{
-    header::{ET_DYN, ET_EXEC},
-    reloc::R_RISCV_RELATIVE,
-    Elf, Reloc,
+    header::{
+        EI_CLASS, EI_DATA, ELFCLASS32, ELFCLASS64, ELFDATA2LSB, ELFDATA2MSB, EM_AARCH64, EM_ARM,
+        EM_RISCV, ET_DYN, ET_EXEC,
+    },
+    Elf,
 };
+use identity::{ElfClass, ElfData, ElfMachine, ElfType, LoadLimits, LoadProfile, LoadRequest};
+use image::ImageLoader;
 use memory_mapper::MappingModeKind;
+use reader::SliceElfReader;
+use relocation::{ArmRelocator, Riscv32Relocator, Riscv64Relocator};
 
 pub use memory_mapper::{MemoryMapper, MemoryPermissions, MemoryRegion};
 
@@ -53,11 +61,6 @@ fn build_memory_layout(binary: &Elf, mapper: &mut MemoryMapper) -> Result {
         }
     }
     mapper.set_entry(binary.entry as usize);
-    Ok(())
-}
-
-fn allocate_memory_for_segments(_binary: &Elf, mapper: &mut MemoryMapper) -> Result {
-    mapper.allocate_memory()?;
     Ok(())
 }
 
@@ -81,37 +84,85 @@ fn copy_content_to_memory(buffer: &[u8], binary: &Elf, mapper: &mut MemoryMapper
     Ok(())
 }
 
-fn handle_riscv_relative_reloc(mapper: &mut MemoryMapper, reloc: &Reloc) -> Result {
-    let vaddr = reloc.r_offset as usize;
-    let val = mapper.real_start()? + reloc.r_addend.unwrap_or(0) as usize;
-    mapper.write_value_at(vaddr, val)?;
-    Ok(())
-}
-
-#[allow(clippy::single_match)]
-fn relocate(binary: &Elf, mapper: &mut MemoryMapper) -> Result {
-    let reloc_section = &binary.dynrelas;
-    for reloc in reloc_section.iter() {
-        match reloc.r_type {
-            R_RISCV_RELATIVE => {
-                handle_riscv_relative_reloc(mapper, &reloc)?;
-            }
-            _ => {}
-        }
-    }
-    Ok(())
-}
-
 fn load_dyn_elf(buffer: &[u8], binary: &Elf, mapper: &mut MemoryMapper) -> Result {
-    if mapper.mode_kind() != MappingModeKind::Allocated {
+    if !mapper.can_load_dynamic_image() {
         return Err("ET_DYN requires Allocated mapping mode");
     }
-    build_memory_layout(binary, mapper)?;
-    allocate_memory_for_segments(binary, mapper)?;
-    copy_content_to_memory(buffer, binary, mapper)?;
-    relocate(binary, mapper)?;
-    mapper.real_entry()?;
+
+    let (profile, class, machine) = dynamic_load_profile(binary)?;
+    let request = LoadRequest::new(profile, LoadLimits::DEFAULT);
+    let decoded = ImageLoader::new(SliceElfReader::new(buffer), request)
+        .admit()
+        .and_then(|image| image.inspect())
+        .and_then(|image| image.plan())
+        .and_then(|image| image.allocate(MemoryMapper::new(None)))
+        .and_then(|image| image.map())
+        .and_then(|image| image.decode())
+        .map_err(compatibility_error)?;
+    let relocated = match (machine, class) {
+        (ElfMachine::Arm, ElfClass::Elf32) => decoded.relocation(ArmRelocator),
+        (ElfMachine::Riscv, ElfClass::Elf32) => decoded.relocation(Riscv32Relocator),
+        (ElfMachine::Riscv, ElfClass::Elf64) => decoded.relocation(Riscv64Relocator),
+        _ => Err(LoadError::new(
+            LoadErrorKind::UnsupportedByProfile,
+            error::ErrorContext::None,
+        )),
+    }
+    .map_err(compatibility_error)?;
+    let sealed = relocated
+        .cache(ArchitectureCodeCache::new(
+            CacheRequirements::CURRENT_EXECUTION_CONTEXT,
+        ))
+        .and_then(|image| image.seal())
+        .map_err(compatibility_error)?;
+    let (mut loaded_mapper, load_bias, runtime_entry) = sealed.into_loaded_parts();
+    loaded_mapper
+        .install_dynamic_image(load_bias, runtime_entry)
+        .map_err(compatibility_error)?;
+    loaded_mapper.real_entry()?;
+    *mapper = loaded_mapper;
     Ok(())
+}
+
+fn dynamic_load_profile(
+    binary: &Elf,
+) -> core::result::Result<(LoadProfile, ElfClass, ElfMachine), &'static str> {
+    let class = match binary.header.e_ident[EI_CLASS] {
+        ELFCLASS32 => ElfClass::Elf32,
+        ELFCLASS64 => ElfClass::Elf64,
+        _ => return Err("Unsupported ELF class"),
+    };
+    let endian = match binary.header.e_ident[EI_DATA] {
+        ELFDATA2LSB => ElfData::Little,
+        ELFDATA2MSB => ElfData::Big,
+        _ => return Err("Unsupported ELF endian"),
+    };
+    let machine = match binary.header.e_machine {
+        EM_ARM => ElfMachine::Arm,
+        EM_RISCV => ElfMachine::Riscv,
+        EM_AARCH64 => ElfMachine::Aarch64,
+        value => ElfMachine::Ohter(value),
+    };
+    Ok((
+        LoadProfile::new(class, endian, machine, ElfType::Dyn),
+        class,
+        machine,
+    ))
+}
+
+fn compatibility_error(error: LoadError) -> &'static str {
+    match error.stage() {
+        Some(error::LoadStage::Admit) => "Unable to admit dynamic ELF",
+        Some(error::LoadStage::Inspect) => "Unable to inspect dynamic ELF",
+        Some(error::LoadStage::Plan) => "Unable to plan dynamic ELF",
+        Some(error::LoadStage::Allocate) => "Unable to allocate dynamic ELF",
+        Some(error::LoadStage::Map) => "Unable to map dynamic ELF",
+        Some(error::LoadStage::Decode) => "Unable to decode dynamic ELF",
+        Some(error::LoadStage::Relocate) => "Unable to relocate dynamic ELF",
+        Some(error::LoadStage::Cache) => "Unable to synchronize dynamic ELF",
+        Some(error::LoadStage::Seal) => "Unable to seal dynamic ELF",
+        None => "Unable to load dynamic ELF",
+    }
 }
 
 fn load_exec_elf(buffer: &[u8], binary: &Elf, mapper: &mut MemoryMapper) -> Result {

@@ -42,6 +42,10 @@ if (coverage || profile) {
 build_rust("blueos_loader") {
   crate_type = "rlib"
   sources = [ "src/lib.rs" ]
+  rustflags = [
+    "--cfg",
+    "target_board=\"${board}\"",
+  ]
   deps = [
     "//external/vendor/goblin-0.9.3:goblin",
     "//kernel/infra:blueos_infra",

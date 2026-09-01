@@ -174,7 +174,12 @@ impl<R: ElfReader, M: ImageMemory> AllocatedImage<R, M> {
                     )
                     .at_stage(LoadStage::Map)
                 })?;
-            self.memory.zero(offset, bss_len)?;
+            let bss_offset = offset
+                .checked_add(region.file_range().len())
+                .map_err(|error| error.at_stage(LoadStage::Map))?;
+            self.memory
+                .zero(bss_offset, bss_len)
+                .map_err(|error| error.at_stage(LoadStage::Map))?;
         }
         Ok(MappedImage::new(
             self.reader,

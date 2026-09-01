@@ -15,6 +15,9 @@
 mod arm;
 mod riscv;
 
+pub(crate) use arm::ArmRelocator;
+pub(crate) use riscv::{Riscv32Relocator, Riscv64Relocator};
+
 use crate::{
     address::TargetAddress,
     error::{ErrorContext, LoadError, LoadErrorKind, LoadResult},

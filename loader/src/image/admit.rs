@@ -15,16 +15,19 @@
 use alloc::vec::Vec;
 use goblin::{
     elf::program_header::{
-        PF_R, PF_W, PF_X, PT_DYNAMIC, PT_GNU_RELRO, PT_GNU_STACK, PT_INTERP, PT_LOAD, PT_TLS,
+        PF_R, PF_W, PF_X, PT_ARM_EXIDX, PT_DYNAMIC, PT_GNU_EH_FRAME, PT_GNU_RELRO, PT_GNU_STACK,
+        PT_INTERP, PT_LOAD, PT_PHDR, PT_TLS,
     },
     elf64,
 };
+
+const PT_RISCV_ATTRIBUTES: u32 = 0x7000_0003;
 
 use crate::{
     address::{FileRange, TargetAddress, TargetRange},
     elf::{DynamicSegmentInfo, ElfHeaderInfo, LoadSegmentInfo, ProgramHeaderInfo},
     error::{ErrorContext, LoadError, LoadErrorKind, LoadResult, LoadStage, ProgramHeaderField},
-    identity::{LoadRequest, LOADPOLICY},
+    identity::{ElfMachine, LoadRequest, LOADPOLICY},
     image::inspect::{InspectedImage, StackKind},
     reader::ElfReader,
     MemoryPermissions,
@@ -217,6 +220,9 @@ impl<R: ElfReader> AdmittedImage<R> {
                         .map_err(|e| e.at_stage(LoadStage::Inspect))?;
                     tls = Some(target_range)
                 }
+                PT_PHDR | PT_GNU_EH_FRAME => {}
+                PT_ARM_EXIDX if self.header.machine() == ElfMachine::Arm => {}
+                PT_RISCV_ATTRIBUTES if self.header.machine() == ElfMachine::Riscv => {}
                 t => {
                     if !LOADPOLICY.allow_unknown_program_headers {
                         return Err(LoadError::new(
