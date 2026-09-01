@@ -12,9 +12,11 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+mod aarch64;
 mod arm;
 mod riscv;
 
+pub use aarch64::AArch64Relocator;
 pub use arm::ArmRelocator;
 pub use riscv::{Riscv32Relocator, Riscv64Relocator};
 
