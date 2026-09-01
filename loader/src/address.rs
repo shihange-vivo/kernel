@@ -85,7 +85,7 @@ impl TargetAddress {
     }
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct TargetRange {
     start: TargetAddress,
     len: u64,

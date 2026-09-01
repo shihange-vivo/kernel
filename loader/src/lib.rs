@@ -19,6 +19,7 @@
 extern crate alloc;
 
 mod address;
+mod cache;
 mod elf;
 mod error;
 mod identity;
