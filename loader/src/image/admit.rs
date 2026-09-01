@@ -14,7 +14,9 @@
 
 use alloc::vec::Vec;
 use goblin::{
-    elf::program_header::{PF_R, PF_W, PF_X, PT_DYNAMIC, PT_GNU_RELRO, PT_INTERP, PT_LOAD, PT_TLS},
+    elf::program_header::{
+        PF_R, PF_W, PF_X, PT_DYNAMIC, PT_GNU_RELRO, PT_GNU_STACK, PT_INTERP, PT_LOAD, PT_TLS,
+    },
     elf64,
 };
 
@@ -140,6 +142,22 @@ impl<R: ElfReader> AdmittedImage<R> {
                     ))
                 }
                 PT_GNU_RELRO => {
+                    if relro.is_some() {
+                        return Err(program_header_error(
+                            index,
+                            ProgramHeaderField::DuplicateRelro,
+                            program_header.r#type().into(),
+                        )
+                        .at_stage(LoadStage::Inspect));
+                    }
+                    let target_range =
+                        TargetRange::new(program_header.vaddr(), program_header.memory_size());
+                    target_range
+                        .end()
+                        .map_err(|error| error.at_stage(LoadStage::Inspect))?;
+                    relro = Some(target_range);
+                }
+                PT_GNU_STACK => {
                     if stack != StackKind::NotDeclared {
                         return Err(program_header_error(
                             index,

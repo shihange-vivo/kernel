@@ -43,7 +43,7 @@ impl AllocationRequest {
     }
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub(crate) struct ImageAllocation {
     base: TargetAddress,
     len: u64,
@@ -73,7 +73,7 @@ impl ImageAllocation {
 }
 
 #[repr(transparent)]
-#[derive(Clone, Copy, PartialEq, PartialOrd)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, PartialOrd)]
 pub(crate) struct AllocationOffset(u64);
 
 impl AllocationOffset {
@@ -116,4 +116,36 @@ pub trait ImageMemory {
     fn zero(&mut self, offset: AllocationOffset, len: u64) -> LoadResult<()>;
 
     fn read(&self, offset: AllocationOffset, dst: &mut [u8]) -> LoadResult<()>;
+}
+
+pub trait ImageProtectionMemory: ImageMemory {
+    fn protect(
+        &mut self,
+        offset: AllocationOffset,
+        len: u64,
+        permissions: MemoryPermissions,
+    ) -> LoadResult<crate::image::ProtectionLevel>;
+
+    fn protection_capabilities(&self) -> crate::image::ProtectionCapabilities;
+
+    fn validate_protection_aliases(
+        &self,
+        allocation: &ImageAllocation,
+        prepared: &crate::image::PreparedProtectionPlan,
+    ) -> LoadResult<()>;
+
+    fn apply_protection(&mut self, mut batch: crate::image::ProtectionBatch<'_>) -> LoadResult<()> {
+        for index in 0..batch.records().len() {
+            let record = batch.records()[index];
+            let level = self
+                .protect(
+                    record.allocation_offset(),
+                    record.applied_range().len(),
+                    record.permissions(),
+                )
+                .map_err(|error| error.at_stage(crate::error::LoadStage::Seal))?;
+            let _ = batch.record_level(index, level);
+        }
+        Ok(())
+    }
 }

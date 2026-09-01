@@ -21,6 +21,10 @@ mod inspect;
 mod map;
 mod plan;
 mod relocate;
+mod seal;
 
 pub(crate) use decode::RelocationRecord;
 pub(crate) use image_loader::{read_u16, read_u32, read_u64};
+pub(crate) use seal::{
+    PreparedProtectionPlan, ProtectionBatch, ProtectionCapabilities, ProtectionLevel,
+};
