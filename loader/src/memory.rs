@@ -73,7 +73,7 @@ impl ImageAllocation {
 }
 
 #[repr(transparent)]
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, PartialOrd)]
 pub(crate) struct AllocationOffset(u64);
 
 impl AllocationOffset {

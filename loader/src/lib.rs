@@ -26,6 +26,7 @@ mod image;
 mod memory;
 mod memory_mapper;
 mod reader;
+mod relocation;
 
 use goblin::elf::{
     header::{ET_DYN, ET_EXEC},

@@ -12,14 +12,30 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-mod admit;
-mod allocate;
-mod decode;
-mod image_loader;
-mod inspect;
-mod map;
-mod plan;
-mod relocate;
+use goblin::elf;
 
-pub(crate) use decode::RelocationRecord;
-pub(crate) use image_loader::{read_u16, read_u32, read_u64};
+use crate::{
+    identity::{ElfClass, ElfMachine},
+    relocation::{AddendEncoding, ArchRelocator},
+};
+
+#[repr(transparent)]
+pub struct ArmRelocator;
+
+impl ArchRelocator for ArmRelocator {
+    fn machine(&self) -> ElfMachine {
+        ElfMachine::Arm
+    }
+
+    fn class(&self) -> super::ElfClass {
+        ElfClass::Elf32
+    }
+
+    fn relative_type(&self) -> u32 {
+        elf::reloc::R_ARM_RELATIVE
+    }
+
+    fn addend_encoding(&self) -> super::AddendEncoding {
+        AddendEncoding::Implicit
+    }
+}
