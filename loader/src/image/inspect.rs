@@ -76,8 +76,12 @@ impl<R: ElfReader> InspectedImage<R> {
                 continue;
             }
             r += 1;
-            let align = normalize_alignment(segment.align(), segment.index())?;
-            self.request.limits().check_segment_alignment(align)?;
+            let align = normalize_alignment(segment.align(), segment.index())
+                .map_err(|error| error.at_stage(LoadStage::Plan))?;
+            self.request
+                .limits()
+                .check_segment_alignment(align)
+                .map_err(|error| error.at_stage(LoadStage::Plan))?;
             if segment.file_range().offset() % align != segment.vaddr().get() % align {
                 return Err(program_header_error(
                     segment.index(),
@@ -116,7 +120,8 @@ impl<R: ElfReader> InspectedImage<R> {
                     pair[1].index(),
                     ProgramHeaderField::VirtualRange,
                     pair[1].vaddr().get(),
-                ));
+                )
+                .at_stage(LoadStage::Plan));
             }
         }
         let segment_max_align = self
@@ -143,7 +148,10 @@ impl<R: ElfReader> InspectedImage<R> {
         let image_span = aligned_max_vaddr
             .checked_sub(aligned_min_vaddr)
             .map_err(|e| e.at_stage(LoadStage::Plan))?;
-        self.request.limits().check_image_span(image_span)?;
+        self.request
+            .limits()
+            .check_image_span(image_span)
+            .map_err(|error| error.at_stage(LoadStage::Plan))?;
 
         let entry_vaddr = TargetAddress::new(self.header.entry());
         let canonical_entry_vaddr = canonical_entry(entry_vaddr, self.header.machine());
@@ -160,7 +168,8 @@ impl<R: ElfReader> InspectedImage<R> {
                     len: 1,
                     align: 0,
                 },
-            ));
+            )
+            .at_stage(LoadStage::Plan));
         }
 
         if let Some(relro) = self.relro {
@@ -177,7 +186,8 @@ impl<R: ElfReader> InspectedImage<R> {
                         len: relro.len(),
                         align: 0,
                     },
-                ));
+                )
+                .at_stage(LoadStage::Plan));
             }
         }
 

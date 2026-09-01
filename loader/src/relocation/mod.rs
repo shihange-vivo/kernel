@@ -15,8 +15,8 @@
 mod arm;
 mod riscv;
 
-pub(crate) use arm::ArmRelocator;
-pub(crate) use riscv::{Riscv32Relocator, Riscv64Relocator};
+pub use arm::ArmRelocator;
+pub use riscv::{Riscv32Relocator, Riscv64Relocator};
 
 use crate::{
     address::TargetAddress,
@@ -59,7 +59,7 @@ impl WordWidth {
 }
 
 #[derive(Clone, Copy)]
-pub(crate) enum AddendEncoding {
+pub enum AddendEncoding {
     Implicit,
     Explicit,
 }
@@ -173,4 +173,22 @@ pub trait ArchRelocator {
     fn relative_type(&self) -> u32;
 
     fn addend_encoding(&self) -> AddendEncoding;
+}
+
+impl<A: ArchRelocator + ?Sized> ArchRelocator for &A {
+    fn machine(&self) -> ElfMachine {
+        (**self).machine()
+    }
+
+    fn class(&self) -> ElfClass {
+        (**self).class()
+    }
+
+    fn relative_type(&self) -> u32 {
+        (**self).relative_type()
+    }
+
+    fn addend_encoding(&self) -> AddendEncoding {
+        (**self).addend_encoding()
+    }
 }

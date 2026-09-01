@@ -44,8 +44,10 @@ fn fixture_builder_emits_a_parseable_elf32_header() {
 }
 
 mod placement {
-    use crate::address::{TargetAddress, TargetRange};
-    use crate::memory::{AllocationRequest, Placement};
+    use crate::{
+        address::{TargetAddress, TargetRange},
+        memory::{AllocationRequest, Placement},
+    };
 
     #[test]
     fn anywhere_request_reports_no_fixed_range() {
@@ -73,13 +75,13 @@ mod placement {
 mod exec_plan {
     use std::{cell::RefCell, rc::Rc, vec::Vec};
 
-    use crate::identity::{
-        ElfClass, ElfData, ElfMachine, ElfType, LoadLimits, LoadProfile, LoadRequest,
+    use crate::{
+        identity::{ElfClass, ElfData, ElfMachine, ElfType, LoadLimits, LoadProfile, LoadRequest},
+        image::ImageLoader,
+        memory::Placement,
+        reader::SliceElfReader,
+        tests::fixture::{ElfFixtureBuilder, RecordingMemory},
     };
-    use crate::image::ImageLoader;
-    use crate::memory::Placement;
-    use crate::reader::SliceElfReader;
-    use crate::tests::fixture::{ElfFixtureBuilder, RecordingMemory};
 
     fn build_exec_request() -> LoadRequest {
         let profile = LoadProfile::new(
@@ -129,9 +131,11 @@ mod exec_plan {
 }
 
 mod fixed_mapper {
-    use crate::address::{TargetAddress, TargetRange};
-    use crate::memory::{AllocationRequest, ImageMemory, Placement};
-    use crate::memory_mapper::{MemoryMapper, MemoryPermissions, MemoryRegion};
+    use crate::{
+        address::{TargetAddress, TargetRange},
+        memory::{AllocationRequest, ImageMemory, Placement},
+        memory_mapper::{MemoryMapper, MemoryPermissions, MemoryRegion},
+    };
 
     // SAFETY: test-only static region. Unit tests only exercise the
     // allocate/validate paths; the span 0x5000_0000..0x5000_2000 is never
@@ -157,7 +161,9 @@ mod fixed_mapper {
     #[test]
     fn fixed_mapper_allocates_borrowed_span() {
         let mut mapper = MemoryMapper::new(Some(&REGIONS));
-        mapper.allocate_image(fixed_request(0x5000_0000, 0x1000)).expect("allocate");
+        mapper
+            .allocate_image(fixed_request(0x5000_0000, 0x1000))
+            .expect("allocate");
         let allocation = mapper.allocation().expect("allocation recorded");
         assert_eq!(allocation.base().get(), 0x5000_0000);
         assert_eq!(allocation.len(), 0x1000);
@@ -168,31 +174,25 @@ mod fixed_mapper {
     fn fixed_mapper_rejects_span_exceeding_regions() {
         let mut mapper = MemoryMapper::new(Some(&REGIONS));
         // The region ends at 0x5000_2000; a span of 0x3000 overruns it.
-        assert!(
-            mapper
-                .allocate_image(fixed_request(0x5000_0000, 0x3000))
-                .is_err()
-        );
+        assert!(mapper
+            .allocate_image(fixed_request(0x5000_0000, 0x3000))
+            .is_err());
     }
 
     #[test]
     fn fixed_mapper_rejects_span_outside_regions() {
         let mut mapper = MemoryMapper::new(Some(&REGIONS));
-        assert!(
-            mapper
-                .allocate_image(fixed_request(0x6000_0000, 0x1000))
-                .is_err()
-        );
+        assert!(mapper
+            .allocate_image(fixed_request(0x6000_0000, 0x1000))
+            .is_err());
     }
 
     #[test]
     fn allocated_mapper_rejects_fixed_request() {
         let mut mapper = MemoryMapper::new(None);
-        assert!(
-            mapper
-                .allocate_image(fixed_request(0x5000_0000, 0x1000))
-                .is_err()
-        );
+        assert!(mapper
+            .allocate_image(fixed_request(0x5000_0000, 0x1000))
+            .is_err());
     }
 
     #[test]
@@ -206,21 +206,17 @@ mod fixed_mapper {
 mod entry_dispatch {
     use std::vec::Vec;
 
-    use crate::memory_mapper::MemoryMapper;
-    use crate::tests::fixture::ElfFixtureBuilder;
-    use crate::load_elf;
+    use crate::{load_elf, memory_mapper::MemoryMapper, tests::fixture::ElfFixtureBuilder};
 
     #[test]
     fn exec_image_on_allocated_mapper_is_rejected() {
         // An ET_EXEC image must only be given to a Fixed mapper; the entry
         // dispatch notices the mismatch before any segment is copied.
-        let bytes = ElfFixtureBuilder::elf64(
-            goblin::elf::header::EM_RISCV,
-            goblin::elf::header::ET_EXEC,
-        )
-        .with_load_segment(0x5000_0000, 0x100, 0x100, 0x4)
-        .with_entry(0x5000_0000)
-        .build();
+        let bytes =
+            ElfFixtureBuilder::elf64(goblin::elf::header::EM_RISCV, goblin::elf::header::ET_EXEC)
+                .with_load_segment(0x5000_0000, 0x100, 0x100, 0x4)
+                .with_entry(0x5000_0000)
+                .build();
         let mut mapper = MemoryMapper::new(None);
         let result = load_elf(&bytes, &mut mapper);
         assert!(result.is_err());

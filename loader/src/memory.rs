@@ -20,7 +20,7 @@ use crate::{
 
 /// Where an image wants its memory to come from.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum Placement {
+pub enum Placement {
     /// Any suitably aligned address (ET_DYN images).
     Anywhere,
     /// Exactly this virtual range (ET_EXEC images).
@@ -28,7 +28,7 @@ pub(crate) enum Placement {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) struct AllocationRequest {
+pub struct AllocationRequest {
     placement: Placement,
     size: u64,
     align: u64,
@@ -37,7 +37,11 @@ pub(crate) struct AllocationRequest {
 impl AllocationRequest {
     #[inline]
     pub const fn new(placement: Placement, size: u64, align: u64) -> Self {
-        Self { placement, size, align }
+        Self {
+            placement,
+            size,
+            align,
+        }
     }
 
     #[inline]
@@ -57,7 +61,7 @@ impl AllocationRequest {
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
-pub(crate) struct ImageAllocation {
+pub struct ImageAllocation {
     base: TargetAddress,
     len: u64,
     align: u64,
@@ -80,6 +84,11 @@ impl ImageAllocation {
     }
 
     #[inline]
+    pub const fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    #[inline]
     pub const fn align(&self) -> u64 {
         self.align
     }
@@ -87,7 +96,7 @@ impl ImageAllocation {
 
 #[repr(transparent)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq, PartialOrd)]
-pub(crate) struct AllocationOffset(u64);
+pub struct AllocationOffset(u64);
 
 impl AllocationOffset {
     #[inline]
@@ -150,15 +159,66 @@ pub trait ImageProtectionMemory: ImageMemory {
     fn apply_protection(&mut self, mut batch: crate::image::ProtectionBatch<'_>) -> LoadResult<()> {
         for index in 0..batch.records().len() {
             let record = batch.records()[index];
-            let level = self
-                .protect(
-                    record.allocation_offset(),
-                    record.applied_range().len(),
-                    record.permissions(),
-                )
-                .map_err(|error| error.at_stage(crate::error::LoadStage::Seal))?;
+            let level = self.protect(
+                record.allocation_offset(),
+                record.applied_range().len(),
+                record.permissions(),
+            )?;
             let _ = batch.record_level(index, level);
         }
         Ok(())
+    }
+}
+
+impl<M: ImageMemory + ?Sized> ImageMemory for &mut M {
+    fn allocate_image(&mut self, request: AllocationRequest) -> LoadResult<()> {
+        (**self).allocate_image(request)
+    }
+
+    fn allocation(&self) -> LoadResult<&ImageAllocation> {
+        (**self).allocation()
+    }
+
+    fn image_span(&self, offset: AllocationOffset, len: u64) -> LoadResult<*mut u8> {
+        (**self).image_span(offset, len)
+    }
+
+    fn write(&mut self, offset: AllocationOffset, data: &[u8]) -> LoadResult<()> {
+        (**self).write(offset, data)
+    }
+
+    fn zero(&mut self, offset: AllocationOffset, len: u64) -> LoadResult<()> {
+        (**self).zero(offset, len)
+    }
+
+    fn read(&self, offset: AllocationOffset, dst: &mut [u8]) -> LoadResult<()> {
+        (**self).read(offset, dst)
+    }
+}
+
+impl<M: ImageProtectionMemory + ?Sized> ImageProtectionMemory for &mut M {
+    fn protect(
+        &mut self,
+        offset: AllocationOffset,
+        len: u64,
+        permissions: MemoryPermissions,
+    ) -> LoadResult<crate::image::ProtectionLevel> {
+        (**self).protect(offset, len, permissions)
+    }
+
+    fn protection_capabilities(&self) -> crate::image::ProtectionCapabilities {
+        (**self).protection_capabilities()
+    }
+
+    fn validate_protection_aliases(
+        &self,
+        allocation: &ImageAllocation,
+        prepared: &crate::image::PreparedProtectionPlan,
+    ) -> LoadResult<()> {
+        (**self).validate_protection_aliases(allocation, prepared)
+    }
+
+    fn apply_protection(&mut self, batch: crate::image::ProtectionBatch<'_>) -> LoadResult<()> {
+        (**self).apply_protection(batch)
     }
 }

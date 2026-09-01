@@ -18,7 +18,7 @@ use core::alloc::Layout;
 
 use crate::{
     address::TargetAddress,
-    error::{ErrorContext, LoadError, LoadErrorKind, LoadResult, LoadStage},
+    error::{ErrorContext, LoadError, LoadErrorKind, LoadResult},
     image::{PreparedProtectionPlan, ProtectionCapabilities, ProtectionLevel},
     memory::{
         AllocationOffset, AllocationRequest, ImageAllocation, ImageMemory, ImageProtectionMemory,
@@ -45,7 +45,7 @@ impl MemoryPermissions {
         Self(self.0 & !removed.0)
     }
 
-    pub(crate) const fn contains(self, requested: Self) -> bool {
+    pub const fn contains(self, requested: Self) -> bool {
         self.0 & requested.0 == requested.0
     }
 }
@@ -156,10 +156,13 @@ impl MemoryMapper {
         let MappingMode::Fixed(regions) = &self.mode else {
             return Err("Fixed span requires a fixed mapper");
         };
+        let end = start
+            .checked_add(size)
+            .ok_or("Address span overflows the target address space")?;
         let valid = regions.iter().any(|region| {
             region.start < region.end
                 && start >= region.start
-                && start + size <= region.end
+                && end <= region.end
                 && region.permissions.contains(requested)
         });
         if valid {
@@ -212,8 +215,8 @@ impl ImageMemory for MemoryMapper {
                 if size == 0 {
                     return Err(allocation_error(&request));
                 }
-                let layout = Layout::from_size_align(size, align)
-                    .map_err(|_| allocation_error(&request))?;
+                let layout =
+                    Layout::from_size_align(size, align).map_err(|_| allocation_error(&request))?;
 
                 let storage = Storage::try_from_layout(layout).ok_or_else(|| {
                     LoadError::new(
@@ -225,9 +228,10 @@ impl ImageMemory for MemoryMapper {
                         },
                     )
                 })?;
-                let base = TargetAddress::new(u64::try_from(storage.base() as usize).map_err(
-                    |_| allocation_error(&request),
-                )?);
+                let base = TargetAddress::new(
+                    u64::try_from(storage.base() as usize)
+                        .map_err(|_| allocation_error(&request))?,
+                );
                 let allocation = ImageAllocation::new(base, request.size(), request.align());
                 self.mem = storage;
                 self.allocattion = Some(allocation);
@@ -242,8 +246,7 @@ impl ImageMemory for MemoryMapper {
                 }
                 let start =
                     usize::try_from(range.start().get()).map_err(|_| allocation_error(&request))?;
-                let len =
-                    usize::try_from(range.len()).map_err(|_| allocation_error(&request))?;
+                let len = usize::try_from(range.len()).map_err(|_| allocation_error(&request))?;
                 self.validate_fixed_span(start, len, MemoryPermissions::NONE)
                     .map_err(|_| allocation_error(&request))?;
                 self.allocattion = Some(ImageAllocation::new(
@@ -296,7 +299,10 @@ impl ImageMemory for MemoryMapper {
             MappingMode::Fixed(_) => {
                 let base = usize::try_from(allocation.base().get())
                     .map_err(|_| memory_access_error(*allocation, offset, len))?;
-                Ok((base + offset_usize) as *mut u8)
+                let address = base
+                    .checked_add(offset_usize)
+                    .ok_or_else(|| memory_access_error(*allocation, offset, len))?;
+                Ok(address as *mut u8)
             }
         }
     }
@@ -361,9 +367,7 @@ impl ImageProtectionMemory for MemoryMapper {
         allocation: &ImageAllocation,
         _prepared: &PreparedProtectionPlan,
     ) -> LoadResult<()> {
-        let actual = self
-            .allocation()
-            .map_err(|error| error.at_stage(LoadStage::Seal))?;
+        let actual = self.allocation()?;
         if actual == allocation {
             Ok(())
         } else {
@@ -409,7 +413,6 @@ fn protection_backend_error(allocation: &ImageAllocation) -> LoadError {
             align: allocation.align(),
         },
     )
-    .at_stage(LoadStage::Seal)
 }
 
 fn compatibility_install_error(allocation: ImageAllocation) -> LoadError {

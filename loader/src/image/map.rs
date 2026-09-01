@@ -303,8 +303,10 @@ impl<R: ElfReader, M: ImageMemory> MappedImage<R, M> {
             let tags = self
                 .decode_dynamic_tags()
                 .map_err(|error| error.at_stage(LoadStage::Decode))?;
-            self.decode_relocation_table(tags.rel(), RelocationTableKind::Rel, &mut relocations)?;
-            self.decode_relocation_table(tags.rela(), RelocationTableKind::Rela, &mut relocations)?;
+            self.decode_relocation_table(tags.rel(), RelocationTableKind::Rel, &mut relocations)
+                .map_err(|error| error.at_stage(LoadStage::Decode))?;
+            self.decode_relocation_table(tags.rela(), RelocationTableKind::Rela, &mut relocations)
+                .map_err(|error| error.at_stage(LoadStage::Decode))?;
         }
 
         Ok(DecodedImage::new(

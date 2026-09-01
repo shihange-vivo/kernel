@@ -60,7 +60,8 @@ impl<R: ElfReader> AdmittedImage<R> {
         let count = self.header.program_header_count();
         self.request
             .limits()
-            .check_load_segment_count(count.into())?;
+            .check_load_segment_count(count.into())
+            .map_err(|error| error.at_stage(LoadStage::Inspect))?;
         let mut load_segments = Vec::new();
         load_segments
             .try_reserve_exact(usize::from(count))
@@ -86,7 +87,9 @@ impl<R: ElfReader> AdmittedImage<R> {
                     program_header_error(index, ProgramHeaderField::FileRange, 0)
                         .at_stage(LoadStage::Inspect)
                 })?;
-            self.reader.read_exact_at(offset, &mut raw[..entry_size])?;
+            self.reader
+                .read_exact_at(offset, &mut raw[..entry_size])
+                .map_err(|error| error.at_stage(LoadStage::Inspect))?;
             let program_header = ProgramHeaderInfo::decode(
                 &raw[..entry_size],
                 self.request.profile().class(),
