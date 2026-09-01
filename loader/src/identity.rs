@@ -18,8 +18,8 @@ use goblin::elf::header::{
 
 use crate::error::{ErrorContext, LimitKind, LoadError, LoadErrorKind, LoadResult};
 
-#[derive(Clone, Copy, PartialEq)]
-pub(crate) enum ElfClass {
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ElfClass {
     Elf32,
     Elf64,
 }
@@ -33,8 +33,8 @@ impl From<ElfClass> for u64 {
     }
 }
 
-#[derive(Clone, Copy, PartialEq)]
-pub(crate) enum ElfData {
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ElfData {
     Little,
     Big,
 }
@@ -48,8 +48,8 @@ impl From<ElfData> for u64 {
     }
 }
 
-#[derive(Clone, Copy, PartialEq)]
-pub(crate) enum ElfType {
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ElfType {
     Dyn,
     Exec,
     Other(u16),
@@ -65,12 +65,12 @@ impl From<ElfType> for u64 {
     }
 }
 
-#[derive(Clone, Copy, PartialEq)]
-pub(crate) enum ElfMachine {
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ElfMachine {
     Riscv,
     Aarch64,
     Arm,
-    Ohter(u16),
+    Other(u16),
 }
 
 impl From<ElfMachine> for u64 {
@@ -79,12 +79,13 @@ impl From<ElfMachine> for u64 {
             ElfMachine::Aarch64 => u64::from(EM_AARCH64),
             ElfMachine::Arm => u64::from(EM_ARM),
             ElfMachine::Riscv => u64::from(EM_RISCV),
-            ElfMachine::Ohter(x) => u64::from(x),
+            ElfMachine::Other(x) => u64::from(x),
         }
     }
 }
 
-pub(crate) struct LoadProfile {
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct LoadProfile {
     class: ElfClass,
     endian: ElfData,
     machine: ElfMachine,
@@ -128,7 +129,8 @@ impl LoadProfile {
     }
 }
 
-pub(crate) struct LoadLimits {
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct LoadLimits {
     max_file_len: u64,
     max_program_headers: u16,
     max_load_segments: u16,
@@ -265,7 +267,8 @@ fn check_limit(resource: LimitKind, actual: u64, maximum: u64) -> LoadResult<()>
     ))
 }
 
-pub(crate) struct LoadRequest {
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct LoadRequest {
     profile: LoadProfile,
     limits: LoadLimits,
 }

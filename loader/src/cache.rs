@@ -16,11 +16,11 @@ use alloc::vec::Vec;
 
 use crate::{
     address::{TargetAddress, TargetRange},
-    error::{ErrorContext, LoadError, LoadErrorKind, LoadResult, LoadStage},
+    error::{ErrorContext, LoadError, LoadErrorKind, LoadResult},
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum ExecutionScope {
+pub enum ExecutionScope {
     CurrentExecutionContext,
     AllExecutionContexts,
 }
@@ -32,7 +32,7 @@ impl ExecutionScope {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum CacheMaintenance {
+pub enum CacheMaintenance {
     CoherentInstructionCache,
     InstructionFence,
     BarrierOnly,
@@ -40,7 +40,7 @@ pub(crate) enum CacheMaintenance {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) struct CacheRequirements {
+pub struct CacheRequirements {
     scope: ExecutionScope,
     maintenance: Option<CacheMaintenance>,
 }
@@ -108,9 +108,7 @@ impl PreparedCacheSync {
             .try_reserve_exact(executable_ranges.len())
             .map_err(|_| cache_oom())?;
         for range in executable_ranges {
-            range
-                .end()
-                .map_err(|error| error.at_stage(LoadStage::Cache))?;
+            range.end()?;
             ranges.push(*range);
         }
         Ok(Self {
@@ -184,6 +182,20 @@ pub trait CodeCache {
     fn prepare(&self, executable_ranges: &[TargetRange]) -> LoadResult<PreparedCacheSync>;
 
     fn synchronize(&mut self, prepared: PreparedCacheSync) -> LoadResult<CacheSyncOutcome>;
+}
+
+impl<C: CodeCache + ?Sized> CodeCache for &mut C {
+    fn requirements(&self) -> CacheRequirements {
+        (**self).requirements()
+    }
+
+    fn prepare(&self, executable_ranges: &[TargetRange]) -> LoadResult<PreparedCacheSync> {
+        (**self).prepare(executable_ranges)
+    }
+
+    fn synchronize(&mut self, prepared: PreparedCacheSync) -> LoadResult<CacheSyncOutcome> {
+        (**self).synchronize(prepared)
+    }
 }
 
 pub(crate) struct ArchitectureCodeCache {
@@ -288,27 +300,16 @@ unsafe fn synchronize_aarch64(runtime_range: TargetRange) -> LoadResult<()> {
     core::arch::asm!("mrs {value}, ctr_el0", value = out(reg) ctr_el0, options(nostack));
     let dcache_line = 4_u64 << ((ctr_el0 >> 16) & 0xf);
     let icache_line = 4_u64 << (ctr_el0 & 0xf);
-    let end = runtime_range
-        .end()
-        .map_err(|error| error.at_stage(LoadStage::Cache))?
-        .get();
+    let end = runtime_range.end()?.get();
 
-    let mut address = runtime_range
-        .start()
-        .align_down(dcache_line)
-        .map_err(|error| error.at_stage(LoadStage::Cache))?
-        .get();
+    let mut address = runtime_range.start().align_down(dcache_line)?.get();
     while address < end {
         core::arch::asm!("dc cvau, {address}", address = in(reg) address, options(nostack));
         address = address.saturating_add(dcache_line);
     }
     core::arch::asm!("dsb ish", options(nostack));
 
-    address = runtime_range
-        .start()
-        .align_down(icache_line)
-        .map_err(|error| error.at_stage(LoadStage::Cache))?
-        .get();
+    address = runtime_range.start().align_down(icache_line)?.get();
     while address < end {
         core::arch::asm!("ic ivau, {address}", address = in(reg) address, options(nostack));
         address = address.saturating_add(icache_line);
@@ -325,16 +326,14 @@ fn cache_error(runtime_range: TargetRange) -> LoadError {
             align: 0,
         },
     )
-    .at_stage(LoadStage::Cache)
 }
 
 fn cache_oom() -> LoadError {
-    LoadError::new(LoadErrorKind::OutOfMemory, ErrorContext::None).at_stage(LoadStage::Cache)
+    LoadError::new(LoadErrorKind::OutOfMemory, ErrorContext::None)
 }
 
 fn cache_capability_error() -> LoadError {
     LoadError::new(LoadErrorKind::UnsupportedByProfile, ErrorContext::None)
-        .at_stage(LoadStage::Cache)
 }
 
 fn cache_contract_error(executable_ranges: &[TargetRange]) -> LoadError {
@@ -350,5 +349,4 @@ fn cache_contract_error(executable_ranges: &[TargetRange]) -> LoadError {
             align: 0,
         },
     )
-    .at_stage(LoadStage::Cache)
 }

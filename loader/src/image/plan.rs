@@ -88,8 +88,7 @@ impl<R: ElfReader> PlannedImage<R> {
                     len: size,
                     align,
                 },
-            )
-            .at_stage(LoadStage::Allocate));
+            ));
         }
         if !align.is_power_of_two() {
             return Err(LoadError::new(
@@ -99,8 +98,7 @@ impl<R: ElfReader> PlannedImage<R> {
                     len: size,
                     align,
                 },
-            )
-            .at_stage(LoadStage::Allocate));
+            ));
         }
         let placement = match self.request.profile().r#type() {
             // Movable image: any suitably aligned address works.
@@ -109,10 +107,10 @@ impl<R: ElfReader> PlannedImage<R> {
             // image span so segment vaddrs map onto themselves (load bias 0).
             ElfType::Exec => Placement::Fixed(TargetRange::new(self.aligned_min_vaddr, size)),
             ElfType::Other(_) => {
-                return Err(
-                    LoadError::new(LoadErrorKind::UnsupportedByProfile, ErrorContext::None)
-                        .at_stage(LoadStage::Allocate),
-                )
+                return Err(LoadError::new(
+                    LoadErrorKind::UnsupportedByProfile,
+                    ErrorContext::None,
+                ))
             }
         };
         Ok(AllocationRequest::new(placement, size, align))
@@ -122,19 +120,22 @@ impl<R: ElfReader> PlannedImage<R> {
     where
         M: ImageMemory,
     {
-        let request = self.allocation_request()?;
-        memory
-            .allocate_image(request)
-            .map_err(|error| error.at_stage(LoadStage::Allocate))?;
+        // The allocation stage attaches LoadStage::Allocate to every error
+        // leaving this function, including the ones raised by helpers.
+        let at_allocate = |error: LoadError| error.at_stage(LoadStage::Allocate);
 
-        let allocation = memory.allocation()?;
+        let request = self.allocation_request().map_err(at_allocate)?;
+        memory.allocate_image(request).map_err(at_allocate)?;
 
-        validate_allocation(allocation, &request, self.request.profile().class())?;
+        let allocation = memory.allocation().map_err(at_allocate)?;
+
+        validate_allocation(allocation, &request, self.request.profile().class())
+            .map_err(at_allocate)?;
         let load_bias = TargetAddress::new(
             allocation
                 .base()
                 .checked_sub(self.aligned_min_vaddr)
-                .map_err(|error| error.at_stage(LoadStage::Allocate))?,
+                .map_err(at_allocate)?,
         );
         Ok(AllocatedImage::new(
             self.reader,
@@ -168,6 +169,9 @@ fn validate_allocation(
         ElfClass::Elf32 => end.get() <= u64::from(u32::MAX),
         ElfClass::Elf64 => true,
     });
+    let host_width_valid = end
+        .as_ref()
+        .is_ok_and(|end| usize::try_from(end.get()).is_ok());
     // Fixed placement must land exactly on the planned image span; the
     // uniform load-bias formula only yields 0 when the base matches.
     let fixed_span_valid = match request.placement() {
@@ -179,6 +183,7 @@ fn validate_allocation(
         && allocation.align() == request.align()
         && aligned
         && target_width_valid
+        && host_width_valid
         && fixed_span_valid
     {
         return Ok(());
@@ -190,6 +195,5 @@ fn validate_allocation(
             len: allocation.len(),
             align: allocation.align(),
         },
-    )
-    .at_stage(LoadStage::Allocate))
+    ))
 }

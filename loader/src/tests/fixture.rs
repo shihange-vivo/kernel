@@ -39,19 +39,12 @@ impl ElfFixtureBuilder {
         write_u16(&mut bytes, 16, e_type);
         write_u16(&mut bytes, 18, e_machine);
         write_u32(&mut bytes, 20, EV_CURRENT as u32);
-        write_u64(
-            &mut bytes,
-            32,
-            elf64::header::SIZEOF_EHDR as u64,
-        );
+        write_u64(&mut bytes, 32, elf64::header::SIZEOF_EHDR as u64);
         write_u16(&mut bytes, 52, elf64::header::SIZEOF_EHDR as u16);
         write_u16(&mut bytes, 54, elf64::program_header::SIZEOF_PHDR as u16);
         write_u16(&mut bytes, 58, elf64::section_header::SIZEOF_SHDR as u16);
 
-        Self {
-            bytes,
-            ph_count: 0,
-        }
+        Self { bytes, ph_count: 0 }
     }
 
     pub fn elf32(e_machine: u16, e_type: u16) -> Self {
@@ -68,21 +61,12 @@ impl ElfFixtureBuilder {
         write_u16(&mut bytes, 42, elf32::program_header::SIZEOF_PHDR as u16);
         write_u16(&mut bytes, 46, elf32::section_header::SIZEOF_SHDR as u16);
 
-        Self {
-            bytes,
-            ph_count: 0,
-        }
+        Self { bytes, ph_count: 0 }
     }
 
     /// Append a PT_LOAD program header (Elf64 only). The first call's flags
     /// default to PF_R|PF_X; subsequent calls default to PF_R|PF_W.
-    pub fn with_load_segment(
-        mut self,
-        vaddr: u64,
-        filesz: u64,
-        memsz: u64,
-        align: u64,
-    ) -> Self {
+    pub fn with_load_segment(mut self, vaddr: u64, filesz: u64, memsz: u64, align: u64) -> Self {
         let ph_offset = elf64::header::SIZEOF_EHDR
             + self.ph_count as usize * elf64::program_header::SIZEOF_PHDR;
         self.bytes
@@ -144,11 +128,7 @@ impl RecordingMemory {
     pub fn new(sink: Rc<RefCell<Option<AllocationRequest>>>) -> Self {
         Self {
             sink,
-            allocation: ImageAllocation::new(
-                crate::address::TargetAddress::new(0),
-                0,
-                1,
-            ),
+            allocation: ImageAllocation::new(crate::address::TargetAddress::new(0), 0, 1),
         }
     }
 

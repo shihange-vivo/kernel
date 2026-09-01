@@ -92,10 +92,10 @@ impl<R: ElfReader, M: ImageMemory> RelocatedImage<R, M> {
             .count();
         executable_ranges
             .try_reserve_exact(executable_count)
-            .map_err(|_| cache_oom())?;
+            .map_err(|_| cache_oom().at_stage(LoadStage::Cache))?;
 
         if self.load_segments.len() != self.regions.len() {
-            return Err(cache_backend_error(None));
+            return Err(cache_backend_error(None).at_stage(LoadStage::Cache));
         }
         for (segment, region) in self.load_segments.iter().zip(self.regions.iter()) {
             let expected_vaddr = TargetRange::new(segment.vaddr(), segment.memory_size());
@@ -107,7 +107,9 @@ impl<R: ElfReader, M: ImageMemory> RelocatedImage<R, M> {
             );
             if region.vaddr_range() != expected_vaddr || region.runtime_range() != expected_runtime
             {
-                return Err(cache_backend_error(Some(region.runtime_range())));
+                return Err(
+                    cache_backend_error(Some(region.runtime_range())).at_stage(LoadStage::Cache)
+                );
             }
             if segment
                 .permissions()
@@ -159,7 +161,7 @@ impl<R: ElfReader, M: ImageMemory> RelocatedImage<R, M> {
 }
 
 fn cache_oom() -> LoadError {
-    LoadError::new(LoadErrorKind::OutOfMemory, ErrorContext::None).at_stage(LoadStage::Cache)
+    LoadError::new(LoadErrorKind::OutOfMemory, ErrorContext::None)
 }
 
 fn cache_backend_error(range: Option<TargetRange>) -> LoadError {
@@ -171,5 +173,5 @@ fn cache_backend_error(range: Option<TargetRange>) -> LoadError {
         },
         None => ErrorContext::None,
     };
-    LoadError::new(LoadErrorKind::Backend, context).at_stage(LoadStage::Cache)
+    LoadError::new(LoadErrorKind::Backend, context)
 }

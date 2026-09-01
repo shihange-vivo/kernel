@@ -19,8 +19,7 @@ use crate::{
     cache::CacheSyncOutcome,
     elf::{DynamicSegmentInfo, LoadSegmentInfo},
     error::{
-        ErrorContext, LimitKind, LoadError, LoadErrorKind, LoadResult, LoadStage,
-        ProgramHeaderField,
+        ErrorContext, LimitKind, LoadError, LoadErrorKind, LoadResult, ProgramHeaderField,
     },
     identity::{ElfClass, LoadRequest},
     image::{inspect::StackKind, map::LoadedRegion, RelocationRecord},
@@ -30,13 +29,13 @@ use crate::{
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum ProtectionLevel {
+pub enum ProtectionLevel {
     HardwareEnforced,
     LogicalOnly,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) struct ProtectionCapabilities {
+pub struct ProtectionCapabilities {
     granule: u64,
     max_ranges: usize,
 }
@@ -113,8 +112,7 @@ impl SealPlan {
                     field: ProgramHeaderField::ExecutableStack,
                     value: 0,
                 },
-            )
-            .at_stage(LoadStage::Seal));
+            ));
         }
         if load_segments.len() != regions.len() {
             return Err(protection_backend_error(allocation));
@@ -153,8 +151,8 @@ impl SealPlan {
 
             let source = region.vaddr_range();
             if let Some(relro) = relro.filter(|relro| relro.overlaps(source)) {
-                let source_end = at_seal(source.end())?;
-                let relro_end = at_seal(relro.end())?;
+                let source_end = source.end()?;
+                let relro_end = relro.end()?;
                 let overlap_start = core::cmp::max(source.start(), relro.start());
                 let overlap_end = core::cmp::min(source_end, relro_end);
                 append_region_range(
@@ -162,7 +160,7 @@ impl SealPlan {
                     region,
                     &mut ranges,
                     source.start(),
-                    at_seal(overlap_start.checked_sub(source.start()))?,
+                    overlap_start.checked_sub(source.start())?,
                     segment.permissions(),
                 )?;
                 append_region_range(
@@ -170,7 +168,7 @@ impl SealPlan {
                     region,
                     &mut ranges,
                     overlap_start,
-                    at_seal(overlap_end.checked_sub(overlap_start))?,
+                    overlap_end.checked_sub(overlap_start)?,
                     segment.permissions().without(MemoryPermissions::WRITE),
                 )?;
                 append_region_range(
@@ -178,7 +176,7 @@ impl SealPlan {
                     region,
                     &mut ranges,
                     overlap_end,
-                    at_seal(source_end.checked_sub(overlap_end))?,
+                    source_end.checked_sub(overlap_end)?,
                     segment.permissions(),
                 )?;
             } else {
@@ -290,21 +288,15 @@ impl PreparedProtectionPlan {
         allocation: &ImageAllocation,
         logical: &SealPlan,
     ) -> LoadResult<Self> {
-        let actual = memory
-            .allocation()
-            .map_err(|error| error.at_stage(LoadStage::Seal))?;
+        let actual = memory.allocation()?;
         if actual != allocation {
             return Err(protection_backend_error(allocation));
         }
 
         let prepared = Self::build(allocation, logical, memory.protection_capabilities())?;
-        memory
-            .validate_protection_aliases(allocation, &prepared)
-            .map_err(|error| error.at_stage(LoadStage::Seal))?;
+        memory.validate_protection_aliases(allocation, &prepared)?;
         for range in prepared.ranges() {
-            memory
-                .image_span(range.allocation_offset(), range.applied_range().len())
-                .map_err(|error| error.at_stage(LoadStage::Seal))?;
+            memory.image_span(range.allocation_offset(), range.applied_range().len())?;
         }
         Ok(prepared)
     }
@@ -326,42 +318,40 @@ impl PreparedProtectionPlan {
                     actual: logical.ranges().len() as u64,
                     maximum: capabilities.max_ranges() as u64,
                 },
-            )
-            .at_stage(LoadStage::Seal));
+            ));
         }
 
         let mut ranges: Vec<ProtectionRecord> = Vec::new();
         ranges
             .try_reserve_exact(logical.ranges().len())
             .map_err(|_| seal_oom())?;
-        let allocation_end = at_seal(allocation.base().checked_add(allocation.len()))?;
+        let allocation_end = allocation.base().checked_add(allocation.len())?;
 
         for requested in logical.ranges() {
-            let expected_start = at_seal(
-                allocation
-                    .base()
-                    .checked_add(requested.allocation_offset().value()),
-            )?;
+            let expected_start = allocation
+                .base()
+                .checked_add(requested.allocation_offset().value())?;
             if expected_start != requested.runtime_range().start() {
                 return Err(protection_backend_error(allocation));
             }
 
-            let requested_end = at_seal(requested.runtime_range().end())?;
-            let applied_start = at_seal(requested.runtime_range().start().align_down(granule))?;
-            let applied_end = at_seal(requested_end.align_up(granule))?;
+            let requested_end = requested.runtime_range().end()?;
+            let applied_start = requested.runtime_range().start().align_down(granule)?;
+            let applied_end = requested_end.align_up(granule)?;
             if applied_start < allocation.base() || applied_end > allocation_end {
                 return Err(protection_backend_error(allocation));
             }
-            let prefix = at_seal(requested.runtime_range().start().checked_sub(applied_start))?;
+            let prefix = requested
+                .runtime_range()
+                .start()
+                .checked_sub(applied_start)?;
             let applied_offset = requested
                 .allocation_offset()
                 .value()
                 .checked_sub(prefix)
                 .ok_or_else(|| protection_backend_error(allocation))?;
-            let applied_range = TargetRange::new(
-                applied_start,
-                at_seal(applied_end.checked_sub(applied_start))?,
-            );
+            let applied_range =
+                TargetRange::new(applied_start, applied_end.checked_sub(applied_start)?);
 
             if let Some(previous) = ranges.last()
                 && previous.applied_range().overlaps(applied_range)
@@ -507,8 +497,24 @@ impl<R: ElfReader, M: ImageMemory> SealedImage<R, M> {
         self.protections.level()
     }
 
-    pub(crate) fn into_loaded_parts(self) -> (M, TargetAddress, TargetAddress) {
-        (self.memory, self.load_bias, self.entry_vaddr)
+    pub(crate) fn into_prepared_parts(
+        self,
+    ) -> (
+        M,
+        TargetAddress,
+        TargetAddress,
+        CacheSyncOutcome,
+        SealPlan,
+        AppliedProtectionSet,
+    ) {
+        (
+            self.memory,
+            self.load_bias,
+            self.entry_vaddr,
+            self.cache_sync,
+            self.seal_plan,
+            self.protections,
+        )
     }
 }
 
@@ -520,17 +526,17 @@ fn validate_region(
 ) -> LoadResult<()> {
     let expected_vaddr = TargetRange::new(segment.vaddr(), segment.memory_size());
     let expected_runtime = TargetRange::new(
-        at_seal(load_bias.checked_add(segment.vaddr().get()))?,
+        load_bias.checked_add(segment.vaddr().get())?,
         segment.memory_size(),
     );
-    let expected_offset = at_seal(expected_runtime.start().checked_sub(allocation.base()))?;
+    let expected_offset = expected_runtime.start().checked_sub(allocation.base())?;
     if region.vaddr_range() != expected_vaddr
         || region.runtime_range() != expected_runtime
         || region.allocation_offset().value() != expected_offset
     {
         return Err(protection_backend_error(allocation));
     }
-    at_seal(region.runtime_range().end())?;
+    region.runtime_range().end()?;
     if segment.permissions().contains(MemoryPermissions::WRITE)
         && segment.permissions().contains(MemoryPermissions::EXECUTE)
     {
@@ -568,8 +574,7 @@ fn validate_relocation_targets(
                 raw_type: relocation.raw_type(),
                 symbol_index: relocation.symbol_index(),
             },
-        )
-        .at_stage(LoadStage::Seal));
+        ));
     }
     Ok(())
 }
@@ -601,10 +606,10 @@ fn append_region_range(
     if len == 0 {
         return Ok(());
     }
-    let region_delta = at_seal(vaddr.checked_sub(region.vaddr_range().start()))?;
-    let allocation_offset = at_seal(region.allocation_offset().checked_add(region_delta))?;
-    let runtime_range = TargetRange::new(at_seal(load_bias.checked_add(vaddr.get()))?, len);
-    at_seal(runtime_range.end())?;
+    let region_delta = vaddr.checked_sub(region.vaddr_range().start())?;
+    let allocation_offset = region.allocation_offset().checked_add(region_delta)?;
+    let runtime_range = TargetRange::new(load_bias.checked_add(vaddr.get())?, len);
+    runtime_range.end()?;
     append_seal_range(ranges, allocation_offset, runtime_range, permissions)
 }
 
@@ -618,8 +623,8 @@ fn append_allocation_range(
     if len == 0 {
         return Ok(());
     }
-    let runtime_range = TargetRange::new(at_seal(allocation.base().checked_add(offset))?, len);
-    at_seal(runtime_range.end())?;
+    let runtime_range = TargetRange::new(allocation.base().checked_add(offset)?, len);
+    runtime_range.end()?;
     append_seal_range(
         ranges,
         AllocationOffset::new(offset),
@@ -639,7 +644,7 @@ fn append_seal_range(
             .allocation_offset()
             .value()
             .checked_add(previous.runtime_range().len());
-        let previous_runtime_end = at_seal(previous.runtime_range().end())?;
+        let previous_runtime_end = previous.runtime_range().end()?;
         if previous.permissions() == permissions
             && previous_offset_end == Some(allocation_offset.value())
             && previous_runtime_end == runtime_range.start()
@@ -679,11 +684,7 @@ fn validate_logical_cover(allocation: &ImageAllocation, ranges: &[SealRange]) ->
 }
 
 fn seal_oom() -> LoadError {
-    LoadError::new(LoadErrorKind::OutOfMemory, ErrorContext::None).at_stage(LoadStage::Seal)
-}
-
-fn at_seal<T>(result: LoadResult<T>) -> LoadResult<T> {
-    result.map_err(|error| error.at_stage(LoadStage::Seal))
+    LoadError::new(LoadErrorKind::OutOfMemory, ErrorContext::None)
 }
 
 fn seal_range_error(range: TargetRange, kind: LoadErrorKind) -> LoadError {
@@ -695,7 +696,6 @@ fn seal_range_error(range: TargetRange, kind: LoadErrorKind) -> LoadError {
             align: 0,
         },
     )
-    .at_stage(LoadStage::Seal)
 }
 
 fn protection_backend_error(allocation: &ImageAllocation) -> LoadError {
@@ -707,5 +707,4 @@ fn protection_backend_error(allocation: &ImageAllocation) -> LoadError {
             align: allocation.align(),
         },
     )
-    .at_stage(LoadStage::Seal)
 }

@@ -29,22 +29,137 @@ mod memory_mapper;
 mod reader;
 mod relocation;
 
-use cache::{ArchitectureCodeCache, CacheRequirements};
+use cache::ArchitectureCodeCache;
 use goblin::elf::header::{
     EI_CLASS, EI_DATA, ELFCLASS32, ELFCLASS64, ELFDATA2LSB, ELFDATA2MSB, EM_AARCH64, EM_ARM,
     EM_RISCV,
 };
-use identity::{ElfClass, ElfData, ElfMachine, ElfType, LoadLimits, LoadProfile, LoadRequest};
 use image::{read_u16, ImageLoader};
 use memory_mapper::MappingMode;
 use reader::SliceElfReader;
-use relocation::{ArmRelocator, Riscv32Relocator, Riscv64Relocator};
 
-pub use error::{ErrorContext, LoadError, LoadErrorKind, LoadResult};
+pub use address::{TargetAddress, TargetRange};
+pub use cache::{
+    CacheMaintenance, CacheRequirements, CacheSyncOutcome, CodeCache, ExecutionScope,
+    PreparedCacheSync,
+};
+pub use error::{
+    ErrorContext, HeaderField, LimitKind, LoadError, LoadErrorKind, LoadResult, LoadStage,
+    ProgramHeaderField,
+};
+pub use identity::{ElfClass, ElfData, ElfMachine, ElfType, LoadLimits, LoadProfile, LoadRequest};
+pub use image::{
+    AppliedProtectionSet, PreparedProtectionPlan, ProtectionBatch, ProtectionCapabilities,
+    ProtectionLevel, ProtectionRecord, SealPlan, SealRange,
+};
+pub use memory::{
+    AllocationOffset, AllocationRequest, ImageAllocation, ImageMemory, ImageProtectionMemory,
+    Placement,
+};
 pub use memory_mapper::{MemoryMapper, MemoryPermissions, MemoryRegion};
 pub use reader::ElfReader;
+pub use relocation::{
+    AddendEncoding, ArchRelocator, ArmRelocator, Riscv32Relocator, Riscv64Relocator,
+};
 
 pub type Result = core::result::Result<(), &'static str>;
+
+/// A fully mapped, relocated, cache-synchronized and sealed image that has
+/// not yet been published by the kernel.
+///
+/// The memory backend remains owned by the caller. This value only carries
+/// the validated result needed by the kernel's install/commit path.
+#[derive(Debug)]
+pub struct PreparedImage {
+    load_bias: TargetAddress,
+    runtime_entry: TargetAddress,
+    cache_sync: CacheSyncOutcome,
+    seal_plan: SealPlan,
+    protections: AppliedProtectionSet,
+}
+
+impl PreparedImage {
+    #[inline]
+    pub const fn load_bias(&self) -> TargetAddress {
+        self.load_bias
+    }
+
+    #[inline]
+    pub const fn runtime_entry(&self) -> TargetAddress {
+        self.runtime_entry
+    }
+
+    #[inline]
+    pub const fn cache_sync(&self) -> &CacheSyncOutcome {
+        &self.cache_sync
+    }
+
+    #[inline]
+    pub const fn seal_plan(&self) -> &SealPlan {
+        &self.seal_plan
+    }
+
+    #[inline]
+    pub const fn protections(&self) -> &AppliedProtectionSet {
+        &self.protections
+    }
+
+    #[inline]
+    pub fn protection(&self) -> ProtectionLevel {
+        self.protections.level()
+    }
+}
+
+/// Prepare one image using a profile and platform backends supplied by the
+/// kernel.
+///
+/// Unlike the compatibility [`load_elf`] entry point, this function never
+/// derives a trusted profile from the artifact and never takes ownership of
+/// the memory backend. On either success or failure, `memory` remains owned
+/// by the caller.
+pub fn prepare_image<R, M, C, A>(
+    reader: R,
+    request: LoadRequest,
+    memory: &mut M,
+    cache: &mut C,
+    relocator: &A,
+) -> LoadResult<PreparedImage>
+where
+    R: ElfReader,
+    M: ImageProtectionMemory + ?Sized,
+    C: CodeCache + ?Sized,
+    A: ArchRelocator + ?Sized,
+{
+    if request.profile().machine() != relocator.machine()
+        || request.profile().class() != relocator.class()
+    {
+        return Err(LoadError::new(
+            LoadErrorKind::UnsupportedByProfile,
+            ErrorContext::None,
+        )
+        .at_stage(LoadStage::Relocate));
+    }
+
+    let sealed = ImageLoader::new(reader, request)
+        .admit()?
+        .inspect()?
+        .plan()?
+        .allocate(memory)?
+        .map()?
+        .decode()?
+        .relocation(relocator)?
+        .cache(cache)?
+        .seal()?;
+    let (_memory, load_bias, runtime_entry, cache_sync, seal_plan, protections) =
+        sealed.into_prepared_parts();
+    Ok(PreparedImage {
+        load_bias,
+        runtime_entry,
+        cache_sync,
+        seal_plan,
+        protections,
+    })
+}
 
 /// Bytes needed to peek at EI_CLASS, EI_DATA and e_machine before the
 /// pipeline takes over (e_machine ends at offset 20).
@@ -72,7 +187,7 @@ fn peek_profile(
         EM_ARM => ElfMachine::Arm,
         EM_RISCV => ElfMachine::Riscv,
         EM_AARCH64 => ElfMachine::Aarch64,
-        value => ElfMachine::Ohter(value),
+        value => ElfMachine::Other(value),
     };
     Ok(LoadProfile::new(class, endian, machine, expected_type))
 }
@@ -99,27 +214,28 @@ fn compatibility_error(error: LoadError) -> &'static str {
     }
 }
 
-/// Load an ELF image from any seek-based reader through the unified
-/// ImageLoader pipeline. See [`load_elf`] for the mapper-mode contract.
+/// Compatibility entry point for loading from a seek-based reader.
+///
+/// New kernel code should construct a trusted [`LoadRequest`] and call
+/// [`prepare_image`] instead. This wrapper derives a compatibility profile
+/// from the artifact because the legacy API has no profile parameter.
 pub fn load_elf_from_reader<R: ElfReader>(reader: R, mapper: &mut MemoryMapper) -> Result {
     let expected_type = expected_type_for(mapper)?;
     let profile = peek_profile(&reader, expected_type)?;
     let (class, machine) = (profile.class(), profile.machine());
     let request = LoadRequest::new(profile, LoadLimits::DEFAULT);
 
-    let decoded = ImageLoader::new(reader, request)
-        .admit()
-        .and_then(|image| image.inspect())
-        .and_then(|image| image.plan())
-        .and_then(|image| image.allocate(core::mem::replace(mapper, MemoryMapper::new(None))))
-        .and_then(|image| image.map())
-        .and_then(|image| image.decode())
-        .map_err(compatibility_error)?;
-
-    let relocated = match (machine, class) {
-        (ElfMachine::Arm, ElfClass::Elf32) => decoded.relocation(ArmRelocator),
-        (ElfMachine::Riscv, ElfClass::Elf32) => decoded.relocation(Riscv32Relocator),
-        (ElfMachine::Riscv, ElfClass::Elf64) => decoded.relocation(Riscv64Relocator),
+    let mut cache = ArchitectureCodeCache::new(CacheRequirements::CURRENT_EXECUTION_CONTEXT);
+    let prepared = match (machine, class) {
+        (ElfMachine::Arm, ElfClass::Elf32) => {
+            prepare_image(reader, request, mapper, &mut cache, &ArmRelocator)
+        }
+        (ElfMachine::Riscv, ElfClass::Elf32) => {
+            prepare_image(reader, request, mapper, &mut cache, &Riscv32Relocator)
+        }
+        (ElfMachine::Riscv, ElfClass::Elf64) => {
+            prepare_image(reader, request, mapper, &mut cache, &Riscv64Relocator)
+        }
         _ => Err(LoadError::new(
             LoadErrorKind::UnsupportedByProfile,
             error::ErrorContext::None,
@@ -127,19 +243,10 @@ pub fn load_elf_from_reader<R: ElfReader>(reader: R, mapper: &mut MemoryMapper) 
     }
     .map_err(compatibility_error)?;
 
-    let sealed = relocated
-        .cache(ArchitectureCodeCache::new(
-            CacheRequirements::CURRENT_EXECUTION_CONTEXT,
-        ))
-        .and_then(|image| image.seal())
+    mapper
+        .install_loaded_image(prepared.load_bias(), prepared.runtime_entry())
         .map_err(compatibility_error)?;
-
-    let (mut loaded_mapper, load_bias, runtime_entry) = sealed.into_loaded_parts();
-    loaded_mapper
-        .install_loaded_image(load_bias, runtime_entry)
-        .map_err(compatibility_error)?;
-    loaded_mapper.real_entry()?;
-    *mapper = loaded_mapper;
+    mapper.real_entry()?;
     Ok(())
 }
 

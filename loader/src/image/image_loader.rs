@@ -40,20 +40,22 @@ impl<R: ElfReader> ImageLoader<R> {
     }
 
     pub fn admit(self) -> LoadResult<AdmittedImage<R>> {
-        let file_len = self.reader.len()?;
-        self.request.limits().check_file_len(file_len)?;
+        // The admit stage attaches LoadStage::Admit to every error leaving
+        // this function, including the ones raised by helpers.
+        let file_len = at_admit(self.reader.len())?;
+        at_admit(self.request.limits().check_file_len(file_len))?;
 
         let mut ident = [0; ELF_IDENT_SIZE];
-        self.reader.read_exact_at(0, &mut ident)?;
-        let (class, endian) = validate_ident(&ident)?;
+        at_admit(self.reader.read_exact_at(0, &mut ident))?;
+        let (class, endian) = at_admit(validate_ident(&ident))?;
         let header_size = match class {
             ElfClass::Elf32 => ELF32_HEADER_SIZE,
             ElfClass::Elf64 => ELF64_HEADER_SIZE,
         };
         let mut bytes = [0; ELF64_HEADER_SIZE];
-        self.reader.read_exact_at(0, &mut bytes[..header_size])?;
-        let header = decode_header(&bytes[..header_size], class, endian)?;
-        validate_header(&header, &self.request, file_len)?;
+        at_admit(self.reader.read_exact_at(0, &mut bytes[..header_size]))?;
+        let header = at_admit(decode_header(&bytes[..header_size], class, endian))?;
+        at_admit(validate_header(&header, &self.request, file_len))?;
         Ok(AdmittedImage::new(
             self.reader,
             header,
@@ -65,52 +67,48 @@ impl<R: ElfReader> ImageLoader<R> {
 
 fn validate_ident(ident: &[u8; ELF_IDENT_SIZE]) -> LoadResult<(ElfClass, ElfData)> {
     if ident[..ELFMAG.len()] != ELFMAG[..] {
-        return Err(bad_header(HeaderField::Magic, 0).at_stage(LoadStage::Admit));
+        return Err(bad_header(HeaderField::Magic, 0));
     }
     let class = match ident[EI_CLASS] {
         ELFCLASS32 => ElfClass::Elf32,
         ELFCLASS64 => ElfClass::Elf64,
-        value => {
-            return Err(bad_header(HeaderField::Class, u64::from(value)).at_stage(LoadStage::Admit))
-        }
+        value => return Err(bad_header(HeaderField::Class, u64::from(value))),
     };
     let endian = match ident[EI_DATA] {
         ELFDATA2LSB => ElfData::Little,
         ELFDATA2MSB => ElfData::Big,
-        value => {
-            return Err(bad_header(HeaderField::Endian, u64::from(value)).at_stage(LoadStage::Admit))
-        }
+        value => return Err(bad_header(HeaderField::Endian, u64::from(value))),
     };
     if ident[EI_VERSION] != EV_CURRENT {
-        return Err(
-            bad_header(HeaderField::Version, u64::from(ident[EI_VERSION]))
-                .at_stage(LoadStage::Admit),
-        );
+        return Err(bad_header(
+            HeaderField::Version,
+            u64::from(ident[EI_VERSION]),
+        ));
     }
     if ident[EI_OSABI] != ELFOSABI_NONE {
-        return Err(
-            unsupported_header(HeaderField::OsAbi, u64::from(ident[EI_OSABI]))
-                .at_stage(LoadStage::Admit),
-        );
+        return Err(unsupported_header(
+            HeaderField::OsAbi,
+            u64::from(ident[EI_OSABI]),
+        ));
     }
     Ok((class, endian))
 }
 
 fn decode_header(bytes: &[u8], class: ElfClass, endian: ElfData) -> LoadResult<ElfHeaderInfo> {
-    let r#type = match at_admit(read_u16(bytes, 16, endian))? {
+    let r#type = match read_u16(bytes, 16, endian)? {
         ET_DYN => ElfType::Dyn,
         ET_EXEC => ElfType::Exec,
         value => ElfType::Other(value),
     };
-    let machine = match at_admit(read_u16(bytes, 18, endian))? {
+    let machine = match read_u16(bytes, 18, endian)? {
         EM_ARM => ElfMachine::Arm,
         EM_AARCH64 => ElfMachine::Aarch64,
         EM_RISCV => ElfMachine::Riscv,
-        value => ElfMachine::Ohter(value),
+        value => ElfMachine::Other(value),
     };
-    let version = at_admit(read_u32(bytes, 20, endian))?;
+    let version = read_u32(bytes, 20, endian)?;
     if version != u32::from(EV_CURRENT) {
-        return Err(bad_header(HeaderField::Version, u64::from(version)).at_stage(LoadStage::Admit));
+        return Err(bad_header(HeaderField::Version, u64::from(version)));
     }
 
     let (
@@ -122,20 +120,20 @@ fn decode_header(bytes: &[u8], class: ElfClass, endian: ElfData) -> LoadResult<E
         program_header_count,
     ) = match class {
         ElfClass::Elf32 => (
-            u64::from(at_admit(read_u32(bytes, 24, endian))?),
-            u64::from(at_admit(read_u32(bytes, 28, endian))?),
-            at_admit(read_u32(bytes, 36, endian))?,
-            at_admit(read_u16(bytes, 40, endian))?,
-            at_admit(read_u16(bytes, 42, endian))?,
-            at_admit(read_u16(bytes, 44, endian))?,
+            u64::from(read_u32(bytes, 24, endian)?),
+            u64::from(read_u32(bytes, 28, endian)?),
+            read_u32(bytes, 36, endian)?,
+            read_u16(bytes, 40, endian)?,
+            read_u16(bytes, 42, endian)?,
+            read_u16(bytes, 44, endian)?,
         ),
         ElfClass::Elf64 => (
-            at_admit(read_u64(bytes, 24, endian))?,
-            at_admit(read_u64(bytes, 32, endian))?,
-            at_admit(read_u32(bytes, 48, endian))?,
-            at_admit(read_u16(bytes, 52, endian))?,
-            at_admit(read_u16(bytes, 54, endian))?,
-            at_admit(read_u16(bytes, 56, endian))?,
+            read_u64(bytes, 24, endian)?,
+            read_u64(bytes, 32, endian)?,
+            read_u32(bytes, 48, endian)?,
+            read_u16(bytes, 52, endian)?,
+            read_u16(bytes, 54, endian)?,
+            read_u16(bytes, 56, endian)?,
         ),
     };
     let expected_header_size = match class {
@@ -143,9 +141,7 @@ fn decode_header(bytes: &[u8], class: ElfClass, endian: ElfData) -> LoadResult<E
         ElfClass::Elf64 => ELF64_HEADER_SIZE as u16,
     };
     if header_size != expected_header_size {
-        return Err(
-            bad_header(HeaderField::HeaderSize, u64::from(header_size)).at_stage(LoadStage::Admit)
-        );
+        return Err(bad_header(HeaderField::HeaderSize, u64::from(header_size)));
     }
     let expected_ph_entry_size = match class {
         ElfClass::Elf32 => ELF32_PROGRAM_HEADER_SIZE,
@@ -173,28 +169,28 @@ fn decode_header(bytes: &[u8], class: ElfClass, endian: ElfData) -> LoadResult<E
 
 fn validate_header(header: &ElfHeaderInfo, request: &LoadRequest, file_len: u64) -> LoadResult<()> {
     if header.r#type() != request.profile().r#type() {
-        return Err(
-            unsupported_header(HeaderField::Type, u64::from(header.r#type()))
-                .at_stage(LoadStage::Admit),
-        );
+        return Err(unsupported_header(
+            HeaderField::Type,
+            u64::from(header.r#type()),
+        ));
     }
     if header.class() != request.profile().class() {
-        return Err(
-            unsupported_header(HeaderField::Class, u64::from(header.class()))
-                .at_stage(LoadStage::Admit),
-        );
+        return Err(unsupported_header(
+            HeaderField::Class,
+            u64::from(header.class()),
+        ));
     }
     if header.endian() != request.profile().endian() {
-        return Err(
-            unsupported_header(HeaderField::Endian, u64::from(header.endian()))
-                .at_stage(LoadStage::Admit),
-        );
+        return Err(unsupported_header(
+            HeaderField::Endian,
+            u64::from(header.endian()),
+        ));
     }
     if header.machine() != request.profile().machine() {
-        return Err(
-            unsupported_header(HeaderField::Machine, u64::from(header.machine()))
-                .at_stage(LoadStage::Admit),
-        );
+        return Err(unsupported_header(
+            HeaderField::Machine,
+            u64::from(header.machine()),
+        ));
     }
     request
         .limits()
@@ -210,7 +206,6 @@ fn validate_header(header: &ElfHeaderInfo, request: &LoadRequest, file_len: u64)
                     value: header.program_header_offset(),
                 },
             )
-            .at_stage(LoadStage::Admit)
         })?;
     let table_end = header
         .program_header_offset()
@@ -224,7 +219,6 @@ fn validate_header(header: &ElfHeaderInfo, request: &LoadRequest, file_len: u64)
                     file_len,
                 },
             )
-            .at_stage(LoadStage::Admit)
         })?;
     if table_end > file_len {
         return Err(LoadError::new(
@@ -234,8 +228,7 @@ fn validate_header(header: &ElfHeaderInfo, request: &LoadRequest, file_len: u64)
                 len: table_len,
                 file_len,
             },
-        )
-        .at_stage(LoadStage::Admit));
+        ));
     }
     Ok(())
 }
