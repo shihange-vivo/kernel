@@ -16,7 +16,7 @@ use crate::error::{ErrorContext, LoadError, LoadErrorKind, LoadResult};
 
 #[non_exhaustive]
 #[derive(PartialEq, PartialOrd, Clone, Copy, Debug, Eq, Ord)]
-pub(crate) struct TargetAddress(u64);
+pub struct TargetAddress(u64);
 
 impl TargetAddress {
     #[inline]
@@ -86,7 +86,7 @@ impl TargetAddress {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) struct TargetRange {
+pub struct TargetRange {
     start: TargetAddress,
     len: u64,
 }
@@ -138,7 +138,7 @@ impl TargetRange {
 }
 
 #[derive(Clone, Copy)]
-pub(crate) struct FileRange {
+pub struct FileRange {
     offset: u64,
     len: u64,
 }

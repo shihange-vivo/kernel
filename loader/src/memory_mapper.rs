@@ -22,6 +22,7 @@ use crate::{
     image::{PreparedProtectionPlan, ProtectionCapabilities, ProtectionLevel},
     memory::{
         AllocationOffset, AllocationRequest, ImageAllocation, ImageMemory, ImageProtectionMemory,
+        Placement,
     },
 };
 
@@ -74,14 +75,8 @@ impl MemoryRegion {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum MappingModeKind {
-    Allocated,
-    Fixed,
-}
-
 #[derive(Debug)]
-enum MappingMode {
+pub(crate) enum MappingMode {
     Allocated,
     Fixed(&'static [MemoryRegion]),
 }
@@ -113,20 +108,11 @@ impl MemoryMapper {
     }
 
     #[inline]
-    pub(crate) fn mode_kind(&self) -> MappingModeKind {
-        match &self.mode {
-            MappingMode::Allocated => MappingModeKind::Allocated,
-            MappingMode::Fixed(_) => MappingModeKind::Fixed,
-        }
+    pub(crate) fn mapping_mode(&self) -> &MappingMode {
+        &self.mode
     }
 
-    pub(crate) fn can_load_dynamic_image(&self) -> bool {
-        matches!(self.mode, MappingMode::Allocated)
-            && self.mem.base().is_null()
-            && self.allocattion.is_none()
-    }
-
-    pub(crate) fn install_dynamic_image(
+    pub(crate) fn install_loaded_image(
         &mut self,
         load_bias: TargetAddress,
         runtime_entry: TargetAddress,
@@ -148,63 +134,6 @@ impl MemoryMapper {
     #[inline]
     pub fn entry(&self) -> usize {
         self.virtual_entry
-    }
-
-    #[inline]
-    pub fn set_entry(&mut self, entry: usize) -> &mut Self {
-        self.virtual_entry = entry;
-        self
-    }
-
-    #[inline]
-    pub fn start(&self) -> usize {
-        self.virtual_start
-    }
-
-    #[inline]
-    pub fn update_start(&mut self, val: usize) -> &mut Self {
-        self.virtual_start = core::cmp::min(self.virtual_start, val);
-        self
-    }
-
-    #[inline]
-    pub fn update_end(&mut self, val: usize) -> &mut Self {
-        self.virtual_end = core::cmp::max(self.virtual_end, val);
-        self
-    }
-
-    #[inline]
-    pub fn total_size(&self) -> Result<usize> {
-        if self.virtual_end < self.virtual_start {
-            return Err("Illegal memory size");
-        }
-        Ok(self.virtual_end - self.virtual_start)
-    }
-
-    #[inline]
-    pub fn allocate_memory(&mut self) -> Result<usize> {
-        // FIXME: We are not using paging yet, so alignment(usually
-        // 4096) specified in program header is not applied here.
-        // BlueKernel on AArch64 uses MMU by default, which requires aligning to
-        // a page boundary.
-        #[cfg(any(target_arch = "aarch64"))]
-        const ALIGN: usize = 4096;
-        #[cfg(not(any(target_arch = "aarch64")))]
-        const ALIGN: usize = 2 * core::mem::size_of::<usize>();
-        let Ok(layout) = Layout::from_size_align(self.total_size()?, ALIGN) else {
-            return Err("Illegal memory layout");
-        };
-        self.mem = Storage::from_layout(layout);
-        Ok(self.mem.size())
-    }
-
-    #[inline]
-    pub fn real_start(&self) -> Result<usize> {
-        let base = self.mem.base();
-        if base.is_null() {
-            return Err("Memory not allocated yet");
-        }
-        Ok(base as usize)
     }
 
     #[inline]
@@ -244,12 +173,7 @@ impl MemoryMapper {
         if vaddr < self.virtual_start || vaddr >= self.virtual_end {
             return Err("The virtual address is in an illegal memory region");
         }
-        let total_size = self.total_size()?;
-        let offset = vaddr - self.virtual_start;
-        if offset >= total_size {
-            return Err("The offset is beyond the virtual memory region");
-        }
-        Ok(offset)
+        Ok(vaddr - self.virtual_start)
     }
 
     fn inner_real_ptr(&self, vaddr: usize) -> Result<*mut u8> {
@@ -271,81 +195,66 @@ impl MemoryMapper {
             }
         }
     }
-
-    fn inner_real_begin(&self, vaddr: usize, size: usize) -> Result<*mut u8> {
-        match &self.mode {
-            MappingMode::Allocated => {
-                if vaddr < self.virtual_start || vaddr + size > self.virtual_end {
-                    return Err("The span of the data is in an illegal memory region");
-                }
-                let real_begin = self.inner_real_ptr(vaddr)?;
-                let _real_end = core::hint::black_box(self.inner_real_ptr(vaddr + size - 1)?);
-                Ok(real_begin)
-            }
-            MappingMode::Fixed(_) => {
-                self.validate_fixed_span(vaddr, size, MemoryPermissions::NONE)?;
-                Ok(vaddr as *mut u8)
-            }
-        }
-    }
-
-    pub fn write_slice_at(&mut self, vaddr: usize, data: &[u8]) -> Result<usize> {
-        let size = data.len();
-        if size == 0 {
-            return Ok(size);
-        }
-        let real_begin = self.inner_real_begin(vaddr, size)?;
-        // FIXME: Is it safe enough to use copy_nonoverlapping?
-        unsafe { core::ptr::copy(data.as_ptr(), real_begin, data.len()) };
-        Ok(size)
-    }
-
-    pub fn write_value_at<T>(&mut self, vaddr: usize, val: T) -> Result<usize>
-    where
-        T: Sized,
-    {
-        let size = core::mem::size_of::<T>();
-        let real_begin = self.inner_real_begin(vaddr, size)?;
-        let val_ptr: *mut T = unsafe { core::mem::transmute(real_begin) };
-        unsafe { val_ptr.write(val) };
-        Ok(size)
-    }
 }
 
 impl ImageMemory for MemoryMapper {
     fn allocate_image(&mut self, request: AllocationRequest) -> LoadResult<()> {
-        if !matches!(self.mode, MappingMode::Allocated)
-            || !self.mem.base().is_null()
-            || self.allocattion.is_some()
-        {
-            return Err(allocation_error(&request));
-        }
+        match (&self.mode, request.placement()) {
+            (MappingMode::Allocated, Placement::Anywhere) => {
+                if !self.mem.base().is_null() || self.allocattion.is_some() {
+                    return Err(allocation_error(&request));
+                }
 
-        let size = usize::try_from(request.size()).map_err(|_| allocation_error(&request))?;
-        let align = usize::try_from(request.align()).map_err(|_| allocation_error(&request))?;
-        if size == 0 {
-            return Err(allocation_error(&request));
-        }
-        let layout =
-            Layout::from_size_align(size, align).map_err(|_| allocation_error(&request))?;
+                let size =
+                    usize::try_from(request.size()).map_err(|_| allocation_error(&request))?;
+                let align =
+                    usize::try_from(request.align()).map_err(|_| allocation_error(&request))?;
+                if size == 0 {
+                    return Err(allocation_error(&request));
+                }
+                let layout = Layout::from_size_align(size, align)
+                    .map_err(|_| allocation_error(&request))?;
 
-        let storage = Storage::try_from_layout(layout).ok_or_else(|| {
-            LoadError::new(
-                LoadErrorKind::OutOfMemory,
-                ErrorContext::Allocation {
-                    base: TargetAddress::new(0),
-                    len: request.size(),
-                    align: request.align(),
-                },
-            )
-        })?;
-        let base = TargetAddress::new(
-            u64::try_from(storage.base() as usize).map_err(|_| allocation_error(&request))?,
-        );
-        let allocation = ImageAllocation::new(base, request.size(), request.align());
-        self.mem = storage;
-        self.allocattion = Some(allocation);
-        Ok(())
+                let storage = Storage::try_from_layout(layout).ok_or_else(|| {
+                    LoadError::new(
+                        LoadErrorKind::OutOfMemory,
+                        ErrorContext::Allocation {
+                            base: TargetAddress::new(0),
+                            len: request.size(),
+                            align: request.align(),
+                        },
+                    )
+                })?;
+                let base = TargetAddress::new(u64::try_from(storage.base() as usize).map_err(
+                    |_| allocation_error(&request),
+                )?);
+                let allocation = ImageAllocation::new(base, request.size(), request.align());
+                self.mem = storage;
+                self.allocattion = Some(allocation);
+                Ok(())
+            }
+            // A fixed image borrows its span from the mapper's static
+            // regions: validate the whole span before recording anything, and
+            // never touch the heap storage.
+            (MappingMode::Fixed(_), Placement::Fixed(range)) => {
+                if self.allocattion.is_some() {
+                    return Err(allocation_error(&request));
+                }
+                let start =
+                    usize::try_from(range.start().get()).map_err(|_| allocation_error(&request))?;
+                let len =
+                    usize::try_from(range.len()).map_err(|_| allocation_error(&request))?;
+                self.validate_fixed_span(start, len, MemoryPermissions::NONE)
+                    .map_err(|_| allocation_error(&request))?;
+                self.allocattion = Some(ImageAllocation::new(
+                    range.start(),
+                    range.len(),
+                    request.align(),
+                ));
+                Ok(())
+            }
+            _ => Err(allocation_error(&request)),
+        }
     }
 
     fn allocation(&self) -> LoadResult<&ImageAllocation> {
@@ -373,11 +282,23 @@ impl ImageMemory for MemoryMapper {
             .map_err(|_| memory_access_error(*allocation, offset, len))?;
         let end =
             usize::try_from(end).map_err(|_| memory_access_error(*allocation, offset, len))?;
-        let base = self.mem.base();
-        if base.is_null() || self.mem.size() < end {
-            return Err(memory_access_error(*allocation, offset, len));
-        };
-        Ok(unsafe { base.add(offset_usize) })
+        match &self.mode {
+            MappingMode::Allocated => {
+                let base = self.mem.base();
+                if base.is_null() || self.mem.size() < end {
+                    return Err(memory_access_error(*allocation, offset, len));
+                };
+                Ok(unsafe { base.add(offset_usize) })
+            }
+            // Fixed images already validated their span against the static
+            // regions at allocation time; the offset bounds check above keeps
+            // accesses inside the recorded allocation.
+            MappingMode::Fixed(_) => {
+                let base = usize::try_from(allocation.base().get())
+                    .map_err(|_| memory_access_error(*allocation, offset, len))?;
+                Ok((base + offset_usize) as *mut u8)
+            }
+        }
     }
 
     fn read(&self, offset: AllocationOffset, dst: &mut [u8]) -> LoadResult<()> {

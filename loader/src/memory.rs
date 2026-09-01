@@ -12,24 +12,37 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use alloc::boxed::Box;
-
 use crate::{
-    address::TargetAddress,
+    address::{TargetAddress, TargetRange},
     error::{ErrorContext, LoadError, LoadErrorKind, LoadResult},
     MemoryPermissions,
 };
 
-#[derive(Clone, Copy)]
+/// Where an image wants its memory to come from.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum Placement {
+    /// Any suitably aligned address (ET_DYN images).
+    Anywhere,
+    /// Exactly this virtual range (ET_EXEC images).
+    Fixed(TargetRange),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct AllocationRequest {
+    placement: Placement,
     size: u64,
     align: u64,
 }
 
 impl AllocationRequest {
     #[inline]
-    pub const fn new(size: u64, align: u64) -> Self {
-        Self { size, align }
+    pub const fn new(placement: Placement, size: u64, align: u64) -> Self {
+        Self { placement, size, align }
+    }
+
+    #[inline]
+    pub const fn placement(&self) -> Placement {
+        self.placement
     }
 
     #[inline]

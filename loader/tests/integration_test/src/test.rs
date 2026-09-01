@@ -13,12 +13,12 @@
 
 extern crate alloc;
 extern crate rsrt;
-// Import it just for the global allocator.
-use alloc::vec::Vec;
 use blueos_loader as loader;
+use blueos_loader::{ElfReader, LoadError, LoadErrorKind, LoadResult};
 use core::ffi::c_char;
 use librs::pthread;
-use semihosting::{io::Read, println};
+use semihosting::io::{Read, Seek, SeekFrom};
+use semihosting::println;
 
 extern "C" {
     static LOADER_TEST_ELF_PATH: *const c_char;
@@ -80,19 +80,59 @@ mod loader_test_config {
     }];
 }
 
-fn read_all(ptr: *const core::ffi::c_char) -> semihosting::io::Result<Vec<u8>> {
+fn open_test_elf(ptr: *const core::ffi::c_char) -> semihosting::fs::File {
     let path = unsafe { core::ffi::CStr::from_ptr(ptr) };
-    let mut file = semihosting::fs::File::open(path)?;
-    let mut tmp = [0u8; 64];
-    let mut buf = Vec::new();
-    loop {
-        let size = file.read(&mut tmp)?;
-        if size == 0 {
-            break;
-        }
-        buf.extend_from_slice(&tmp[..size]);
+    semihosting::fs::File::open(path).expect("open test ELF")
+}
+
+/// A seek-based `ElfReader` over a semihosting file: the image is never
+/// buffered as a whole, so debug ELFs (with full debug info) load without
+/// inflating the kernel heap.
+struct SemihostingElfReader<'a> {
+    file: &'a semihosting::fs::File,
+    len: u64,
+}
+
+impl<'a> SemihostingElfReader<'a> {
+    fn new(file: &'a semihosting::fs::File) -> semihosting::io::Result<Self> {
+        let mut file = file;
+        let len = file.seek(SeekFrom::End(0))?;
+        file.seek(SeekFrom::Start(0))?;
+        Ok(Self { file, len })
     }
-    Ok(buf)
+}
+
+fn io_error() -> LoadError {
+    LoadError::new(LoadErrorKind::Io, loader::ErrorContext::None)
+}
+
+impl ElfReader for SemihostingElfReader<'_> {
+    fn len(&self) -> LoadResult<u64> {
+        Ok(self.len)
+    }
+
+    fn read_exact_at(&self, offset: u64, dst: &mut [u8]) -> LoadResult<()> {
+        // `&File` implements Read/Seek, so a reborrow of the shared
+        // reference is enough to move the file cursor.
+        let mut file = self.file;
+        file.seek(SeekFrom::Start(offset)).map_err(|_| io_error())?;
+        let mut filled = 0;
+        while filled < dst.len() {
+            let n = file.read(&mut dst[filled..]).map_err(|_| io_error())?;
+            if n == 0 {
+                return Err(LoadError::new(
+                    LoadErrorKind::OutOfBounds,
+                    loader::ErrorContext::FileRange {
+                        offset,
+                        len: dst.len() as u64,
+                        file_len: self.len,
+                    },
+                ));
+            }
+            filled += n;
+        }
+        Ok(())
+    }
 }
 
 mod test_elf_loader {
@@ -137,14 +177,12 @@ mod test_elf_loader {
         }
     }
 
-    // FIXME: The PIC ELF file is too large in debug mode. We should use
-    // lseek to parse the ELF file.
-    #[cfg(not(debug_assertions))]
     #[test]
     fn test_load_elf_and_run() {
-        let buf = read_all(unsafe { LOADER_TEST_ELF_PATH }).unwrap();
+        let file = open_test_elf(unsafe { LOADER_TEST_ELF_PATH });
+        let reader = SemihostingElfReader::new(&file).unwrap();
         let mut mapper = new_mapper();
-        assert!(loader::load_elf(&buf, &mut mapper).is_ok());
+        assert!(loader::load_elf_from_reader(reader, &mut mapper).is_ok());
         let entry = mapper.real_entry().unwrap();
 
         #[cfg(loader_test_exec)]
@@ -159,60 +197,47 @@ mod test_elf_loader {
         }
     }
 
-    // FIXME: We should use FS's lseek API to get lower footprint.
-    // TODO: Use semihosting's seek API to parse the ELF file.
-    #[cfg(not(loader_test_exec))]
-    #[test]
-    fn test_seek_and_parse_elf() {}
-
-    #[cfg(not(debug_assertions))]
     #[test]
     fn test_invalid_entry() {
-        let res = read_all(unsafe { INVALID_ENTRY_ELF_PATH });
-        assert!(res.is_ok());
-        let buf = res.unwrap();
+        let file = open_test_elf(unsafe { INVALID_ENTRY_ELF_PATH });
+        let reader = SemihostingElfReader::new(&file).unwrap();
         let mut mapper = new_mapper();
-        let res = loader::load_elf(buf.as_slice(), &mut mapper);
-        assert!(res.is_err());
+        assert!(loader::load_elf_from_reader(reader, &mut mapper).is_err());
     }
 
-    #[cfg(not(debug_assertions))]
     #[test]
     fn test_invalid_magic() {
-        let res = read_all(unsafe { INVALID_MAGIC_ELF_PATH });
-        assert!(res.is_ok());
-        let buf = res.unwrap();
+        let file = open_test_elf(unsafe { INVALID_MAGIC_ELF_PATH });
+        let reader = SemihostingElfReader::new(&file).unwrap();
         let mut mapper = new_mapper();
-        let res = loader::load_elf(buf.as_slice(), &mut mapper);
-        assert!(res.is_err());
+        assert!(loader::load_elf_from_reader(reader, &mut mapper).is_err());
     }
 
-    #[cfg(not(debug_assertions))]
     #[test]
     fn test_invalid_segment_size() {
-        let res = read_all(unsafe { INVALID_SEGMENT_SIZE_ELF_PATH });
-        assert!(res.is_ok());
-        let buf = res.unwrap();
+        let file = open_test_elf(unsafe { INVALID_SEGMENT_SIZE_ELF_PATH });
+        let reader = SemihostingElfReader::new(&file).unwrap();
         let mut mapper = new_mapper();
-        let res = loader::load_elf(buf.as_slice(), &mut mapper);
-        assert!(res.is_err());
+        assert!(loader::load_elf_from_reader(reader, &mut mapper).is_err());
     }
 
     #[cfg(loader_test_exec)]
     #[test]
     fn test_exec_rejects_allocated_mapper() {
-        let buf = read_all(unsafe { LOADER_TEST_ELF_PATH }).unwrap();
+        let file = open_test_elf(unsafe { LOADER_TEST_ELF_PATH });
+        let reader = SemihostingElfReader::new(&file).unwrap();
         let mut mapper = loader::MemoryMapper::new(None);
-        assert!(loader::load_elf(&buf, &mut mapper).is_err());
+        assert!(loader::load_elf_from_reader(reader, &mut mapper).is_err());
     }
 
     #[cfg(loader_test_exec)]
     #[test]
     fn test_exec_rejects_out_of_range_without_writing() {
-        let buf = read_all(unsafe { LOADER_TEST_ELF_PATH }).unwrap();
+        let file = open_test_elf(unsafe { LOADER_TEST_ELF_PATH });
+        let reader = SemihostingElfReader::new(&file).unwrap();
         let before = unsafe { (TEST_REGION_START as *const u32).read_volatile() };
         let mut mapper = loader::MemoryMapper::new(Some(&SHORT_REGIONS));
-        assert!(loader::load_elf(&buf, &mut mapper).is_err());
+        assert!(loader::load_elf_from_reader(reader, &mut mapper).is_err());
         let after = unsafe { (TEST_REGION_START as *const u32).read_volatile() };
         assert_eq!(after, before);
     }
@@ -220,9 +245,10 @@ mod test_elf_loader {
     #[cfg(loader_test_exec)]
     #[test]
     fn test_exec_rejects_non_executable_region() {
-        let buf = read_all(unsafe { LOADER_TEST_ELF_PATH }).unwrap();
+        let file = open_test_elf(unsafe { LOADER_TEST_ELF_PATH });
+        let reader = SemihostingElfReader::new(&file).unwrap();
         let mut mapper = loader::MemoryMapper::new(Some(&NON_EXEC_REGIONS));
-        assert!(loader::load_elf(&buf, &mut mapper).is_err());
+        assert!(loader::load_elf_from_reader(reader, &mut mapper).is_err());
     }
 }
 

@@ -19,7 +19,7 @@ use crate::address::TargetAddress;
 pub type LoadResult<T> = core::result::Result<T, LoadError>;
 
 #[derive(Clone, Copy, Debug)]
-pub(crate) enum LoadStage {
+pub enum LoadStage {
     Admit,
     Inspect,
     Plan,
@@ -32,7 +32,7 @@ pub(crate) enum LoadStage {
 }
 
 #[derive(Clone, Copy, Debug)]
-pub(crate) enum LoadErrorKind {
+pub enum LoadErrorKind {
     BadElf,
     UnsupportedByProfile,
     OutOfBounds,
@@ -49,7 +49,7 @@ pub(crate) enum LoadErrorKind {
 }
 
 #[derive(Debug)]
-pub(crate) enum HeaderField {
+pub enum HeaderField {
     Magic,
     Class,
     Endian,
@@ -65,7 +65,7 @@ pub(crate) enum HeaderField {
 }
 
 #[derive(Debug)]
-pub(crate) enum LimitKind {
+pub enum LimitKind {
     FileLength,
     ProgramHeaderCount,
     LoadSegmentCount,
@@ -80,7 +80,7 @@ pub(crate) enum LimitKind {
 }
 
 #[derive(Debug)]
-pub(crate) enum ProgramHeaderField {
+pub enum ProgramHeaderField {
     Type,
     FileRange,
     VirtualRange,
@@ -98,7 +98,7 @@ pub(crate) enum ProgramHeaderField {
 
 #[non_exhaustive]
 #[derive(Debug)]
-pub(crate) enum ErrorContext {
+pub enum ErrorContext {
     None,
     FileRange {
         offset: u64,
@@ -147,7 +147,7 @@ pub(crate) enum ErrorContext {
     },
 }
 
-pub(crate) struct LoadError {
+pub struct LoadError {
     stage: Option<LoadStage>,
     kind: LoadErrorKind,
     context: ErrorContext,

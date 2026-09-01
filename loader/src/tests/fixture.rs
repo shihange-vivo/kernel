@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::vec::Vec;
+use std::{cell::RefCell, rc::Rc, vec::Vec};
 
 use goblin::{
     elf::header::{
@@ -21,8 +21,11 @@ use goblin::{
     elf32, elf64,
 };
 
+use crate::memory::{AllocationRequest, ImageAllocation, ImageMemory, Placement};
+
 pub struct ElfFixtureBuilder {
     bytes: Vec<u8>,
+    ph_count: u16,
 }
 
 impl ElfFixtureBuilder {
@@ -36,11 +39,19 @@ impl ElfFixtureBuilder {
         write_u16(&mut bytes, 16, e_type);
         write_u16(&mut bytes, 18, e_machine);
         write_u32(&mut bytes, 20, EV_CURRENT as u32);
+        write_u64(
+            &mut bytes,
+            32,
+            elf64::header::SIZEOF_EHDR as u64,
+        );
         write_u16(&mut bytes, 52, elf64::header::SIZEOF_EHDR as u16);
         write_u16(&mut bytes, 54, elf64::program_header::SIZEOF_PHDR as u16);
         write_u16(&mut bytes, 58, elf64::section_header::SIZEOF_SHDR as u16);
 
-        Self { bytes }
+        Self {
+            bytes,
+            ph_count: 0,
+        }
     }
 
     pub fn elf32(e_machine: u16, e_type: u16) -> Self {
@@ -57,7 +68,51 @@ impl ElfFixtureBuilder {
         write_u16(&mut bytes, 42, elf32::program_header::SIZEOF_PHDR as u16);
         write_u16(&mut bytes, 46, elf32::section_header::SIZEOF_SHDR as u16);
 
-        Self { bytes }
+        Self {
+            bytes,
+            ph_count: 0,
+        }
+    }
+
+    /// Append a PT_LOAD program header (Elf64 only). The first call's flags
+    /// default to PF_R|PF_X; subsequent calls default to PF_R|PF_W.
+    pub fn with_load_segment(
+        mut self,
+        vaddr: u64,
+        filesz: u64,
+        memsz: u64,
+        align: u64,
+    ) -> Self {
+        let ph_offset = elf64::header::SIZEOF_EHDR
+            + self.ph_count as usize * elf64::program_header::SIZEOF_PHDR;
+        self.bytes
+            .resize(ph_offset + elf64::program_header::SIZEOF_PHDR, 0);
+
+        let flags = if self.ph_count == 0 { 0x5 } else { 0x6 }; // PF_R|PF_X or PF_R|PF_W
+        write_u32(&mut self.bytes, ph_offset, 1); // p_type = PT_LOAD
+        write_u32(&mut self.bytes, ph_offset + 4, flags); // p_flags
+        write_u64(&mut self.bytes, ph_offset + 8, ph_offset as u64); // p_offset (right after headers)
+        write_u64(&mut self.bytes, ph_offset + 16, vaddr); // p_vaddr
+        write_u64(&mut self.bytes, ph_offset + 24, vaddr); // p_paddr
+        write_u64(&mut self.bytes, ph_offset + 32, filesz); // p_filesz
+        write_u64(&mut self.bytes, ph_offset + 40, memsz); // p_memsz
+        write_u64(&mut self.bytes, ph_offset + 48, align); // p_align
+
+        self.ph_count += 1;
+        write_u16(&mut self.bytes, 56, self.ph_count);
+
+        // Ensure the file is large enough to cover the segment's file range.
+        let file_end = (ph_offset as u64) + elf64::program_header::SIZEOF_PHDR as u64 + filesz;
+        if self.bytes.len() < file_end as usize {
+            self.bytes.resize(file_end as usize, 0);
+        }
+
+        self
+    }
+
+    pub fn with_entry(mut self, entry: u64) -> Self {
+        write_u64(&mut self.bytes, 24, entry);
+        self
     }
 
     pub fn build(self) -> Vec<u8> {
@@ -71,4 +126,81 @@ fn write_u16(bytes: &mut [u8], offset: usize, value: u16) {
 
 fn write_u32(bytes: &mut [u8], offset: usize, value: u32) {
     bytes[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
+}
+
+fn write_u64(bytes: &mut [u8], offset: usize, value: u64) {
+    bytes[offset..offset + 8].copy_from_slice(&value.to_le_bytes());
+}
+
+/// An `ImageMemory` impl that records the `AllocationRequest` it received
+/// into a shared cell, so tests can inspect it after `allocate()` consumes
+/// the memory.
+pub struct RecordingMemory {
+    sink: Rc<RefCell<Option<AllocationRequest>>>,
+    allocation: ImageAllocation,
+}
+
+impl RecordingMemory {
+    pub fn new(sink: Rc<RefCell<Option<AllocationRequest>>>) -> Self {
+        Self {
+            sink,
+            allocation: ImageAllocation::new(
+                crate::address::TargetAddress::new(0),
+                0,
+                1,
+            ),
+        }
+    }
+
+    pub fn recorded(sink: &Rc<RefCell<Option<AllocationRequest>>>) -> Option<AllocationRequest> {
+        *sink.borrow()
+    }
+}
+
+impl ImageMemory for RecordingMemory {
+    fn allocate_image(&mut self, request: AllocationRequest) -> crate::error::LoadResult<()> {
+        let base = match request.placement() {
+            Placement::Fixed(range) => range.start(),
+            Placement::Anywhere => crate::address::TargetAddress::new(0x1_0000),
+        };
+        self.allocation = ImageAllocation::new(base, request.size(), request.align());
+        *self.sink.borrow_mut() = Some(request);
+        Ok(())
+    }
+
+    fn allocation(&self) -> crate::error::LoadResult<&ImageAllocation> {
+        Ok(&self.allocation)
+    }
+
+    fn image_span(
+        &self,
+        _offset: crate::memory::AllocationOffset,
+        _len: u64,
+    ) -> crate::error::LoadResult<*mut u8> {
+        Ok(core::ptr::null_mut())
+    }
+
+    fn write(
+        &mut self,
+        _offset: crate::memory::AllocationOffset,
+        _data: &[u8],
+    ) -> crate::error::LoadResult<()> {
+        Ok(())
+    }
+
+    fn zero(
+        &mut self,
+        _offset: crate::memory::AllocationOffset,
+        _len: u64,
+    ) -> crate::error::LoadResult<()> {
+        Ok(())
+    }
+
+    fn read(
+        &self,
+        _offset: crate::memory::AllocationOffset,
+        _dst: &mut [u8],
+    ) -> crate::error::LoadResult<()> {
+        Ok(())
+    }
 }
