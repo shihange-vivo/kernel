@@ -20,7 +20,7 @@ use crate::{
     error::{ErrorContext, LoadError, LoadErrorKind, LoadResult, LoadStage},
     identity::{ElfClass, ElfType, LoadRequest},
     image::{allocate::AllocatedImage, inspect::StackKind},
-    memory::{AllocationRequest, ImageAllocation, ImageMemory},
+    memory::{AllocationRequest, ImageAllocation, ImageMemory, Placement},
     reader::ElfReader,
 };
 
@@ -78,13 +78,6 @@ impl<R: ElfReader> PlannedImage<R> {
     }
 
     fn allocation_request(&self) -> LoadResult<AllocationRequest> {
-        if self.request.profile().r#type() != ElfType::Dyn {
-            return Err(
-                LoadError::new(LoadErrorKind::UnsupportedByProfile, ErrorContext::None)
-                    .at_stage(LoadStage::Allocate),
-            );
-        }
-
         let size = self.image_span;
         let align = self.max_align;
         if size == 0 {
@@ -109,7 +102,20 @@ impl<R: ElfReader> PlannedImage<R> {
             )
             .at_stage(LoadStage::Allocate));
         }
-        Ok(AllocationRequest::new(size, align))
+        let placement = match self.request.profile().r#type() {
+            // Movable image: any suitably aligned address works.
+            ElfType::Dyn => Placement::Anywhere,
+            // Fixed image: the allocation must cover exactly the aligned
+            // image span so segment vaddrs map onto themselves (load bias 0).
+            ElfType::Exec => Placement::Fixed(TargetRange::new(self.aligned_min_vaddr, size)),
+            ElfType::Other(_) => {
+                return Err(
+                    LoadError::new(LoadErrorKind::UnsupportedByProfile, ErrorContext::None)
+                        .at_stage(LoadStage::Allocate),
+                )
+            }
+        };
+        Ok(AllocationRequest::new(placement, size, align))
     }
 
     pub fn allocate<M>(self, mut memory: M) -> LoadResult<AllocatedImage<R, M>>
@@ -162,11 +168,18 @@ fn validate_allocation(
         ElfClass::Elf32 => end.get() <= u64::from(u32::MAX),
         ElfClass::Elf64 => true,
     });
+    // Fixed placement must land exactly on the planned image span; the
+    // uniform load-bias formula only yields 0 when the base matches.
+    let fixed_span_valid = match request.placement() {
+        Placement::Fixed(range) => base == range.start() && allocation.len() == range.len(),
+        Placement::Anywhere => true,
+    };
 
     if allocation.len() == request.size()
         && allocation.align() == request.align()
         && aligned
         && target_width_valid
+        && fixed_span_valid
     {
         return Ok(());
     }
