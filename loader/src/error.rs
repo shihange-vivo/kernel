@@ -20,6 +20,7 @@ pub type LoadResult<T> = core::result::Result<T, LoadError>;
 
 #[derive(Clone, Copy, Debug)]
 pub enum LoadStage {
+    Beginning,
     Admit,
     Inspect,
     Plan,

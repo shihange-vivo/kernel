@@ -59,7 +59,8 @@ pub use memory::{
 pub use memory_mapper::{MemoryMapper, MemoryPermissions, MemoryRegion};
 pub use reader::ElfReader;
 pub use relocation::{
-    AddendEncoding, ArchRelocator, ArmRelocator, Riscv32Relocator, Riscv64Relocator,
+    AArch64Relocator, AddendEncoding, ArchRelocator, ArmRelocator, Riscv32Relocator,
+    Riscv64Relocator,
 };
 
 pub type Result = core::result::Result<(), &'static str>;
@@ -133,11 +134,10 @@ where
     if request.profile().machine() != relocator.machine()
         || request.profile().class() != relocator.class()
     {
-        return Err(LoadError::new(
-            LoadErrorKind::UnsupportedByProfile,
-            ErrorContext::None,
-        )
-        .at_stage(LoadStage::Relocate));
+        return Err(
+            LoadError::new(LoadErrorKind::UnsupportedByProfile, ErrorContext::None)
+                .at_stage(LoadStage::Beginning),
+        );
     }
 
     let sealed = ImageLoader::new(reader, request)
@@ -201,6 +201,7 @@ fn expected_type_for(mapper: &MemoryMapper) -> core::result::Result<ElfType, &'s
 
 fn compatibility_error(error: LoadError) -> &'static str {
     match error.stage() {
+        Some(error::LoadStage::Beginning) => "Request conflicts wtih relocator",
         Some(error::LoadStage::Admit) => "Unable to admit ELF image",
         Some(error::LoadStage::Inspect) => "Unable to inspect ELF image",
         Some(error::LoadStage::Plan) => "Unable to plan ELF image",
@@ -235,6 +236,9 @@ pub fn load_elf_from_reader<R: ElfReader>(reader: R, mapper: &mut MemoryMapper) 
         }
         (ElfMachine::Riscv, ElfClass::Elf64) => {
             prepare_image(reader, request, mapper, &mut cache, &Riscv64Relocator)
+        }
+        (ElfMachine::Aarch64, ElfClass::Elf64) => {
+            prepare_image(reader, request, mapper, &mut cache, &AArch64Relocator)
         }
         _ => Err(LoadError::new(
             LoadErrorKind::UnsupportedByProfile,
