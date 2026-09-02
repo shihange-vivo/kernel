@@ -25,7 +25,7 @@ use crate::{
     error::{ErrorContext, LoadError, LoadErrorKind, LoadResult},
     identity::{ElfClass, ElfData, ElfMachine},
     image::RelocationRecord,
-    memory::{AllocationOffset, ImageMemory},
+    memory::{AllocationOffset, ImageAllocation, ImageLoadTransaction, ImageMemory},
 };
 
 #[derive(Clone, Copy)]
@@ -88,25 +88,40 @@ impl TargetWord {
         self.endian
     }
 
-    pub fn read<M: ImageMemory>(self, memory: &M, offset: AllocationOffset) -> LoadResult<u64> {
+    pub fn read<M: ImageMemory>(
+        self,
+        memory: &M,
+        allocation: &ImageAllocation,
+        offset: AllocationOffset,
+    ) -> LoadResult<u64> {
         let mut bytes = [0; 8];
         let len = self.width.bytes() as usize;
-        memory.read(offset, &mut bytes[..len])?;
+        memory.read(allocation, offset, &mut bytes[..len])?;
+        Ok(self.decode(bytes))
+    }
+
+    fn decode(self, bytes: [u8; 8]) -> u64 {
         let word32 = [bytes[0], bytes[1], bytes[2], bytes[3]];
-        Ok(match (self.width, self.endian) {
+        match (self.width, self.endian) {
             (WordWidth::U32, ElfData::Little) => u64::from(u32::from_le_bytes(word32)),
             (WordWidth::U32, ElfData::Big) => u64::from(u32::from_be_bytes(word32)),
             (WordWidth::U64, ElfData::Little) => u64::from_le_bytes(bytes),
             (WordWidth::U64, ElfData::Big) => u64::from_be_bytes(bytes),
-        })
+        }
     }
 
     pub fn write<M: ImageMemory>(
         self,
         memory: &mut M,
+        allocation: &ImageAllocation,
         offset: AllocationOffset,
         value: u64,
     ) -> LoadResult<()> {
+        let (bytes, len) = self.encode(offset, value)?;
+        memory.write(allocation, offset, &bytes[..len])
+    }
+
+    fn encode(self, offset: AllocationOffset, value: u64) -> LoadResult<([u8; 8], usize)> {
         if value > self.width.maximum() {
             return Err(LoadError::new(
                 LoadErrorKind::IntegerOverflow,
@@ -131,7 +146,32 @@ impl TargetWord {
             (WordWidth::U64, ElfData::Little) => bytes.copy_from_slice(&value.to_le_bytes()),
             (WordWidth::U64, ElfData::Big) => bytes.copy_from_slice(&value.to_be_bytes()),
         }
-        memory.write(offset, &bytes[..len])
+        Ok((bytes, len))
+    }
+
+    /// Read through an active image transaction: the transaction supplies
+    /// both the memory backend and the owner-bound allocation descriptor.
+    pub fn read_via<M: ImageMemory>(
+        self,
+        transaction: &ImageLoadTransaction<M>,
+        offset: AllocationOffset,
+    ) -> LoadResult<u64> {
+        let mut bytes = [0; 8];
+        let len = self.width.bytes() as usize;
+        transaction.read(offset, &mut bytes[..len])?;
+        Ok(self.decode(bytes))
+    }
+
+    /// Write through an active image transaction, marking bytes-modified
+    /// before the backend call so a partial write is rolled back correctly.
+    pub fn write_via<M: ImageMemory>(
+        self,
+        transaction: &mut ImageLoadTransaction<M>,
+        offset: AllocationOffset,
+        value: u64,
+    ) -> LoadResult<()> {
+        let (bytes, len) = self.encode(offset, value)?;
+        transaction.write(offset, &bytes[..len])
     }
 }
 

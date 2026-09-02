@@ -12,6 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use alloc::vec::Vec;
+
 use crate::{
     address::{TargetAddress, TargetRange},
     error::{ErrorContext, LoadError, LoadErrorKind, LoadResult},
@@ -213,9 +215,22 @@ impl AllocationOffset {
     }
 }
 
+/// Memory backend contract for one or more concurrently live image
+/// allocations.
+///
+/// Every data access explicitly names the allocation it targets. A backend
+/// must validate the complete descriptor against its own bookkeeping
+/// (identifier, base, length, alignment and ownership) before serving the
+/// access; it must not maintain a "current allocation" side channel.
+/// `MemoryMapper` keeps at most one active allocation and rejects any
+/// descriptor that does not match it; Phase 0.5 backends key allocations by
+/// `AllocationId` and may serve many at once.
 pub trait ImageMemory {
     /// Allocate or borrow exactly the logical range requested by the loader.
-    /// Returning `Err` must leave no allocation behind.
+    /// Returning `Err` must leave no allocation behind. On success the
+    /// backend returns the unique allocation lease; the loader transfers it
+    /// back through `abort_image` or into the committed owner through
+    /// `ImageCommitMemory::commit_install`.
     fn allocate_image(&mut self, request: AllocationRequest) -> LoadResult<AllocationLease>;
 
     /// Abort an uncommitted image. This operation must not allocate, fail or
@@ -226,20 +241,42 @@ pub trait ImageMemory {
     /// lifetime. Borrowed-fixed contents are not restored or poisoned.
     fn release_committed(&mut self, allocation: AllocationLease);
 
-    fn allocation(&self) -> LoadResult<&ImageAllocation>;
+    /// Return a host pointer covering `allocation[offset..offset+len]`.
+    /// The descriptor must name an allocation this backend currently
+    /// tracks; otherwise an error is returned.
+    fn image_span(
+        &self,
+        allocation: &ImageAllocation,
+        offset: AllocationOffset,
+        len: u64,
+    ) -> LoadResult<*mut u8>;
 
-    fn image_span(&self, offset: AllocationOffset, len: u64) -> LoadResult<*mut u8>;
+    fn write(
+        &mut self,
+        allocation: &ImageAllocation,
+        offset: AllocationOffset,
+        data: &[u8],
+    ) -> LoadResult<()>;
 
-    fn write(&mut self, offset: AllocationOffset, data: &[u8]) -> LoadResult<()>;
+    fn zero(
+        &mut self,
+        allocation: &ImageAllocation,
+        offset: AllocationOffset,
+        len: u64,
+    ) -> LoadResult<()>;
 
-    fn zero(&mut self, offset: AllocationOffset, len: u64) -> LoadResult<()>;
-
-    fn read(&self, offset: AllocationOffset, dst: &mut [u8]) -> LoadResult<()>;
+    fn read(
+        &self,
+        allocation: &ImageAllocation,
+        offset: AllocationOffset,
+        dst: &mut [u8],
+    ) -> LoadResult<()>;
 }
 
 pub trait ImageProtectionMemory: ImageMemory {
     fn protect(
         &mut self,
+        allocation: &ImageAllocation,
         offset: AllocationOffset,
         len: u64,
         permissions: MemoryPermissions,
@@ -253,10 +290,15 @@ pub trait ImageProtectionMemory: ImageMemory {
         prepared: &crate::image::PreparedProtectionPlan,
     ) -> LoadResult<()>;
 
-    fn apply_protection(&mut self, mut batch: crate::image::ProtectionBatch<'_>) -> LoadResult<()> {
+    fn apply_protection(
+        &mut self,
+        allocation: &ImageAllocation,
+        mut batch: crate::image::ProtectionBatch<'_>,
+    ) -> LoadResult<()> {
         for index in 0..batch.records().len() {
             let record = batch.records()[index];
             let level = self.protect(
+                allocation,
                 record.allocation_offset(),
                 record.applied_range().len(),
                 record.permissions(),
@@ -295,6 +337,131 @@ pub trait ImageCommitMemory: ImageProtectionMemory {
     ) -> Self::CommitReceipt;
 }
 
+/// Stable reference to one allocation whose unique lease is owned by a
+/// session rollback log.
+///
+/// This value is intentionally copyable: it can select an image for reads,
+/// relocation and protection, but it has no authority to abort, commit or
+/// release the allocation.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct SessionAllocation {
+    slot: RollbackSlot,
+    allocation: ImageAllocation,
+}
+
+impl SessionAllocation {
+    #[inline]
+    pub(crate) const fn allocation(self) -> ImageAllocation {
+        self.allocation
+    }
+}
+
+#[repr(transparent)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct RollbackSlot(usize);
+
+#[derive(Debug)]
+struct AllocationRollbackEntry {
+    lease: AllocationLease,
+    progress: MutationProgress,
+}
+
+/// Unique rollback authority for the image allocations absorbed by a future
+/// multi-image link session.
+///
+/// The owning session must keep this log beside the exact memory backend from
+/// which the transactions were created. While the session is active, its
+/// `Drop` implementation calls `abort_all` on that backend. A later batch
+/// commit will instead drain the same entries into the committed owner.
+#[must_use = "an active allocation rollback log must be aborted or committed"]
+pub(crate) struct AllocationRollbackLog {
+    entries: Vec<AllocationRollbackEntry>,
+}
+
+impl AllocationRollbackLog {
+    #[inline]
+    pub(crate) const fn new() -> Self {
+        Self {
+            entries: Vec::new(),
+        }
+    }
+
+    /// Reserve a slot while the source transaction is still armed. If this
+    /// fails, the transaction remains the lease owner and its Drop aborts the
+    /// allocation.
+    fn reserve_entry(&mut self) -> LoadResult<()> {
+        self.entries
+            .try_reserve(1)
+            .map_err(|_| LoadError::new(LoadErrorKind::OutOfMemory, ErrorContext::None))
+    }
+
+    /// Insert into the slot reserved immediately before this call. No
+    /// allocation or user-defined code is executed between taking the lease
+    /// from the transaction and storing it here.
+    fn push_reserved(
+        &mut self,
+        lease: AllocationLease,
+        progress: MutationProgress,
+    ) -> SessionAllocation {
+        let slot = RollbackSlot(self.entries.len());
+        let allocation = *lease.allocation();
+        self.entries
+            .push(AllocationRollbackEntry { lease, progress });
+        SessionAllocation { slot, allocation }
+    }
+
+    fn entry_mut(
+        &mut self,
+        allocation: SessionAllocation,
+    ) -> LoadResult<&mut AllocationRollbackEntry> {
+        let entry = self
+            .entries
+            .get_mut(allocation.slot.0)
+            .ok_or_else(|| session_allocation_error(allocation.allocation))?;
+        if entry.lease.allocation() != &allocation.allocation {
+            return Err(session_allocation_error(allocation.allocation));
+        }
+        Ok(entry)
+    }
+
+    /// Record a later session write before invoking the backend, preserving
+    /// conservative rollback semantics if that write partially succeeds.
+    pub(crate) fn mark_bytes_modified(&mut self, allocation: SessionAllocation) -> LoadResult<()> {
+        let entry = self.entry_mut(allocation)?;
+        entry.progress = core::cmp::max(entry.progress, MutationProgress::BytesModified);
+        Ok(())
+    }
+
+    /// Record a later session protection mutation before invoking the
+    /// backend.
+    pub(crate) fn mark_protection_modified(
+        &mut self,
+        allocation: SessionAllocation,
+    ) -> LoadResult<()> {
+        self.entry_mut(allocation)?.progress = MutationProgress::ProtectionModified;
+        Ok(())
+    }
+
+    /// Abort every absorbed allocation in reverse creation order. This
+    /// operation performs no allocation and leaves the log empty.
+    pub(crate) fn abort_all<M: ImageMemory + ?Sized>(&mut self, memory: &mut M) {
+        while let Some(entry) = self.entries.pop() {
+            memory.abort_image(entry.lease, entry.progress);
+        }
+    }
+}
+
+fn session_allocation_error(allocation: ImageAllocation) -> LoadError {
+    LoadError::new(
+        LoadErrorKind::Backend,
+        ErrorContext::Allocation {
+            base: allocation.base(),
+            len: allocation.len(),
+            align: allocation.align(),
+        },
+    )
+}
+
 #[must_use = "dropping an active image transaction aborts its allocation"]
 pub(crate) struct ImageLoadTransaction<M: ImageMemory> {
     memory: M,
@@ -321,22 +488,17 @@ impl<M: ImageMemory> ImageLoadTransaction<M> {
     }
 
     #[inline]
-    pub(crate) const fn memory(&self) -> &M {
-        &self.memory
-    }
-
-    #[inline]
     pub(crate) fn memory_mut(&mut self) -> &mut M {
         &mut self.memory
     }
 
     #[inline]
-    pub(crate) fn mark_bytes_modified(&mut self) {
+    fn mark_bytes_modified(&mut self) {
         self.progress = core::cmp::max(self.progress, MutationProgress::BytesModified);
     }
 
     #[inline]
-    pub(crate) fn mark_protection_modified(&mut self) {
+    fn mark_protection_modified(&mut self) {
         self.progress = MutationProgress::ProtectionModified;
     }
 
@@ -345,6 +507,88 @@ impl<M: ImageMemory> ImageLoadTransaction<M> {
         self.pending
             .take()
             .expect("ready image transaction must own its lease")
+    }
+
+    /// Owner-bound wrapper around `ImageMemory::read` that always passes the
+    /// transaction's own allocation descriptor. Bytes modifications must go
+    /// through `write`/`zero` so the progress marker stays accurate.
+    pub(crate) fn read(&self, offset: AllocationOffset, dst: &mut [u8]) -> LoadResult<()> {
+        let allocation = *self.allocation();
+        self.memory.read(&allocation, offset, dst)
+    }
+
+    /// Owner-bound wrapper around `ImageMemory::write`. Marks the allocation
+    /// as bytes-modified before issuing the write so that an abort on error
+    /// still observes the modification.
+    pub(crate) fn write(&mut self, offset: AllocationOffset, src: &[u8]) -> LoadResult<()> {
+        let allocation = *self.allocation();
+        self.mark_bytes_modified();
+        self.memory.write(&allocation, offset, src)
+    }
+
+    /// Owner-bound wrapper around `ImageMemory::zero`. Marks the allocation
+    /// as bytes-modified before issuing the zero fill.
+    pub(crate) fn zero(&mut self, offset: AllocationOffset, len: u64) -> LoadResult<()> {
+        let allocation = *self.allocation();
+        self.mark_bytes_modified();
+        self.memory.zero(&allocation, offset, len)
+    }
+
+    /// Owner-bound wrapper around `ImageMemory::image_span`. The returned
+    /// pointer borrows the backend; it must not escape the caller.
+    pub(crate) fn image_span(&self, offset: AllocationOffset, len: u64) -> LoadResult<*mut u8> {
+        let allocation = *self.allocation();
+        self.memory.image_span(&allocation, offset, len)
+    }
+}
+
+impl<M: ImageProtectionMemory> ImageLoadTransaction<M> {
+    #[inline]
+    pub(crate) fn protection_capabilities(&self) -> crate::image::ProtectionCapabilities {
+        self.memory.protection_capabilities()
+    }
+
+    pub(crate) fn validate_protection_aliases(
+        &self,
+        prepared: &crate::image::PreparedProtectionPlan,
+    ) -> LoadResult<()> {
+        let allocation = *self.allocation();
+        self.memory
+            .validate_protection_aliases(&allocation, prepared)
+    }
+
+    /// Apply the complete protection batch to this transaction's allocation.
+    /// Progress is advanced first so partial backend mutation is always
+    /// conservatively rolled back.
+    pub(crate) fn apply_protection(
+        &mut self,
+        batch: crate::image::ProtectionBatch<'_>,
+    ) -> LoadResult<()> {
+        let allocation = *self.allocation();
+        self.mark_protection_modified();
+        self.memory.apply_protection(&allocation, batch)
+    }
+}
+
+impl<M: ImageMemory + ?Sized> ImageLoadTransaction<&mut M> {
+    /// Transfer this transaction's unique lease directly into a pre-reserved
+    /// session rollback slot.
+    ///
+    /// Slot reservation happens while the transaction is still armed. On
+    /// allocation failure `self` drops normally and aborts the image; after
+    /// reservation, moving the lease into the log is infallible. Consuming
+    /// `self` also ends the short mutable reborrow of the session backend.
+    pub(crate) fn transfer_to(
+        mut self,
+        rollback: &mut AllocationRollbackLog,
+    ) -> LoadResult<SessionAllocation> {
+        rollback.reserve_entry()?;
+        debug_assert!(rollback.entries.len() < rollback.entries.capacity());
+        let lease = self
+            .pending
+            .take()
+            .expect("active image transaction must own its lease");
+        Ok(rollback.push_reserved(lease, self.progress))
     }
 }
 
@@ -369,35 +613,52 @@ impl<M: ImageMemory + ?Sized> ImageMemory for &mut M {
         (**self).release_committed(allocation)
     }
 
-    fn allocation(&self) -> LoadResult<&ImageAllocation> {
-        (**self).allocation()
+    fn image_span(
+        &self,
+        allocation: &ImageAllocation,
+        offset: AllocationOffset,
+        len: u64,
+    ) -> LoadResult<*mut u8> {
+        (**self).image_span(allocation, offset, len)
     }
 
-    fn image_span(&self, offset: AllocationOffset, len: u64) -> LoadResult<*mut u8> {
-        (**self).image_span(offset, len)
+    fn write(
+        &mut self,
+        allocation: &ImageAllocation,
+        offset: AllocationOffset,
+        data: &[u8],
+    ) -> LoadResult<()> {
+        (**self).write(allocation, offset, data)
     }
 
-    fn write(&mut self, offset: AllocationOffset, data: &[u8]) -> LoadResult<()> {
-        (**self).write(offset, data)
+    fn zero(
+        &mut self,
+        allocation: &ImageAllocation,
+        offset: AllocationOffset,
+        len: u64,
+    ) -> LoadResult<()> {
+        (**self).zero(allocation, offset, len)
     }
 
-    fn zero(&mut self, offset: AllocationOffset, len: u64) -> LoadResult<()> {
-        (**self).zero(offset, len)
-    }
-
-    fn read(&self, offset: AllocationOffset, dst: &mut [u8]) -> LoadResult<()> {
-        (**self).read(offset, dst)
+    fn read(
+        &self,
+        allocation: &ImageAllocation,
+        offset: AllocationOffset,
+        dst: &mut [u8],
+    ) -> LoadResult<()> {
+        (**self).read(allocation, offset, dst)
     }
 }
 
 impl<M: ImageProtectionMemory + ?Sized> ImageProtectionMemory for &mut M {
     fn protect(
         &mut self,
+        allocation: &ImageAllocation,
         offset: AllocationOffset,
         len: u64,
         permissions: MemoryPermissions,
     ) -> LoadResult<crate::image::ProtectionLevel> {
-        (**self).protect(offset, len, permissions)
+        (**self).protect(allocation, offset, len, permissions)
     }
 
     fn protection_capabilities(&self) -> crate::image::ProtectionCapabilities {
@@ -412,7 +673,11 @@ impl<M: ImageProtectionMemory + ?Sized> ImageProtectionMemory for &mut M {
         (**self).validate_protection_aliases(allocation, prepared)
     }
 
-    fn apply_protection(&mut self, batch: crate::image::ProtectionBatch<'_>) -> LoadResult<()> {
-        (**self).apply_protection(batch)
+    fn apply_protection(
+        &mut self,
+        allocation: &ImageAllocation,
+        batch: crate::image::ProtectionBatch<'_>,
+    ) -> LoadResult<()> {
+        (**self).apply_protection(allocation, batch)
     }
 }

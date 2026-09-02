@@ -138,6 +138,20 @@ impl RecordingMemory {
     pub fn recorded(sink: &Rc<RefCell<Option<AllocationRequest>>>) -> Option<AllocationRequest> {
         *sink.borrow()
     }
+
+    fn validate_allocation(&self, allocation: &ImageAllocation) -> crate::error::LoadResult<()> {
+        if allocation == &self.allocation {
+            return Ok(());
+        }
+        Err(crate::error::LoadError::new(
+            crate::error::LoadErrorKind::Backend,
+            crate::error::ErrorContext::Allocation {
+                base: allocation.base(),
+                len: allocation.len(),
+                align: allocation.align(),
+            },
+        ))
+    }
 }
 
 impl ImageMemory for RecordingMemory {
@@ -167,39 +181,43 @@ impl ImageMemory for RecordingMemory {
 
     fn release_committed(&mut self, _allocation: AllocationLease) {}
 
-    fn allocation(&self) -> crate::error::LoadResult<&ImageAllocation> {
-        Ok(&self.allocation)
-    }
-
     fn image_span(
         &self,
+        allocation: &ImageAllocation,
         _offset: crate::memory::AllocationOffset,
         _len: u64,
     ) -> crate::error::LoadResult<*mut u8> {
+        self.validate_allocation(allocation)?;
         Ok(core::ptr::null_mut())
     }
 
     fn write(
         &mut self,
+        allocation: &ImageAllocation,
         _offset: crate::memory::AllocationOffset,
         _data: &[u8],
     ) -> crate::error::LoadResult<()> {
+        self.validate_allocation(allocation)?;
         Ok(())
     }
 
     fn zero(
         &mut self,
+        allocation: &ImageAllocation,
         _offset: crate::memory::AllocationOffset,
         _len: u64,
     ) -> crate::error::LoadResult<()> {
+        self.validate_allocation(allocation)?;
         Ok(())
     }
 
     fn read(
         &self,
+        allocation: &ImageAllocation,
         _offset: crate::memory::AllocationOffset,
         _dst: &mut [u8],
     ) -> crate::error::LoadResult<()> {
+        self.validate_allocation(allocation)?;
         Ok(())
     }
 }

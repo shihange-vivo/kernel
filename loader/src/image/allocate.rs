@@ -149,9 +149,7 @@ impl<R: ElfReader, M: ImageMemory> AllocatedImage<R, M> {
                         &mut scratch[..chunk_len],
                     )
                     .map_err(|error| error.at_stage(LoadStage::Map))?;
-                self.transaction.mark_bytes_modified();
                 self.transaction
-                    .memory_mut()
                     .write(
                         region
                             .allocation_offset()
@@ -181,9 +179,7 @@ impl<R: ElfReader, M: ImageMemory> AllocatedImage<R, M> {
                 .checked_add(region.file_range().len())
                 .map_err(|error| error.at_stage(LoadStage::Map))?;
             if bss_len != 0 {
-                self.transaction.mark_bytes_modified();
                 self.transaction
-                    .memory_mut()
                     .zero(bss_offset, bss_len)
                     .map_err(|error| error.at_stage(LoadStage::Map))?;
             }
