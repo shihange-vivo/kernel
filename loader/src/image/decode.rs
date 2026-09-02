@@ -184,7 +184,7 @@ impl<R: ElfReader, M: ImageMemory> DecodedImage<R, M> {
                 let offset = self
                     .locate_vaddr_at(record.offset(), target_word.width().bytes())
                     .map_err(|_| relocation_error(record, LoadErrorKind::OutOfBounds))?;
-                i128::from(target_word.read(self.transaction.memory(), offset)?)
+                i128::from(target_word.read_via(&self.transaction, offset)?)
             }
             _ => {
                 return Err(relocation_error(
@@ -253,13 +253,8 @@ impl<R: ElfReader, M: ImageMemory> DecodedImage<R, M> {
             }
         }
         for operation in operations {
-            self.transaction.mark_bytes_modified();
             target_word
-                .write(
-                    self.transaction.memory_mut(),
-                    operation.offset(),
-                    operation.value(),
-                )
+                .write_via(&mut self.transaction, operation.offset(), operation.value())
                 .map_err(|error| error.at_stage(LoadStage::Relocate))?;
         }
         Ok(RelocatedImage::new(

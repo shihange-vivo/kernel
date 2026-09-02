@@ -161,13 +161,14 @@ mod fixed_mapper {
     #[test]
     fn fixed_mapper_allocates_borrowed_span() {
         let mut mapper = MemoryMapper::new(Some(&REGIONS));
-        mapper
+        let lease = mapper
             .allocate_image(fixed_request(0x5000_0000, 0x1000))
             .expect("allocate");
-        let allocation = mapper.allocation().expect("allocation recorded");
+        let allocation = lease.allocation();
         assert_eq!(allocation.base().get(), 0x5000_0000);
         assert_eq!(allocation.len(), 0x1000);
         assert_eq!(allocation.align(), 4);
+        mapper.abort_image(lease, crate::memory::MutationProgress::Reserved);
     }
 
     #[test]

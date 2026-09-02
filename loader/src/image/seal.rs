@@ -284,19 +284,14 @@ pub struct PreparedProtectionPlan {
 
 impl PreparedProtectionPlan {
     pub(crate) fn prepare<M: ImageProtectionMemory>(
-        memory: &M,
-        allocation: &ImageAllocation,
+        transaction: &ImageLoadTransaction<M>,
         logical: &SealPlan,
     ) -> LoadResult<Self> {
-        let actual = memory.allocation()?;
-        if actual != allocation {
-            return Err(protection_backend_error(allocation));
-        }
-
-        let prepared = Self::build(allocation, logical, memory.protection_capabilities())?;
-        memory.validate_protection_aliases(allocation, &prepared)?;
+        let allocation = *transaction.allocation();
+        let prepared = Self::build(&allocation, logical, transaction.protection_capabilities())?;
+        transaction.validate_protection_aliases(&prepared)?;
         for range in prepared.ranges() {
-            memory.image_span(range.allocation_offset(), range.applied_range().len())?;
+            transaction.image_span(range.allocation_offset(), range.applied_range().len())?;
         }
         Ok(prepared)
     }

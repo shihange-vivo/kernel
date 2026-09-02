@@ -279,6 +279,25 @@ impl MemoryMapper {
     }
 }
 
+impl MemoryMapper {
+    /// Validate that `descriptor` matches the mapper's currently tracked
+    /// allocation. `MemoryMapper` keeps at most one active allocation; any
+    /// mismatch — including a stale descriptor from a finished load — is an
+    /// error rather than a silent redirect.
+    fn expect_active_allocation(
+        &self,
+        descriptor: &ImageAllocation,
+        offset: AllocationOffset,
+        len: u64,
+    ) -> LoadResult<()> {
+        match &self.allocation {
+            Some(active) if active == descriptor => Ok(()),
+            Some(_) => Err(memory_access_error(*descriptor, offset, len)),
+            None => Err(not_allocated_error(*descriptor)),
+        }
+    }
+}
+
 impl ImageMemory for MemoryMapper {
     fn allocate_image(&mut self, request: AllocationRequest) -> LoadResult<AllocationLease> {
         if self.poisoned.is_some() || self.installed.is_some() || self.allocation.is_some() {
@@ -351,22 +370,13 @@ impl ImageMemory for MemoryMapper {
         self.release_lease(allocation, false);
     }
 
-    fn allocation(&self) -> LoadResult<&ImageAllocation> {
-        if let Some(allocation) = &self.allocation {
-            return Ok(allocation);
-        }
-        Err(LoadError::new(
-            LoadErrorKind::NotAllocated,
-            ErrorContext::Allocation {
-                base: TargetAddress::new(0),
-                len: 0,
-                align: 0,
-            },
-        ))
-    }
-
-    fn image_span(&self, offset: AllocationOffset, len: u64) -> LoadResult<*mut u8> {
-        let allocation = self.allocation()?;
+    fn image_span(
+        &self,
+        allocation: &ImageAllocation,
+        offset: AllocationOffset,
+        len: u64,
+    ) -> LoadResult<*mut u8> {
+        self.expect_active_allocation(allocation, offset, len)?;
         let end = offset
             .value()
             .checked_add(len)
@@ -398,11 +408,15 @@ impl ImageMemory for MemoryMapper {
         }
     }
 
-    fn read(&self, offset: AllocationOffset, dst: &mut [u8]) -> LoadResult<()> {
-        let allocation = self.allocation()?;
+    fn read(
+        &self,
+        allocation: &ImageAllocation,
+        offset: AllocationOffset,
+        dst: &mut [u8],
+    ) -> LoadResult<()> {
         let len = u64::try_from(dst.len())
             .map_err(|_| memory_access_error(*allocation, offset, u64::MAX))?;
-        let source = self.image_span(offset, len)?;
+        let source = self.image_span(allocation, offset, len)?;
         if !dst.is_empty() {
             unsafe {
                 core::ptr::copy_nonoverlapping(source, dst.as_mut_ptr(), dst.len());
@@ -411,11 +425,15 @@ impl ImageMemory for MemoryMapper {
         Ok(())
     }
 
-    fn write(&mut self, offset: AllocationOffset, data: &[u8]) -> LoadResult<()> {
-        let allocation = self.allocation()?;
+    fn write(
+        &mut self,
+        allocation: &ImageAllocation,
+        offset: AllocationOffset,
+        data: &[u8],
+    ) -> LoadResult<()> {
         let len = u64::try_from(data.len())
             .map_err(|_| memory_access_error(*allocation, offset, u64::MAX))?;
-        let target = self.image_span(offset, len)?;
+        let target = self.image_span(allocation, offset, len)?;
         if !data.is_empty() {
             unsafe {
                 core::ptr::copy_nonoverlapping(data.as_ptr(), target, data.len());
@@ -424,9 +442,13 @@ impl ImageMemory for MemoryMapper {
         Ok(())
     }
 
-    fn zero(&mut self, offset: AllocationOffset, len: u64) -> LoadResult<()> {
-        let allocation = self.allocation()?;
-        let target = self.image_span(offset, len)?;
+    fn zero(
+        &mut self,
+        allocation: &ImageAllocation,
+        offset: AllocationOffset,
+        len: u64,
+    ) -> LoadResult<()> {
+        let target = self.image_span(allocation, offset, len)?;
         let len =
             usize::try_from(len).map_err(|_| memory_access_error(*allocation, offset, len))?;
         if len != 0 {
@@ -441,11 +463,12 @@ impl ImageMemory for MemoryMapper {
 impl ImageProtectionMemory for MemoryMapper {
     fn protect(
         &mut self,
+        allocation: &ImageAllocation,
         offset: AllocationOffset,
         len: u64,
         _permissions: MemoryPermissions,
     ) -> LoadResult<ProtectionLevel> {
-        self.image_span(offset, len)?;
+        self.image_span(allocation, offset, len)?;
         Ok(ProtectionLevel::LogicalOnly)
     }
 
@@ -458,11 +481,9 @@ impl ImageProtectionMemory for MemoryMapper {
         allocation: &ImageAllocation,
         _prepared: &PreparedProtectionPlan,
     ) -> LoadResult<()> {
-        let actual = self.allocation()?;
-        if actual == allocation {
-            Ok(())
-        } else {
-            Err(protection_backend_error(allocation))
+        match &self.allocation {
+            Some(actual) if actual == allocation => Ok(()),
+            _ => Err(protection_backend_error(allocation)),
         }
     }
 }
@@ -476,8 +497,11 @@ impl ImageCommitMemory for MemoryMapper {
         allocation: &ImageAllocation,
         sealed: &SealedState,
     ) -> LoadResult<Self::PreparedInstall> {
-        let actual = *self.allocation()?;
-        if actual != *allocation || self.installed.is_some() || self.poisoned.is_some() {
+        let mismatch = match &self.allocation {
+            Some(actual) => actual != allocation,
+            None => true,
+        };
+        if mismatch || self.installed.is_some() || self.poisoned.is_some() {
             return Err(compatibility_install_error(*allocation));
         }
 
@@ -579,6 +603,17 @@ fn memory_access_error(
             allocation_align: allocation.align(),
             offset: offset.value(),
             len,
+        },
+    )
+}
+
+fn not_allocated_error(allocation: ImageAllocation) -> LoadError {
+    LoadError::new(
+        LoadErrorKind::NotAllocated,
+        ErrorContext::Allocation {
+            base: allocation.base(),
+            len: allocation.len(),
+            align: allocation.align(),
         },
     )
 }

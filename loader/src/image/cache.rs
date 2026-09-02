@@ -110,13 +110,10 @@ impl<R: ElfReader, M: ImageMemory> CachedImage<R, M> {
             &self.relocations,
         )
         .map_err(|error| error.at_stage(LoadStage::Seal))?;
-        let prepared =
-            PreparedProtectionPlan::prepare(self.transaction.memory(), &allocation, &seal_plan)
-                .map_err(|error| error.at_stage(LoadStage::Seal))?;
+        let prepared = PreparedProtectionPlan::prepare(&self.transaction, &seal_plan)
+            .map_err(|error| error.at_stage(LoadStage::Seal))?;
         let mut protection_records = prepared.into_ranges();
-        self.transaction.mark_protection_modified();
         self.transaction
-            .memory_mut()
             .apply_protection(ProtectionBatch::new(&mut protection_records))
             .map_err(|error| error.at_stage(LoadStage::Seal))?;
         let protections = AppliedProtectionSet::new(protection_records);
