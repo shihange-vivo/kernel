@@ -377,6 +377,9 @@ pub struct LoadLimits {
     max_relocations: u64,
     max_runtime_metadata_bytes: u64,
     max_relocation_operation_bytes: u64,
+    max_string_table_bytes: u64,
+    max_symbol_name_len: u32,
+    max_dependency_name_len: u32,
 }
 
 impl LoadLimits {
@@ -390,6 +393,9 @@ impl LoadLimits {
         1024 * 1024,
         64 * 1024 * 1024,
         64 * 1024 * 1024,
+        64 * 1024 * 1024,
+        256,
+        256,
     );
 
     #[inline]
@@ -403,6 +409,9 @@ impl LoadLimits {
         max_relocations: u64,
         max_runtime_metadata_bytes: u64,
         max_relocation_operation_bytes: u64,
+        max_string_table_bytes: u64,
+        max_symbol_name_len: u32,
+        max_dependency_name_len: u32,
     ) -> Self {
         Self {
             max_file_len,
@@ -414,6 +423,9 @@ impl LoadLimits {
             max_relocations,
             max_runtime_metadata_bytes,
             max_relocation_operation_bytes,
+            max_string_table_bytes,
+            max_symbol_name_len,
+            max_dependency_name_len,
         }
     }
 
@@ -487,6 +499,24 @@ impl LoadLimits {
             actual,
             self.max_relocation_operation_bytes,
         )
+    }
+
+    pub fn check_string_table_bytes(&self, actual: u64) -> LoadResult<()> {
+        check_limit(
+            LimitKind::StringTableBytes,
+            actual,
+            self.max_string_table_bytes,
+        )
+    }
+
+    #[inline]
+    pub const fn max_symbol_name_len(&self) -> u32 {
+        self.max_symbol_name_len
+    }
+
+    #[inline]
+    pub const fn max_dependency_name_len(&self) -> u32 {
+        self.max_dependency_name_len
     }
 }
 
@@ -680,6 +710,7 @@ pub(crate) struct LoadPolicy {
     allow_relr: bool,
     allow_lifecycle: bool,
     allow_search_paths: bool,
+    allow_dynamic_symbols: bool,
     allow_symbolic_lookup: bool,
     allow_symbol_versions: bool,
     allow_tls_descriptors: bool,
@@ -706,6 +737,7 @@ impl LoadPolicy {
             allow_relr: false,
             allow_lifecycle: false,
             allow_search_paths: false,
+            allow_dynamic_symbols: false,
             allow_symbolic_lookup: false,
             allow_symbol_versions: false,
             allow_tls_descriptors: false,
@@ -725,6 +757,7 @@ impl LoadPolicy {
             allow_needed: true,
             allow_plt_relocations: true,
             allow_lifecycle: true,
+            allow_dynamic_symbols: true,
             ..Self::phase0()
         }
     }
@@ -747,6 +780,16 @@ impl LoadPolicy {
     #[inline]
     pub const fn allows_unknown_program_headers(&self) -> bool {
         self.allow_unknown_program_headers
+    }
+
+    #[inline]
+    pub const fn allows_dynamic_symbols(&self) -> bool {
+        self.allow_dynamic_symbols
+    }
+
+    #[inline]
+    pub const fn allows_lifecycle(&self) -> bool {
+        self.allow_lifecycle
     }
 
     /// Returns whether a non-empty PT_LOAD permission set is supported.

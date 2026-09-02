@@ -19,8 +19,16 @@
 
 mod artifact;
 mod graph;
+mod metadata;
+mod symbol;
 
 pub use artifact::{
     ArtifactIdentity, ArtifactResolver, ArtifactRole, BuildId, DependencyName, DependencyRequest,
     FileIdentity, ImageId, ImageOwnership, LinkDomainId, ResolvedArtifact,
 };
+
+pub(crate) use metadata::{
+    ImageLifecycleMetadata, ProgramHeaderRuntimeInfo, RelocationTableInfo, RelocationTables,
+    RuntimeDynamicInfo, RuntimeImageMetadata,
+};
+pub(crate) use symbol::{symbol_count_from_hash, SymbolTable};

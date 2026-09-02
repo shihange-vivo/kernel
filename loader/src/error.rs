@@ -84,6 +84,7 @@ pub enum LimitKind {
     RelocationCount,
     RuntimeMetadataBytes,
     RelocationOperationBytes,
+    StringTableBytes,
     ProtectionRangeCount,
     ImageCount,
     DependencyEdgeCount,
@@ -161,6 +162,11 @@ pub enum ErrorContext {
     Dependency {
         requester: u32,
         needed: Box<[u8]>,
+    },
+    Symbol {
+        image: u32,
+        index: u32,
+        name: Box<[u8]>,
     },
     Limit {
         resource: LimitKind,
