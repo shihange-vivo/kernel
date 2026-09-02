@@ -24,7 +24,7 @@ mod plan;
 mod relocate;
 mod seal;
 
-pub(crate) use decode::RelocationRecord;
+pub(crate) use decode::{RelocationAddend, RelocationRecord, RelocationTableKind};
 pub(crate) use features::DynamicFeatureSummary;
 pub(crate) use image_loader::{read_u16, read_u32, read_u64, ImageLoader};
 pub use seal::{

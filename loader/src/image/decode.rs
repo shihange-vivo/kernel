@@ -16,6 +16,7 @@ use alloc::{boxed::Box, vec::Vec};
 
 use crate::{
     address::{FileRange, TargetAddress, TargetRange},
+    dynamic_linker::RuntimeImageMetadata,
     elf::{DynamicSegmentInfo, LoadSegmentInfo},
     error::{ErrorContext, HeaderField, LoadError, LoadErrorKind, LoadResult, LoadStage},
     identity::LoadRequest,
@@ -87,7 +88,7 @@ pub(crate) struct DecodedImage<R: ElfReader, M: ImageMemory> {
     load_segments: Box<[LoadSegmentInfo]>,
     regions: Vec<LoadedRegion>,
     dynamic: Option<DynamicSegmentInfo>,
-    relocations: Vec<RelocationRecord>,
+    metadata: RuntimeImageMetadata,
     relro: Option<TargetRange>,
     stack: StackKind,
     interpreter: Option<FileRange>,
@@ -106,7 +107,7 @@ impl<R: ElfReader, M: ImageMemory> DecodedImage<R, M> {
         load_segments: Box<[LoadSegmentInfo]>,
         regions: Vec<LoadedRegion>,
         dynamic: Option<DynamicSegmentInfo>,
-        relocations: Vec<RelocationRecord>,
+        metadata: RuntimeImageMetadata,
         relro: Option<TargetRange>,
         stack: StackKind,
         interpreter: Option<FileRange>,
@@ -122,7 +123,7 @@ impl<R: ElfReader, M: ImageMemory> DecodedImage<R, M> {
             load_segments,
             regions,
             dynamic,
-            relocations,
+            metadata,
             relro,
             stack,
             interpreter,
@@ -216,7 +217,9 @@ impl<R: ElfReader, M: ImageMemory> DecodedImage<R, M> {
         );
         let mut operations = Vec::new();
         let operation_bytes = self
-            .relocations
+            .metadata
+            .relocations()
+            .records()
             .len()
             .checked_mul(core::mem::size_of::<RelocationOperation>())
             .and_then(|bytes| u64::try_from(bytes).ok())
@@ -226,13 +229,13 @@ impl<R: ElfReader, M: ImageMemory> DecodedImage<R, M> {
             .check_relocation_operation_bytes(operation_bytes)
             .map_err(|error| error.at_stage(LoadStage::Relocate))?;
         operations
-            .try_reserve_exact(self.relocations.len())
+            .try_reserve_exact(self.metadata.relocations().records().len())
             .map_err(|_| {
                 LoadError::new(LoadErrorKind::OutOfMemory, ErrorContext::None)
                     .at_stage(LoadStage::Relocate)
             })?;
 
-        for record in self.relocations.iter() {
+        for record in self.metadata.relocations().records().iter() {
             operations.push(
                 self.preflight_relative(*record, &relocator, target_word)
                     .map_err(|error| error.at_stage(LoadStage::Relocate))?,
@@ -267,7 +270,7 @@ impl<R: ElfReader, M: ImageMemory> DecodedImage<R, M> {
             self.load_segments,
             self.regions,
             self.dynamic,
-            self.relocations,
+            self.metadata,
             self.relro,
             self.stack,
             self.interpreter,
@@ -276,7 +279,7 @@ impl<R: ElfReader, M: ImageMemory> DecodedImage<R, M> {
     }
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug)]
 pub(crate) enum RelocationTableKind {
     Rel,
     Rela,
@@ -325,6 +328,24 @@ impl RelocationTableTags {
 pub(crate) struct DynamicTags {
     rel: RelocationTableTags,
     rela: RelocationTableTags,
+    symtab: Option<u64>,
+    syment: Option<u64>,
+    strtab: Option<u64>,
+    strsz: Option<u64>,
+    hash: Option<u64>,
+    gnu_hash: Option<u64>,
+    needed: Vec<u64>,
+    soname: Option<u64>,
+    flags: Option<u64>,
+    flags_1: Option<u64>,
+    init: Option<u64>,
+    fini: Option<u64>,
+    preinit_array: Option<u64>,
+    preinit_arraysz: Option<u64>,
+    init_array: Option<u64>,
+    init_arraysz: Option<u64>,
+    fini_array: Option<u64>,
+    fini_arraysz: Option<u64>,
 }
 
 impl DynamicTags {
@@ -345,6 +366,192 @@ impl DynamicTags {
     #[inline]
     pub fn rela_mut(&mut self) -> &mut RelocationTableTags {
         &mut self.rela
+    }
+
+    #[inline]
+    pub const fn symtab(&self) -> Option<u64> {
+        self.symtab
+    }
+
+    #[inline]
+    pub const fn syment(&self) -> Option<u64> {
+        self.syment
+    }
+
+    #[inline]
+    pub const fn strtab(&self) -> Option<u64> {
+        self.strtab
+    }
+
+    #[inline]
+    pub const fn strsz(&self) -> Option<u64> {
+        self.strsz
+    }
+
+    #[inline]
+    pub const fn hash(&self) -> Option<u64> {
+        self.hash
+    }
+
+    #[inline]
+    pub const fn gnu_hash(&self) -> Option<u64> {
+        self.gnu_hash
+    }
+
+    #[inline]
+    pub fn symtab_mut(&mut self) -> &mut Option<u64> {
+        &mut self.symtab
+    }
+
+    #[inline]
+    pub fn syment_mut(&mut self) -> &mut Option<u64> {
+        &mut self.syment
+    }
+
+    #[inline]
+    pub fn strtab_mut(&mut self) -> &mut Option<u64> {
+        &mut self.strtab
+    }
+
+    #[inline]
+    pub fn strsz_mut(&mut self) -> &mut Option<u64> {
+        &mut self.strsz
+    }
+
+    #[inline]
+    pub fn hash_mut(&mut self) -> &mut Option<u64> {
+        &mut self.hash
+    }
+
+    #[inline]
+    pub fn gnu_hash_mut(&mut self) -> &mut Option<u64> {
+        &mut self.gnu_hash
+    }
+
+    #[inline]
+    pub fn needed(&self) -> &[u64] {
+        &self.needed
+    }
+
+    pub fn push_needed(&mut self, tag: u64, value: u64) -> LoadResult<()> {
+        self.needed.try_reserve(1).map_err(|_| {
+            LoadError::new(
+                LoadErrorKind::OutOfMemory,
+                ErrorContext::DynamicTag { tag, value },
+            )
+        })?;
+        self.needed.push(value);
+        Ok(())
+    }
+
+    #[inline]
+    pub const fn soname(&self) -> Option<u64> {
+        self.soname
+    }
+
+    #[inline]
+    pub fn soname_mut(&mut self) -> &mut Option<u64> {
+        &mut self.soname
+    }
+
+    #[inline]
+    pub const fn flags(&self) -> Option<u64> {
+        self.flags
+    }
+
+    #[inline]
+    pub const fn flags_1(&self) -> Option<u64> {
+        self.flags_1
+    }
+
+    #[inline]
+    pub fn flags_mut(&mut self) -> &mut Option<u64> {
+        &mut self.flags
+    }
+
+    #[inline]
+    pub fn flags_1_mut(&mut self) -> &mut Option<u64> {
+        &mut self.flags_1
+    }
+
+    #[inline]
+    pub const fn init(&self) -> Option<u64> {
+        self.init
+    }
+
+    #[inline]
+    pub const fn fini(&self) -> Option<u64> {
+        self.fini
+    }
+
+    #[inline]
+    pub const fn preinit_array(&self) -> Option<u64> {
+        self.preinit_array
+    }
+
+    #[inline]
+    pub const fn preinit_arraysz(&self) -> Option<u64> {
+        self.preinit_arraysz
+    }
+
+    #[inline]
+    pub const fn init_array(&self) -> Option<u64> {
+        self.init_array
+    }
+
+    #[inline]
+    pub const fn init_arraysz(&self) -> Option<u64> {
+        self.init_arraysz
+    }
+
+    #[inline]
+    pub const fn fini_array(&self) -> Option<u64> {
+        self.fini_array
+    }
+
+    #[inline]
+    pub const fn fini_arraysz(&self) -> Option<u64> {
+        self.fini_arraysz
+    }
+
+    #[inline]
+    pub fn init_mut(&mut self) -> &mut Option<u64> {
+        &mut self.init
+    }
+
+    #[inline]
+    pub fn fini_mut(&mut self) -> &mut Option<u64> {
+        &mut self.fini
+    }
+
+    #[inline]
+    pub fn preinit_array_mut(&mut self) -> &mut Option<u64> {
+        &mut self.preinit_array
+    }
+
+    #[inline]
+    pub fn preinit_arraysz_mut(&mut self) -> &mut Option<u64> {
+        &mut self.preinit_arraysz
+    }
+
+    #[inline]
+    pub fn init_array_mut(&mut self) -> &mut Option<u64> {
+        &mut self.init_array
+    }
+
+    #[inline]
+    pub fn init_arraysz_mut(&mut self) -> &mut Option<u64> {
+        &mut self.init_arraysz
+    }
+
+    #[inline]
+    pub fn fini_array_mut(&mut self) -> &mut Option<u64> {
+        &mut self.fini_array
+    }
+
+    #[inline]
+    pub fn fini_arraysz_mut(&mut self) -> &mut Option<u64> {
+        &mut self.fini_arraysz
     }
 }
 

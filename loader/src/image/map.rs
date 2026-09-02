@@ -13,10 +13,19 @@
 // limitations under the License.
 
 use alloc::{boxed::Box, vec::Vec};
-use goblin::elf::dynamic::{DT_NULL, DT_REL, DT_RELA, DT_RELAENT, DT_RELASZ, DT_RELENT, DT_RELSZ};
+use goblin::elf::dynamic::{
+    DT_FINI, DT_FINI_ARRAY, DT_FINI_ARRAYSZ, DT_FLAGS, DT_FLAGS_1, DT_GNU_HASH, DT_HASH, DT_INIT,
+    DT_INIT_ARRAY, DT_INIT_ARRAYSZ, DT_NEEDED, DT_NULL, DT_PREINIT_ARRAY, DT_PREINIT_ARRAYSZ,
+    DT_REL, DT_RELA, DT_RELAENT, DT_RELASZ, DT_RELENT, DT_RELSZ, DT_SONAME, DT_STRTAB, DT_STRSZ,
+    DT_SYMENT, DT_SYMTAB,
+};
 
 use crate::{
     address::{FileRange, TargetAddress, TargetRange},
+    dynamic_linker::{
+        symbol_count_from_hash, DependencyName, ImageLifecycleMetadata, ProgramHeaderRuntimeInfo,
+        RelocationTableInfo, RelocationTables, RuntimeDynamicInfo, RuntimeImageMetadata, SymbolTable,
+    },
     elf::{DynamicSegmentInfo, LoadSegmentInfo},
     error::{ErrorContext, LoadError, LoadErrorKind, LoadResult, LoadStage},
     identity::{ElfClass, ElfData, LoadPolicy, LoadRequest, PHASE0_LOAD_POLICY},
@@ -163,9 +172,14 @@ impl<R: ElfReader, M: ImageMemory> MappedImage<R, M> {
                 .offset()
                 .checked_add(offset)
                 .ok_or_else(|| dynamic_error(DT_NULL, dynamic.file_range().offset()))?;
+            // The dynamic bytes must lie wholly within this region's
+            // *file-backed* range: a PT_DYNAMIC reaching into BSS is malformed.
             let file_end = offset
                 .checked_add(dynamic.file_range().len())
                 .filter(|end| *end <= region.file_range().len());
+            if file_end.is_none() {
+                continue;
+            }
             if expected_file_offset == dynamic.file_range().offset() {
                 return self.locate_vaddr_at(dynamic.vaddr(), dynamic.file_range().len());
             }
@@ -235,11 +249,11 @@ impl<R: ElfReader, M: ImageMemory> MappedImage<R, M> {
         tags: &RelocationTableTags,
         kind: RelocationTableKind,
         records: &mut Vec<RelocationRecord>,
-    ) -> LoadResult<()> {
+    ) -> LoadResult<Option<RelocationTableInfo>> {
         let absent =
             tags.address().is_none() && tags.byte_len().is_none() && tags.entry_size().is_none();
         if absent {
-            return Ok(());
+            return Ok(None);
         }
         let tag = match kind {
             RelocationTableKind::Rel => DT_REL,
@@ -267,29 +281,34 @@ impl<R: ElfReader, M: ImageMemory> MappedImage<R, M> {
                 ErrorContext::DynamicTag { tag, value: count },
             )
         })?;
-        if byte_len == 0 {
-            return Ok(());
-        }
         let table_vaddr = TargetAddress::new(address);
-        let offset = self.locate_vaddr_at(table_vaddr, byte_len)?;
-        self.transaction.image_span(offset, byte_len)?;
-        let mut raw = [0; 24];
-        for index in 0..count {
-            let entry_offset = offset.checked_add(index * entry_size)?;
-            self.transaction
-                .read(entry_offset, &mut raw[..entry_size as usize])?;
-            let record = decode_relocation_entry(
-                &raw[..entry_size as usize],
-                self.request.profile().class(),
-                self.request.profile().endian(),
-                kind,
-            )?;
-            if record.symbol_index() != 0 {
-                return Err(unsupported_relocation(record));
+        if byte_len != 0 {
+            let offset = self.locate_vaddr_at(table_vaddr, byte_len)?;
+            self.transaction.image_span(offset, byte_len)?;
+            let mut raw = [0; 24];
+            for index in 0..count {
+                let entry_offset = offset.checked_add(index * entry_size)?;
+                self.transaction
+                    .read(entry_offset, &mut raw[..entry_size as usize])?;
+                let record = decode_relocation_entry(
+                    &raw[..entry_size as usize],
+                    self.request.profile().class(),
+                    self.request.profile().endian(),
+                    kind,
+                )?;
+                if record.symbol_index() != 0 {
+                    return Err(unsupported_relocation(record));
+                }
+                records.push(record);
             }
-            records.push(record);
         }
-        Ok(())
+        Ok(Some(RelocationTableInfo::new(
+            kind,
+            table_vaddr,
+            byte_len,
+            entry_size,
+            count,
+        )))
     }
 
     pub fn decode(self) -> LoadResult<DecodedImage<R, M>> {
@@ -304,14 +323,40 @@ impl<R: ElfReader, M: ImageMemory> MappedImage<R, M> {
     }
 
     fn decode_inner(mut self, policy: LoadPolicy) -> LoadResult<DecodedImage<R, M>> {
-        let mut relocations = Vec::new();
-        if let Some(dynamic) = self.dynamic.as_ref() {
+        let mut metadata = RuntimeImageMetadata::empty();
+        if self.dynamic.is_some() {
             let tags = self
                 .decode_dynamic_tags(policy)
                 .map_err(|error| error.at_stage(LoadStage::Decode))?;
-            self.decode_relocation_table(tags.rel(), RelocationTableKind::Rel, &mut relocations)
+            let mut records = Vec::new();
+            let rel = self
+                .decode_relocation_table(tags.rel(), RelocationTableKind::Rel, &mut records)
                 .map_err(|error| error.at_stage(LoadStage::Decode))?;
-            self.decode_relocation_table(tags.rela(), RelocationTableKind::Rela, &mut relocations)
+            let rela = self
+                .decode_relocation_table(tags.rela(), RelocationTableKind::Rela, &mut records)
+                .map_err(|error| error.at_stage(LoadStage::Decode))?;
+            let relocations = RelocationTables::new(rel, rela, records);
+            let dynamic = self
+                .decode_dynamic_info(&tags)
+                .map_err(|error| error.at_stage(LoadStage::Decode))?;
+            let (symbols, needed, soname) = self
+                .decode_symbols_and_dependencies(&tags, policy)
+                .map_err(|error| error.at_stage(LoadStage::Decode))?;
+            let lifecycle = self
+                .decode_lifecycle(&tags, policy)
+                .map_err(|error| error.at_stage(LoadStage::Decode))?;
+            metadata = RuntimeImageMetadata::new(
+                dynamic,
+                needed,
+                soname,
+                symbols,
+                relocations,
+                lifecycle,
+                ProgramHeaderRuntimeInfo,
+            );
+            self.request
+                .limits()
+                .check_runtime_metadata_bytes(metadata.metadata_bytes())
                 .map_err(|error| error.at_stage(LoadStage::Decode))?;
         }
 
@@ -325,12 +370,267 @@ impl<R: ElfReader, M: ImageMemory> MappedImage<R, M> {
             self.load_segments,
             self.regions,
             self.dynamic,
-            relocations,
+            metadata,
             self.relro,
             self.stack,
             self.interpreter,
             self.tls,
         ))
+    }
+
+    /// Typed provenance of the validated `.dynamic` table (§7.2).
+    fn decode_dynamic_info(&self, tags: &DynamicTags) -> LoadResult<RuntimeDynamicInfo> {
+        let dynamic = self.dynamic.as_ref().unwrap();
+        let entry_size = dynamic_entry_size(self.request.profile().class());
+        let byte_len = dynamic.file_range().len();
+        let entry_count = byte_len / entry_size;
+        Ok(RuntimeDynamicInfo::new(
+            dynamic.vaddr(),
+            byte_len,
+            entry_size,
+            entry_count,
+            tags.flags().unwrap_or(0),
+            tags.flags_1().unwrap_or(0),
+        ))
+    }
+
+    /// S4 stage 3: decode `.dynstr`/`.dynsym` and the hash table(s) into an
+    /// owned, validated [`SymbolTable`], and resolve the raw `DT_NEEDED`/
+    /// `DT_SONAME` offsets into owned [`DependencyName`]s against the same
+    /// `.dynstr` (§7.3). The symbol count is proven from a SysV `DT_HASH` or
+    /// GNU `DT_GNU_HASH` table — never from section headers.
+    fn decode_symbols_and_dependencies(
+        &self,
+        tags: &DynamicTags,
+        policy: LoadPolicy,
+    ) -> LoadResult<(SymbolTable, Box<[DependencyName]>, Option<DependencyName>)> {
+        if !policy.allows_dynamic_symbols() {
+            return Ok((SymbolTable::empty(), Box::new([]), None));
+        }
+        let class = self.request.profile().class();
+        let endian = self.request.profile().endian();
+        let thumb = self.request.profile().entry_mode().is_thumb();
+        let max_name_len = self.request.limits().max_symbol_name_len();
+        let expected_syment: u64 = match class {
+            ElfClass::Elf32 => 16,
+            ElfClass::Elf64 => 24,
+        };
+
+        let any_symbol_tag = tags.symtab().is_some()
+            || tags.syment().is_some()
+            || tags.strtab().is_some()
+            || tags.strsz().is_some()
+            || tags.hash().is_some()
+            || tags.gnu_hash().is_some();
+        if !any_symbol_tag {
+            return Ok((SymbolTable::empty(), Box::new([]), None));
+        }
+
+        // `DT_STRTAB`/`DT_STRSZ` and `DT_SYMTAB`/`DT_SYMENT` are paired tags (§7.2).
+        let (strtab, strsz) = match (tags.strtab(), tags.strsz()) {
+            (Some(strtab), Some(strsz)) => (strtab, strsz),
+            _ => return Err(dynamic_error(DT_STRTAB, 0)),
+        };
+        let (symtab, syment) = match (tags.symtab(), tags.syment()) {
+            (Some(symtab), Some(syment)) => (symtab, syment),
+            _ => return Err(dynamic_error(DT_SYMTAB, 0)),
+        };
+        if syment != expected_syment {
+            return Err(dynamic_error(DT_SYMENT, syment));
+        }
+
+        self.request.limits().check_string_table_bytes(strsz)?;
+        let dynstr = self.read_table_bytes(strtab, strsz, DT_STRTAB)?;
+
+        // Resolve dependency names against the same `.dynstr` before it is
+        // moved into the symbol table. `DT_NEEDED` keeps encounter order.
+        let needed = self.decode_dependency_names(tags.needed(), &dynstr, DT_NEEDED)?;
+        let soname = match tags.soname() {
+            Some(offset) => Some(self.decode_dependency_name(offset, &dynstr, DT_SONAME)?),
+            None => None,
+        };
+
+        let sysv_bytes = match tags.hash() {
+            Some(hash_vaddr) => {
+                // A SysV table is self-describing: the header carries the
+                // bucket/chain counts that bound the whole read.
+                let mut header = [0; 8];
+                let offset = self.locate_vaddr_at(TargetAddress::new(hash_vaddr), 8)?;
+                self.transaction.read(offset, &mut header)?;
+                let nbucket = read_u32(&header, 0, endian)?;
+                let nchain = read_u32(&header, 4, endian)?;
+                let total = 8u64
+                    .checked_add(4u64 * (u64::from(nbucket) + u64::from(nchain)))
+                    .ok_or_else(|| dynamic_error(DT_HASH, 0))?;
+                Some(self.read_table_bytes(hash_vaddr, total, DT_HASH)?)
+            }
+            None => None,
+        };
+
+        let gnu_bytes = match tags.gnu_hash() {
+            Some(gnu_vaddr) => {
+                // The GNU hash chain runs up to the start of `.dynsym`, so the
+                // symtab address is the precise upper bound (§7.4).
+                if gnu_vaddr >= symtab {
+                    return Err(dynamic_error(DT_GNU_HASH, gnu_vaddr));
+                }
+                let len = symtab - gnu_vaddr;
+                Some(self.read_table_bytes(gnu_vaddr, len, DT_GNU_HASH)?)
+            }
+            None => None,
+        };
+
+        let symbol_count = symbol_count_from_hash(class, endian, gnu_bytes.as_deref(), sysv_bytes.as_deref())?;
+
+        let symtab_len = u64::from(symbol_count)
+            .checked_mul(syment)
+            .ok_or_else(|| dynamic_error(DT_SYMTAB, 0))?;
+        // All symbol entries are charged against the total metadata budget
+        // *before* parsing, so a malformed table with a huge proven count can
+        // never reserve memory past the limit (§7.4).
+        self.request.limits().check_runtime_metadata_bytes(symtab_len)?;
+        let symtab_bytes = self.read_table_bytes(symtab, symtab_len, DT_SYMTAB)?;
+
+        let symbols = SymbolTable::decode(
+            &symtab_bytes,
+            dynstr,
+            class,
+            endian,
+            self.load_bias,
+            &self.load_segments,
+            thumb,
+            max_name_len,
+            gnu_bytes,
+            sysv_bytes,
+        )?;
+        Ok((symbols, needed, soname))
+    }
+
+    /// Decode a list of `DT_NEEDED` offsets into owned, validated
+    /// [`DependencyName`]s, bounded by `max_dependency_name_len` (§7.3).
+    fn decode_dependency_names(
+        &self,
+        offsets: &[u64],
+        dynstr: &[u8],
+        tag: u64,
+    ) -> LoadResult<Box<[DependencyName]>> {
+        let mut names = Vec::new();
+        names.try_reserve_exact(offsets.len()).map_err(|_| {
+            LoadError::new(
+                LoadErrorKind::OutOfMemory,
+                ErrorContext::DynamicTag {
+                    tag,
+                    value: offsets.len() as u64,
+                },
+            )
+        })?;
+        for &offset in offsets {
+            names.push(self.decode_dependency_name(offset, dynstr, tag)?);
+        }
+        Ok(names.into_boxed_slice())
+    }
+
+    /// Decode one `DT_NEEDED`/`DT_SONAME` offset into an owned
+    /// [`DependencyName`], bounded by `max_dependency_name_len` (§7.3).
+    fn decode_dependency_name(
+        &self,
+        offset: u64,
+        dynstr: &[u8],
+        tag: u64,
+    ) -> LoadResult<DependencyName> {
+        let max_len = self.request.limits().max_dependency_name_len();
+        let start = usize::try_from(offset).map_err(|_| dynamic_error(tag, offset))?;
+        let tail = dynstr.get(start..).ok_or_else(|| dynamic_error(tag, offset))?;
+        let scan = core::cmp::min(max_len as usize + 1, tail.len());
+        let nul = tail[..scan]
+            .iter()
+            .position(|&byte| byte == 0)
+            .ok_or_else(|| dynamic_error(tag, offset))?;
+        if nul == 0 {
+            return Err(dynamic_error(tag, offset));
+        }
+        DependencyName::from_terminated(&tail[..nul + 1])
+            .map_err(|_| dynamic_error(tag, offset))
+    }
+
+    /// S4 stage 4: save the lifecycle targets and array ranges without fixing
+    /// the array contents into function addresses (§7.6). The array entry
+    /// words are re-read after relocation (S7) by the lifecycle plan builder.
+    fn decode_lifecycle(
+        &self,
+        tags: &DynamicTags,
+        policy: LoadPolicy,
+    ) -> LoadResult<ImageLifecycleMetadata> {
+        if !policy.allows_lifecycle() {
+            return Ok(ImageLifecycleMetadata::empty());
+        }
+        let word_size = match self.request.profile().class() {
+            ElfClass::Elf32 => 4,
+            ElfClass::Elf64 => 8,
+        };
+        let init = tags.init().map(TargetAddress::new);
+        let fini = tags.fini().map(TargetAddress::new);
+        let preinit_array = self.array_range(
+            tags.preinit_array(),
+            tags.preinit_arraysz(),
+            word_size,
+            DT_PREINIT_ARRAY,
+        )?;
+        let init_array = self.array_range(tags.init_array(), tags.init_arraysz(), word_size, DT_INIT_ARRAY)?;
+        let fini_array = self.array_range(tags.fini_array(), tags.fini_arraysz(), word_size, DT_FINI_ARRAY)?;
+        Ok(ImageLifecycleMetadata::new(
+            init,
+            fini,
+            preinit_array,
+            init_array,
+            fini_array,
+        ))
+    }
+
+    /// Pair an init/fini array address with its size into a validated
+    /// [`TargetRange`]. Both tags must be present together, the size must be a
+    /// whole number of target words, and the range end must not overflow.
+    fn array_range(
+        &self,
+        address: Option<u64>,
+        size: Option<u64>,
+        word_size: u64,
+        tag: u64,
+    ) -> LoadResult<Option<TargetRange>> {
+        match (address, size) {
+            (None, None) => Ok(None),
+            (Some(address), Some(size)) => {
+                if size % word_size != 0 {
+                    return Err(dynamic_error(tag, size));
+                }
+                let range = TargetRange::new(TargetAddress::new(address), size);
+                range.end().map_err(|_| dynamic_error(tag, size))?;
+                Ok(Some(range))
+            }
+            _ => Err(dynamic_error(tag, 0)),
+        }
+    }
+
+    /// Read `len` bytes at `vaddr` through the owner-bound transaction into an
+    /// owned, bounded buffer. A zero-length read yields an empty box without
+    /// touching the allocation.
+    fn read_table_bytes(&self, vaddr: u64, len: u64, tag: u64) -> LoadResult<Box<[u8]>> {
+        if len == 0 {
+            return Ok(Box::new([]));
+        }
+        let offset = self.locate_vaddr_at(TargetAddress::new(vaddr), len)?;
+        self.transaction.image_span(offset, len)?;
+        let len_usize = usize::try_from(len).map_err(|_| dynamic_error(tag, len))?;
+        let mut buffer = Vec::new();
+        buffer.try_reserve_exact(len_usize).map_err(|_| {
+            LoadError::new(
+                LoadErrorKind::OutOfMemory,
+                ErrorContext::DynamicTag { tag, value: len },
+            )
+        })?;
+        buffer.resize(len_usize, 0);
+        self.transaction.read(offset, &mut buffer)?;
+        Ok(buffer.into_boxed_slice())
     }
 }
 
@@ -424,6 +724,24 @@ fn accept_dynamic_tag(
         DT_RELA => set_once(tags.rela_mut().address_mut(), tag, value),
         DT_RELASZ => set_once(tags.rela_mut().byte_len_mut(), tag, value),
         DT_RELAENT => set_once(tags.rela_mut().entry_size_mut(), tag, value),
+        DT_SYMTAB => set_once(tags.symtab_mut(), tag, value),
+        DT_SYMENT => set_once(tags.syment_mut(), tag, value),
+        DT_STRTAB => set_once(tags.strtab_mut(), tag, value),
+        DT_STRSZ => set_once(tags.strsz_mut(), tag, value),
+        DT_HASH => set_once(tags.hash_mut(), tag, value),
+        DT_GNU_HASH => set_once(tags.gnu_hash_mut(), tag, value),
+        DT_NEEDED => tags.push_needed(tag, value),
+        DT_SONAME => set_once(tags.soname_mut(), tag, value),
+        DT_FLAGS => set_once(tags.flags_mut(), tag, value),
+        DT_FLAGS_1 => set_once(tags.flags_1_mut(), tag, value),
+        DT_INIT => set_once(tags.init_mut(), tag, value),
+        DT_FINI => set_once(tags.fini_mut(), tag, value),
+        DT_PREINIT_ARRAY => set_once(tags.preinit_array_mut(), tag, value),
+        DT_PREINIT_ARRAYSZ => set_once(tags.preinit_arraysz_mut(), tag, value),
+        DT_INIT_ARRAY => set_once(tags.init_array_mut(), tag, value),
+        DT_INIT_ARRAYSZ => set_once(tags.init_arraysz_mut(), tag, value),
+        DT_FINI_ARRAY => set_once(tags.fini_array_mut(), tag, value),
+        DT_FINI_ARRAYSZ => set_once(tags.fini_arraysz_mut(), tag, value),
         _ => Ok(()),
     }
 }

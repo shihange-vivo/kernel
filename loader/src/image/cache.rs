@@ -17,6 +17,7 @@ use alloc::{boxed::Box, vec::Vec};
 use crate::{
     address::{FileRange, TargetAddress, TargetRange},
     cache::CacheSyncOutcome,
+    dynamic_linker::RuntimeImageMetadata,
     elf::{DynamicSegmentInfo, LoadSegmentInfo},
     error::{LoadResult, LoadStage},
     identity::LoadRequest,
@@ -26,7 +27,6 @@ use crate::{
         seal::{
             AppliedProtectionSet, PreparedProtectionPlan, ProtectionBatch, SealPlan, SealedImage,
         },
-        RelocationRecord,
     },
     memory::{ImageLoadTransaction, ImageMemory, ImageProtectionMemory},
     reader::ElfReader,
@@ -43,7 +43,7 @@ pub(crate) struct CachedImage<R: ElfReader, M: ImageMemory> {
     load_segments: Box<[LoadSegmentInfo]>,
     regions: Vec<LoadedRegion>,
     dynamic: Option<DynamicSegmentInfo>,
-    relocations: Vec<RelocationRecord>,
+    metadata: RuntimeImageMetadata,
     relro: Option<TargetRange>,
     stack: StackKind,
     interpreter: Option<FileRange>,
@@ -63,7 +63,7 @@ impl<R: ElfReader, M: ImageMemory> CachedImage<R, M> {
         load_segments: Box<[LoadSegmentInfo]>,
         regions: Vec<LoadedRegion>,
         dynamic: Option<DynamicSegmentInfo>,
-        relocations: Vec<RelocationRecord>,
+        metadata: RuntimeImageMetadata,
         relro: Option<TargetRange>,
         stack: StackKind,
         interpreter: Option<FileRange>,
@@ -80,7 +80,7 @@ impl<R: ElfReader, M: ImageMemory> CachedImage<R, M> {
             load_segments,
             regions,
             dynamic,
-            relocations,
+            metadata,
             relro,
             stack,
             interpreter,
@@ -107,7 +107,7 @@ impl<R: ElfReader, M: ImageMemory> CachedImage<R, M> {
             &self.regions,
             self.relro,
             &self.stack,
-            &self.relocations,
+            self.metadata.relocations().records(),
         )
         .map_err(|error| error.at_stage(LoadStage::Seal))?;
         let prepared = PreparedProtectionPlan::prepare(&self.transaction, &seal_plan)
@@ -128,7 +128,7 @@ impl<R: ElfReader, M: ImageMemory> CachedImage<R, M> {
             self.load_segments,
             self.regions,
             self.dynamic,
-            self.relocations,
+            self.metadata,
             self.relro,
             self.stack,
             self.interpreter,

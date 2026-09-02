@@ -1,0 +1,729 @@
+// Copyright (c) 2026 vivo Mobile Communication Co., Ltd.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//       http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+//! Dynamic symbol table decoding and hash lookup (S4).
+//!
+//! A [`SymbolTable`] owns a copy of the validated `.dynstr` bytes and the
+//! decoded symbol entries. The symbol count is always *proven* from a SysV
+//! `DT_HASH` or GNU `DT_GNU_HASH` table — never inferred from section headers
+//! or from the tail of a segment (§7.4). Lookup goes through the hash table's
+//! fast path; the bounded linear scan (`lookup_linear`) exists only as the
+//! oracle the tests compare against (§7.5).
+
+use alloc::{boxed::Box, vec::Vec};
+
+use crate::{
+    address::{TargetAddress, TargetRange},
+    elf::LoadSegmentInfo,
+    error::{ErrorContext, LoadError, LoadErrorKind, LoadResult},
+    identity::{ElfClass, ElfData},
+    image::{read_u16, read_u32, read_u64},
+    MemoryPermissions,
+};
+
+/// ELF symbol binding (`STB_*`). OS/processor-specific bindings are rejected.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum SymbolBinding {
+    Local,
+    Global,
+    Weak,
+}
+
+/// ELF symbol visibility (`STV_*`). `STV_DEFAULT`/`HIDDEN`/`PROTECTED`/`INTERNAL`
+/// are understood; the reserved/elimination values are rejected.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum SymbolVisibility {
+    Default,
+    Protected,
+    Hidden,
+    Internal,
+}
+
+/// ELF symbol type (`STT_*`). The first release supports the three meaningful
+/// relocation targets; TLS/IFUNC/section/file/common are rejected.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum SymbolType {
+    NoType,
+    Object,
+    Func,
+}
+
+/// Whether a symbol is defined in this image or imported from elsewhere.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum SymbolDefinition {
+    Defined,
+    Undefined,
+}
+
+/// One decoded `.dynsym` entry. `name_offset`/`name_len` index into the
+/// table's owned `.dynstr` copy; `value` is already load-biased to a runtime
+/// address for defined symbols (bit 0 of a Thumb function is preserved).
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct SymbolEntry {
+    name_offset: u32,
+    name_len: u32,
+    value: TargetAddress,
+    size: u64,
+    binding: SymbolBinding,
+    visibility: SymbolVisibility,
+    symbol_type: SymbolType,
+    definition: SymbolDefinition,
+}
+
+impl SymbolEntry {
+    #[inline]
+    pub(crate) const fn name_offset(&self) -> u32 {
+        self.name_offset
+    }
+
+    #[inline]
+    pub(crate) const fn name_len(&self) -> u32 {
+        self.name_len
+    }
+
+    #[inline]
+    pub(crate) const fn value(&self) -> TargetAddress {
+        self.value
+    }
+
+    #[inline]
+    pub(crate) const fn size(&self) -> u64 {
+        self.size
+    }
+
+    #[inline]
+    pub(crate) const fn binding(&self) -> SymbolBinding {
+        self.binding
+    }
+
+    #[inline]
+    pub(crate) const fn visibility(&self) -> SymbolVisibility {
+        self.visibility
+    }
+
+    #[inline]
+    pub(crate) const fn symbol_type(&self) -> SymbolType {
+        self.symbol_type
+    }
+
+    #[inline]
+    pub(crate) const fn definition(&self) -> SymbolDefinition {
+        self.definition
+    }
+}
+
+/// GNU ELF string hash (`DT_GNU_HASH`), over raw bytes.
+pub(crate) fn gnu_hash(name: &[u8]) -> u32 {
+    const SEED: u32 = 5381;
+    name.iter()
+        .fold(SEED, |hash, &byte| hash.wrapping_mul(33).wrapping_add(u32::from(byte)))
+}
+
+/// SysV ELF string hash (`DT_HASH`), over raw bytes.
+pub(crate) fn sysv_hash(name: &[u8]) -> u32 {
+    let mut hash: u32 = 0;
+    for &byte in name {
+        hash = hash.wrapping_shl(4).wrapping_add(u32::from(byte));
+        let g = hash & 0xf000_0000;
+        if g != 0 {
+            hash ^= g >> 24;
+        }
+        hash &= !g;
+    }
+    hash
+}
+
+/// Validated SysV hash table. The symbol count is `nchain`.
+struct SysVHash {
+    nbucket: u32,
+    buckets: Box<[u32]>,
+    chains: Box<[u32]>,
+}
+
+impl SysVHash {
+    /// Parse a complete `DT_HASH` table. Returns the table and the symbol
+    /// count (`nchain`). Every bucket/chain link is validated in-bounds so a
+    /// later lookup can never index out of range.
+    fn parse(bytes: &[u8], endian: ElfData) -> LoadResult<(Self, u32)> {
+        if bytes.len() < 8 {
+            return Err(hash_error());
+        }
+        let nbucket = read_u32(bytes, 0, endian)?;
+        let nchain = read_u32(bytes, 4, endian)?;
+        let expected = 8u64
+            .checked_add(4u64 * (u64::from(nbucket) + u64::from(nchain)))
+            .ok_or_else(hash_error)?;
+        if u64::try_from(bytes.len()).map_err(|_| hash_error())? != expected {
+            return Err(hash_error());
+        }
+        let mut buckets = Vec::new();
+        buckets
+            .try_reserve_exact(nbucket as usize)
+            .map_err(|_| hash_oom())?;
+        let mut chains = Vec::new();
+        chains
+            .try_reserve_exact(nchain as usize)
+            .map_err(|_| hash_oom())?;
+        for index in 0..nbucket {
+            let bucket = read_u32(bytes, 8 + 4 * index as usize, endian)?;
+            if bucket >= nchain && bucket != 0 {
+                return Err(hash_error());
+            }
+            buckets.push(bucket);
+        }
+        let chain_base = 8 + 4 * nbucket as usize;
+        for index in 0..nchain {
+            let link = read_u32(bytes, chain_base + 4 * index as usize, endian)?;
+            if link >= nchain {
+                return Err(hash_error());
+            }
+            chains.push(link);
+        }
+        Ok((
+            Self {
+                nbucket,
+                buckets: buckets.into_boxed_slice(),
+                chains: chains.into_boxed_slice(),
+            },
+            nchain,
+        ))
+    }
+
+    fn lookup(&self, name: &[u8], hash: u32, dynstr: &[u8], entries: &[SymbolEntry]) -> Option<u32> {
+        if self.nbucket == 0 {
+            return None;
+        }
+        let mut index = self.buckets[(hash % self.nbucket) as usize];
+        while index != 0 {
+            if index < entries.len() as u32 && self.chains[index as usize] == hash {
+                let entry = &entries[index as usize];
+                if name_matches(dynstr, entry, name) {
+                    return Some(index);
+                }
+            }
+            index = self.chains[index as usize];
+        }
+        None
+    }
+}
+
+/// Validated GNU hash table. The symbol count is `symndx + chains.len()`.
+struct GnuHash {
+    symndx: u32,
+    shift2: u32,
+    class_bits: u32,
+    bloom: Box<[u64]>,
+    buckets: Box<[u32]>,
+    chains: Box<[u32]>,
+}
+
+impl GnuHash {
+    /// Parse a complete `DT_GNU_HASH` table. Returns the table and the symbol
+    /// count. `maskwords` must be a power of two; the final chain entry must
+    /// carry the low "end of chain" bit so the count is provable (§7.4).
+    fn parse(bytes: &[u8], endian: ElfData, class: ElfClass) -> LoadResult<(Self, u32)> {
+        if bytes.len() < 20 {
+            return Err(hash_error());
+        }
+        let nbuckets = read_u32(bytes, 0, endian)?;
+        let symndx = read_u32(bytes, 4, endian)?;
+        let maskwords = read_u32(bytes, 8, endian)?;
+        let shift2 = read_u32(bytes, 12, endian)?;
+        if !maskwords.is_power_of_two() || maskwords == 0 {
+            return Err(hash_error());
+        }
+        let class_bits: u32 = match class {
+            ElfClass::Elf32 => 32,
+            ElfClass::Elf64 => 64,
+        };
+        let word_size = class_bits / 8;
+        let bloom_bytes = u64::from(maskwords) * u64::from(word_size);
+        let buckets_bytes = u64::from(nbuckets) * 4;
+        let head = 16u64
+            .checked_add(bloom_bytes)
+            .and_then(|v| v.checked_add(buckets_bytes))
+            .ok_or_else(hash_error)?;
+        let total = u64::try_from(bytes.len()).map_err(|_| hash_error())?;
+        if total < head + 4 {
+            return Err(hash_error());
+        }
+        let chains_bytes = total - head;
+        if chains_bytes % 4 != 0 {
+            return Err(hash_error());
+        }
+        let chain_count = chains_bytes / 4;
+        let symbol_count = symndx
+            .checked_add(chain_count as u32)
+            .ok_or_else(hash_error)?;
+
+        let mut bloom = Vec::new();
+        bloom
+            .try_reserve_exact(maskwords as usize)
+            .map_err(|_| hash_oom())?;
+        for index in 0..maskwords as usize {
+            let offset = 16 + index * word_size as usize;
+            let word = match class {
+                ElfClass::Elf32 => u64::from(read_u32(bytes, offset, endian)?),
+                ElfClass::Elf64 => read_u64(bytes, offset, endian)?,
+            };
+            bloom.push(word);
+        }
+        let mut buckets = Vec::new();
+        buckets
+            .try_reserve_exact(nbuckets as usize)
+            .map_err(|_| hash_oom())?;
+        for index in 0..nbuckets as usize {
+            let bucket = read_u32(bytes, 16 + maskwords as usize * word_size as usize + 4 * index, endian)?;
+            if bucket >= symbol_count && bucket != 0 {
+                return Err(hash_error());
+            }
+            buckets.push(bucket);
+        }
+        let mut chains = Vec::new();
+        chains
+            .try_reserve_exact(chain_count as usize)
+            .map_err(|_| hash_oom())?;
+        let chain_base = 16 + maskwords as usize * word_size as usize + nbuckets as usize * 4;
+        for index in 0..chain_count as usize {
+            chains.push(read_u32(bytes, chain_base + 4 * index, endian)?);
+        }
+        // A proper GNU hash table ends the final chain with the low bit set.
+        if chain_count == 0 || chains[chain_count as usize - 1] & 1 == 0 {
+            return Err(hash_error());
+        }
+        Ok((
+            Self {
+                symndx,
+                shift2,
+                class_bits,
+                bloom: bloom.into_boxed_slice(),
+                buckets: buckets.into_boxed_slice(),
+                chains: chains.into_boxed_slice(),
+            },
+            symbol_count,
+        ))
+    }
+
+    fn bloom_may_match(&self, hash: u32) -> bool {
+        let mask = self.class_bits - 1;
+        let hash2 = hash >> self.shift2;
+        let bitmask: u64 = (1u64 << (hash & mask)) | (1u64 << (hash2 & mask));
+        let bloom_index = ((hash / self.class_bits) & ((self.bloom.len() as u32) - 1)) as usize;
+        (self.bloom[bloom_index] & bitmask) == bitmask
+    }
+
+    fn lookup(&self, name: &[u8], hash: u32, dynstr: &[u8], entries: &[SymbolEntry]) -> Option<u32> {
+        if self.buckets.is_empty() {
+            return None;
+        }
+        let bucket = self.buckets[(hash % self.buckets.len() as u32) as usize];
+        if bucket < self.symndx || !self.bloom_may_match(hash) {
+            return None;
+        }
+        let mut index = (bucket - self.symndx) as usize;
+        while index < self.chains.len() {
+            let chain = self.chains[index];
+            if chain & !1 == hash & !1 {
+                let symbol_index = self.symndx + index as u32;
+                if symbol_index < entries.len() as u32
+                    && name_matches(dynstr, &entries[symbol_index as usize], name)
+                {
+                    return Some(symbol_index);
+                }
+            }
+            if chain & 1 == 1 {
+                break;
+            }
+            index += 1;
+        }
+        None
+    }
+}
+
+/// Owned, validated `.dynstr` plus the decoded symbol entries.
+pub(crate) struct SymbolTable {
+    dynstr: Box<[u8]>,
+    entries: Box<[SymbolEntry]>,
+    gnu: Option<GnuHash>,
+    sysv: Option<SysVHash>,
+}
+
+impl SymbolTable {
+    /// An empty table for images that carry no `DT_SYMTAB`.
+    pub(crate) fn empty() -> Self {
+        Self {
+            dynstr: Box::new([]),
+            entries: Box::new([]),
+            gnu: None,
+            sysv: None,
+        }
+    }
+
+    /// Decode the dynamic symbol table.
+    ///
+    /// `symtab` holds the `DT_SYMTAB` bytes (`symbol_count * syment`), `dynstr`
+    /// the validated `DT_STRTAB` bytes. The symbol count is proven from the
+    /// hash table(s) — the two tables must agree when both are present. Every
+    /// defined symbol's `st_value`/`st_size` is checked against the load
+    /// segments, and unsupported binding/type/visibility/`st_shndx` fail closed.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn decode(
+        symtab: &[u8],
+        dynstr: Box<[u8]>,
+        class: ElfClass,
+        endian: ElfData,
+        load_bias: TargetAddress,
+        segments: &[LoadSegmentInfo],
+        thumb: bool,
+        max_symbol_name_len: u32,
+        gnu_bytes: Option<Box<[u8]>>,
+        sysv_bytes: Option<Box<[u8]>>,
+    ) -> LoadResult<Self> {
+        let syment: usize = match class {
+            ElfClass::Elf32 => 16,
+            ElfClass::Elf64 => 24,
+        };
+
+        let (gnu, gnu_count) = match gnu_bytes {
+            Some(bytes) => {
+                let (table, count) = GnuHash::parse(&bytes, endian, class)?;
+                (Some(table), count)
+            }
+            None => (None, 0),
+        };
+        let (sysv, sysv_count) = match sysv_bytes {
+            Some(bytes) => {
+                let (table, count) = SysVHash::parse(&bytes, endian)?;
+                (Some(table), count)
+            }
+            None => (None, 0),
+        };
+
+        // The count must be provable, and the two tables must agree (§7.4).
+        let symbol_count = match (gnu.as_ref(), sysv.as_ref()) {
+            (Some(_), Some(_)) => {
+                if gnu_count != sysv_count {
+                    return Err(hash_error());
+                }
+                gnu_count
+            }
+            (Some(_), None) => gnu_count,
+            (None, Some(_)) => sysv_count,
+            (None, None) => return Err(hash_error()),
+        };
+
+        let expected = u64::from(symbol_count)
+            .checked_mul(syment as u64)
+            .ok_or_else(hash_error)?;
+        if u64::try_from(symtab.len()).map_err(|_| hash_error())? != expected {
+            return Err(hash_error());
+        }
+
+        let mut entries = Vec::new();
+        entries
+            .try_reserve_exact(symbol_count as usize)
+            .map_err(|_| hash_oom())?;
+        for index in 0..symbol_count as usize {
+            let raw = &symtab[index * syment..(index + 1) * syment];
+            let entry = parse_symbol_entry(
+                raw,
+                class,
+                endian,
+                load_bias,
+                segments,
+                thumb,
+                max_symbol_name_len,
+                index as u32,
+                &dynstr,
+            )?;
+            entries.push(entry);
+        }
+
+        Ok(Self {
+            dynstr,
+            entries: entries.into_boxed_slice(),
+            gnu,
+            sysv,
+        })
+    }
+
+    #[inline]
+    pub(crate) fn symbol_count(&self) -> u32 {
+        self.entries.len() as u32
+    }
+
+    /// Total owned metadata bytes kept by this table: the `.dynstr` copy, the
+    /// decoded symbol entries, and the retained hash tables. Charged against
+    /// `max_runtime_metadata_bytes` during S4 (§7.4).
+    pub(crate) fn metadata_bytes(&self) -> u64 {
+        let dynstr = self.dynstr.len() as u64;
+        let entries = self.entries.len() as u64 * core::mem::size_of::<SymbolEntry>() as u64;
+        let sysv = self.sysv.as_ref().map_or(0, |table| {
+            (table.buckets.len() + table.chains.len()) as u64 * 4
+        });
+        let gnu = self.gnu.as_ref().map_or(0, |table| {
+            (table.bloom.len() as u64 * core::mem::size_of::<u64>() as u64)
+                + (table.buckets.len() + table.chains.len()) as u64 * 4
+        });
+        dynstr
+            .checked_add(entries)
+            .and_then(|v| v.checked_add(sysv))
+            .and_then(|v| v.checked_add(gnu))
+            .unwrap_or(u64::MAX)
+    }
+
+    #[inline]
+    pub(crate) fn entry(&self, index: u32) -> Option<&SymbolEntry> {
+        self.entries.get(index as usize)
+    }
+
+    /// The NUL-free name bytes of a symbol entry, indexed into the owned
+    /// `.dynstr`.
+    #[inline]
+    pub(crate) fn name(&self, entry: &SymbolEntry) -> &[u8] {
+        let start = entry.name_offset() as usize;
+        let end = start + entry.name_len() as usize;
+        &self.dynstr[start..end]
+    }
+
+    /// Lookup by name through the hash table fast path.
+    pub(crate) fn lookup(&self, name: &[u8]) -> Option<u32> {
+        if let Some(gnu) = &self.gnu {
+            return gnu.lookup(name, gnu_hash(name), &self.dynstr, &self.entries);
+        }
+        if let Some(sysv) = &self.sysv {
+            return sysv.lookup(name, sysv_hash(name), &self.dynstr, &self.entries);
+        }
+        self.lookup_linear(name)
+    }
+
+    /// Bounded linear scan — the oracle the hash lookup must agree with.
+    pub(crate) fn lookup_linear(&self, name: &[u8]) -> Option<u32> {
+        self.entries
+            .iter()
+            .position(|entry| name_matches(&self.dynstr, entry, name))
+            .map(|index| index as u32)
+    }
+}
+
+/// Prove the dynamic symbol count from the available hash table(s).
+///
+/// The count is never inferred from section headers or a segment tail. When
+/// both a SysV `DT_HASH` and a GNU `DT_GNU_HASH` are present their counts must
+/// agree (§7.4). This is the single source of truth the decode stage uses to
+/// size the `DT_SYMTAB` read; [`SymbolTable::decode`] re-derives the same count
+/// from the identical bytes.
+pub(crate) fn symbol_count_from_hash(
+    class: ElfClass,
+    endian: ElfData,
+    gnu_bytes: Option<&[u8]>,
+    sysv_bytes: Option<&[u8]>,
+) -> LoadResult<u32> {
+    let gnu_count = match gnu_bytes {
+        Some(bytes) => Some(GnuHash::parse(bytes, endian, class)?.1),
+        None => None,
+    };
+    let sysv_count = match sysv_bytes {
+        Some(bytes) => Some(SysVHash::parse(bytes, endian)?.1),
+        None => None,
+    };
+    match (gnu_count, sysv_count) {
+        (Some(gnu), Some(sysv)) => {
+            if gnu != sysv {
+                return Err(hash_error());
+            }
+            Ok(gnu)
+        }
+        (Some(gnu), None) => Ok(gnu),
+        (None, Some(sysv)) => Ok(sysv),
+        (None, None) => Err(hash_error()),
+    }
+}
+
+#[inline]
+fn name_matches(dynstr: &[u8], entry: &SymbolEntry, name: &[u8]) -> bool {
+    let start = entry.name_offset() as usize;
+    let end = start + entry.name_len() as usize;
+    end <= dynstr.len() && &dynstr[start..end] == name
+}
+
+#[allow(clippy::too_many_arguments)]
+fn parse_symbol_entry(
+    raw: &[u8],
+    class: ElfClass,
+    endian: ElfData,
+    load_bias: TargetAddress,
+    segments: &[LoadSegmentInfo],
+    thumb: bool,
+    max_symbol_name_len: u32,
+    index: u32,
+    dynstr: &[u8],
+) -> LoadResult<SymbolEntry> {
+    let (name_offset, value_raw, size_raw, info, other, shndx) = match class {
+        ElfClass::Elf32 => (
+            read_u32(raw, 0, endian)?,
+            u64::from(read_u32(raw, 4, endian)?),
+            u64::from(read_u32(raw, 8, endian)?),
+            raw[12],
+            raw[13],
+            read_u16(raw, 14, endian)?,
+        ),
+        ElfClass::Elf64 => (
+            read_u32(raw, 0, endian)?,
+            read_u64(raw, 8, endian)?,
+            read_u64(raw, 16, endian)?,
+            raw[4],
+            raw[5],
+            read_u16(raw, 6, endian)?,
+        ),
+    };
+
+    let binding = match info >> 4 {
+        0 => SymbolBinding::Local,
+        1 => SymbolBinding::Global,
+        2 => SymbolBinding::Weak,
+        _ => return Err(symbol_error(index, LoadErrorKind::BadElf)),
+    };
+    let symbol_type = match info & 0xf {
+        0 => SymbolType::NoType,
+        1 => SymbolType::Object,
+        2 => SymbolType::Func,
+        _ => return Err(symbol_error(index, LoadErrorKind::BadElf)),
+    };
+    let visibility = match other & 0x7 {
+        0 => SymbolVisibility::Default,
+        1 => SymbolVisibility::Internal,
+        2 => SymbolVisibility::Hidden,
+        3 => SymbolVisibility::Protected,
+        _ => return Err(symbol_error(index, LoadErrorKind::BadElf)),
+    };
+    // SHN_COMMON (0xfff2) and reserved/processor indices are unsupported.
+    let definition = match shndx {
+        0 => SymbolDefinition::Undefined,
+        0xfff1 => SymbolDefinition::Defined, // SHN_ABS: absolute, no region check
+        0xfff2 => return Err(symbol_error(index, LoadErrorKind::BadElf)),
+        1..=0xff00 => SymbolDefinition::Defined,
+        _ => return Err(symbol_error(index, LoadErrorKind::BadElf)),
+    };
+
+    let (name_offset, name_len) = scan_name(dynstr, name_offset, max_symbol_name_len, index)?;
+
+    let value = match definition {
+        SymbolDefinition::Undefined => TargetAddress::new(0),
+        SymbolDefinition::Defined => {
+            if shndx == 0xfff1 {
+                // Absolute symbol: `st_value` is already a runtime address.
+                TargetAddress::new(value_raw)
+            } else {
+                validate_symbol_region(segments, symbol_type, thumb, value_raw, size_raw, index)?;
+                // Load-bias applied; bit 0 of a Thumb function is preserved.
+                load_bias
+                    .checked_add(value_raw)
+                    .map_err(|_| symbol_error(index, LoadErrorKind::BadElf))?
+            }
+        }
+    };
+
+    Ok(SymbolEntry {
+        name_offset,
+        name_len,
+        value,
+        size: size_raw,
+        binding,
+        visibility,
+        symbol_type,
+        definition,
+    })
+}
+
+/// Scan a NUL-terminated name at `offset`, bounded by `max_symbol_name_len`.
+/// Returns `(offset, name_len)` with `name_len` excluding the terminator.
+fn scan_name(
+    dynstr: &[u8],
+    offset: u32,
+    max_symbol_name_len: u32,
+    index: u32,
+) -> LoadResult<(u32, u32)> {
+    let start = offset as usize;
+    if start >= dynstr.len() {
+        return Err(symbol_error(index, LoadErrorKind::BadElf));
+    }
+    let limit = (max_symbol_name_len as usize)
+        .checked_add(1)
+        .ok_or_else(|| symbol_error(index, LoadErrorKind::BadElf))?;
+    let tail = &dynstr[start..];
+    let scan = core::cmp::min(limit, tail.len());
+    let nul = tail[..scan]
+        .iter()
+        .position(|&byte| byte == 0)
+        .ok_or_else(|| symbol_error(index, LoadErrorKind::BadElf))?;
+    if nul > max_symbol_name_len as usize {
+        return Err(symbol_error(index, LoadErrorKind::BadElf));
+    }
+    Ok((offset, nul as u32))
+}
+
+/// A defined symbol must land in a compatible load segment: a function's
+/// canonical target in an executable region, an object/notype in a readable
+/// region, with `st_size` contained in the same segment.
+fn validate_symbol_region(
+    segments: &[LoadSegmentInfo],
+    symbol_type: SymbolType,
+    thumb: bool,
+    value_raw: u64,
+    size_raw: u64,
+    index: u32,
+) -> LoadResult<()> {
+    let canonical = if thumb && symbol_type == SymbolType::Func {
+        value_raw & !1
+    } else {
+        value_raw
+    };
+    let need_execute = symbol_type == SymbolType::Func;
+    let span = core::cmp::max(size_raw, 1);
+    let ok = segments.iter().any(|segment| {
+        let permitted = if need_execute {
+            segment.permissions().contains(MemoryPermissions::EXECUTE)
+        } else {
+            segment.permissions().contains(MemoryPermissions::READ)
+        };
+        permitted
+            && TargetRange::new(segment.vaddr(), segment.memory_size())
+                .contains_span(TargetAddress::new(canonical), span)
+    });
+    if ok {
+        Ok(())
+    } else {
+        Err(symbol_error(index, LoadErrorKind::BadElf))
+    }
+}
+
+fn symbol_error(index: u32, kind: LoadErrorKind) -> LoadError {
+    LoadError::new(
+        kind,
+        ErrorContext::Symbol {
+            image: 0,
+            index,
+            name: Box::new([]),
+        },
+    )
+}
+
+fn hash_error() -> LoadError {
+    LoadError::new(LoadErrorKind::BadElf, ErrorContext::None)
+}
+
+fn hash_oom() -> LoadError {
+    LoadError::new(LoadErrorKind::OutOfMemory, ErrorContext::None)
+}
