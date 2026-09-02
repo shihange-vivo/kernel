@@ -25,10 +25,15 @@ const PT_RISCV_ATTRIBUTES: u32 = 0x7000_0003;
 
 use crate::{
     address::{FileRange, TargetAddress, TargetRange},
+    dynamic_linker::ArtifactRole,
     elf::{DynamicSegmentInfo, ElfHeaderInfo, LoadSegmentInfo, ProgramHeaderInfo},
     error::{ErrorContext, LoadError, LoadErrorKind, LoadResult, LoadStage, ProgramHeaderField},
-    identity::{ElfMachine, LoadRequest, PHASE0_LOAD_POLICY},
-    image::inspect::{InspectedImage, StackKind},
+    identity::{ElfMachine, LoadPolicy, LoadRequest, PHASE0_LOAD_POLICY},
+    image::{
+        features::validate_dynamic_features,
+        inspect::{InspectedImage, StackKind},
+        DynamicFeatureSummary,
+    },
     reader::ElfReader,
     MemoryPermissions,
 };
@@ -38,6 +43,8 @@ pub(crate) struct AdmittedImage<R: ElfReader> {
     header: ElfHeaderInfo,
     request: LoadRequest,
     file_len: u64,
+    policy: LoadPolicy,
+    role: ArtifactRole,
 }
 
 impl<R: ElfReader> AdmittedImage<R> {
@@ -53,7 +60,27 @@ impl<R: ElfReader> AdmittedImage<R> {
             header,
             request,
             file_len,
+            policy: PHASE0_LOAD_POLICY,
+            role: ArtifactRole::ExecutableRoot,
         }
+    }
+
+    /// Override the policy used by `inspect`/`plan` and later decode. The
+    /// public `prepare_image`/`load_elf` entry stays on [`PHASE0_LOAD_POLICY`];
+    /// only the crate-internal `DynamicLinker` may pass
+    /// [`crate::identity::PHASE05_LOAD_POLICY`].
+    #[inline]
+    pub(crate) fn inspect_with_policy(mut self, policy: LoadPolicy) -> Self {
+        self.policy = policy;
+        self
+    }
+
+    /// Mark this artifact as a shared object rather than the executable root.
+    /// A shared object may have `e_entry == 0` and must provide a SONAME.
+    #[inline]
+    pub(crate) const fn with_role(mut self, role: ArtifactRole) -> Self {
+        self.role = role;
+        self
     }
 
     pub fn inspect(self) -> LoadResult<InspectedImage<R>> {
@@ -107,6 +134,18 @@ impl<R: ElfReader> AdmittedImage<R> {
                         )
                         .at_stage(LoadStage::Inspect));
                     }
+                    let permissions = permissions_from_flags(program_header.flags());
+                    if !self.policy.allows_segment_permissions(permissions) {
+                        return Err(LoadError::new(
+                            LoadErrorKind::UnsupportedByProfile,
+                            ErrorContext::ProgramHeader {
+                                index,
+                                field: ProgramHeaderField::Permissions,
+                                value: u64::from(permissions.bits()),
+                            },
+                        )
+                        .at_stage(LoadStage::Inspect));
+                    }
                     let file_range =
                         FileRange::new(program_header.file_offset(), program_header.file_size());
                     file_range
@@ -121,7 +160,7 @@ impl<R: ElfReader> AdmittedImage<R> {
                         program_header.vaddr(),
                         program_header.memory_size(),
                         program_header.align(),
-                        permissions_from_flags(program_header.flags()),
+                        permissions,
                     ));
                 }
                 PT_DYNAMIC => {
@@ -227,7 +266,7 @@ impl<R: ElfReader> AdmittedImage<R> {
                 PT_ARM_EXIDX if self.header.machine() == ElfMachine::Arm => {}
                 PT_RISCV_ATTRIBUTES if self.header.machine() == ElfMachine::Riscv => {}
                 t => {
-                    if !PHASE0_LOAD_POLICY.allows_unknown_program_headers() {
+                    if !self.policy.allows_unknown_program_headers() {
                         return Err(LoadError::new(
                             LoadErrorKind::UnsupportedByProfile,
                             ErrorContext::ProgramHeader {
@@ -241,7 +280,7 @@ impl<R: ElfReader> AdmittedImage<R> {
                 }
             }
         }
-        if !PHASE0_LOAD_POLICY.allows_executable_stack() && stack == StackKind::Executable {
+        if !self.policy.allows_executable_stack() && stack == StackKind::Executable {
             return Err(LoadError::new(
                 LoadErrorKind::UnsupportedByProfile,
                 ErrorContext::ProgramHeader {
@@ -252,7 +291,7 @@ impl<R: ElfReader> AdmittedImage<R> {
             )
             .at_stage(LoadStage::Inspect));
         }
-        if !PHASE0_LOAD_POLICY.allows_interpreter() && interpreter.is_some() {
+        if !self.policy.allows_interpreter() && interpreter.is_some() {
             return Err(LoadError::new(
                 LoadErrorKind::UnsupportedByProfile,
                 ErrorContext::ProgramHeader {
@@ -263,7 +302,7 @@ impl<R: ElfReader> AdmittedImage<R> {
             )
             .at_stage(LoadStage::Inspect));
         }
-        if !PHASE0_LOAD_POLICY.allows_tls() && tls.is_some() {
+        if !self.policy.allows_tls() && tls.is_some() {
             return Err(LoadError::new(
                 LoadErrorKind::UnsupportedByProfile,
                 ErrorContext::ProgramHeader {
@@ -275,6 +314,23 @@ impl<R: ElfReader> AdmittedImage<R> {
             .at_stage(LoadStage::Inspect));
         }
 
+        // S1 stage 2: the dynamic feature summary must be decided here, before
+        // any allocation or write. A `PT_DYNAMIC` that requests an unsupported
+        // feature is rejected while the write count is still zero.
+        let summary = match dynamic.as_ref() {
+            Some(dynamic) => validate_dynamic_features(
+                &self.reader,
+                dynamic,
+                self.policy,
+                self.role,
+                self.header.class(),
+                self.header.endian(),
+                self.request.limits(),
+            )
+            .map_err(|error| error.at_stage(LoadStage::Inspect))?,
+            None => DynamicFeatureSummary::empty(),
+        };
+
         Ok(InspectedImage::new(
             self.reader,
             self.request,
@@ -285,7 +341,10 @@ impl<R: ElfReader> AdmittedImage<R> {
             stack,
             interpreter,
             tls,
-        ))
+            summary,
+        )
+        .with_policy(self.policy)
+        .with_role(self.role))
     }
 }
 

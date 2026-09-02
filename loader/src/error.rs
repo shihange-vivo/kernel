@@ -79,6 +79,15 @@ pub enum LimitKind {
     RuntimeMetadataBytes,
     RelocationOperationBytes,
     ProtectionRangeCount,
+    ImageCount,
+    DependencyEdgeCount,
+    DependencyDepth,
+    TotalImageBytes,
+    TotalRuntimeMetadataBytes,
+    TotalRelocations,
+    SymbolLookups,
+    SymbolNameLength,
+    DependencyNameLength,
 }
 
 #[derive(Debug)]

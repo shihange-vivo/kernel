@@ -12,22 +12,14 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-mod admit;
-mod allocate;
-mod cache;
-mod decode;
-mod features;
-mod image_loader;
-mod inspect;
-mod map;
-mod plan;
-mod relocate;
-mod seal;
+//! Phase 0.5 multi-image dynamic linking (C11–C17).
+//!
+//! Only the artifact/resolver contract exists at C11-b; graph, scope and
+//! session typestate land in C12–C17.
 
-pub(crate) use decode::RelocationRecord;
-pub(crate) use features::DynamicFeatureSummary;
-pub(crate) use image_loader::{read_u16, read_u32, read_u64, ImageLoader};
-pub use seal::{
-    AppliedProtectionSet, PreparedProtectionPlan, ProtectionBatch, ProtectionCapabilities,
-    ProtectionLevel, ProtectionRecord, SealPlan, SealRange, SealedState,
+mod artifact;
+
+pub use artifact::{
+    ArtifactIdentity, ArtifactResolver, ArtifactRole, BuildId, DependencyName, DependencyRequest,
+    FileIdentity, ImageId, ImageOwnership, LinkDomainId, ResolvedArtifact,
 };

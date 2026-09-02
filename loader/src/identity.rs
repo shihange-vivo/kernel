@@ -527,6 +527,137 @@ impl LoadRequest {
     }
 }
 
+/// Session-wide resource budgets for a bounded multi-image link.
+///
+/// `LoadLimits` keeps governing each individual image; these quotas bound the
+/// aggregate session (image count, dependency graph, total metadata, symbol
+/// lookup budget). Every `Vec`/map growth must be charged here before it is
+/// `try_reserve`d. The `DEFAULT` value is a development ceiling, not a board
+/// configuration — Phase 1 supplies real limits from the board/application
+/// profile.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct SessionLimits {
+    per_image: LoadLimits,
+    max_images: u32,
+    max_dependency_edges: u32,
+    max_dependency_depth: u16,
+    max_total_image_bytes: u64,
+    max_total_runtime_metadata_bytes: u64,
+    max_total_relocations: u64,
+    max_symbol_lookups: u64,
+    max_symbol_name_len: u32,
+    max_dependency_name_len: u32,
+}
+
+impl SessionLimits {
+    pub const DEFAULT: Self = Self::new(
+        LoadLimits::DEFAULT,
+        64,
+        1024,
+        32,
+        256 * 1024 * 1024,
+        256 * 1024 * 1024,
+        8 * 1024 * 1024,
+        64 * 1024 * 1024,
+        256,
+        256,
+    );
+
+    #[inline]
+    pub const fn new(
+        per_image: LoadLimits,
+        max_images: u32,
+        max_dependency_edges: u32,
+        max_dependency_depth: u16,
+        max_total_image_bytes: u64,
+        max_total_runtime_metadata_bytes: u64,
+        max_total_relocations: u64,
+        max_symbol_lookups: u64,
+        max_symbol_name_len: u32,
+        max_dependency_name_len: u32,
+    ) -> Self {
+        Self {
+            per_image,
+            max_images,
+            max_dependency_edges,
+            max_dependency_depth,
+            max_total_image_bytes,
+            max_total_runtime_metadata_bytes,
+            max_total_relocations,
+            max_symbol_lookups,
+            max_symbol_name_len,
+            max_dependency_name_len,
+        }
+    }
+
+    #[inline]
+    pub const fn per_image(&self) -> &LoadLimits {
+        &self.per_image
+    }
+
+    pub fn check_image_count(&self, actual: u32) -> LoadResult<()> {
+        check_u32_limit(LimitKind::ImageCount, actual, self.max_images)
+    }
+
+    pub fn check_dependency_edge_count(&self, actual: u32) -> LoadResult<()> {
+        check_u32_limit(LimitKind::DependencyEdgeCount, actual, self.max_dependency_edges)
+    }
+
+    pub fn check_dependency_depth(&self, actual: u16) -> LoadResult<()> {
+        check_u32_limit(
+            LimitKind::DependencyDepth,
+            u32::from(actual),
+            u32::from(self.max_dependency_depth),
+        )
+    }
+
+    pub fn check_total_image_bytes(&self, actual: u64) -> LoadResult<()> {
+        check_limit(LimitKind::TotalImageBytes, actual, self.max_total_image_bytes)
+    }
+
+    pub fn check_total_runtime_metadata_bytes(&self, actual: u64) -> LoadResult<()> {
+        check_limit(
+            LimitKind::TotalRuntimeMetadataBytes,
+            actual,
+            self.max_total_runtime_metadata_bytes,
+        )
+    }
+
+    pub fn check_total_relocations(&self, actual: u64) -> LoadResult<()> {
+        check_limit(LimitKind::TotalRelocations, actual, self.max_total_relocations)
+    }
+
+    pub fn check_symbol_lookups(&self, actual: u64) -> LoadResult<()> {
+        check_limit(LimitKind::SymbolLookups, actual, self.max_symbol_lookups)
+    }
+
+    pub fn check_symbol_name_len(&self, actual: u32) -> LoadResult<()> {
+        check_u32_limit(LimitKind::SymbolNameLength, actual, self.max_symbol_name_len)
+    }
+
+    pub fn check_dependency_name_len(&self, actual: u32) -> LoadResult<()> {
+        check_u32_limit(
+            LimitKind::DependencyNameLength,
+            actual,
+            self.max_dependency_name_len,
+        )
+    }
+}
+
+fn check_u32_limit(resource: LimitKind, actual: u32, maximum: u32) -> LoadResult<()> {
+    if actual <= maximum {
+        return Ok(());
+    }
+    Err(LoadError::new(
+        LoadErrorKind::ResourceLimit,
+        ErrorContext::Limit {
+            resource,
+            actual: u64::from(actual),
+            maximum: u64::from(maximum),
+        },
+    ))
+}
+
 /// Loader capabilities enabled for the current implementation phase.
 ///
 /// This policy only controls optional ELF semantics. Structural checks and
@@ -581,6 +712,20 @@ impl LoadPolicy {
             allow_unknown_dynamic_tags: false,
             allowed_dynamic_flags: DF_BIND_NOW,
             allowed_dynamic_flags_1: DF_1_NOW | DF_1_PIE,
+        }
+    }
+
+    /// Phase 0.5 multi-image policy. It differs from [`Self::phase0`] only in
+    /// the three switches that have a real consumer in the `DynamicLinker`
+    /// (`DT_NEEDED`, `DT_JMPREL/DT_PLTREL`, lifecycle arrays); everything else
+    /// stays fail-closed so an unsupported feature is never silently accepted.
+    #[inline]
+    const fn phase05() -> Self {
+        Self {
+            allow_needed: true,
+            allow_plt_relocations: true,
+            allow_lifecycle: true,
+            ..Self::phase0()
         }
     }
 
@@ -664,3 +809,4 @@ impl LoadPolicy {
 }
 
 pub(crate) const PHASE0_LOAD_POLICY: LoadPolicy = LoadPolicy::phase0();
+pub(crate) const PHASE05_LOAD_POLICY: LoadPolicy = LoadPolicy::phase05();
