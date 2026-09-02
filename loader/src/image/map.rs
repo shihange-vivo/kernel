@@ -36,7 +36,7 @@ use crate::{
         inspect::StackKind,
         read_u32, read_u64,
     },
-    memory::{AllocationOffset, ImageMemory},
+    memory::{AllocationOffset, ImageLoadTransaction, ImageMemory},
     reader::ElfReader,
 };
 
@@ -84,9 +84,10 @@ impl LoadedRegion {
     }
 }
 
+#[must_use = "dropping a mapped image aborts its allocation"]
 pub(crate) struct MappedImage<R: ElfReader, M: ImageMemory> {
     reader: R,
-    memory: M,
+    transaction: ImageLoadTransaction<M>,
     load_bias: TargetAddress,
     request: LoadRequest,
     entry_vaddr: TargetAddress,
@@ -104,7 +105,7 @@ impl<R: ElfReader, M: ImageMemory> MappedImage<R, M> {
     #[inline]
     pub fn new(
         reader: R,
-        memory: M,
+        transaction: ImageLoadTransaction<M>,
         load_bias: TargetAddress,
         request: LoadRequest,
         entry_vaddr: TargetAddress,
@@ -119,7 +120,7 @@ impl<R: ElfReader, M: ImageMemory> MappedImage<R, M> {
     ) -> Self {
         Self {
             reader,
-            memory,
+            transaction,
             load_bias,
             request,
             entry_vaddr,
@@ -198,7 +199,9 @@ impl<R: ElfReader, M: ImageMemory> MappedImage<R, M> {
             return Err(dynamic_error(DT_NULL, dynamic.file_range().len()));
         }
         let offset = self.locate_file_backed_dynamic(dynamic)?;
-        self.memory.image_span(offset, dynamic.file_range().len())?;
+        self.transaction
+            .memory()
+            .image_span(offset, dynamic.file_range().len())?;
 
         let limits = self.request.limits();
         let entry_count = dynamic.file_range().len() / entry_size;
@@ -217,7 +220,9 @@ impl<R: ElfReader, M: ImageMemory> MappedImage<R, M> {
                         },
                     )
                 })?)?;
-            self.memory.read(current, &mut raw[..entry_size as usize])?;
+            self.transaction
+                .memory()
+                .read(current, &mut raw[..entry_size as usize])?;
             let (tag, value) = decode_dynamic_entry(
                 &raw[..entry_size as usize],
                 self.request.profile().class(),
@@ -277,11 +282,12 @@ impl<R: ElfReader, M: ImageMemory> MappedImage<R, M> {
         }
         let table_vaddr = TargetAddress::new(address);
         let offset = self.locate_vaddr_at(table_vaddr, byte_len)?;
-        self.memory.image_span(offset, byte_len)?;
+        self.transaction.memory().image_span(offset, byte_len)?;
         let mut raw = [0; 24];
         for index in 0..count {
             let entry_offset = offset.checked_add(index * entry_size)?;
-            self.memory
+            self.transaction
+                .memory()
                 .read(entry_offset, &mut raw[..entry_size as usize])?;
             let record = decode_relocation_entry(
                 &raw[..entry_size as usize],
@@ -311,7 +317,7 @@ impl<R: ElfReader, M: ImageMemory> MappedImage<R, M> {
 
         Ok(DecodedImage::new(
             self.reader,
-            self.memory,
+            self.transaction,
             self.load_bias,
             self.request,
             self.entry_vaddr,

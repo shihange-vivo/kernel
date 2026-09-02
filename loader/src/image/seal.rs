@@ -18,12 +18,12 @@ use crate::{
     address::{FileRange, TargetAddress, TargetRange},
     cache::CacheSyncOutcome,
     elf::{DynamicSegmentInfo, LoadSegmentInfo},
-    error::{
-        ErrorContext, LimitKind, LoadError, LoadErrorKind, LoadResult, ProgramHeaderField,
-    },
+    error::{ErrorContext, LimitKind, LoadError, LoadErrorKind, LoadResult, ProgramHeaderField},
     identity::{ElfClass, LoadRequest},
     image::{inspect::StackKind, map::LoadedRegion, RelocationRecord},
-    memory::{AllocationOffset, ImageAllocation, ImageMemory, ImageProtectionMemory},
+    memory::{
+        AllocationOffset, ImageAllocation, ImageLoadTransaction, ImageMemory, ImageProtectionMemory,
+    },
     reader::ElfReader,
     MemoryPermissions,
 };
@@ -415,9 +415,62 @@ impl AppliedProtectionSet {
     }
 }
 
+/// The sealed, unpublished payload validated by a commit backend.
+///
+/// This value carries no allocation authority by itself. In the public API it
+/// is always kept private inside `PreparedImage`/`ReadyImageCommit` until the
+/// same transaction transfers its unique lease to the committed owner.
+#[derive(Debug)]
+pub struct SealedState {
+    load_bias: TargetAddress,
+    runtime_entry: TargetAddress,
+    canonical_entry: TargetAddress,
+    cache_sync: CacheSyncOutcome,
+    seal_plan: SealPlan,
+    protections: AppliedProtectionSet,
+}
+
+impl SealedState {
+    #[inline]
+    pub const fn load_bias(&self) -> TargetAddress {
+        self.load_bias
+    }
+
+    #[inline]
+    pub const fn entry(&self) -> TargetAddress {
+        self.runtime_entry
+    }
+
+    #[inline]
+    pub const fn canonical_entry(&self) -> TargetAddress {
+        self.canonical_entry
+    }
+
+    #[inline]
+    pub const fn cache_sync(&self) -> &CacheSyncOutcome {
+        &self.cache_sync
+    }
+
+    #[inline]
+    pub const fn seal_plan(&self) -> &SealPlan {
+        &self.seal_plan
+    }
+
+    #[inline]
+    pub const fn protections(&self) -> &AppliedProtectionSet {
+        &self.protections
+    }
+
+    #[inline]
+    pub fn protection(&self) -> ProtectionLevel {
+        self.protections.level()
+    }
+}
+
+#[must_use = "dropping a sealed image aborts its allocation"]
 pub(crate) struct SealedImage<R: ElfReader, M: ImageMemory> {
     reader: R,
-    memory: M,
+    transaction: ImageLoadTransaction<M>,
     load_bias: TargetAddress,
     request: LoadRequest,
     entry_vaddr: TargetAddress,
@@ -439,7 +492,7 @@ impl<R: ElfReader, M: ImageMemory> SealedImage<R, M> {
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
         reader: R,
-        memory: M,
+        transaction: ImageLoadTransaction<M>,
         load_bias: TargetAddress,
         request: LoadRequest,
         entry_vaddr: TargetAddress,
@@ -458,7 +511,7 @@ impl<R: ElfReader, M: ImageMemory> SealedImage<R, M> {
     ) -> Self {
         Self {
             reader,
-            memory,
+            transaction,
             load_bias,
             request,
             entry_vaddr,
@@ -497,23 +550,27 @@ impl<R: ElfReader, M: ImageMemory> SealedImage<R, M> {
         self.protections.level()
     }
 
-    pub(crate) fn into_prepared_parts(
-        self,
-    ) -> (
-        M,
-        TargetAddress,
-        TargetAddress,
-        CacheSyncOutcome,
-        SealPlan,
-        AppliedProtectionSet,
-    ) {
+    pub(crate) fn into_prepared_parts(self) -> (ImageLoadTransaction<M>, SealedState) {
+        let Self {
+            transaction,
+            load_bias,
+            entry_vaddr,
+            canonical_entry_vaddr,
+            cache_sync,
+            seal_plan,
+            protections,
+            ..
+        } = self;
         (
-            self.memory,
-            self.load_bias,
-            self.entry_vaddr,
-            self.cache_sync,
-            self.seal_plan,
-            self.protections,
+            transaction,
+            SealedState {
+                load_bias,
+                runtime_entry: entry_vaddr,
+                canonical_entry: canonical_entry_vaddr,
+                cache_sync,
+                seal_plan,
+                protections,
+            },
         )
     }
 }

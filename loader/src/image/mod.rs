@@ -27,5 +27,5 @@ pub(crate) use decode::RelocationRecord;
 pub(crate) use image_loader::{read_u16, read_u32, read_u64, ImageLoader};
 pub use seal::{
     AppliedProtectionSet, PreparedProtectionPlan, ProtectionBatch, ProtectionCapabilities,
-    ProtectionLevel, ProtectionRecord, SealPlan, SealRange,
+    ProtectionLevel, ProtectionRecord, SealPlan, SealRange, SealedState,
 };

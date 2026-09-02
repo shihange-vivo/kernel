@@ -30,6 +30,7 @@ pub enum LoadStage {
     Relocate,
     Cache,
     Seal,
+    Publish,
 }
 
 #[derive(Clone, Copy, Debug)]

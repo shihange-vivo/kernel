@@ -23,15 +23,16 @@ use crate::{
         inspect::StackKind,
         map::{LoadedRegion, MappedImage},
     },
-    memory::{AllocationOffset, ImageMemory},
+    memory::{AllocationOffset, ImageLoadTransaction, ImageMemory},
     reader::ElfReader,
 };
 
 const COPY_BUFFER_SIZE: usize = 512;
 
+#[must_use = "dropping a reserved image aborts its allocation"]
 pub(crate) struct AllocatedImage<R: ElfReader, M: ImageMemory> {
     reader: R,
-    memory: M,
+    transaction: ImageLoadTransaction<M>,
     aligned_min_vaddr: TargetAddress,
     aligned_max_vaddr: TargetAddress,
     max_align: u64,
@@ -51,7 +52,7 @@ impl<R: ElfReader, M: ImageMemory> AllocatedImage<R, M> {
     #[inline]
     pub fn new(
         reader: R,
-        memory: M,
+        transaction: ImageLoadTransaction<M>,
         aligned_min_vaddr: TargetAddress,
         aligned_max_vaddr: TargetAddress,
         max_align: u64,
@@ -68,7 +69,7 @@ impl<R: ElfReader, M: ImageMemory> AllocatedImage<R, M> {
     ) -> Self {
         Self {
             reader,
-            memory,
+            transaction,
             aligned_min_vaddr,
             aligned_max_vaddr,
             max_align,
@@ -148,7 +149,9 @@ impl<R: ElfReader, M: ImageMemory> AllocatedImage<R, M> {
                         &mut scratch[..chunk_len],
                     )
                     .map_err(|error| error.at_stage(LoadStage::Map))?;
-                self.memory
+                self.transaction.mark_bytes_modified();
+                self.transaction
+                    .memory_mut()
                     .write(
                         region
                             .allocation_offset()
@@ -177,13 +180,17 @@ impl<R: ElfReader, M: ImageMemory> AllocatedImage<R, M> {
             let bss_offset = offset
                 .checked_add(region.file_range().len())
                 .map_err(|error| error.at_stage(LoadStage::Map))?;
-            self.memory
-                .zero(bss_offset, bss_len)
-                .map_err(|error| error.at_stage(LoadStage::Map))?;
+            if bss_len != 0 {
+                self.transaction.mark_bytes_modified();
+                self.transaction
+                    .memory_mut()
+                    .zero(bss_offset, bss_len)
+                    .map_err(|error| error.at_stage(LoadStage::Map))?;
+            }
         }
         Ok(MappedImage::new(
             self.reader,
-            self.memory,
+            self.transaction,
             self.load_bias,
             self.request,
             entry,

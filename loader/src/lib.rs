@@ -50,10 +50,11 @@ pub use error::{
 pub use identity::{ElfClass, ElfData, ElfMachine, ElfType, LoadLimits, LoadProfile, LoadRequest};
 pub use image::{
     AppliedProtectionSet, PreparedProtectionPlan, ProtectionBatch, ProtectionCapabilities,
-    ProtectionLevel, ProtectionRecord, SealPlan, SealRange,
+    ProtectionLevel, ProtectionRecord, SealPlan, SealRange, SealedState,
 };
 pub use memory::{
-    AllocationOffset, AllocationRequest, ImageAllocation, ImageMemory, ImageProtectionMemory,
+    AllocationId, AllocationLease, AllocationOffset, AllocationOwnership, AllocationRequest,
+    ImageAllocation, ImageCommitMemory, ImageMemory, ImageProtectionMemory, MutationProgress,
     Placement,
 };
 pub use memory_mapper::{MemoryMapper, MemoryPermissions, MemoryRegion};
@@ -68,46 +69,50 @@ pub type Result = core::result::Result<(), &'static str>;
 /// A fully mapped, relocated, cache-synchronized and sealed image that has
 /// not yet been published by the kernel.
 ///
-/// The memory backend remains owned by the caller. This value only carries
-/// the validated result needed by the kernel's install/commit path.
-#[derive(Debug)]
-pub struct PreparedImage {
-    load_bias: TargetAddress,
-    runtime_entry: TargetAddress,
-    cache_sync: CacheSyncOutcome,
-    seal_plan: SealPlan,
-    protections: AppliedProtectionSet,
+/// This value exclusively borrows the memory backend and keeps the unique
+/// allocation lease armed. Dropping it aborts the image; successful
+/// publication must go through `prepare_commit()` and `ReadyImageCommit`.
+#[must_use = "dropping a prepared image aborts its allocation"]
+pub struct PreparedImage<'m, M: ImageMemory + ?Sized> {
+    transaction: memory::ImageLoadTransaction<&'m mut M>,
+    sealed: SealedState,
 }
 
-impl PreparedImage {
-    #[inline]
-    pub const fn load_bias(&self) -> TargetAddress {
-        self.load_bias
+impl<'m, M: ImageCommitMemory + ?Sized> PreparedImage<'m, M> {
+    pub fn prepare_commit(mut self) -> LoadResult<ReadyImageCommit<'m, M>> {
+        let allocation = *self.transaction.allocation();
+        let install = (**self.transaction.memory_mut())
+            .prepare_install(&allocation, &self.sealed)
+            .map_err(|error| error.at_stage(LoadStage::Publish))?;
+        Ok(ReadyImageCommit {
+            transaction: self.transaction,
+            sealed: self.sealed,
+            install,
+        })
     }
+}
 
-    #[inline]
-    pub const fn runtime_entry(&self) -> TargetAddress {
-        self.runtime_entry
-    }
+#[must_use = "dropping a ready image commit still aborts its allocation"]
+pub struct ReadyImageCommit<'m, M: ImageCommitMemory + ?Sized> {
+    transaction: memory::ImageLoadTransaction<&'m mut M>,
+    sealed: SealedState,
+    install: M::PreparedInstall,
+}
 
-    #[inline]
-    pub const fn cache_sync(&self) -> &CacheSyncOutcome {
-        &self.cache_sync
-    }
-
-    #[inline]
-    pub const fn seal_plan(&self) -> &SealPlan {
-        &self.seal_plan
-    }
-
-    #[inline]
-    pub const fn protections(&self) -> &AppliedProtectionSet {
-        &self.protections
-    }
-
-    #[inline]
-    pub fn protection(&self) -> ProtectionLevel {
-        self.protections.level()
+impl<M: ImageCommitMemory + ?Sized> ReadyImageCommit<'_, M> {
+    /// Atomically installs the already prepared state and transfers the
+    /// allocation lease into the backend's committed owner.
+    pub fn commit(self) -> M::CommitReceipt {
+        let Self {
+            mut transaction,
+            sealed,
+            install,
+        } = self;
+        let lease = transaction.take_lease();
+        // SAFETY: all three values were produced by this transaction and its
+        // same exclusively borrowed backend. `prepare_install` completed all
+        // fallible work before the lease was disarmed.
+        unsafe { (**transaction.memory_mut()).commit_install(install, sealed, lease) }
     }
 }
 
@@ -116,15 +121,16 @@ impl PreparedImage {
 ///
 /// Unlike the compatibility [`load_elf`] entry point, this function never
 /// derives a trusted profile from the artifact and never takes ownership of
-/// the memory backend. On either success or failure, `memory` remains owned
-/// by the caller.
-pub fn prepare_image<R, M, C, A>(
+/// the memory backend. On success the returned `PreparedImage` keeps an
+/// exclusive borrow until it is committed or dropped; on failure the same
+/// transaction aborts any allocation before returning the borrow.
+pub fn prepare_image<'m, R, M, C, A>(
     reader: R,
     request: LoadRequest,
-    memory: &mut M,
+    memory: &'m mut M,
     cache: &mut C,
     relocator: &A,
-) -> LoadResult<PreparedImage>
+) -> LoadResult<PreparedImage<'m, M>>
 where
     R: ElfReader,
     M: ImageProtectionMemory + ?Sized,
@@ -150,14 +156,10 @@ where
         .relocation(relocator)?
         .cache(cache)?
         .seal()?;
-    let (_memory, load_bias, runtime_entry, cache_sync, seal_plan, protections) =
-        sealed.into_prepared_parts();
+    let (transaction, sealed) = sealed.into_prepared_parts();
     Ok(PreparedImage {
-        load_bias,
-        runtime_entry,
-        cache_sync,
-        seal_plan,
-        protections,
+        transaction,
+        sealed,
     })
 }
 
@@ -201,7 +203,7 @@ fn expected_type_for(mapper: &MemoryMapper) -> core::result::Result<ElfType, &'s
 
 fn compatibility_error(error: LoadError) -> &'static str {
     match error.stage() {
-        Some(error::LoadStage::Beginning) => "Request conflicts wtih relocator",
+        Some(error::LoadStage::Beginning) => "Request conflicts with relocator",
         Some(error::LoadStage::Admit) => "Unable to admit ELF image",
         Some(error::LoadStage::Inspect) => "Unable to inspect ELF image",
         Some(error::LoadStage::Plan) => "Unable to plan ELF image",
@@ -211,6 +213,7 @@ fn compatibility_error(error: LoadError) -> &'static str {
         Some(error::LoadStage::Relocate) => "Unable to relocate ELF image",
         Some(error::LoadStage::Cache) => "Unable to synchronize ELF image",
         Some(error::LoadStage::Seal) => "Unable to seal ELF image",
+        Some(error::LoadStage::Publish) => "Unable to publish ELF image",
         None => "Unable to load ELF image",
     }
 }
@@ -247,10 +250,10 @@ pub fn load_elf_from_reader<R: ElfReader>(reader: R, mapper: &mut MemoryMapper) 
     }
     .map_err(compatibility_error)?;
 
-    mapper
-        .install_loaded_image(prepared.load_bias(), prepared.runtime_entry())
-        .map_err(compatibility_error)?;
-    mapper.real_entry()?;
+    let _receipt = prepared
+        .prepare_commit()
+        .map_err(compatibility_error)?
+        .commit();
     Ok(())
 }
 

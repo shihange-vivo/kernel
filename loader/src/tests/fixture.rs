@@ -21,7 +21,10 @@ use goblin::{
     elf32, elf64,
 };
 
-use crate::memory::{AllocationRequest, ImageAllocation, ImageMemory, Placement};
+use crate::memory::{
+    AllocationId, AllocationLease, AllocationOwnership, AllocationRequest, ImageAllocation,
+    ImageMemory, MutationProgress, Placement,
+};
 
 pub struct ElfFixtureBuilder {
     bytes: Vec<u8>,
@@ -138,15 +141,31 @@ impl RecordingMemory {
 }
 
 impl ImageMemory for RecordingMemory {
-    fn allocate_image(&mut self, request: AllocationRequest) -> crate::error::LoadResult<()> {
-        let base = match request.placement() {
-            Placement::Fixed(range) => range.start(),
-            Placement::Anywhere => crate::address::TargetAddress::new(0x1_0000),
+    fn allocate_image(
+        &mut self,
+        request: AllocationRequest,
+    ) -> crate::error::LoadResult<AllocationLease> {
+        let (base, ownership) = match request.placement() {
+            Placement::Fixed(range) => (range.start(), AllocationOwnership::BorrowedFixed),
+            Placement::Anywhere => (
+                crate::address::TargetAddress::new(0x1_0000),
+                AllocationOwnership::Owned,
+            ),
         };
-        self.allocation = ImageAllocation::new(base, request.size(), request.align());
+        self.allocation = ImageAllocation::with_identity(
+            AllocationId::new(1),
+            base,
+            request.size(),
+            request.align(),
+            ownership,
+        );
         *self.sink.borrow_mut() = Some(request);
-        Ok(())
+        Ok(AllocationLease::new(self.allocation))
     }
+
+    fn abort_image(&mut self, _allocation: AllocationLease, _progress: MutationProgress) {}
+
+    fn release_committed(&mut self, _allocation: AllocationLease) {}
 
     fn allocation(&self) -> crate::error::LoadResult<&ImageAllocation> {
         Ok(&self.allocation)

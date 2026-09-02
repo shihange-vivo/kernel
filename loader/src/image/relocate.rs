@@ -21,13 +21,14 @@ use crate::{
     error::{ErrorContext, LoadError, LoadErrorKind, LoadResult, LoadStage},
     identity::LoadRequest,
     image::{cache::CachedImage, decode::RelocationRecord, inspect::StackKind, map::LoadedRegion},
-    memory::ImageMemory,
+    memory::{ImageLoadTransaction, ImageMemory},
     reader::ElfReader,
 };
 
+#[must_use = "dropping a relocated image aborts its allocation"]
 pub(crate) struct RelocatedImage<R: ElfReader, M: ImageMemory> {
     reader: R,
-    memory: M,
+    transaction: ImageLoadTransaction<M>,
     load_bias: TargetAddress,
     request: LoadRequest,
     entry_vaddr: TargetAddress,
@@ -46,7 +47,7 @@ impl<R: ElfReader, M: ImageMemory> RelocatedImage<R, M> {
     #[inline]
     pub fn new(
         reader: R,
-        memory: M,
+        transaction: ImageLoadTransaction<M>,
         load_bias: TargetAddress,
         request: LoadRequest,
         entry_vaddr: TargetAddress,
@@ -62,7 +63,7 @@ impl<R: ElfReader, M: ImageMemory> RelocatedImage<R, M> {
     ) -> Self {
         Self {
             reader,
-            memory,
+            transaction,
             load_bias,
             request,
             entry_vaddr,
@@ -142,7 +143,7 @@ impl<R: ElfReader, M: ImageMemory> RelocatedImage<R, M> {
 
         Ok(CachedImage::new(
             self.reader,
-            self.memory,
+            self.transaction,
             self.load_bias,
             self.request,
             self.entry_vaddr,
