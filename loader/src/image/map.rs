@@ -180,7 +180,7 @@ impl<R: ElfReader, M: ImageMemory> MappedImage<R, M> {
         ))
     }
 
-    fn decode_dynamic_tags(&self) -> LoadResult<DynamicTags> {
+    fn decode_dynamic_tags(&self, policy: LoadPolicy) -> LoadResult<DynamicTags> {
         let dynamic = self.dynamic.as_ref().unwrap();
         let entry_size = dynamic_entry_size(self.request.profile().class());
 
@@ -222,7 +222,7 @@ impl<R: ElfReader, M: ImageMemory> MappedImage<R, M> {
                 terminated = true;
                 break;
             }
-            accept_dynamic_tag(&PHASE0_LOAD_POLICY, &mut tags, tag, value)?;
+            accept_dynamic_tag(&policy, &mut tags, tag, value)?;
         }
         if !terminated {
             return Err(dynamic_error(DT_NULL, dynamic.file_range().len()));
@@ -292,11 +292,22 @@ impl<R: ElfReader, M: ImageMemory> MappedImage<R, M> {
         Ok(())
     }
 
-    pub fn decode(mut self) -> LoadResult<DecodedImage<R, M>> {
+    pub fn decode(self) -> LoadResult<DecodedImage<R, M>> {
+        self.decode_inner(PHASE0_LOAD_POLICY)
+    }
+
+    /// Decode with an explicit policy. The public image pipeline stays fixed
+    /// to [`PHASE0_LOAD_POLICY`]; the crate-internal `DynamicLinker` passes
+    /// [`crate::identity::PHASE05_LOAD_POLICY`] here.
+    pub(crate) fn decode_with_policy(self, policy: LoadPolicy) -> LoadResult<DecodedImage<R, M>> {
+        self.decode_inner(policy)
+    }
+
+    fn decode_inner(mut self, policy: LoadPolicy) -> LoadResult<DecodedImage<R, M>> {
         let mut relocations = Vec::new();
         if let Some(dynamic) = self.dynamic.as_ref() {
             let tags = self
-                .decode_dynamic_tags()
+                .decode_dynamic_tags(policy)
                 .map_err(|error| error.at_stage(LoadStage::Decode))?;
             self.decode_relocation_table(tags.rel(), RelocationTableKind::Rel, &mut relocations)
                 .map_err(|error| error.at_stage(LoadStage::Decode))?;
@@ -339,7 +350,7 @@ const fn relocation_entry_size(class: ElfClass, kind: RelocationTableKind) -> u6
     }
 }
 
-fn decode_dynamic_entry(bytes: &[u8], class: ElfClass, endian: ElfData) -> LoadResult<(u64, u64)> {
+pub(crate) fn decode_dynamic_entry(bytes: &[u8], class: ElfClass, endian: ElfData) -> LoadResult<(u64, u64)> {
     Ok(match class {
         ElfClass::Elf32 => (
             u64::from(read_u32(bytes, 0, endian)?),
@@ -417,14 +428,14 @@ fn accept_dynamic_tag(
     }
 }
 
-fn dynamic_error(tag: u64, value: u64) -> LoadError {
+pub(crate) fn dynamic_error(tag: u64, value: u64) -> LoadError {
     LoadError::new(
         LoadErrorKind::BadElf,
         ErrorContext::DynamicTag { tag, value },
     )
 }
 
-fn unsupported_dynamic(tag: u64, value: u64) -> LoadError {
+pub(crate) fn unsupported_dynamic(tag: u64, value: u64) -> LoadError {
     LoadError::new(
         LoadErrorKind::UnsupportedByProfile,
         ErrorContext::DynamicTag { tag, value },

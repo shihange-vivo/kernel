@@ -20,6 +20,7 @@ extern crate alloc;
 
 mod address;
 mod cache;
+mod dynamic_linker;
 mod elf;
 mod error;
 mod identity;
@@ -43,13 +44,17 @@ pub use cache::{
     CacheMaintenance, CacheRequirements, CacheSyncOutcome, CodeCache, ExecutionScope,
     PreparedCacheSync,
 };
+pub use dynamic_linker::{
+    ArtifactIdentity, ArtifactResolver, ArtifactRole, BuildId, DependencyName, DependencyRequest,
+    FileIdentity, ImageId, ImageOwnership, LinkDomainId, ResolvedArtifact,
+};
 pub use error::{
     ErrorContext, HeaderField, LimitKind, LoadError, LoadErrorKind, LoadResult, LoadStage,
     ProgramHeaderField,
 };
 pub use identity::{
     ElfClass, ElfData, ElfMachine, ElfType, EntryMode, HeaderFlagsPolicy, LoadLimits, LoadProfile,
-    LoadRequest,
+    LoadRequest, SessionLimits,
 };
 pub use image::{
     AppliedProtectionSet, PreparedProtectionPlan, ProtectionBatch, ProtectionCapabilities,
