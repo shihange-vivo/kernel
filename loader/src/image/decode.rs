@@ -20,7 +20,7 @@ use crate::{
     error::{ErrorContext, HeaderField, LoadError, LoadErrorKind, LoadResult, LoadStage},
     identity::LoadRequest,
     image::{inspect::StackKind, map::LoadedRegion, relocate::RelocatedImage},
-    memory::{AllocationOffset, ImageAllocation, ImageMemory},
+    memory::{AllocationOffset, ImageAllocation, ImageLoadTransaction, ImageMemory},
     reader::ElfReader,
     relocation::{AddendEncoding, ArchRelocator, RelocationOperation, TargetWord, WordWidth},
 };
@@ -76,9 +76,10 @@ impl RelocationRecord {
     }
 }
 
+#[must_use = "dropping a decoded image aborts its allocation"]
 pub(crate) struct DecodedImage<R: ElfReader, M: ImageMemory> {
     reader: R,
-    memory: M,
+    transaction: ImageLoadTransaction<M>,
     load_bias: TargetAddress,
     request: LoadRequest,
     entry_vaddr: TargetAddress,
@@ -97,7 +98,7 @@ impl<R: ElfReader, M: ImageMemory> DecodedImage<R, M> {
     #[inline]
     pub fn new(
         reader: R,
-        memory: M,
+        transaction: ImageLoadTransaction<M>,
         load_bias: TargetAddress,
         request: LoadRequest,
         entry_vaddr: TargetAddress,
@@ -113,7 +114,7 @@ impl<R: ElfReader, M: ImageMemory> DecodedImage<R, M> {
     ) -> Self {
         Self {
             reader,
-            memory,
+            transaction,
             load_bias,
             request,
             entry_vaddr,
@@ -183,7 +184,7 @@ impl<R: ElfReader, M: ImageMemory> DecodedImage<R, M> {
                 let offset = self
                     .locate_vaddr_at(record.offset(), target_word.width().bytes())
                     .map_err(|_| relocation_error(record, LoadErrorKind::OutOfBounds))?;
-                i128::from(target_word.read(&self.memory, offset)?)
+                i128::from(target_word.read(self.transaction.memory(), offset)?)
             }
             _ => {
                 return Err(relocation_error(
@@ -252,13 +253,18 @@ impl<R: ElfReader, M: ImageMemory> DecodedImage<R, M> {
             }
         }
         for operation in operations {
+            self.transaction.mark_bytes_modified();
             target_word
-                .write(&mut self.memory, operation.offset(), operation.value())
+                .write(
+                    self.transaction.memory_mut(),
+                    operation.offset(),
+                    operation.value(),
+                )
                 .map_err(|error| error.at_stage(LoadStage::Relocate))?;
         }
         Ok(RelocatedImage::new(
             self.reader,
-            self.memory,
+            self.transaction,
             self.load_bias,
             self.request,
             self.entry_vaddr,

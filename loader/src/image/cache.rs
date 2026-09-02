@@ -28,13 +28,14 @@ use crate::{
         },
         RelocationRecord,
     },
-    memory::{ImageMemory, ImageProtectionMemory},
+    memory::{ImageLoadTransaction, ImageMemory, ImageProtectionMemory},
     reader::ElfReader,
 };
 
+#[must_use = "dropping a cache-synchronized image aborts its allocation"]
 pub(crate) struct CachedImage<R: ElfReader, M: ImageMemory> {
     reader: R,
-    memory: M,
+    transaction: ImageLoadTransaction<M>,
     load_bias: TargetAddress,
     request: LoadRequest,
     entry_vaddr: TargetAddress,
@@ -54,7 +55,7 @@ impl<R: ElfReader, M: ImageMemory> CachedImage<R, M> {
     #[inline]
     pub fn new(
         reader: R,
-        memory: M,
+        transaction: ImageLoadTransaction<M>,
         load_bias: TargetAddress,
         request: LoadRequest,
         entry_vaddr: TargetAddress,
@@ -71,7 +72,7 @@ impl<R: ElfReader, M: ImageMemory> CachedImage<R, M> {
     ) -> Self {
         Self {
             reader,
-            memory,
+            transaction,
             load_bias,
             request,
             entry_vaddr,
@@ -97,10 +98,7 @@ impl<R: ElfReader, M: ImageMemory> CachedImage<R, M> {
     where
         M: ImageProtectionMemory,
     {
-        let allocation = *self
-            .memory
-            .allocation()
-            .map_err(|error| error.at_stage(LoadStage::Seal))?;
+        let allocation = *self.transaction.allocation();
         let seal_plan = SealPlan::build(
             &allocation,
             self.load_bias,
@@ -112,17 +110,20 @@ impl<R: ElfReader, M: ImageMemory> CachedImage<R, M> {
             &self.relocations,
         )
         .map_err(|error| error.at_stage(LoadStage::Seal))?;
-        let prepared = PreparedProtectionPlan::prepare(&self.memory, &allocation, &seal_plan)
-            .map_err(|error| error.at_stage(LoadStage::Seal))?;
+        let prepared =
+            PreparedProtectionPlan::prepare(self.transaction.memory(), &allocation, &seal_plan)
+                .map_err(|error| error.at_stage(LoadStage::Seal))?;
         let mut protection_records = prepared.into_ranges();
-        self.memory
+        self.transaction.mark_protection_modified();
+        self.transaction
+            .memory_mut()
             .apply_protection(ProtectionBatch::new(&mut protection_records))
             .map_err(|error| error.at_stage(LoadStage::Seal))?;
         let protections = AppliedProtectionSet::new(protection_records);
 
         Ok(SealedImage::new(
             self.reader,
-            self.memory,
+            self.transaction,
             self.load_bias,
             self.request,
             self.entry_vaddr,

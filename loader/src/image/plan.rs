@@ -20,7 +20,7 @@ use crate::{
     error::{ErrorContext, LoadError, LoadErrorKind, LoadResult, LoadStage},
     identity::{ElfClass, ElfType, LoadRequest},
     image::{allocate::AllocatedImage, inspect::StackKind},
-    memory::{AllocationRequest, ImageAllocation, ImageMemory, Placement},
+    memory::{AllocationRequest, ImageAllocation, ImageLoadTransaction, ImageMemory, Placement},
     reader::ElfReader,
 };
 
@@ -125,21 +125,25 @@ impl<R: ElfReader> PlannedImage<R> {
         let at_allocate = |error: LoadError| error.at_stage(LoadStage::Allocate);
 
         let request = self.allocation_request().map_err(at_allocate)?;
-        memory.allocate_image(request).map_err(at_allocate)?;
+        let lease = memory.allocate_image(request).map_err(at_allocate)?;
+        let transaction = ImageLoadTransaction::new(memory, lease);
 
-        let allocation = memory.allocation().map_err(at_allocate)?;
-
-        validate_allocation(allocation, &request, self.request.profile().class())
-            .map_err(at_allocate)?;
+        validate_allocation(
+            transaction.allocation(),
+            &request,
+            self.request.profile().class(),
+        )
+        .map_err(at_allocate)?;
         let load_bias = TargetAddress::new(
-            allocation
+            transaction
+                .allocation()
                 .base()
                 .checked_sub(self.aligned_min_vaddr)
                 .map_err(at_allocate)?,
         );
         Ok(AllocatedImage::new(
             self.reader,
-            memory,
+            transaction,
             self.aligned_min_vaddr,
             self.aligned_max_vaddr,
             self.max_align,
