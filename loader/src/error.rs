@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use alloc::boxed::Box;
 use core::fmt::Debug;
 
 use crate::address::TargetAddress;
@@ -31,6 +32,10 @@ pub enum LoadStage {
     Cache,
     Seal,
     Publish,
+    Discover,
+    Scope,
+    LinkRelocate,
+    LinkSeal,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -43,6 +48,7 @@ pub enum LoadErrorKind {
     OutOfMemory,
     InvalidAlignment,
     PermissionConflict,
+    IdentityConflict,
     Backend,
     Io,
     SourceChanged,
@@ -151,6 +157,10 @@ pub enum ErrorContext {
         offset: TargetAddress,
         raw_type: u32,
         symbol_index: u32,
+    },
+    Dependency {
+        requester: u32,
+        needed: Box<[u8]>,
     },
     Limit {
         resource: LimitKind,

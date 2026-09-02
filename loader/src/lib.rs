@@ -250,6 +250,10 @@ fn compatibility_error(error: LoadError) -> &'static str {
         Some(error::LoadStage::Cache) => "Unable to synchronize ELF image",
         Some(error::LoadStage::Seal) => "Unable to seal ELF image",
         Some(error::LoadStage::Publish) => "Unable to publish ELF image",
+        Some(error::LoadStage::Discover) => "Unable to discover ELF dependencies",
+        Some(error::LoadStage::Scope) => "Unable to freeze ELF symbol scope",
+        Some(error::LoadStage::LinkRelocate) => "Unable to relocate linked ELF images",
+        Some(error::LoadStage::LinkSeal) => "Unable to seal linked ELF images",
         None => "Unable to load ELF image",
     }
 }
