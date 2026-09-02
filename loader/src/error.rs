@@ -49,6 +49,7 @@ pub enum LoadErrorKind {
     InvalidAlignment,
     PermissionConflict,
     IdentityConflict,
+    AmbiguousStrongDefinition,
     Backend,
     Io,
     SourceChanged,

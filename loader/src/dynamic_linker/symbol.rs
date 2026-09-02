@@ -488,6 +488,11 @@ impl SymbolTable {
         self.entries.get(index as usize)
     }
 
+    #[inline]
+    pub(crate) fn entries(&self) -> &[SymbolEntry] {
+        &self.entries
+    }
+
     /// The NUL-free name bytes of a symbol entry, indexed into the owned
     /// `.dynstr`.
     #[inline]
