@@ -29,6 +29,7 @@ use crate::memory::{
 pub struct ElfFixtureBuilder {
     bytes: Vec<u8>,
     ph_count: u16,
+    is64: bool,
 }
 
 impl ElfFixtureBuilder {
@@ -47,7 +48,11 @@ impl ElfFixtureBuilder {
         write_u16(&mut bytes, 54, elf64::program_header::SIZEOF_PHDR as u16);
         write_u16(&mut bytes, 58, elf64::section_header::SIZEOF_SHDR as u16);
 
-        Self { bytes, ph_count: 0 }
+        Self {
+            bytes,
+            ph_count: 0,
+            is64: true,
+        }
     }
 
     pub fn elf32(e_machine: u16, e_type: u16) -> Self {
@@ -60,16 +65,36 @@ impl ElfFixtureBuilder {
         write_u16(&mut bytes, 16, e_type);
         write_u16(&mut bytes, 18, e_machine);
         write_u32(&mut bytes, 20, EV_CURRENT as u32);
-        write_u16(&mut bytes, 40, elf32::header::SIZEOF_EHDR as u16);
-        write_u16(&mut bytes, 42, elf32::program_header::SIZEOF_PHDR as u16);
-        write_u16(&mut bytes, 46, elf32::section_header::SIZEOF_SHDR as u16);
+        write_u32(&mut bytes, 28, elf32::header::SIZEOF_EHDR as u32); // e_phoff
+        write_u16(&mut bytes, 40, elf32::header::SIZEOF_EHDR as u16); // e_ehsize
+        write_u16(&mut bytes, 42, elf32::program_header::SIZEOF_PHDR as u16); // e_phentsize
+        write_u16(&mut bytes, 46, elf32::section_header::SIZEOF_SHDR as u16); // e_shentsize
 
-        Self { bytes, ph_count: 0 }
+        Self {
+            bytes,
+            ph_count: 0,
+            is64: false,
+        }
     }
 
-    /// Append a PT_LOAD program header (Elf64 only). The first call's flags
-    /// default to PF_R|PF_X; subsequent calls default to PF_R|PF_W.
-    pub fn with_load_segment(mut self, vaddr: u64, filesz: u64, memsz: u64, align: u64) -> Self {
+    /// Set `e_flags` (offset 36 for ELF32, 48 for ELF64).
+    pub fn with_flags(mut self, flags: u32) -> Self {
+        let offset = if self.is64 { 48 } else { 36 };
+        write_u32(&mut self.bytes, offset, flags);
+        self
+    }
+
+    /// Append a PT_LOAD program header. The first call's flags default to
+    /// PF_R|PF_X; subsequent calls default to PF_R|PF_W.
+    pub fn with_load_segment(self, vaddr: u64, filesz: u64, memsz: u64, align: u64) -> Self {
+        if self.is64 {
+            self.with_load_segment_64(vaddr, filesz, memsz, align)
+        } else {
+            self.with_load_segment_32(vaddr, filesz, memsz, align)
+        }
+    }
+
+    fn with_load_segment_64(mut self, vaddr: u64, filesz: u64, memsz: u64, align: u64) -> Self {
         let ph_offset = elf64::header::SIZEOF_EHDR
             + self.ph_count as usize * elf64::program_header::SIZEOF_PHDR;
         self.bytes
@@ -97,8 +122,40 @@ impl ElfFixtureBuilder {
         self
     }
 
+    fn with_load_segment_32(mut self, vaddr: u64, filesz: u64, memsz: u64, align: u64) -> Self {
+        let ph_offset = elf32::header::SIZEOF_EHDR
+            + self.ph_count as usize * elf32::program_header::SIZEOF_PHDR;
+        self.bytes
+            .resize(ph_offset + elf32::program_header::SIZEOF_PHDR, 0);
+
+        let flags = if self.ph_count == 0 { 0x5 } else { 0x6 }; // PF_R|PF_X or PF_R|PF_W
+        write_u32(&mut self.bytes, ph_offset, 1); // p_type = PT_LOAD
+        write_u32(&mut self.bytes, ph_offset + 4, ph_offset as u32); // p_offset
+        write_u32(&mut self.bytes, ph_offset + 8, vaddr as u32); // p_vaddr
+        write_u32(&mut self.bytes, ph_offset + 12, vaddr as u32); // p_paddr
+        write_u32(&mut self.bytes, ph_offset + 16, filesz as u32); // p_filesz
+        write_u32(&mut self.bytes, ph_offset + 20, memsz as u32); // p_memsz
+        write_u32(&mut self.bytes, ph_offset + 24, flags); // p_flags
+        write_u32(&mut self.bytes, ph_offset + 28, align as u32); // p_align
+
+        self.ph_count += 1;
+        write_u16(&mut self.bytes, 44, self.ph_count); // e_phnum
+
+        // Ensure the file is large enough to cover the segment's file range.
+        let file_end = (ph_offset as u64) + elf32::program_header::SIZEOF_PHDR as u64 + filesz;
+        if self.bytes.len() < file_end as usize {
+            self.bytes.resize(file_end as usize, 0);
+        }
+
+        self
+    }
+
     pub fn with_entry(mut self, entry: u64) -> Self {
-        write_u64(&mut self.bytes, 24, entry);
+        if self.is64 {
+            write_u64(&mut self.bytes, 24, entry);
+        } else {
+            write_u32(&mut self.bytes, 24, entry as u32);
+        }
         self
     }
 

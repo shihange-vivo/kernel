@@ -76,7 +76,7 @@ mod exec_plan {
     use std::{cell::RefCell, rc::Rc, vec::Vec};
 
     use crate::{
-        identity::{ElfClass, ElfData, ElfMachine, ElfType, LoadLimits, LoadProfile, LoadRequest},
+        identity::{ElfType, LoadLimits, LoadProfile, LoadRequest},
         image::ImageLoader,
         memory::Placement,
         reader::SliceElfReader,
@@ -84,12 +84,7 @@ mod exec_plan {
     };
 
     fn build_exec_request() -> LoadRequest {
-        let profile = LoadProfile::new(
-            ElfClass::Elf64,
-            ElfData::Little,
-            ElfMachine::Riscv,
-            ElfType::Exec,
-        );
+        let profile = LoadProfile::riscv64(ElfType::Exec);
         LoadRequest::new(profile, LoadLimits::DEFAULT)
     }
 
@@ -221,5 +216,137 @@ mod entry_dispatch {
         let mut mapper = MemoryMapper::new(None);
         let result = load_elf(&bytes, &mut mapper);
         assert!(result.is_err());
+    }
+}
+
+mod arm_admission {
+    use goblin::elf::header::{EM_ARM, ET_DYN};
+
+    use crate::{
+        error::{ErrorContext, HeaderField, LoadErrorKind},
+        identity::{ElfType, LoadLimits, LoadProfile, LoadRequest},
+        image::ImageLoader,
+        reader::SliceElfReader,
+        tests::fixture::ElfFixtureBuilder,
+    };
+
+    // EF_ARM_EABI_VER5 | EF_ARM_ABI_FLOAT_SOFT, as produced for
+    // `thumbv7m-none-eabi` soft-float images.
+    const SOFT_EABI5: u32 = 0x0500_0200;
+    const HARD_EABI5: u32 = 0x0500_0400;
+    const EABI4: u32 = 0x0400_0200;
+
+    fn arm_request() -> LoadRequest {
+        LoadRequest::new(
+            LoadProfile::arm_thumb_soft_float(ElfType::Dyn),
+            LoadLimits::DEFAULT,
+        )
+    }
+
+    fn admit(bytes: &[u8]) -> crate::error::LoadResult<()> {
+        ImageLoader::new(SliceElfReader::new(bytes), arm_request())
+            .admit()
+            .map(|_| ())
+    }
+
+    #[test]
+    fn soft_float_eabi5_flags_are_accepted() {
+        let bytes = ElfFixtureBuilder::elf32(EM_ARM, ET_DYN)
+            .with_flags(SOFT_EABI5)
+            .build();
+        assert!(admit(&bytes).is_ok());
+    }
+
+    #[test]
+    fn hard_float_flags_are_rejected_by_soft_float_profile() {
+        let bytes = ElfFixtureBuilder::elf32(EM_ARM, ET_DYN)
+            .with_flags(HARD_EABI5)
+            .build();
+        let error = match admit(&bytes) {
+            Ok(()) => panic!("hard-float e_flags must be rejected"),
+            Err(error) => error,
+        };
+        assert!(matches!(error.kind(), LoadErrorKind::UnsupportedByProfile));
+        assert!(matches!(
+            error.context(),
+            ErrorContext::HeaderField {
+                field: HeaderField::Flags,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn wrong_eabi_version_is_rejected() {
+        let bytes = ElfFixtureBuilder::elf32(EM_ARM, ET_DYN)
+            .with_flags(EABI4)
+            .build();
+        assert!(admit(&bytes).is_err());
+    }
+
+    #[test]
+    fn thumb_entry_requires_bit_zero() {
+        // Entry with bit 0 clear (even) is not a valid Thumb entry.
+        let bytes = ElfFixtureBuilder::elf32(EM_ARM, ET_DYN)
+            .with_flags(SOFT_EABI5)
+            .with_load_segment(0x1000, 0x10, 0x10, 0x4)
+            .with_entry(0x1000) // even -> not Thumb
+            .build();
+        let result = ImageLoader::new(SliceElfReader::new(&bytes), arm_request())
+            .admit()
+            .expect("admit")
+            .inspect()
+            .expect("inspect")
+            .plan();
+        let error = match result {
+            Ok(_) => panic!("even ARM entry must be rejected"),
+            Err(error) => error,
+        };
+        assert!(matches!(error.kind(), LoadErrorKind::BadElf));
+        assert!(matches!(
+            error.context(),
+            ErrorContext::HeaderField {
+                field: HeaderField::Entry,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn thumb_entry_min_instruction_span_must_fall_in_x_segment() {
+        // A single-byte segment cannot hold a whole 2-byte Thumb instruction;
+        // the canonical entry span must lie fully inside an X segment.
+        let bytes = ElfFixtureBuilder::elf32(EM_ARM, ET_DYN)
+            .with_flags(SOFT_EABI5)
+            .with_load_segment(0x1000, 0x1, 0x1, 0x1)
+            .with_entry(0x1001) // bit 0 set; canonical 0x1000, span 2 > segment len 1
+            .build();
+        let result = ImageLoader::new(SliceElfReader::new(&bytes), arm_request())
+            .admit()
+            .expect("admit")
+            .inspect()
+            .expect("inspect")
+            .plan();
+        let error = match result {
+            Ok(_) => panic!("entry min-instruction span must be rejected"),
+            Err(error) => error,
+        };
+        assert!(matches!(error.kind(), LoadErrorKind::PermissionConflict));
+    }
+
+    #[test]
+    fn thumb_entry_with_valid_span_is_accepted() {
+        let bytes = ElfFixtureBuilder::elf32(EM_ARM, ET_DYN)
+            .with_flags(SOFT_EABI5)
+            .with_load_segment(0x1000, 0x10, 0x10, 0x4)
+            .with_entry(0x1001) // canonical 0x1000, within the 0x10-byte segment
+            .build();
+        ImageLoader::new(SliceElfReader::new(&bytes), arm_request())
+            .admit()
+            .expect("admit")
+            .inspect()
+            .expect("inspect")
+            .plan()
+            .expect("valid Thumb entry must be planned");
     }
 }
