@@ -20,6 +20,7 @@
 mod artifact;
 mod graph;
 mod metadata;
+mod scope;
 mod symbol;
 
 pub use artifact::{
@@ -31,4 +32,8 @@ pub(crate) use metadata::{
     ImageLifecycleMetadata, ProgramHeaderRuntimeInfo, RelocationTableInfo, RelocationTables,
     RuntimeDynamicInfo, RuntimeImageMetadata,
 };
-pub(crate) use symbol::{symbol_count_from_hash, SymbolTable};
+pub(crate) use scope::{ResolvedSymbol, ScopeImage, ScopeSet, SymbolRegionKind, SymbolScope};
+pub(crate) use symbol::{
+    symbol_count_from_hash, SymbolBinding, SymbolDefinition, SymbolEntry, SymbolTable, SymbolType,
+    SymbolVisibility,
+};
