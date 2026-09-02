@@ -14,10 +14,11 @@
 
 //! Phase 0.5 multi-image dynamic linking (C11–C17).
 //!
-//! Only the artifact/resolver contract exists at C11-b; graph, scope and
-//! session typestate land in C12–C17.
+//! C11-b delivered the artifact/resolver contract; C12 adds the bounded
+//! dependency graph. Scope (C14) and session typestate (C15) land later.
 
 mod artifact;
+mod graph;
 
 pub use artifact::{
     ArtifactIdentity, ArtifactResolver, ArtifactRole, BuildId, DependencyName, DependencyRequest,
