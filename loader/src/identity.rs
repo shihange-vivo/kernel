@@ -100,12 +100,137 @@ impl From<ElfMachine> for u64 {
     }
 }
 
+/// ARM `e_flags` bits the loader interprets. Only the EABI version and float
+/// ABI are gated; the remaining bits are ignored because they do not change
+/// how a single BlueOS image is loaded.
+const EF_ARM_EABI_MASK: u32 = 0xFF00_0000;
+const EF_ARM_EABI_VER5: u32 = 0x0500_0000;
+const EF_ARM_ABI_FLOAT_MASK: u32 = 0x0000_0600;
+const EF_ARM_ABI_FLOAT_SOFT: u32 = 0x0000_0200;
+const EF_ARM_ABI_FLOAT_HARD: u32 = 0x0000_0400;
+const EF_ARM_BE8: u32 = 0x0080_0000;
+
+/// RISC-V `e_flags` bits the loader interprets. The float ABI must be soft for
+/// the single-image profile; the embedded (RVE) register model is unsupported.
+const EF_RISCV_FLOAT_ABI_MASK: u32 = 0x0000_0006;
+const EF_RISCV_FLOAT_ABI_SOFT: u32 = 0x0000_0000;
+const EF_RISCV_RVE: u32 = 0x0000_0008;
+
+/// Bit-level `e_flags` admission policy for one ELF machine.
+///
+/// `e_flags` is machine-defined; a policy only ever names the bits its
+/// profile understands, so an unknown flag is never interpreted across
+/// architectures. A header's flags are accepted when every `required` bit is
+/// set, every `forbidden` bit is clear, and the `mask`-selected bits equal
+/// `required`.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct HeaderFlagsPolicy {
+    mask: u32,
+    required: u32,
+    forbidden: u32,
+}
+
+impl HeaderFlagsPolicy {
+    #[inline]
+    pub const fn new(mask: u32, required: u32, forbidden: u32) -> Self {
+        Self {
+            mask,
+            required,
+            forbidden,
+        }
+    }
+
+    /// A policy that accepts any `e_flags`. Reserved for the compatibility
+    /// entry point that derives its profile from the artifact rather than a
+    /// board ABI; trusted callers must use a named machine profile.
+    #[inline]
+    pub(crate) const fn permissive() -> Self {
+        Self::new(0, 0, 0)
+    }
+
+    #[inline]
+    pub const fn accepts(self, flags: u32) -> bool {
+        (flags & self.mask) == self.required && (flags & self.forbidden) == 0
+    }
+}
+
+/// How a machine encodes its entry point and the span a load must reserve
+/// there so that at least one whole instruction lies inside an executable
+/// segment.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum EntryMode {
+    /// Native instruction set; the entry is the instruction address itself.
+    Direct {
+        instruction_alignment: u8,
+        minimum_instruction_size: u8,
+    },
+    /// ARM Thumb state; bit 0 of the entry marks Thumb and is cleared before
+    /// the address is used for range membership.
+    Thumb {
+        instruction_alignment: u8,
+        minimum_instruction_size: u8,
+    },
+}
+
+impl EntryMode {
+    #[inline]
+    pub const fn direct(instruction_alignment: u8, minimum_instruction_size: u8) -> Self {
+        Self::Direct {
+            instruction_alignment,
+            minimum_instruction_size,
+        }
+    }
+
+    #[inline]
+    pub const fn thumb(instruction_alignment: u8, minimum_instruction_size: u8) -> Self {
+        Self::Thumb {
+            instruction_alignment,
+            minimum_instruction_size,
+        }
+    }
+
+    #[inline]
+    pub const fn is_thumb(self) -> bool {
+        matches!(self, Self::Thumb { .. })
+    }
+
+    #[inline]
+    pub const fn instruction_alignment(self) -> u8 {
+        match self {
+            Self::Direct {
+                instruction_alignment,
+                ..
+            }
+            | Self::Thumb {
+                instruction_alignment,
+                ..
+            } => instruction_alignment,
+        }
+    }
+
+    #[inline]
+    pub const fn minimum_instruction_size(self) -> u8 {
+        match self {
+            Self::Direct {
+                minimum_instruction_size,
+                ..
+            }
+            | Self::Thumb {
+                minimum_instruction_size,
+                ..
+            } => minimum_instruction_size,
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct LoadProfile {
     class: ElfClass,
     endian: ElfData,
     machine: ElfMachine,
     r#type: ElfType,
+    header_flags: HeaderFlagsPolicy,
+    entry_mode: EntryMode,
 }
 
 impl LoadProfile {
@@ -115,13 +240,99 @@ impl LoadProfile {
         endian: ElfData,
         machine: ElfMachine,
         r#type: ElfType,
+        header_flags: HeaderFlagsPolicy,
+        entry_mode: EntryMode,
     ) -> Self {
         Self {
             class,
             endian,
             machine,
             r#type,
+            header_flags,
+            entry_mode,
         }
+    }
+
+    /// Cortex-M soft-float Thumb profile (`thumbv7m-none-eabi`): EABI5, soft
+    /// float ABI, little-endian Thumb entry with bit 0 set.
+    #[inline]
+    pub const fn arm_thumb_soft_float(r#type: ElfType) -> Self {
+        Self::new(
+            ElfClass::Elf32,
+            ElfData::Little,
+            ElfMachine::Arm,
+            r#type,
+            HeaderFlagsPolicy::new(
+                EF_ARM_EABI_MASK | EF_ARM_ABI_FLOAT_MASK,
+                EF_ARM_EABI_VER5 | EF_ARM_ABI_FLOAT_SOFT,
+                EF_ARM_BE8,
+            ),
+            EntryMode::thumb(2, 2),
+        )
+    }
+
+    /// Cortex-M hard-float Thumb profile (`thumbv8m.main-none-eabihf`).
+    #[inline]
+    pub const fn arm_thumb_hard_float(r#type: ElfType) -> Self {
+        Self::new(
+            ElfClass::Elf32,
+            ElfData::Little,
+            ElfMachine::Arm,
+            r#type,
+            HeaderFlagsPolicy::new(
+                EF_ARM_EABI_MASK | EF_ARM_ABI_FLOAT_MASK,
+                EF_ARM_EABI_VER5 | EF_ARM_ABI_FLOAT_HARD,
+                EF_ARM_BE8,
+            ),
+            EntryMode::thumb(2, 2),
+        )
+    }
+
+    /// RISC-V RV32 soft-float profile (RVC permitted, RVE rejected).
+    #[inline]
+    pub const fn riscv32(r#type: ElfType) -> Self {
+        Self::new(
+            ElfClass::Elf32,
+            ElfData::Little,
+            ElfMachine::Riscv,
+            r#type,
+            HeaderFlagsPolicy::new(
+                EF_RISCV_FLOAT_ABI_MASK,
+                EF_RISCV_FLOAT_ABI_SOFT,
+                EF_RISCV_RVE,
+            ),
+            EntryMode::direct(2, 2),
+        )
+    }
+
+    /// RISC-V RV64 soft-float profile (RVC permitted, RVE rejected).
+    #[inline]
+    pub const fn riscv64(r#type: ElfType) -> Self {
+        Self::new(
+            ElfClass::Elf64,
+            ElfData::Little,
+            ElfMachine::Riscv,
+            r#type,
+            HeaderFlagsPolicy::new(
+                EF_RISCV_FLOAT_ABI_MASK,
+                EF_RISCV_FLOAT_ABI_SOFT,
+                EF_RISCV_RVE,
+            ),
+            EntryMode::direct(2, 2),
+        )
+    }
+
+    /// AArch64 profile: fixed 4-byte, 4-aligned A64 instructions.
+    #[inline]
+    pub const fn aarch64(r#type: ElfType) -> Self {
+        Self::new(
+            ElfClass::Elf64,
+            ElfData::Little,
+            ElfMachine::Aarch64,
+            r#type,
+            HeaderFlagsPolicy::new(0, 0, 0),
+            EntryMode::direct(4, 4),
+        )
     }
 
     #[inline]
@@ -142,6 +353,16 @@ impl LoadProfile {
     #[inline]
     pub const fn r#type(&self) -> ElfType {
         self.r#type
+    }
+
+    #[inline]
+    pub const fn header_flags(&self) -> HeaderFlagsPolicy {
+        self.header_flags
+    }
+
+    #[inline]
+    pub const fn entry_mode(&self) -> EntryMode {
+        self.entry_mode
     }
 }
 

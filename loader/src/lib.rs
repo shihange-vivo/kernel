@@ -47,7 +47,10 @@ pub use error::{
     ErrorContext, HeaderField, LimitKind, LoadError, LoadErrorKind, LoadResult, LoadStage,
     ProgramHeaderField,
 };
-pub use identity::{ElfClass, ElfData, ElfMachine, ElfType, LoadLimits, LoadProfile, LoadRequest};
+pub use identity::{
+    ElfClass, ElfData, ElfMachine, ElfType, EntryMode, HeaderFlagsPolicy, LoadLimits, LoadProfile,
+    LoadRequest,
+};
 pub use image::{
     AppliedProtectionSet, PreparedProtectionPlan, ProtectionBatch, ProtectionCapabilities,
     ProtectionLevel, ProtectionRecord, SealPlan, SealRange, SealedState,
@@ -191,7 +194,35 @@ fn peek_profile(
         EM_AARCH64 => ElfMachine::Aarch64,
         value => ElfMachine::Other(value),
     };
-    Ok(LoadProfile::new(class, endian, machine, expected_type))
+    // The compatibility entry point derives its profile from the artifact, so
+    // it cannot assert a board ABI: accept any `e_flags` and only enforce the
+    // entry-mode geometry for the recognized machines.
+    let (flags, entry_mode) = match machine {
+        ElfMachine::Arm => (
+            identity::HeaderFlagsPolicy::permissive(),
+            EntryMode::thumb(2, 2),
+        ),
+        ElfMachine::Riscv => (
+            identity::HeaderFlagsPolicy::permissive(),
+            EntryMode::direct(2, 2),
+        ),
+        ElfMachine::Aarch64 => (
+            identity::HeaderFlagsPolicy::permissive(),
+            EntryMode::direct(4, 4),
+        ),
+        ElfMachine::Other(_) => (
+            identity::HeaderFlagsPolicy::permissive(),
+            EntryMode::direct(1, 1),
+        ),
+    };
+    Ok(LoadProfile::new(
+        class,
+        endian,
+        machine,
+        expected_type,
+        flags,
+        entry_mode,
+    ))
 }
 
 fn expected_type_for(mapper: &MemoryMapper) -> core::result::Result<ElfType, &'static str> {

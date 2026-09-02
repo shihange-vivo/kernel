@@ -17,8 +17,11 @@ use alloc::boxed::Box;
 use crate::{
     address::{FileRange, TargetAddress, TargetRange},
     elf::{DynamicSegmentInfo, ElfHeaderInfo, LoadSegmentInfo},
-    error::{ErrorContext, LoadError, LoadErrorKind, LoadResult, LoadStage, ProgramHeaderField},
-    identity::{ElfMachine, LoadRequest, PHASE0_LOAD_POLICY},
+    error::{
+        ErrorContext, HeaderField, LoadError, LoadErrorKind, LoadResult, LoadStage,
+        ProgramHeaderField,
+    },
+    identity::{EntryMode, LoadRequest, PHASE0_LOAD_POLICY},
     image::{admit::program_header_error, plan::PlannedImage},
     reader::ElfReader,
     MemoryPermissions,
@@ -165,19 +168,36 @@ impl<R: ElfReader> InspectedImage<R> {
             .map_err(|error| error.at_stage(LoadStage::Plan))?;
 
         let entry_vaddr = TargetAddress::new(self.header.entry());
-        let canonical_entry_vaddr = canonical_entry(entry_vaddr, self.header.machine());
+        let entry_mode = self.request.profile().entry_mode();
+        let canonical_entry_vaddr = canonical_entry(entry_vaddr, entry_mode)
+            .map_err(|error| error.at_stage(LoadStage::Plan))?;
+        let instruction_alignment = u64::from(entry_mode.instruction_alignment());
+        let minimum_instruction_size = u64::from(entry_mode.minimum_instruction_size());
+        // A whole instruction must lie inside an executable segment, and the
+        // canonical entry must satisfy the profile's instruction alignment.
+        if instruction_alignment != 0 && canonical_entry_vaddr.get() % instruction_alignment != 0 {
+            return Err(LoadError::new(
+                LoadErrorKind::InvalidAlignment,
+                ErrorContext::TargetRange {
+                    start: canonical_entry_vaddr,
+                    len: minimum_instruction_size,
+                    align: instruction_alignment,
+                },
+            )
+            .at_stage(LoadStage::Plan));
+        }
         let executable = self.load_segments.iter().any(|segment| {
             segment.permissions().contains(MemoryPermissions::EXECUTE)
                 && TargetRange::new(segment.vaddr(), segment.memory_size())
-                    .contains_span(canonical_entry_vaddr, 1)
+                    .contains_span(canonical_entry_vaddr, minimum_instruction_size)
         });
         if !executable {
             return Err(LoadError::new(
                 LoadErrorKind::PermissionConflict,
                 ErrorContext::TargetRange {
                     start: canonical_entry_vaddr,
-                    len: 1,
-                    align: 0,
+                    len: minimum_instruction_size,
+                    align: instruction_alignment,
                 },
             )
             .at_stage(LoadStage::Plan));
@@ -221,11 +241,23 @@ impl<R: ElfReader> InspectedImage<R> {
     }
 }
 
-fn canonical_entry(entry: TargetAddress, machine: ElfMachine) -> TargetAddress {
-    if machine == ElfMachine::Arm {
-        TargetAddress::new(entry.get() & !1)
-    } else {
-        entry
+fn canonical_entry(entry: TargetAddress, mode: EntryMode) -> LoadResult<TargetAddress> {
+    match mode {
+        EntryMode::Direct { .. } => Ok(entry),
+        EntryMode::Thumb { .. } => {
+            // ARM Thumb entry: bit 0 must be set (Thumb state marker) and is
+            // cleared to obtain the canonical instruction address.
+            if entry.get() & 1 == 0 {
+                return Err(LoadError::new(
+                    LoadErrorKind::BadElf,
+                    ErrorContext::HeaderField {
+                        field: HeaderField::Entry,
+                        value: entry.get(),
+                    },
+                ));
+            }
+            Ok(TargetAddress::new(entry.get() & !1))
+        }
     }
 }
 

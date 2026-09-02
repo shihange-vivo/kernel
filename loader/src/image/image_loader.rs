@@ -192,6 +192,15 @@ fn validate_header(header: &ElfHeaderInfo, request: &LoadRequest, file_len: u64)
             u64::from(header.machine()),
         ));
     }
+    // `e_flags` is machine-defined; a trusted profile always carries a
+    // HeaderFlagsPolicy for its machine, so an unknown ABI/float/RVE
+    // combination fails admission before any allocation.
+    if !request.profile().header_flags().accepts(header.flags()) {
+        return Err(unsupported_header(
+            HeaderField::Flags,
+            u64::from(header.flags()),
+        ));
+    }
     request
         .limits()
         .check_program_header_count(header.program_header_count())?;
