@@ -13,21 +13,13 @@
 // limitations under the License.
 
 use alloc::{boxed::Box, vec::Vec};
-use goblin::elf::dynamic::{
-    DF_TEXTREL, DT_BIND_NOW, DT_DEBUG, DT_FINI, DT_FINI_ARRAY, DT_FINI_ARRAYSZ, DT_FLAGS,
-    DT_FLAGS_1, DT_GNU_HASH, DT_HASH, DT_INIT, DT_INIT_ARRAY, DT_INIT_ARRAYSZ, DT_JMPREL,
-    DT_NEEDED, DT_NULL, DT_PLTGOT, DT_PLTREL, DT_PLTRELSZ, DT_PREINIT_ARRAY, DT_PREINIT_ARRAYSZ,
-    DT_REL, DT_RELA, DT_RELACOUNT, DT_RELAENT, DT_RELASZ, DT_RELCOUNT, DT_RELENT, DT_RELSZ,
-    DT_RPATH, DT_RUNPATH, DT_SONAME, DT_STRSZ, DT_STRTAB, DT_SYMBOLIC, DT_SYMENT, DT_SYMTAB,
-    DT_TEXTREL, DT_TLSDESC_GOT, DT_TLSDESC_PLT, DT_VERDEF, DT_VERDEFNUM, DT_VERNEED, DT_VERNEEDNUM,
-    DT_VERSYM,
-};
+use goblin::elf::dynamic::{DT_NULL, DT_REL, DT_RELA, DT_RELAENT, DT_RELASZ, DT_RELENT, DT_RELSZ};
 
 use crate::{
     address::{FileRange, TargetAddress, TargetRange},
-    elf::{DynamicSegmentInfo, LoadSegmentInfo, DT_RELR, DT_RELRENT, DT_RELRSZ},
-    error::{ErrorContext, LoadError, LoadErrorKind, LoadResult, LoadStage, ProgramHeaderField},
-    identity::{ElfClass, ElfData, LoadRequest},
+    elf::{DynamicSegmentInfo, LoadSegmentInfo},
+    error::{ErrorContext, LoadError, LoadErrorKind, LoadResult, LoadStage},
+    identity::{ElfClass, ElfData, LoadPolicy, LoadRequest, PHASE0_LOAD_POLICY},
     image::{
         decode::{
             DecodedImage, DynamicTags, RelocationAddend, RelocationRecord, RelocationTableKind,
@@ -232,7 +224,7 @@ impl<R: ElfReader, M: ImageMemory> MappedImage<R, M> {
                 terminated = true;
                 break;
             }
-            accept_dynamic_tag(&mut tags, tag, value)?;
+            accept_dynamic_tag(&PHASE0_LOAD_POLICY, &mut tags, tag, value)?;
         }
         if !terminated {
             return Err(dynamic_error(DT_NULL, dynamic.file_range().len()));
@@ -408,7 +400,15 @@ fn decode_relocation_entry(
     ))
 }
 
-fn accept_dynamic_tag(tags: &mut DynamicTags, tag: u64, value: u64) -> LoadResult<()> {
+fn accept_dynamic_tag(
+    policy: &LoadPolicy,
+    tags: &mut DynamicTags,
+    tag: u64,
+    value: u64,
+) -> LoadResult<()> {
+    if !policy.allows_dynamic_tag(tag, value) {
+        return Err(unsupported_dynamic(tag, value));
+    }
     match tag {
         DT_REL => set_once(tags.rel_mut().address_mut(), tag, value),
         DT_RELSZ => set_once(tags.rel_mut().byte_len_mut(), tag, value),
@@ -416,17 +416,6 @@ fn accept_dynamic_tag(tags: &mut DynamicTags, tag: u64, value: u64) -> LoadResul
         DT_RELA => set_once(tags.rela_mut().address_mut(), tag, value),
         DT_RELASZ => set_once(tags.rela_mut().byte_len_mut(), tag, value),
         DT_RELAENT => set_once(tags.rela_mut().entry_size_mut(), tag, value),
-        DT_TEXTREL => Err(unsupported_dynamic(tag, value)),
-        DT_RELR | DT_RELRSZ | DT_RELRENT | DT_NEEDED | DT_PLTRELSZ | DT_PLTREL | DT_JMPREL
-        | DT_INIT | DT_FINI | DT_SONAME | DT_RPATH | DT_SYMBOLIC | DT_INIT_ARRAY
-        | DT_FINI_ARRAY | DT_INIT_ARRAYSZ | DT_FINI_ARRAYSZ | DT_RUNPATH | DT_PREINIT_ARRAY
-        | DT_PREINIT_ARRAYSZ | DT_VERSYM | DT_VERDEF | DT_VERDEFNUM | DT_VERNEED
-        | DT_VERNEEDNUM | DT_TLSDESC_PLT | DT_TLSDESC_GOT => Ok(()),
-        DT_FLAGS if value & DF_TEXTREL != 0 => Err(unsupported_dynamic(tag, value)),
-        DT_FLAGS => Ok(()),
-        DT_FLAGS_1 => Ok(()),
-        DT_PLTGOT | DT_HASH | DT_STRTAB | DT_SYMTAB | DT_STRSZ | DT_SYMENT | DT_DEBUG
-        | DT_BIND_NOW | DT_GNU_HASH | DT_RELACOUNT | DT_RELCOUNT => Ok(()),
         _ => Ok(()),
     }
 }
@@ -442,17 +431,6 @@ fn unsupported_dynamic(tag: u64, value: u64) -> LoadError {
     LoadError::new(
         LoadErrorKind::UnsupportedByProfile,
         ErrorContext::DynamicTag { tag, value },
-    )
-}
-
-fn unsupported_program_header(index: u16, field: ProgramHeaderField, value: u64) -> LoadError {
-    LoadError::new(
-        LoadErrorKind::UnsupportedByProfile,
-        ErrorContext::ProgramHeader {
-            index,
-            field,
-            value,
-        },
     )
 }
 

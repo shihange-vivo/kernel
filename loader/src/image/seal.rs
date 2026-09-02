@@ -19,7 +19,7 @@ use crate::{
     cache::CacheSyncOutcome,
     elf::{DynamicSegmentInfo, LoadSegmentInfo},
     error::{ErrorContext, LimitKind, LoadError, LoadErrorKind, LoadResult, ProgramHeaderField},
-    identity::{ElfClass, LoadRequest},
+    identity::{ElfClass, LoadRequest, PHASE0_LOAD_POLICY},
     image::{inspect::StackKind, map::LoadedRegion, RelocationRecord},
     memory::{
         AllocationOffset, ImageAllocation, ImageLoadTransaction, ImageMemory, ImageProtectionMemory,
@@ -104,7 +104,7 @@ impl SealPlan {
         stack: &StackKind,
         relocations: &[RelocationRecord],
     ) -> LoadResult<Self> {
-        if *stack == StackKind::Executable {
+        if *stack == StackKind::Executable && !PHASE0_LOAD_POLICY.allows_executable_stack() {
             return Err(LoadError::new(
                 LoadErrorKind::UnsupportedByProfile,
                 ErrorContext::ProgramHeader {

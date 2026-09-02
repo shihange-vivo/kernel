@@ -27,7 +27,7 @@ use crate::{
     address::{FileRange, TargetAddress, TargetRange},
     elf::{DynamicSegmentInfo, ElfHeaderInfo, LoadSegmentInfo, ProgramHeaderInfo},
     error::{ErrorContext, LoadError, LoadErrorKind, LoadResult, LoadStage, ProgramHeaderField},
-    identity::{ElfMachine, LoadRequest, LOADPOLICY},
+    identity::{ElfMachine, LoadRequest, PHASE0_LOAD_POLICY},
     image::inspect::{InspectedImage, StackKind},
     reader::ElfReader,
     MemoryPermissions,
@@ -227,7 +227,7 @@ impl<R: ElfReader> AdmittedImage<R> {
                 PT_ARM_EXIDX if self.header.machine() == ElfMachine::Arm => {}
                 PT_RISCV_ATTRIBUTES if self.header.machine() == ElfMachine::Riscv => {}
                 t => {
-                    if !LOADPOLICY.allow_unknown_program_headers {
+                    if !PHASE0_LOAD_POLICY.allows_unknown_program_headers() {
                         return Err(LoadError::new(
                             LoadErrorKind::UnsupportedByProfile,
                             ErrorContext::ProgramHeader {
@@ -241,7 +241,7 @@ impl<R: ElfReader> AdmittedImage<R> {
                 }
             }
         }
-        if !LOADPOLICY.allow_executable_stack && stack == StackKind::Executable {
+        if !PHASE0_LOAD_POLICY.allows_executable_stack() && stack == StackKind::Executable {
             return Err(LoadError::new(
                 LoadErrorKind::UnsupportedByProfile,
                 ErrorContext::ProgramHeader {
@@ -252,9 +252,7 @@ impl<R: ElfReader> AdmittedImage<R> {
             )
             .at_stage(LoadStage::Inspect));
         }
-        if !LOADPOLICY.allow_interpreter
-            && let Some(x) = interpreter
-        {
+        if !PHASE0_LOAD_POLICY.allows_interpreter() && interpreter.is_some() {
             return Err(LoadError::new(
                 LoadErrorKind::UnsupportedByProfile,
                 ErrorContext::ProgramHeader {
@@ -265,9 +263,7 @@ impl<R: ElfReader> AdmittedImage<R> {
             )
             .at_stage(LoadStage::Inspect));
         }
-        if !LOADPOLICY.allow_tls
-            && let Some(x) = tls
-        {
+        if !PHASE0_LOAD_POLICY.allows_tls() && tls.is_some() {
             return Err(LoadError::new(
                 LoadErrorKind::UnsupportedByProfile,
                 ErrorContext::ProgramHeader {

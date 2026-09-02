@@ -94,6 +94,7 @@ pub enum ProgramHeaderField {
     UnsupportedInterpreter,
     UnsupportedTls,
     ExecutableStack,
+    Permissions,
     Align,
     UnknownField,
 }

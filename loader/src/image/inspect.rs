@@ -18,7 +18,7 @@ use crate::{
     address::{FileRange, TargetAddress, TargetRange},
     elf::{DynamicSegmentInfo, ElfHeaderInfo, LoadSegmentInfo},
     error::{ErrorContext, LoadError, LoadErrorKind, LoadResult, LoadStage, ProgramHeaderField},
-    identity::{ElfMachine, LoadRequest},
+    identity::{ElfMachine, LoadRequest, PHASE0_LOAD_POLICY},
     image::{admit::program_header_error, plan::PlannedImage},
     reader::ElfReader,
     MemoryPermissions,
@@ -99,6 +99,17 @@ impl<R: ElfReader> InspectedImage<R> {
                         index: segment.index(),
                         field: ProgramHeaderField::VirtualRange,
                         value: segment.vaddr().get(),
+                    },
+                )
+                .at_stage(LoadStage::Plan));
+            }
+            if !PHASE0_LOAD_POLICY.allows_segment_permissions(segment.permissions()) {
+                return Err(LoadError::new(
+                    LoadErrorKind::UnsupportedByProfile,
+                    ErrorContext::ProgramHeader {
+                        index: segment.index(),
+                        field: ProgramHeaderField::Permissions,
+                        value: u64::from(segment.permissions().bits()),
                     },
                 )
                 .at_stage(LoadStage::Plan));

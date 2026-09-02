@@ -49,6 +49,11 @@ impl MemoryPermissions {
     pub const fn contains(self, requested: Self) -> bool {
         self.0 & requested.0 == requested.0
     }
+
+    #[inline]
+    pub const fn bits(self) -> u8 {
+        self.0
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
