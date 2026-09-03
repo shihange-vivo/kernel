@@ -46,7 +46,7 @@ use crate::{
 /// and the mapped runtime span. A later [`crate::dynamic_linker::CommittedImage`]
 /// adds the long-lived allocation lease that outlives publication.
 #[derive(Clone, Debug)]
-pub(crate) struct LinkMapEntry {
+pub struct LinkMapEntry {
     owner: ImageId,
     identity: ArtifactIdentity,
     soname: Option<DependencyName>,
@@ -77,33 +77,33 @@ impl LinkMapEntry {
     }
 
     #[inline]
-    pub(crate) const fn owner(&self) -> ImageId {
+    pub const fn owner(&self) -> ImageId {
         self.owner
     }
 
     #[inline]
-    pub(crate) const fn identity(&self) -> &ArtifactIdentity {
+    pub const fn identity(&self) -> &ArtifactIdentity {
         &self.identity
     }
 
     #[inline]
-    pub(crate) const fn soname(&self) -> Option<&DependencyName> {
+    pub const fn soname(&self) -> Option<&DependencyName> {
         self.soname.as_ref()
     }
 
     #[inline]
-    pub(crate) const fn load_bias(&self) -> TargetAddress {
+    pub const fn load_bias(&self) -> TargetAddress {
         self.load_bias
     }
 
     /// The runtime entry, present only for the executable root (§2.3).
     #[inline]
-    pub(crate) const fn entry(&self) -> Option<TargetAddress> {
+    pub const fn entry(&self) -> Option<TargetAddress> {
         self.entry
     }
 
     #[inline]
-    pub(crate) const fn map_span(&self) -> TargetRange {
+    pub const fn map_span(&self) -> TargetRange {
         self.map_span
     }
 }
@@ -112,7 +112,7 @@ impl LinkMapEntry {
 /// validates (§13.1). It owns only the allocatable facts the publisher must
 /// check (entry, link-map slots); it holds no lease and mutates no snapshot.
 #[derive(Clone, Debug)]
-pub(crate) struct PreparedLinkManifest {
+pub struct PreparedLinkManifest {
     entry: TargetAddress,
     link_map: Vec<LinkMapEntry>,
 }
@@ -120,12 +120,12 @@ pub(crate) struct PreparedLinkManifest {
 impl PreparedLinkManifest {
     /// The root's mapped runtime entry, Thumb bit preserved.
     #[inline]
-    pub(crate) const fn entry(&self) -> TargetAddress {
+    pub const fn entry(&self) -> TargetAddress {
         self.entry
     }
 
     #[inline]
-    pub(crate) fn link_map(&self) -> &[LinkMapEntry] {
+    pub fn link_map(&self) -> &[LinkMapEntry] {
         &self.link_map
     }
 
@@ -259,7 +259,7 @@ fn publish_oom() -> LoadError {
 /// which is the long-term owner (§13.2 "CommittedImage 或 publisher receipt
 /// 必须长期持有 allocation lease").
 #[derive(Debug)]
-pub(crate) struct CommittedImage {
+pub struct CommittedImage {
     owner: ImageId,
     allocation: ImageAllocation,
     sealed: SealedState,
@@ -280,24 +280,24 @@ impl CommittedImage {
     }
 
     #[inline]
-    pub(crate) const fn owner(&self) -> ImageId {
+    pub const fn owner(&self) -> ImageId {
         self.owner
     }
 
     #[inline]
-    pub(crate) const fn allocation(&self) -> ImageAllocation {
+    pub const fn allocation(&self) -> ImageAllocation {
         self.allocation
     }
 
     #[inline]
-    pub(crate) const fn sealed(&self) -> &SealedState {
+    pub const fn sealed(&self) -> &SealedState {
         &self.sealed
     }
 }
 
 /// The owned, immutable context a [`LinkProduct`] exposes (§13.2): the closed
 /// dependency graph, the frozen scopes, and one committed image per id.
-pub(crate) struct LinkContext {
+pub struct LinkContext {
     graph: DependencyGraph,
     scopes: ScopeSet,
     images: Vec<CommittedImage>,
@@ -328,7 +328,7 @@ impl LinkContext {
     }
 
     #[inline]
-    pub(crate) fn images(&self) -> &[CommittedImage] {
+    pub fn images(&self) -> &[CommittedImage] {
         &self.images
     }
 }
@@ -340,7 +340,7 @@ impl LinkContext {
 /// the entry and link-map slots. The only thing the infallible commit step
 /// must move is the set of unique allocation leases, so this value is exactly
 /// that set, in image-id order.
-pub(crate) struct CommittingLinkProduct {
+pub struct CommittingLinkProduct {
     leases: Vec<AllocationLease>,
 }
 
@@ -351,7 +351,7 @@ impl CommittingLinkProduct {
     }
 
     #[inline]
-    pub(crate) fn into_leases(self) -> Vec<AllocationLease> {
+    pub fn into_leases(self) -> Vec<AllocationLease> {
         self.leases
     }
 }
@@ -363,7 +363,7 @@ impl CommittingLinkProduct {
 /// snapshot; `commit_batch` only moves the prepared state and the leases, and
 /// must not allocate, validate, panic, or otherwise fail. The returned
 /// `Receipt` is the publisher's long-term owner of the committed images.
-pub(crate) trait LinkPublisher {
+pub trait LinkPublisher {
     type PreparedBatch;
     type Receipt;
 
@@ -388,7 +388,7 @@ pub(crate) trait LinkPublisher {
 /// context, the root entry, the constructor/destructor plans, the flat link
 /// map, the session metrics, and the publisher's receipt (the long-term owner
 /// of every committed allocation lease).
-pub(crate) struct LinkProduct<Receipt> {
+pub struct LinkProduct<Receipt> {
     context: LinkContext,
     entry: TargetAddress,
     init_plan: InitPlan,
@@ -422,38 +422,38 @@ impl<Receipt> LinkProduct<Receipt> {
     }
 
     #[inline]
-    pub(crate) const fn context(&self) -> &LinkContext {
+    pub const fn context(&self) -> &LinkContext {
         &self.context
     }
 
     /// The root's runtime entry (Thumb bit preserved on ARM).
     #[inline]
-    pub(crate) const fn entry(&self) -> TargetAddress {
+    pub const fn entry(&self) -> TargetAddress {
         self.entry
     }
 
     #[inline]
-    pub(crate) const fn init_plan(&self) -> &InitPlan {
+    pub const fn init_plan(&self) -> &InitPlan {
         &self.init_plan
     }
 
     #[inline]
-    pub(crate) const fn fini_plan(&self) -> &FiniPlan {
+    pub const fn fini_plan(&self) -> &FiniPlan {
         &self.fini_plan
     }
 
     #[inline]
-    pub(crate) fn link_map(&self) -> &[LinkMapEntry] {
+    pub fn link_map(&self) -> &[LinkMapEntry] {
         &self.link_map
     }
 
     #[inline]
-    pub(crate) fn metrics(&self) -> LoadMetrics {
+    pub fn metrics(&self) -> LoadMetrics {
         self.metrics
     }
 
     #[inline]
-    pub(crate) const fn publication(&self) -> &Receipt {
+    pub const fn publication(&self) -> &Receipt {
         &self.publication
     }
 }
