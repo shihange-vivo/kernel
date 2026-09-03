@@ -19,8 +19,10 @@ use crate::{
     relocation::{AddendEncoding, ArchRelocator},
 };
 
+#[derive(Clone, Copy)]
 pub struct Riscv64Relocator;
 
+#[derive(Clone, Copy)]
 pub struct Riscv32Relocator;
 
 impl ArchRelocator for Riscv64Relocator {

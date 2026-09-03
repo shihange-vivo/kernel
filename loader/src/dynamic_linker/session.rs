@@ -27,6 +27,7 @@ use alloc::vec::Vec;
 use crate::{
     dynamic_linker::{
         graph::{DependencyGraph, DiscoveryItem, DiscoveryQueue},
+        relocate::{self, RelocationImage, RelocationPolicy},
         ArtifactIdentity, ArtifactResolver, ArtifactRole, DependencyRequest, ImageId, LinkDomainId,
         ResolvedArtifact, RuntimeImageState, ScopeSet, SymbolTable,
     },
@@ -71,6 +72,21 @@ impl LoadMetrics {
     #[inline]
     pub(crate) fn record_edge(&mut self) {
         self.edges += 1;
+    }
+
+    #[inline]
+    pub(crate) fn record_symbol_lookup(&mut self) {
+        self.symbol_lookups += 1;
+    }
+
+    #[inline]
+    pub(crate) fn record_hash_probe(&mut self) {
+        self.hash_probes += 1;
+    }
+
+    #[inline]
+    pub(crate) fn record_relocation_operation(&mut self) {
+        self.relocation_operations += 1;
     }
 
     #[inline]
@@ -142,6 +158,11 @@ impl<S> SessionImage<S> {
     pub(crate) const fn allocation(&self) -> SessionAllocation {
         self.allocation
     }
+
+    #[inline]
+    pub(crate) const fn state(&self) -> &S {
+        &self.state
+    }
 }
 
 /// Immutable session state while dependencies are being discovered (S5).
@@ -154,6 +175,18 @@ pub(crate) struct BuildingState {
 /// Immutable session state once scopes are frozen (S6).
 pub(crate) struct ScopedState {
     images: Vec<SessionImage<RuntimeImageState>>,
+    scopes: ScopeSet,
+}
+
+/// Owned runtime state after session-wide relocation (S7). Relocation only
+/// rewrites memory; the decoded metadata, load regions and segments are
+/// unchanged, so this newtypes the decoded state to make a second relocation
+/// unrepresentable.
+pub(crate) struct RelocatedImageState(RuntimeImageState);
+
+/// Immutable session state once every image is relocated (S7).
+pub(crate) struct RelocatedState {
+    images: Vec<SessionImage<RelocatedImageState>>,
     scopes: ScopeSet,
 }
 
@@ -176,12 +209,12 @@ impl<M: ImageMemory + ?Sized> Drop for RollbackGuard<'_, M> {
 
 /// A staged, multi-image link session (§10).
 ///
-/// `S` is one of [`BuildingState`] or [`ScopedState`] (and, in C16/C17,
-/// relocated/sealed states). The session owns the dependency graph, the
-/// rollback log, the session budgets and metrics; the trusted [`LoadProfile`]
-/// and [`LoadPolicy`] are carried so each absorbed image reuses the same
-/// profile without re-deriving it.
-pub(crate) struct LinkSession<'a, M: ImageMemory + ?Sized, S> {
+/// `S` is one of [`BuildingState`], [`ScopedState`] or [`RelocatedState`]
+/// (and, in C17, a sealed state). The session owns the dependency graph, the
+/// rollback log, the session budgets and metrics; the trusted [`LoadProfile`],
+/// [`LoadPolicy`] and the single [`ArchRelocator`] are carried so every image
+/// reuses the same profile and relocation semantics without re-deriving them.
+pub(crate) struct LinkSession<'a, M: ImageMemory + ?Sized, S, A> {
     rollback: RollbackGuard<'a, M>,
     graph: DependencyGraph,
     limits: SessionLimits,
@@ -189,11 +222,13 @@ pub(crate) struct LinkSession<'a, M: ImageMemory + ?Sized, S> {
     profile: LoadProfile,
     policy: LoadPolicy,
     domain: LinkDomainId,
+    arch: A,
     state: S,
 }
 
-pub(crate) type BuildingSession<'a, M> = LinkSession<'a, M, BuildingState>;
-pub(crate) type ScopedSession<'a, M> = LinkSession<'a, M, ScopedState>;
+pub(crate) type BuildingSession<'a, M, A> = LinkSession<'a, M, BuildingState, A>;
+pub(crate) type ScopedSession<'a, M, A> = LinkSession<'a, M, ScopedState, A>;
+pub(crate) type RelocatedSession<'a, M, A> = LinkSession<'a, M, RelocatedState, A>;
 
 /// Phase 0.5 entry point (§10.2): a trusted profile, a session budget and the
 /// single [`ArchRelocator`] used by every image in the link.
@@ -202,7 +237,7 @@ pub(crate) struct DynamicLinker<A> {
     policy: LoadPolicy,
 }
 
-impl<A: ArchRelocator> DynamicLinker<A> {
+impl<A: ArchRelocator + Clone> DynamicLinker<A> {
     pub(crate) fn new(arch: A) -> Self {
         Self {
             arch,
@@ -222,7 +257,7 @@ impl<A: ArchRelocator> DynamicLinker<A> {
         domain: LinkDomainId,
         limits: SessionLimits,
         memory: &'a mut Memory,
-    ) -> LoadResult<BuildingSession<'a, Memory>>
+    ) -> LoadResult<BuildingSession<'a, Memory, A>>
     where
         R: ElfReader,
         Memory: ImageMemory + ?Sized,
@@ -281,6 +316,7 @@ impl<A: ArchRelocator> DynamicLinker<A> {
             profile,
             policy: self.policy,
             domain,
+            arch: self.arch.clone(),
             state: BuildingState {
                 images,
                 discovery,
@@ -290,7 +326,7 @@ impl<A: ArchRelocator> DynamicLinker<A> {
     }
 }
 
-impl<'a, M: ImageMemory + ?Sized> BuildingSession<'a, M> {
+impl<'a, M: ImageMemory + ?Sized, A: ArchRelocator> BuildingSession<'a, M, A> {
     /// Drive the bounded BFS closure until the discovery queue is empty.
     ///
     /// Each resolved dependency is de-duplicated by identity *before* it is
@@ -391,7 +427,7 @@ impl<'a, M: ImageMemory + ?Sized> BuildingSession<'a, M> {
     ///
     /// Consumes the building session; on any error the session is dropped and
     /// every absorbed allocation is aborted in reverse creation order.
-    pub fn freeze_scopes(self) -> LoadResult<ScopedSession<'a, M>> {
+    pub fn freeze_scopes(self) -> LoadResult<ScopedSession<'a, M, A>> {
         let LinkSession {
             rollback,
             graph,
@@ -400,6 +436,7 @@ impl<'a, M: ImageMemory + ?Sized> BuildingSession<'a, M> {
             profile,
             policy,
             domain,
+            arch,
             state,
         } = self;
         let BuildingState {
@@ -428,7 +465,81 @@ impl<'a, M: ImageMemory + ?Sized> BuildingSession<'a, M> {
             profile,
             policy,
             domain,
+            arch,
             state: ScopedState { images, scopes },
+        })
+    }
+}
+
+impl<'a, M: ImageMemory + ?Sized, A: ArchRelocator> ScopedSession<'a, M, A> {
+    /// Run the session-wide relocation (S7, §11).
+    ///
+    /// Consumes the scoped session; every decoded relocation record is
+    /// preflighted and applied against the frozen scopes. On any error the
+    /// session is dropped and all absorbed allocations aborted.
+    pub fn relocate(mut self) -> LoadResult<RelocatedSession<'a, M, A>> {
+        let symbols: Vec<&SymbolTable> = self
+            .state
+            .images
+            .iter()
+            .map(|image| image.state.metadata().symbols())
+            .collect();
+
+        let relocation_images: Vec<RelocationImage<'_>> = self
+            .state
+            .images
+            .iter()
+            .map(|image| {
+                RelocationImage::new(
+                    image.image_id,
+                    image.allocation,
+                    image.state.regions(),
+                    image.state.load_segments(),
+                    image.state.metadata(),
+                    image.state.load_bias(),
+                )
+            })
+            .collect();
+
+        let policy = RelocationPolicy::for_profile(&self.profile);
+        let _operations = relocate::run(
+            &self.arch,
+            &symbols,
+            &relocation_images,
+            &self.state.scopes,
+            &self.profile,
+            &policy,
+            &self.limits,
+            &mut self.metrics,
+            &mut *self.rollback.memory,
+            &mut self.rollback.log,
+        )
+        .map_err(|error| error.at_stage(LoadStage::LinkRelocate))?;
+
+        // Rewrap the decoded state so a second relocation is unrepresentable.
+        let images = self
+            .state
+            .images
+            .into_iter()
+            .map(|image| SessionImage {
+                image_id: image.image_id,
+                artifact: image.artifact,
+                allocation: image.allocation,
+                state: RelocatedImageState(image.state),
+            })
+            .collect();
+        let scopes = self.state.scopes;
+
+        Ok(LinkSession {
+            rollback: self.rollback,
+            graph: self.graph,
+            limits: self.limits,
+            metrics: self.metrics,
+            profile: self.profile,
+            policy: self.policy,
+            domain: self.domain,
+            arch: self.arch,
+            state: RelocatedState { images, scopes },
         })
     }
 }
