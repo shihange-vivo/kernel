@@ -25,17 +25,20 @@
 use alloc::vec::Vec;
 
 use crate::{
+    address::TargetAddress,
     dynamic_linker::{
         graph::{DependencyGraph, DiscoveryItem, DiscoveryQueue},
+        lifecycle::{self, FiniPlan, InitPlan, LifecycleImage},
         relocate::{self, RelocationImage, RelocationPolicy},
         ArtifactIdentity, ArtifactResolver, ArtifactRole, DependencyRequest, ImageId, LinkDomainId,
-        ResolvedArtifact, RuntimeImageState, ScopeSet, SymbolTable,
+        ResolvedArtifact, RuntimeImageMetadata, RuntimeImageState, ScopeSet, SymbolTable,
     },
+    elf::LoadSegmentInfo,
     error::{ErrorContext, LoadError, LoadErrorKind, LoadResult, LoadStage},
     identity::{
         LoadLimits, LoadPolicy, LoadProfile, LoadRequest, SessionLimits, PHASE05_LOAD_POLICY,
     },
-    image::{absorb_into_session, ImageLoader},
+    image::{absorb_into_session, ImageLoader, LoadedRegion},
     memory::{AllocationRollbackLog, ImageMemory, SessionAllocation},
     reader::ElfReader,
     relocation::ArchRelocator,
@@ -183,6 +186,28 @@ pub(crate) struct ScopedState {
 /// unchanged, so this newtypes the decoded state to make a second relocation
 /// unrepresentable.
 pub(crate) struct RelocatedImageState(RuntimeImageState);
+
+impl RelocatedImageState {
+    #[inline]
+    pub(crate) fn regions(&self) -> &[LoadedRegion] {
+        self.0.regions()
+    }
+
+    #[inline]
+    pub(crate) fn load_segments(&self) -> &[LoadSegmentInfo] {
+        self.0.load_segments()
+    }
+
+    #[inline]
+    pub(crate) const fn metadata(&self) -> &RuntimeImageMetadata {
+        self.0.metadata()
+    }
+
+    #[inline]
+    pub(crate) const fn load_bias(&self) -> TargetAddress {
+        self.0.load_bias()
+    }
+}
 
 /// Immutable session state once every image is relocated (S7).
 pub(crate) struct RelocatedState {
@@ -541,6 +566,36 @@ impl<'a, M: ImageMemory + ?Sized, A: ArchRelocator> ScopedSession<'a, M, A> {
             arch: self.arch,
             state: RelocatedState { images, scopes },
         })
+    }
+
+    /// Build the dependency-first init and reverse fini plans (§12.2).
+    ///
+    /// Reads the post-relocation init/fini array words back through the
+    /// session memory backend and validates each non-sentinel function target
+    /// against its owner's executable region (and Thumb bit on ARM). The plans
+    /// only *name* targets — nothing here calls a constructor.
+    pub fn build_lifecycle_plans(&self) -> LoadResult<(InitPlan, FiniPlan)> {
+        let images: Vec<LifecycleImage<'_>> = self
+            .state
+            .images
+            .iter()
+            .map(|image| {
+                LifecycleImage::new(
+                    image.image_id,
+                    image.allocation,
+                    image.state.regions(),
+                    image.state.load_segments(),
+                    image.state.metadata().lifecycle(),
+                    image.state.load_bias(),
+                )
+            })
+            .collect();
+        lifecycle::build(
+            &self.graph,
+            &images,
+            &self.profile,
+            &*self.rollback.memory,
+        )
     }
 }
 
