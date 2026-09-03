@@ -14,9 +14,12 @@
 
 use alloc::vec::Vec;
 use goblin::{
-    elf::program_header::{
-        PF_R, PF_W, PF_X, PT_ARM_EXIDX, PT_DYNAMIC, PT_GNU_EH_FRAME, PT_GNU_RELRO, PT_GNU_STACK,
-        PT_INTERP, PT_LOAD, PT_PHDR, PT_TLS,
+    elf::{
+        dynamic::DT_SONAME,
+        program_header::{
+            PF_R, PF_W, PF_X, PT_ARM_EXIDX, PT_DYNAMIC, PT_GNU_EH_FRAME, PT_GNU_RELRO,
+            PT_GNU_STACK, PT_INTERP, PT_LOAD, PT_PHDR, PT_TLS,
+        },
     },
     elf64,
 };
@@ -32,6 +35,7 @@ use crate::{
     image::{
         features::validate_dynamic_features,
         inspect::{InspectedImage, StackKind},
+        map::dynamic_error,
         DynamicFeatureSummary,
     },
     reader::ElfReader,
@@ -328,6 +332,9 @@ impl<R: ElfReader> AdmittedImage<R> {
                 self.request.limits(),
             )
             .map_err(|error| error.at_stage(LoadStage::Inspect))?,
+            None if self.role == ArtifactRole::SharedObject => {
+                return Err(dynamic_error(DT_SONAME, 0).at_stage(LoadStage::Inspect));
+            }
             None => DynamicFeatureSummary::empty(),
         };
 
