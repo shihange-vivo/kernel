@@ -36,8 +36,8 @@ use crate::{
         },
         relocate::{self, RelocationImage, RelocationPolicy},
         ArtifactIdentity, ArtifactResolver, ArtifactRole, DependencyName, DependencyRequest,
-        ImageId, ImageOwnership, LinkDomainId, ResolvedArtifact, RuntimeImageMetadata,
-        RuntimeImageState, ScopeSet, SymbolTable,
+        ImageId, ImageOwnership, LinkDomainId, PublishedImageDescriptor, ResolvedArtifact,
+        RuntimeImageMetadata, RuntimeImageState, ScopeSet, SymbolTable,
     },
     elf::LoadSegmentInfo,
     error::{ErrorContext, LoadError, LoadErrorKind, LoadResult, LoadStage},
@@ -1023,11 +1023,25 @@ impl<M: ImageMemory + ?Sized, A: ArchRelocator> SealedSession<'_, M, A> {
         let SealedSessionState { images, scopes } = state;
 
         for image in images {
-            committed.push(CommittedImage::new(
-                image.image_id,
+            let node = graph.node(image.image_id).ok_or_else(|| {
+                LoadError::new(LoadErrorKind::BadElf, ErrorContext::None)
+                    .at_stage(LoadStage::Publish)
+            })?;
+            let SealedImageState { runtime, sealed } = image.state;
+            let (regions, load_segments, load_bias, program_headers, symbols) =
+                runtime.into_publish_parts();
+            let descriptor = PublishedImageDescriptor::from_node_and_state(
+                node,
                 image.allocation.allocation(),
-                image.state.sealed,
-            ));
+                sealed,
+                regions,
+                load_segments,
+                load_bias,
+                program_headers,
+                symbols,
+            )
+            .map_err(|error| error.at_stage(LoadStage::Publish))?;
+            committed.push(CommittedImage::new(image.image_id, descriptor));
         }
 
         let context = LinkContext::new(graph, scopes, committed);
