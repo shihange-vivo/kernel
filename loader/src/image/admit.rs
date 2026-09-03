@@ -28,7 +28,7 @@ const PT_RISCV_ATTRIBUTES: u32 = 0x7000_0003;
 
 use crate::{
     address::{FileRange, TargetAddress, TargetRange},
-    dynamic_linker::ArtifactRole,
+    dynamic_linker::{ArtifactRole, ProgramHeaderGeometry},
     elf::{DynamicSegmentInfo, ElfHeaderInfo, LoadSegmentInfo, ProgramHeaderInfo},
     error::{ErrorContext, LoadError, LoadErrorKind, LoadResult, LoadStage, ProgramHeaderField},
     identity::{ElfMachine, LoadPolicy, LoadRequest, PHASE0_LOAD_POLICY},
@@ -108,6 +108,7 @@ impl<R: ElfReader> AdmittedImage<R> {
         let mut stack = StackKind::NotDeclared;
         let mut interpreter = None;
         let mut tls = None;
+        let mut phdr_vaddr = None;
 
         for index in 0..count {
             let offset = self
@@ -266,7 +267,18 @@ impl<R: ElfReader> AdmittedImage<R> {
                         .map_err(|e| e.at_stage(LoadStage::Inspect))?;
                     tls = Some(target_range)
                 }
-                PT_PHDR | PT_GNU_EH_FRAME => {}
+                PT_PHDR => {
+                    if phdr_vaddr.is_some() {
+                        return Err(program_header_error(
+                            index,
+                            ProgramHeaderField::DuplicatePhdr,
+                            program_header.r#type().into(),
+                        )
+                        .at_stage(LoadStage::Inspect));
+                    }
+                    phdr_vaddr = Some(program_header.vaddr());
+                }
+                PT_GNU_EH_FRAME => {}
                 PT_ARM_EXIDX if self.header.machine() == ElfMachine::Arm => {}
                 PT_RISCV_ATTRIBUTES if self.header.machine() == ElfMachine::Riscv => {}
                 t => {
@@ -338,6 +350,12 @@ impl<R: ElfReader> AdmittedImage<R> {
             None => DynamicFeatureSummary::empty(),
         };
 
+        let phdr_geometry = ProgramHeaderGeometry::new(
+            self.header.program_header_entry_size(),
+            self.header.program_header_count(),
+            phdr_vaddr,
+        );
+
         Ok(InspectedImage::new(
             self.reader,
             self.request,
@@ -349,6 +367,7 @@ impl<R: ElfReader> AdmittedImage<R> {
             interpreter,
             tls,
             summary,
+            phdr_geometry,
         )
         .with_policy(self.policy)
         .with_role(self.role))

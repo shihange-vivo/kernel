@@ -23,7 +23,7 @@ use goblin::elf::dynamic::{
 use crate::{
     address::{FileRange, TargetAddress, TargetRange},
     dynamic_linker::{
-        symbol_count_from_hash, DependencyName, ImageLifecycleMetadata, ProgramHeaderRuntimeInfo,
+        symbol_count_from_hash, DependencyName, ImageLifecycleMetadata, ProgramHeaderGeometry,
         RelocationTableInfo, RelocationTables, RuntimeDynamicInfo, RuntimeImageMetadata,
         SymbolTable,
     },
@@ -101,6 +101,7 @@ pub(crate) struct MappedImage<R: ElfReader, M: ImageMemory> {
     stack: StackKind,
     interpreter: Option<FileRange>,
     tls: Option<TargetRange>,
+    phdr_geometry: ProgramHeaderGeometry,
 }
 
 impl<R: ElfReader, M: ImageMemory> MappedImage<R, M> {
@@ -119,6 +120,7 @@ impl<R: ElfReader, M: ImageMemory> MappedImage<R, M> {
         stack: StackKind,
         interpreter: Option<FileRange>,
         tls: Option<TargetRange>,
+        phdr_geometry: ProgramHeaderGeometry,
     ) -> Self {
         Self {
             reader,
@@ -134,6 +136,7 @@ impl<R: ElfReader, M: ImageMemory> MappedImage<R, M> {
             stack,
             interpreter,
             tls,
+            phdr_geometry,
         }
     }
 
@@ -387,6 +390,10 @@ impl<R: ElfReader, M: ImageMemory> MappedImage<R, M> {
             let lifecycle = self
                 .decode_lifecycle(&tags, policy)
                 .map_err(|error| error.at_stage(LoadStage::Decode))?;
+            let program_headers = self
+                .phdr_geometry
+                .resolve(self.load_bias)
+                .map_err(|error| error.at_stage(LoadStage::Decode))?;
             metadata = RuntimeImageMetadata::new(
                 dynamic,
                 needed,
@@ -394,7 +401,7 @@ impl<R: ElfReader, M: ImageMemory> MappedImage<R, M> {
                 symbols,
                 relocations,
                 lifecycle,
-                ProgramHeaderRuntimeInfo,
+                program_headers,
             );
             self.request
                 .limits()
