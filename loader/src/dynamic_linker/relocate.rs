@@ -305,6 +305,7 @@ where
                 arch,
                 symbols,
                 scopes,
+                images,
                 policy,
                 limits,
                 target_word,
@@ -330,6 +331,7 @@ fn preflight_one<A, M>(
     arch: &A,
     symbols: &[&SymbolTable],
     scopes: &ScopeSet,
+    images: &[RelocationImage<'_>],
     policy: &RelocationPolicy,
     limits: &SessionLimits,
     target_word: TargetWord,
@@ -380,6 +382,7 @@ where
         arch,
         symbols,
         scopes,
+        images,
         policy,
         limits,
         thumb,
@@ -452,6 +455,7 @@ fn resolve_source<A>(
     _arch: &A,
     symbols: &[&SymbolTable],
     scopes: &ScopeSet,
+    images: &[RelocationImage<'_>],
     policy: &RelocationPolicy,
     limits: &SessionLimits,
     thumb: bool,
@@ -513,7 +517,7 @@ where
 
     match resolved {
         Some(symbol) => {
-            validate_symbol_kind(kind, thumb, &symbol, record)?;
+            validate_symbol_kind(kind, thumb, &symbol, images, policy, record)?;
             Ok(RelocationSource::Symbol(symbol))
         }
         None => {
@@ -542,6 +546,8 @@ fn validate_symbol_kind(
     kind: RelocationKind,
     thumb: bool,
     symbol: &ResolvedSymbol,
+    images: &[RelocationImage<'_>],
+    policy: &RelocationPolicy,
     record: RelocationRecord,
 ) -> LoadResult<()> {
     if kind == RelocationKind::JumpSlot && symbol.region() != SymbolRegionKind::Executable {
@@ -549,6 +555,35 @@ fn validate_symbol_kind(
     }
     if thumb && symbol.region() == SymbolRegionKind::Executable && symbol.address().get() & 1 == 0 {
         return Err(relocation_error(record, LoadErrorKind::BadElf));
+    }
+    if kind == RelocationKind::JumpSlot {
+        if symbol.is_absolute() {
+            return Err(relocation_error(record, LoadErrorKind::UnsupportedByProfile));
+        }
+        if policy.require_control_flow_target_x {
+            let provider = images
+                .get(symbol.owner().get() as usize)
+                .ok_or_else(|| relocation_error(record, LoadErrorKind::BadElf))?;
+            if provider.load_segments.len() != provider.regions.len() {
+                return Err(relocation_error(record, LoadErrorKind::BadElf));
+            }
+            let span = core::cmp::max(symbol.size(), 1);
+            let executable = provider
+                .load_segments
+                .iter()
+                .zip(provider.regions.iter())
+                .any(|(segment, region)| {
+                    segment
+                        .permissions()
+                        .contains(MemoryPermissions::EXECUTE)
+                        && region
+                            .runtime_range()
+                            .contains_span(symbol.canonical(), span)
+                });
+            if !executable {
+                return Err(relocation_error(record, LoadErrorKind::PermissionConflict));
+            }
+        }
     }
     Ok(())
 }

@@ -69,6 +69,7 @@ pub(crate) struct ResolvedSymbol {
     size: u64,
     binding: SymbolBinding,
     region: SymbolRegionKind,
+    absolute: bool,
 }
 
 impl ResolvedSymbol {
@@ -87,6 +88,7 @@ impl ResolvedSymbol {
             size: entry.size(),
             binding: entry.binding(),
             region,
+            absolute: entry.is_absolute(),
         }
     }
 
@@ -118,6 +120,11 @@ impl ResolvedSymbol {
     #[inline]
     pub(crate) const fn region(&self) -> SymbolRegionKind {
         self.region
+    }
+
+    #[inline]
+    pub(crate) const fn is_absolute(&self) -> bool {
+        self.absolute
     }
 }
 

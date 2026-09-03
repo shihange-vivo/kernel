@@ -79,6 +79,7 @@ pub(crate) struct SymbolEntry {
     visibility: SymbolVisibility,
     symbol_type: SymbolType,
     definition: SymbolDefinition,
+    absolute: bool,
 }
 
 impl SymbolEntry {
@@ -120,6 +121,11 @@ impl SymbolEntry {
     #[inline]
     pub(crate) const fn definition(&self) -> SymbolDefinition {
         self.definition
+    }
+
+    #[inline]
+    pub(crate) const fn is_absolute(&self) -> bool {
+        self.absolute
     }
 }
 
@@ -721,7 +727,7 @@ fn parse_symbol_entry(
         0 => SymbolDefinition::Undefined,
         0xfff1 => SymbolDefinition::Defined, // SHN_ABS: absolute, no region check
         0xfff2 => return Err(symbol_error(index, LoadErrorKind::BadElf)),
-        1..=0xff00 => SymbolDefinition::Defined,
+        1..=0xfeff => SymbolDefinition::Defined,
         _ => return Err(symbol_error(index, LoadErrorKind::BadElf)),
     };
 
@@ -752,6 +758,7 @@ fn parse_symbol_entry(
         visibility,
         symbol_type,
         definition,
+        absolute: shndx == 0xfff1,
     })
 }
 
