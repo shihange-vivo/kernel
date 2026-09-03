@@ -228,8 +228,13 @@ impl<'a> DependencyRequest<'a> {
 /// system DSO catalog.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ImageOwnership {
+    /// Owned by this link session: allocated, relocated and sealed here.
     SessionPrivate,
+    /// A candidate to become a shared system DSO, loaded for the first time.
     SystemCandidate,
+    /// A Ready system DSO imported from the registry: already relocated and
+    /// sealed, contributed to the graph/scopes without a fresh load (§12.1).
+    ExternalReady,
 }
 
 /// A resolved artifact: its identity and a reader over the same snapshot.
@@ -287,6 +292,16 @@ pub trait ArtifactResolver {
         &mut self,
         request: &DependencyRequest<'_>,
     ) -> LoadResult<ResolvedArtifact<Self::Reader>>;
+}
+
+/// What a [`DependencyRequest`] resolved into (§12.1).
+///
+/// `Load` hands the session a reader over a snapshot it must load through
+/// S0–S8; `Import` hands it a Ready provider already relocated and sealed by a
+/// previous link, to be joined to the graph and scopes without a fresh load.
+pub enum DependencyResolution<R> {
+    Load(ResolvedArtifact<R>),
+    Import(super::ImportedImageDescriptor),
 }
 
 fn try_copy_bytes(bytes: &[u8]) -> LoadResult<Vec<u8>> {

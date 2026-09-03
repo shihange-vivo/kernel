@@ -22,6 +22,7 @@ mod graph;
 mod lifecycle;
 mod metadata;
 mod publish;
+mod published;
 mod relocate;
 mod scope;
 mod session;
@@ -29,25 +30,30 @@ mod symbol;
 
 pub use artifact::{
     ArtifactIdentity, ArtifactResolver, ArtifactRole, BuildId, DependencyName, DependencyRequest,
-    FileIdentity, ImageId, ImageOwnership, LinkDomainId, ResolvedArtifact,
+    DependencyResolution, FileIdentity, ImageId, ImageOwnership, LinkDomainId, ResolvedArtifact,
 };
 
+pub use published::{
+    ImportedImageDescriptor, PublishedImageDescriptor, PublishedRegion, PublishedSymbolTable,
+};
+
+pub(crate) use lifecycle::LifecycleImage;
 pub use lifecycle::{FiniPlan, InitPlan, LifecycleEntry};
+pub use metadata::ProgramHeaderRuntimeInfo;
+pub(crate) use metadata::{
+    ImageLayout, ImageLifecycleMetadata, RelocationTableInfo, RelocationTables, RuntimeDynamicInfo,
+    RuntimeImageMetadata, RuntimeImageState,
+};
+pub(crate) use publish::{build_manifest, LinkMapImage};
 pub use publish::{
     CommittedImage, CommittingLinkProduct, LinkContext, LinkMapEntry, LinkProduct, LinkPublisher,
     PreparedLinkManifest,
 };
+pub(crate) use scope::{ResolvedSymbol, ScopeImage, ScopeSet, SymbolRegionKind, SymbolScope};
 pub use session::{
     BuildingSession, DynamicLinker, LinkSession, LoadMetrics, RelocatedSession, ScopedSession,
     SealedSession,
 };
-pub(crate) use lifecycle::LifecycleImage;
-pub(crate) use publish::{build_manifest, LinkMapImage};
-pub(crate) use metadata::{
-    ImageLayout, ImageLifecycleMetadata, ProgramHeaderRuntimeInfo, RelocationTableInfo,
-    RelocationTables, RuntimeDynamicInfo, RuntimeImageMetadata, RuntimeImageState,
-};
-pub(crate) use scope::{ResolvedSymbol, ScopeImage, ScopeSet, SymbolRegionKind, SymbolScope};
 pub(crate) use symbol::{
     symbol_count_from_hash, SymbolBinding, SymbolDefinition, SymbolEntry, SymbolTable, SymbolType,
     SymbolVisibility,
