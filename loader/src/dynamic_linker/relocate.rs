@@ -23,7 +23,7 @@
 use alloc::vec::Vec;
 
 use crate::{
-    address::TargetAddress,
+    address::{TargetAddress, TargetRange},
     dynamic_linker::{
         ImageId, LoadMetrics, ResolvedSymbol, RuntimeImageMetadata, ScopeSet, SymbolBinding,
         SymbolDefinition, SymbolRegionKind, SymbolTable, SymbolVisibility,
@@ -379,6 +379,12 @@ where
         metrics,
     )?;
     let value = fold_value(kind, image.load_bias, &source, addend, width, record)?;
+    if kind == RelocationKind::Relative
+        && !TargetRange::new(allocation.base(), allocation.len())
+            .contains_span(TargetAddress::new(value), 1)
+    {
+        return Err(relocation_error(record, LoadErrorKind::OutOfBounds));
+    }
 
     metrics.record_relocation_operation();
     Ok(SessionRelocation {

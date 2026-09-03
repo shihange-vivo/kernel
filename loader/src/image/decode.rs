@@ -182,14 +182,33 @@ impl<R: ElfReader, M: ImageMemory> DecodedImage<R, M> {
                 LoadErrorKind::UnsupportedByProfile,
             ));
         }
+        let width = target_word.width().bytes();
+        if record.offset().get() % width != 0 {
+            return Err(relocation_error(record, LoadErrorKind::InvalidAlignment));
+        }
+        let offset = self
+            .locate_vaddr_at(record.offset(), width)
+            .map_err(|_| relocation_error(record, LoadErrorKind::OutOfBounds))?;
+        let writable = self.load_segments.iter().any(|segment| {
+            segment
+                .permissions()
+                .contains(crate::MemoryPermissions::WRITE)
+                && TargetRange::new(segment.vaddr(), segment.memory_size())
+                    .contains_span(record.offset(), width)
+        });
+        if !writable {
+            return Err(relocation_error(record, LoadErrorKind::PermissionConflict));
+        }
         let addend = match (relocator.addend_encoding(), record.addend()) {
             (AddendEncoding::Explicit, RelocationAddend::Explicit(value)) => i128::from(value),
-            (AddendEncoding::Implicit, RelocationAddend::Implicit) => {
-                let offset = self
-                    .locate_vaddr_at(record.offset(), target_word.width().bytes())
-                    .map_err(|_| relocation_error(record, LoadErrorKind::OutOfBounds))?;
-                i128::from(target_word.read_via(&self.transaction, offset)?)
-            }
+            (AddendEncoding::Implicit, RelocationAddend::Implicit) => match target_word.width() {
+                WordWidth::U32 => {
+                    i128::from(target_word.read_via(&self.transaction, offset)? as u32 as i32)
+                }
+                WordWidth::U64 => {
+                    i128::from(target_word.read_via(&self.transaction, offset)? as u64 as i64)
+                }
+            },
             _ => {
                 return Err(relocation_error(
                     record,
@@ -197,14 +216,17 @@ impl<R: ElfReader, M: ImageMemory> DecodedImage<R, M> {
                 ))
             }
         };
-        let offset = self
-            .locate_vaddr_at(record.offset(), target_word.width().bytes())
-            .map_err(|_| relocation_error(record, LoadErrorKind::OutOfBounds))?;
         let result = i128::from(self.load_bias.get())
             .checked_add(addend)
             .filter(|value| *value >= 0 && *value <= i128::from(target_word.width().maximum()))
             .ok_or_else(|| relocation_error(record, LoadErrorKind::IntegerOverflow))?;
         let value = result as u64;
+        let allocation = self.transaction.allocation();
+        if !TargetRange::new(allocation.base(), allocation.len())
+            .contains_span(TargetAddress::new(value), 1)
+        {
+            return Err(relocation_error(record, LoadErrorKind::OutOfBounds));
+        }
         Ok(RelocationOperation::new(offset, value, record))
     }
 
