@@ -493,6 +493,11 @@ impl LoadLimits {
         )
     }
 
+    #[inline]
+    pub(crate) const fn max_runtime_metadata_bytes(&self) -> u64 {
+        self.max_runtime_metadata_bytes
+    }
+
     pub fn check_relocation_operation_bytes(&self, actual: u64) -> LoadResult<()> {
         check_limit(
             LimitKind::RelocationOperationBytes,
@@ -630,7 +635,11 @@ impl SessionLimits {
     }
 
     pub fn check_dependency_edge_count(&self, actual: u32) -> LoadResult<()> {
-        check_u32_limit(LimitKind::DependencyEdgeCount, actual, self.max_dependency_edges)
+        check_u32_limit(
+            LimitKind::DependencyEdgeCount,
+            actual,
+            self.max_dependency_edges,
+        )
     }
 
     pub fn check_dependency_depth(&self, actual: u16) -> LoadResult<()> {
@@ -642,7 +651,11 @@ impl SessionLimits {
     }
 
     pub fn check_total_image_bytes(&self, actual: u64) -> LoadResult<()> {
-        check_limit(LimitKind::TotalImageBytes, actual, self.max_total_image_bytes)
+        check_limit(
+            LimitKind::TotalImageBytes,
+            actual,
+            self.max_total_image_bytes,
+        )
     }
 
     pub fn check_total_runtime_metadata_bytes(&self, actual: u64) -> LoadResult<()> {
@@ -654,7 +667,11 @@ impl SessionLimits {
     }
 
     pub fn check_total_relocations(&self, actual: u64) -> LoadResult<()> {
-        check_limit(LimitKind::TotalRelocations, actual, self.max_total_relocations)
+        check_limit(
+            LimitKind::TotalRelocations,
+            actual,
+            self.max_total_relocations,
+        )
     }
 
     pub fn check_symbol_lookups(&self, actual: u64) -> LoadResult<()> {
@@ -662,7 +679,11 @@ impl SessionLimits {
     }
 
     pub fn check_symbol_name_len(&self, actual: u32) -> LoadResult<()> {
-        check_u32_limit(LimitKind::SymbolNameLength, actual, self.max_symbol_name_len)
+        check_u32_limit(
+            LimitKind::SymbolNameLength,
+            actual,
+            self.max_symbol_name_len,
+        )
     }
 
     pub fn check_dependency_name_len(&self, actual: u32) -> LoadResult<()> {

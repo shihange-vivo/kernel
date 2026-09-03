@@ -510,15 +510,18 @@ impl<R: ElfReader, M: ImageMemory> MappedImage<R, M> {
         };
 
         let gnu_bytes = match tags.gnu_hash() {
-            Some(gnu_vaddr) => {
-                // The GNU hash chain runs up to the start of `.dynsym`, so the
-                // symtab address is the precise upper bound (§7.4).
-                if gnu_vaddr >= symtab {
-                    return Err(dynamic_error(DT_GNU_HASH, gnu_vaddr));
-                }
-                let len = symtab - gnu_vaddr;
-                Some(self.read_table_bytes(gnu_vaddr, len, DT_GNU_HASH)?)
-            }
+            Some(gnu_vaddr) => Some(
+                self.read_gnu_hash_bytes(
+                    gnu_vaddr,
+                    class,
+                    endian,
+                    expected_syment,
+                    sysv_bytes
+                        .as_deref()
+                        .map(|bytes| read_u32(bytes, 4, endian))
+                        .transpose()?,
+                )?,
+            ),
             None => None,
         };
 
@@ -687,6 +690,109 @@ impl<R: ElfReader, M: ImageMemory> MappedImage<R, M> {
         buffer.resize(len_usize, 0);
         self.transaction.read(offset, &mut buffer)?;
         Ok(buffer.into_boxed_slice())
+    }
+
+    /// Read exactly the reachable GNU hash extent without relying on section
+    /// adjacency. When SysV hash is also present its `nchain` supplies the
+    /// symbol count; otherwise the chain beginning at the greatest bucket is
+    /// scanned to its bounded terminator.
+    fn read_gnu_hash_bytes(
+        &self,
+        vaddr: u64,
+        class: ElfClass,
+        endian: ElfData,
+        syment: u64,
+        known_symbol_count: Option<u32>,
+    ) -> LoadResult<Box<[u8]>> {
+        let header = self.read_table_bytes(vaddr, 16, DT_GNU_HASH)?;
+        let nbuckets = read_u32(&header, 0, endian)?;
+        let symndx = read_u32(&header, 4, endian)?;
+        let maskwords = read_u32(&header, 8, endian)?;
+        let shift2 = read_u32(&header, 12, endian)?;
+        if nbuckets == 0 || maskwords == 0 || !maskwords.is_power_of_two() || shift2 >= u32::BITS {
+            return Err(dynamic_error(DT_GNU_HASH, vaddr));
+        }
+
+        let word_size = match class {
+            ElfClass::Elf32 => 4_u64,
+            ElfClass::Elf64 => 8_u64,
+        };
+        let head_len = 16_u64
+            .checked_add(
+                u64::from(maskwords)
+                    .checked_mul(word_size)
+                    .ok_or_else(|| dynamic_error(DT_GNU_HASH, vaddr))?,
+            )
+            .and_then(|value| value.checked_add(u64::from(nbuckets) * 4))
+            .ok_or_else(|| dynamic_error(DT_GNU_HASH, vaddr))?;
+
+        if let Some(symbol_count) = known_symbol_count {
+            let chain_count = symbol_count
+                .checked_sub(symndx)
+                .ok_or_else(|| dynamic_error(DT_GNU_HASH, vaddr))?;
+            let total = head_len
+                .checked_add(u64::from(chain_count) * 4)
+                .ok_or_else(|| dynamic_error(DT_GNU_HASH, vaddr))?;
+            self.request.limits().check_runtime_metadata_bytes(total)?;
+            return self.read_table_bytes(vaddr, total, DT_GNU_HASH);
+        }
+
+        self.request
+            .limits()
+            .check_runtime_metadata_bytes(head_len)?;
+        let head = self.read_table_bytes(vaddr, head_len, DT_GNU_HASH)?;
+        let bucket_base = usize::try_from(
+            16_u64
+                .checked_add(u64::from(maskwords) * word_size)
+                .ok_or_else(|| dynamic_error(DT_GNU_HASH, vaddr))?,
+        )
+        .map_err(|_| dynamic_error(DT_GNU_HASH, vaddr))?;
+        let mut greatest_bucket = 0_u32;
+        for index in 0..nbuckets as usize {
+            let bucket = read_u32(&head, bucket_base + index * 4, endian)?;
+            if bucket != 0 && bucket < symndx {
+                return Err(dynamic_error(DT_GNU_HASH, u64::from(bucket)));
+            }
+            greatest_bucket = greatest_bucket.max(bucket);
+        }
+        if greatest_bucket == 0 {
+            return Ok(head);
+        }
+
+        let max_symbols = self.request.limits().max_runtime_metadata_bytes() / syment;
+        if u64::from(greatest_bucket) >= max_symbols {
+            return Err(dynamic_error(DT_GNU_HASH, u64::from(greatest_bucket)));
+        }
+        let mut chain_index = greatest_bucket - symndx;
+        let maximum_chain_count = max_symbols
+            .checked_sub(u64::from(symndx))
+            .ok_or_else(|| dynamic_error(DT_GNU_HASH, vaddr))?;
+        loop {
+            if u64::from(chain_index) >= maximum_chain_count {
+                return Err(dynamic_error(DT_GNU_HASH, u64::from(chain_index)));
+            }
+            let word_delta = u64::from(chain_index)
+                .checked_mul(4)
+                .ok_or_else(|| dynamic_error(DT_GNU_HASH, vaddr))?;
+            let word_vaddr = vaddr
+                .checked_add(head_len)
+                .and_then(|value| value.checked_add(word_delta))
+                .ok_or_else(|| dynamic_error(DT_GNU_HASH, vaddr))?;
+            let word = self.read_table_bytes(word_vaddr, 4, DT_GNU_HASH)?;
+            if read_u32(&word, 0, endian)? & 1 != 0 {
+                let chain_count = chain_index
+                    .checked_add(1)
+                    .ok_or_else(|| dynamic_error(DT_GNU_HASH, vaddr))?;
+                let total = head_len
+                    .checked_add(u64::from(chain_count) * 4)
+                    .ok_or_else(|| dynamic_error(DT_GNU_HASH, vaddr))?;
+                self.request.limits().check_runtime_metadata_bytes(total)?;
+                return self.read_table_bytes(vaddr, total, DT_GNU_HASH);
+            }
+            chain_index = chain_index
+                .checked_add(1)
+                .ok_or_else(|| dynamic_error(DT_GNU_HASH, vaddr))?;
+        }
     }
 }
 
