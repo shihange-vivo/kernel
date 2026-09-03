@@ -229,7 +229,9 @@ fn ordered_images(graph: &DependencyGraph) -> LoadResult<Vec<ImageId>> {
     let groups = graph.dependency_order()?;
     let total = groups.iter().map(|group| group.len()).sum();
     let mut ordered = Vec::new();
-    ordered.try_reserve_exact(total).map_err(|_| lifecycle_oom())?;
+    ordered
+        .try_reserve_exact(total)
+        .map_err(|_| lifecycle_oom())?;
     for group in groups.iter() {
         ordered.extend_from_slice(group);
     }
@@ -251,7 +253,7 @@ fn emit_direct(
         .load_bias
         .checked_add(vaddr.get())
         .map_err(|_| lifecycle_error(LoadErrorKind::IntegerOverflow))?;
-    validate_function(decode, image.load_segments, runtime)?;
+    validate_function(decode, image, runtime)?;
     push_entry(plan, image.image_id, runtime)
 }
 
@@ -287,11 +289,11 @@ fn read_array<M: ImageMemory + ?Sized>(
             .target_word
             .read(memory, &allocation, offset)
             .map_err(|error| error.at_stage(LoadStage::LinkSeal))?;
-        if value == 0 {
+        if value == 0 || value == width.maximum() {
             continue;
         }
         let function = TargetAddress::new(value);
-        validate_function(decode, image.load_segments, function)?;
+        validate_function(decode, image, function)?;
         push_entry(plan, image.image_id, function)?;
     }
     Ok(())
@@ -302,7 +304,7 @@ fn read_array<M: ImageMemory + ?Sized>(
 /// segment owned by the image (§12.2).
 fn validate_function(
     decode: &Decode,
-    segments: &[LoadSegmentInfo],
+    image: &LifecycleImage<'_>,
     function: TargetAddress,
 ) -> LoadResult<()> {
     let canonical = if decode.thumb {
@@ -313,11 +315,19 @@ fn validate_function(
     if decode.thumb && function.get() & 1 == 0 {
         return Err(function_error(function));
     }
-    let ok = segments.iter().any(|segment| {
-        segment.permissions().contains(MemoryPermissions::EXECUTE)
-            && TargetRange::new(segment.vaddr(), segment.memory_size())
-                .contains_span(canonical, decode.min_instruction)
-    });
+    if image.load_segments.len() != image.regions.len() {
+        return Err(lifecycle_error(LoadErrorKind::BadElf));
+    }
+    let ok = image
+        .load_segments
+        .iter()
+        .zip(image.regions.iter())
+        .any(|(segment, region)| {
+            segment.permissions().contains(MemoryPermissions::EXECUTE)
+                && region
+                    .runtime_range()
+                    .contains_span(canonical, decode.min_instruction)
+        });
     if ok {
         Ok(())
     } else {
