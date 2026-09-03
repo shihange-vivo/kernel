@@ -147,6 +147,28 @@ impl DependencyGraph {
         self.nodes.get(id.get() as usize)
     }
 
+    /// Look up an already-admitted image by its full identity, so the
+    /// discovery driver can de-duplicate *before* allocating (§5.3 rule 1).
+    #[inline]
+    pub(crate) fn find_identity(&self, identity: &ArtifactIdentity) -> Option<ImageId> {
+        self.identity_index.get(identity).copied()
+    }
+
+    /// Record an edge from `requester` to an already-admitted `provider`.
+    ///
+    /// This is the de-duplication fast path (§8.2 rule 6): the discovery driver
+    /// resolved an identity already present in the graph, so no new image is
+    /// loaded, but the dependency edge must still be recorded.
+    #[inline]
+    pub(crate) fn link_existing(
+        &mut self,
+        requester: ImageId,
+        provider: ImageId,
+        needed_index: u16,
+    ) -> LoadResult<()> {
+        self.record_edge(requester, provider, needed_index)
+    }
+
     /// Admit the link root. The root is always `ImageId(0)` at depth 0. Role
     /// validation (an `ExecutableRoot` root, a `SharedObject` dependency) is
     /// the discovery driver's responsibility and happens before this call.

@@ -26,7 +26,8 @@ use alloc::{boxed::Box, vec::Vec};
 use crate::{
     address::{TargetAddress, TargetRange},
     dynamic_linker::{DependencyName, SymbolTable},
-    image::{RelocationRecord, RelocationTableKind},
+    image::{LoadedRegion, RelocationRecord, RelocationTableKind},
+    memory::ImageAllocation,
 };
 
 /// One relocation table (`DT_REL` or `DT_RELA`): its vaddr, byte extent and
@@ -391,5 +392,79 @@ impl RuntimeImageMetadata {
             .checked_add(names)
             .and_then(|v| v.checked_add(records))
             .unwrap_or(u64::MAX)
+    }
+}
+
+/// Physical identity of one decoded image's backing allocation.
+///
+/// The layout-locator skeleton for C15: it names the allocation that every
+/// later normalized target for this image references. Full vaddr →
+/// `TargetLocation { allocation, offset, runtime }` normalization (which also
+/// needs the image's [`LoadedRegion`]s and `load_bias`) lands with the
+/// session-wide relocation engine in C16 (`relocate.rs`).
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct ImageLayout {
+    allocation: ImageAllocation,
+}
+
+impl ImageLayout {
+    #[inline]
+    pub(crate) const fn new(allocation: ImageAllocation) -> Self {
+        Self { allocation }
+    }
+
+    #[inline]
+    pub(crate) const fn allocation(&self) -> ImageAllocation {
+        self.allocation
+    }
+}
+
+/// Owned runtime state of one decoded image (§7.1): the physical allocation
+/// layout, the mapped load regions, the aggregate metadata, and the load bias.
+///
+/// The session keeps one of these per admitted image inside a
+/// `SessionImage`; the unique allocation lease lives in the session rollback
+/// log, never here.
+pub(crate) struct RuntimeImageState {
+    layout: ImageLayout,
+    regions: Box<[LoadedRegion]>,
+    metadata: RuntimeImageMetadata,
+    load_bias: TargetAddress,
+}
+
+impl RuntimeImageState {
+    #[inline]
+    pub(crate) fn new(
+        layout: ImageLayout,
+        regions: Box<[LoadedRegion]>,
+        metadata: RuntimeImageMetadata,
+        load_bias: TargetAddress,
+    ) -> Self {
+        Self {
+            layout,
+            regions,
+            metadata,
+            load_bias,
+        }
+    }
+
+    #[inline]
+    pub(crate) const fn layout(&self) -> &ImageLayout {
+        &self.layout
+    }
+
+    #[inline]
+    pub(crate) fn regions(&self) -> &[LoadedRegion] {
+        &self.regions
+    }
+
+    #[inline]
+    pub(crate) const fn metadata(&self) -> &RuntimeImageMetadata {
+        &self.metadata
+    }
+
+    #[inline]
+    pub(crate) const fn load_bias(&self) -> TargetAddress {
+        self.load_bias
     }
 }

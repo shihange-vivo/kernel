@@ -16,12 +16,15 @@ use alloc::{boxed::Box, vec::Vec};
 
 use crate::{
     address::{FileRange, TargetAddress, TargetRange},
-    dynamic_linker::RuntimeImageMetadata,
+    dynamic_linker::{ImageLayout, RuntimeImageMetadata, RuntimeImageState},
     elf::{DynamicSegmentInfo, LoadSegmentInfo},
     error::{ErrorContext, HeaderField, LoadError, LoadErrorKind, LoadResult, LoadStage},
     identity::LoadRequest,
     image::{inspect::StackKind, map::LoadedRegion, relocate::RelocatedImage},
-    memory::{AllocationOffset, ImageAllocation, ImageLoadTransaction, ImageMemory},
+    memory::{
+        AllocationOffset, AllocationRollbackLog, ImageAllocation, ImageLoadTransaction,
+        ImageMemory, SessionAllocation,
+    },
     reader::ElfReader,
     relocation::{AddendEncoding, ArchRelocator, RelocationOperation, TargetWord, WordWidth},
 };
@@ -277,6 +280,35 @@ impl<R: ElfReader, M: ImageMemory> DecodedImage<R, M> {
             self.tls,
         ))
     }
+}
+
+/// Consume a fully decoded image and absorb its allocation lease into the
+/// session rollback log, producing the copyable session descriptor plus the
+/// owned runtime state (§6.2/§7.1).
+///
+/// `decoded` owns an `ImageLoadTransaction<&mut M>`: the short reborrow of the
+/// session memory ends when the lease is transferred here. On success the
+/// unique lease lives only in the rollback log; on failure the transaction's
+/// `Drop` aborts the image.
+pub(crate) fn absorb_into_session<R, M>(
+    decoded: DecodedImage<R, &mut M>,
+    rollback: &mut AllocationRollbackLog,
+) -> LoadResult<(SessionAllocation, RuntimeImageState)>
+where
+    R: ElfReader,
+    M: ImageMemory + ?Sized,
+{
+    let DecodedImage {
+        transaction,
+        load_bias,
+        regions,
+        metadata,
+        ..
+    } = decoded;
+    let session_allocation = transaction.transfer_to(rollback)?;
+    let layout = ImageLayout::new(session_allocation.allocation());
+    let state = RuntimeImageState::new(layout, regions.into_boxed_slice(), metadata, load_bias);
+    Ok((session_allocation, state))
 }
 
 #[derive(Clone, Copy, Debug)]
