@@ -597,7 +597,7 @@ fn apply<M: ImageMemory + ?Sized>(
     Ok(())
 }
 
-fn locate_region_offset(
+pub(crate) fn locate_region_offset(
     regions: &[LoadedRegion],
     vaddr: TargetAddress,
     len: u64,

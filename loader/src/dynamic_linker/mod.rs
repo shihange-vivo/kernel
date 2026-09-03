@@ -19,6 +19,7 @@
 
 mod artifact;
 mod graph;
+mod lifecycle;
 mod metadata;
 mod relocate;
 mod scope;
@@ -30,6 +31,7 @@ pub use artifact::{
     FileIdentity, ImageId, ImageOwnership, LinkDomainId, ResolvedArtifact,
 };
 
+pub(crate) use lifecycle::{FiniPlan, InitPlan, LifecycleEntry, LifecycleImage};
 pub(crate) use metadata::{
     ImageLayout, ImageLifecycleMetadata, ProgramHeaderRuntimeInfo, RelocationTableInfo,
     RelocationTables, RuntimeDynamicInfo, RuntimeImageMetadata, RuntimeImageState,
