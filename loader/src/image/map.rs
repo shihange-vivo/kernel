@@ -463,7 +463,9 @@ impl<R: ElfReader, M: ImageMemory> MappedImage<R, M> {
             || tags.strtab().is_some()
             || tags.strsz().is_some()
             || tags.hash().is_some()
-            || tags.gnu_hash().is_some();
+            || tags.gnu_hash().is_some()
+            || !tags.needed().is_empty()
+            || tags.soname().is_some();
         if !any_symbol_tag {
             return Ok((SymbolTable::empty(), Box::new([]), None));
         }
