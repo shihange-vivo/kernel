@@ -26,7 +26,7 @@ use crate::{
     address::TargetAddress,
     dynamic_linker::{
         ImageId, LoadMetrics, ResolvedSymbol, RuntimeImageMetadata, ScopeSet, SymbolBinding,
-        SymbolDefinition, SymbolRegionKind, SymbolTable,
+        SymbolDefinition, SymbolRegionKind, SymbolTable, SymbolVisibility,
     },
     elf::LoadSegmentInfo,
     error::{ErrorContext, LoadError, LoadErrorKind, LoadResult, LoadStage},
@@ -257,15 +257,7 @@ where
     M: ImageMemory + ?Sized,
 {
     let operations = preflight(
-        arch,
-        symbols,
-        images,
-        scopes,
-        profile,
-        policy,
-        limits,
-        metrics,
-        &*memory,
+        arch, symbols, images, scopes, profile, policy, limits, metrics, &*memory,
     )?;
     apply(&operations, images, profile, memory, log)?;
     Ok(operations)
@@ -375,7 +367,17 @@ where
 
     // Resolve the addend and the symbol value, then fold into the final word.
     let addend = resolve_addend(arch, target_word, record, offset, allocation, memory)?;
-    let source = resolve_source(arch, symbols, scopes, policy, thumb, image.image_id, record, kind, metrics)?;
+    let source = resolve_source(
+        arch,
+        symbols,
+        scopes,
+        policy,
+        thumb,
+        image.image_id,
+        record,
+        kind,
+        metrics,
+    )?;
     let value = fold_value(kind, image.load_bias, &source, addend, width, record)?;
 
     metrics.record_relocation_operation();
@@ -411,7 +413,10 @@ where
             Ok(implicit_addend(word, target_word.width()))
         }
         (AddendEncoding::Explicit, RelocationAddend::Explicit(value)) => Ok(i128::from(value)),
-        _ => Err(relocation_error(record, LoadErrorKind::UnsupportedByProfile)),
+        _ => Err(relocation_error(
+            record,
+            LoadErrorKind::UnsupportedByProfile,
+        )),
     }
 }
 
@@ -459,12 +464,34 @@ where
 
     metrics.record_symbol_lookup();
 
-    let resolved = if entry.definition() == SymbolDefinition::Defined {
-        // Self-first: a defined symbol binds to the owner's own definition.
-        Some(ResolvedSymbol::from_entry(owner, entry))
-    } else {
-        let name = table.name(entry);
-        scopes.resolve_name(symbols, owner, name)
+    let resolved = match (entry.binding(), entry.visibility(), entry.definition()) {
+        // Local references never enter an external scope.
+        (SymbolBinding::Local, _, SymbolDefinition::Defined) => {
+            scopes.resolve_index(symbols, owner, record.symbol_index())
+        }
+        (SymbolBinding::Local, _, SymbolDefinition::Undefined) => {
+            return Err(relocation_error(record, LoadErrorKind::BadElf));
+        }
+
+        // Non-default visibility cannot be satisfied by another image. A
+        // defined hidden/internal/protected reference binds to this exact
+        // symbol index; an undefined one is malformed.
+        (
+            SymbolBinding::Global | SymbolBinding::Weak,
+            SymbolVisibility::Hidden | SymbolVisibility::Internal | SymbolVisibility::Protected,
+            SymbolDefinition::Defined,
+        ) => scopes.resolve_index(symbols, owner, record.symbol_index()),
+        (
+            SymbolBinding::Global | SymbolBinding::Weak,
+            SymbolVisibility::Hidden | SymbolVisibility::Internal | SymbolVisibility::Protected,
+            SymbolDefinition::Undefined,
+        ) => return Err(relocation_error(record, LoadErrorKind::BadElf)),
+
+        // Default-visible definitions are preemptible. Search the requester's
+        // frozen scope even when the referenced entry is defined locally.
+        (SymbolBinding::Global | SymbolBinding::Weak, SymbolVisibility::Default, _) => {
+            scopes.resolve_name(symbols, owner, table.name(entry))
+        }
     };
 
     match resolved {
@@ -503,10 +530,7 @@ fn validate_symbol_kind(
     if kind == RelocationKind::JumpSlot && symbol.region() != SymbolRegionKind::Executable {
         return Err(relocation_error(record, LoadErrorKind::BadElf));
     }
-    if thumb
-        && symbol.region() == SymbolRegionKind::Executable
-        && symbol.address().get() & 1 == 0
-    {
+    if thumb && symbol.region() == SymbolRegionKind::Executable && symbol.address().get() & 1 == 0 {
         return Err(relocation_error(record, LoadErrorKind::BadElf));
     }
     Ok(())
@@ -574,10 +598,7 @@ fn apply<M: ImageMemory + ?Sized>(
     memory: &mut M,
     log: &mut AllocationRollbackLog,
 ) -> LoadResult<()> {
-    let target_word = TargetWord::new(
-        WordWidth::for_elf_class(profile.class()),
-        profile.endian(),
-    );
+    let target_word = TargetWord::new(WordWidth::for_elf_class(profile.class()), profile.endian());
     for pass in [
         RelocationKind::Relative,
         RelocationKind::Absolute,
@@ -590,7 +611,12 @@ fn apply<M: ImageMemory + ?Sized>(
                 .map_err(|error| error.at_stage(LoadStage::LinkRelocate))?;
             let allocation = image.allocation().allocation();
             target_word
-                .write(memory, &allocation, operation.target.offset, operation.value)
+                .write(
+                    memory,
+                    &allocation,
+                    operation.target.offset,
+                    operation.value,
+                )
                 .map_err(|error| error.at_stage(LoadStage::LinkRelocate))?;
         }
     }
