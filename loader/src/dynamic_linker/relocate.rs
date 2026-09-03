@@ -278,7 +278,7 @@ impl ProviderRegion {
 pub(crate) fn run<A, M>(
     arch: &A,
     symbols: &[&SymbolTable],
-    images: &[RelocationImage<'_>],
+    images: &[Option<RelocationImage<'_>>],
     provider_regions: &[Vec<ProviderRegion>],
     scopes: &ScopeSet,
     profile: &LoadProfile,
@@ -315,7 +315,7 @@ where
 fn preflight<A, M>(
     arch: &A,
     symbols: &[&SymbolTable],
-    images: &[RelocationImage<'_>],
+    images: &[Option<RelocationImage<'_>>],
     provider_regions: &[Vec<ProviderRegion>],
     scopes: &ScopeSet,
     profile: &LoadProfile,
@@ -332,7 +332,7 @@ where
     let target_word = TargetWord::new(width, profile.endian());
     let thumb = profile.entry_mode().is_thumb();
 
-    let total = images.iter().try_fold(0_u64, |total, image| {
+    let total = images.iter().flatten().try_fold(0_u64, |total, image| {
         total
             .checked_add(image.metadata.relocations().len() as u64)
             .ok_or_else(relocation_oom)
@@ -345,13 +345,12 @@ where
     operations
         .try_reserve_exact(operation_count)
         .map_err(|_| relocation_oom())?;
-    for image in images {
+    for image in images.iter().flatten() {
         for record in image.metadata.relocations().records().iter() {
             let operation = preflight_one(
                 arch,
                 symbols,
                 scopes,
-                images,
                 provider_regions,
                 policy,
                 limits,
@@ -378,7 +377,6 @@ fn preflight_one<A, M>(
     arch: &A,
     symbols: &[&SymbolTable],
     scopes: &ScopeSet,
-    images: &[RelocationImage<'_>],
     provider_regions: &[Vec<ProviderRegion>],
     policy: &RelocationPolicy,
     limits: &SessionLimits,
@@ -684,7 +682,7 @@ fn reject_overlapping_targets(
 /// data/global, then PLT/JUMP_SLOT (§11.3).
 fn apply<M: ImageMemory + ?Sized>(
     operations: &[SessionRelocation],
-    images: &[RelocationImage<'_>],
+    images: &[Option<RelocationImage<'_>>],
     profile: &LoadProfile,
     memory: &mut M,
     log: &mut AllocationRollbackLog,
@@ -697,7 +695,9 @@ fn apply<M: ImageMemory + ?Sized>(
         RelocationKind::JumpSlot,
     ] {
         for operation in operations.iter().filter(|op| op.kind == pass) {
-            let image = &images[operation.owner.get() as usize];
+            let image = images[operation.owner.get() as usize]
+                .as_ref()
+                .ok_or_else(|| relocation_error(operation.record, LoadErrorKind::BadElf))?;
             log.mark_bytes_modified(image.allocation())
                 .map_err(|error| error.at_stage(LoadStage::LinkRelocate))?;
             let allocation = image.allocation().allocation();

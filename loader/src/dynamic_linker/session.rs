@@ -792,21 +792,30 @@ impl<'a, M: ImageMemory + ?Sized, A: ArchRelocator> ScopedSession<'a, M, A> {
     pub fn relocate(mut self) -> LoadResult<RelocatedSession<'a, M, A>> {
         let image_count = self.state.images.len();
         let total_images = image_count + self.state.imported.len();
-        let mut symbols = Vec::new();
-        symbols
-            .try_reserve_exact(total_images)
-            .map_err(|_| link_relocation_oom())?;
-        let mut relocation_images = Vec::new();
-        relocation_images
-            .try_reserve_exact(image_count)
-            .map_err(|_| link_relocation_oom())?;
         let mut relocated_images = Vec::new();
         relocated_images
             .try_reserve_exact(image_count)
             .map_err(|_| link_relocation_oom())?;
+
+        // Both arrays are image-id indexed over every admitted image — loaded
+        // and imported (§12.1) — because relocation resolves a symbol's owner
+        // id back into them. `symbols` supplies each imported provider's
+        // retained export table; `relocation_images` is `None` at an imported
+        // id (an imported image contributes no relocation records and is never
+        // rewritten), while `apply` indexes it by owner id.
+        let mut symbol_slots: Vec<Option<&SymbolTable>> = Vec::new();
+        symbol_slots
+            .try_reserve_exact(total_images)
+            .map_err(|_| link_relocation_oom())?;
+        symbol_slots.resize_with(total_images, || None);
+        let mut relocation_slots: Vec<Option<RelocationImage<'_>>> = Vec::new();
+        relocation_slots
+            .try_reserve_exact(total_images)
+            .map_err(|_| link_relocation_oom())?;
+        relocation_slots.resize_with(total_images, || None);
         for image in &self.state.images {
-            symbols.push(image.state.metadata().symbols());
-            relocation_images.push(RelocationImage::new(
+            symbol_slots[image.image_id.get() as usize] = Some(image.state.metadata().symbols());
+            relocation_slots[image.image_id.get() as usize] = Some(RelocationImage::new(
                 image.image_id,
                 image.allocation,
                 image.state.regions(),
@@ -815,6 +824,24 @@ impl<'a, M: ImageMemory + ?Sized, A: ArchRelocator> ScopedSession<'a, M, A> {
                 image.state.load_bias(),
             ));
         }
+        for imported in &self.state.imported {
+            symbol_slots[imported.image_id.get() as usize] = Some(imported.descriptor().exports());
+        }
+        let mut symbols = Vec::new();
+        symbols
+            .try_reserve_exact(total_images)
+            .map_err(|_| link_relocation_oom())?;
+        for slot in symbol_slots {
+            symbols.push(slot.ok_or_else(|| {
+                LoadError::new(LoadErrorKind::BadElf, ErrorContext::None)
+                    .at_stage(LoadStage::LinkRelocate)
+            })?);
+        }
+        let mut relocation_images = Vec::new();
+        relocation_images
+            .try_reserve_exact(total_images)
+            .map_err(|_| link_relocation_oom())?;
+        relocation_images.extend(relocation_slots);
 
         // The provider-region array is image-id indexed over every admitted
         // image, loaded and imported (§12.1), so a symbol resolved into an
