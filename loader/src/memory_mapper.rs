@@ -258,7 +258,11 @@ impl MemoryMapper {
             request.align(),
             ownership,
         );
-        Ok((allocation, AllocationLease::new(allocation)))
+        // SAFETY: this mapper has just recorded `allocation` as its sole
+        // active allocation and cannot mint another lease until it is
+        // aborted, committed, or released.
+        let lease = unsafe { AllocationLease::new(allocation) };
+        Ok((allocation, lease))
     }
 
     fn release_lease(&mut self, lease: AllocationLease, poison: bool) {

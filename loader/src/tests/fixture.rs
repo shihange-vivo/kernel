@@ -231,7 +231,9 @@ impl ImageMemory for RecordingMemory {
             ownership,
         );
         *self.sink.borrow_mut() = Some(request);
-        Ok(AllocationLease::new(self.allocation))
+        // SAFETY: the fixture permits only one active allocation and records
+        // it immediately above before returning its sole lease.
+        Ok(unsafe { AllocationLease::new(self.allocation) })
     }
 
     fn abort_image(&mut self, _allocation: AllocationLease, _progress: MutationProgress) {}
