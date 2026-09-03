@@ -118,7 +118,7 @@ pub(crate) struct PreparedLinkManifest {
 }
 
 impl PreparedLinkManifest {
-    /// The root's runtime entry: `load_bias + entry_vaddr`, Thumb bit preserved.
+    /// The root's mapped runtime entry, Thumb bit preserved.
     #[inline]
     pub(crate) const fn entry(&self) -> TargetAddress {
         self.entry
@@ -140,7 +140,7 @@ impl PreparedLinkManifest {
 pub(crate) struct LinkMapImage<'a> {
     image_id: ImageId,
     load_bias: TargetAddress,
-    entry_vaddr: TargetAddress,
+    runtime_entry: TargetAddress,
     regions: &'a [LoadedRegion],
 }
 
@@ -149,13 +149,13 @@ impl<'a> LinkMapImage<'a> {
     pub(crate) const fn new(
         image_id: ImageId,
         load_bias: TargetAddress,
-        entry_vaddr: TargetAddress,
+        runtime_entry: TargetAddress,
         regions: &'a [LoadedRegion],
     ) -> Self {
         Self {
             image_id,
             load_bias,
-            entry_vaddr,
+            runtime_entry,
             regions,
         }
     }
@@ -183,10 +183,7 @@ pub(crate) fn build_manifest(
             .ok_or_else(|| publish_error(LoadErrorKind::BadElf, ErrorContext::None))?;
 
         let entry = if image.image_id.get() == 0 {
-            let runtime = image
-                .load_bias
-                .checked_add(image.entry_vaddr.get())
-                .map_err(|error| error.at_stage(LoadStage::LinkSeal))?;
+            let runtime = image.runtime_entry;
             root_entry = Some(runtime);
             Some(runtime)
         } else {
@@ -203,7 +200,8 @@ pub(crate) fn build_manifest(
         });
     }
 
-    let entry = root_entry.ok_or_else(|| publish_error(LoadErrorKind::BadElf, ErrorContext::None))?;
+    let entry =
+        root_entry.ok_or_else(|| publish_error(LoadErrorKind::BadElf, ErrorContext::None))?;
     Ok(PreparedLinkManifest {
         entry,
         link_map: entries.into_boxed_slice(),
@@ -218,7 +216,9 @@ fn image_span(regions: &[LoadedRegion]) -> LoadResult<TargetRange> {
     let mut end = None;
     for region in regions {
         let range = region.runtime_range();
-        let range_end = range.end().map_err(|error| error.at_stage(LoadStage::LinkSeal))?;
+        let range_end = range
+            .end()
+            .map_err(|error| error.at_stage(LoadStage::LinkSeal))?;
         start = Some(match start {
             Some(current) => core::cmp::min(current, range.start()),
             None => range.start(),
@@ -235,7 +235,10 @@ fn image_span(regions: &[LoadedRegion]) -> LoadResult<TargetRange> {
                 .map_err(|error| error.at_stage(LoadStage::LinkSeal))?;
             Ok(TargetRange::new(start, len))
         }
-        _ => Err(publish_error(LoadErrorKind::IncorrectLayout, ErrorContext::None)),
+        _ => Err(publish_error(
+            LoadErrorKind::IncorrectLayout,
+            ErrorContext::None,
+        )),
     }
 }
 
@@ -350,10 +353,8 @@ pub(crate) trait LinkPublisher {
     type PreparedBatch;
     type Receipt;
 
-    fn prepare_batch(
-        &mut self,
-        manifest: &PreparedLinkManifest,
-    ) -> LoadResult<Self::PreparedBatch>;
+    fn prepare_batch(&mut self, manifest: &PreparedLinkManifest)
+        -> LoadResult<Self::PreparedBatch>;
 
     /// # Safety
     ///

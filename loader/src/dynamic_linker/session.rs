@@ -29,8 +29,10 @@ use crate::{
     dynamic_linker::{
         graph::{DependencyGraph, DiscoveryItem, DiscoveryQueue},
         lifecycle::{self, FiniPlan, InitPlan, LifecycleImage},
-        publish::{self, CommittedImage, CommittingLinkProduct, LinkContext, LinkProduct,
-            LinkPublisher, LinkMapImage, PreparedLinkManifest},
+        publish::{
+            self, CommittedImage, CommittingLinkProduct, LinkContext, LinkMapImage, LinkProduct,
+            LinkPublisher, PreparedLinkManifest,
+        },
         relocate::{self, RelocationImage, RelocationPolicy},
         ArtifactIdentity, ArtifactResolver, ArtifactRole, DependencyRequest, ImageId, LinkDomainId,
         ResolvedArtifact, RuntimeImageMetadata, RuntimeImageState, ScopeSet, SymbolTable,
@@ -211,8 +213,8 @@ impl RelocatedImageState {
     }
 
     #[inline]
-    pub(crate) const fn entry_vaddr(&self) -> TargetAddress {
-        self.0.entry_vaddr()
+    pub(crate) const fn runtime_entry(&self) -> TargetAddress {
+        self.0.runtime_entry()
     }
 }
 
@@ -599,19 +601,14 @@ impl<M: ImageMemory + ?Sized, A: ArchRelocator> RelocatedSession<'_, M, A> {
                 )
             })
             .collect();
-        lifecycle::build(
-            &self.graph,
-            &images,
-            &self.profile,
-            &*self.rollback.memory,
-        )
+        lifecycle::build(&self.graph, &images, &self.profile, &*self.rollback.memory)
     }
 
     /// Build the prepared link manifest (link map + root entry) for atomic
     /// publication (§13.1).
     ///
     /// Emits one [`LinkMapEntry`] per relocated image in image-id order and
-    /// folds the root's `load_bias + entry_vaddr` into the runtime entry. The
+    /// uses the root's runtime entry computed during mapping. The
     /// result holds no lease: it is the pure description the host publisher
     /// validates in `prepare_batch` before the committed snapshot is swapped.
     pub fn prepare_link_manifest(&self) -> LoadResult<PreparedLinkManifest> {
@@ -623,7 +620,7 @@ impl<M: ImageMemory + ?Sized, A: ArchRelocator> RelocatedSession<'_, M, A> {
                 LinkMapImage::new(
                     image.image_id,
                     image.state.load_bias(),
-                    image.state.entry_vaddr(),
+                    image.state.runtime_entry(),
                     image.state.regions(),
                 )
             })
@@ -685,10 +682,7 @@ impl<M: ImageMemory + ?Sized, A: ArchRelocator> RelocatedSession<'_, M, A> {
             arch: _,
             state,
         } = self;
-        let RelocatedState {
-            images: _,
-            scopes,
-        } = state;
+        let RelocatedState { images: _, scopes } = state;
 
         let context = LinkContext::new(graph, scopes, committed.into_boxed_slice());
 
@@ -736,6 +730,5 @@ fn session_error(kind: LoadErrorKind, context: ErrorContext) -> LoadError {
 }
 
 fn publish_oom() -> LoadError {
-    LoadError::new(LoadErrorKind::OutOfMemory, ErrorContext::None)
-        .at_stage(LoadStage::Publish)
+    LoadError::new(LoadErrorKind::OutOfMemory, ErrorContext::None).at_stage(LoadStage::Publish)
 }
