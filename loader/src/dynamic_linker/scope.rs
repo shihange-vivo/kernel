@@ -182,7 +182,7 @@ impl ScopeSet {
     /// image, supplied by the session). The produced value owns no symbol data:
     /// lookups read the tables through `resolve_*`, so the tables must outlive
     /// the `ScopeSet`.
-    pub(crate) fn freeze(graph: &DependencyGraph, symbols: &[SymbolTable]) -> LoadResult<Self> {
+    pub(crate) fn freeze(graph: &DependencyGraph, symbols: &[&SymbolTable]) -> LoadResult<Self> {
         let nodes = graph.nodes();
         let mut session_private = Vec::new();
         let mut system_candidates = Vec::new();
@@ -241,7 +241,7 @@ impl ScopeSet {
     /// binding in the requester's table.
     pub(crate) fn resolve_name(
         &self,
-        symbols: &[SymbolTable],
+        symbols: &[&SymbolTable],
         requester: ImageId,
         name: &[u8],
     ) -> Option<ResolvedSymbol> {
@@ -286,7 +286,7 @@ impl ScopeSet {
     /// references that never enter the external scope (§9.2 rule 1).
     pub(crate) fn resolve_index(
         &self,
-        symbols: &[SymbolTable],
+        symbols: &[&SymbolTable],
         owner: ImageId,
         index: u32,
     ) -> Option<ResolvedSymbol> {

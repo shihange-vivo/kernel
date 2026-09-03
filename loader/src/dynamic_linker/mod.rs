@@ -21,6 +21,7 @@ mod artifact;
 mod graph;
 mod metadata;
 mod scope;
+mod session;
 mod symbol;
 
 pub use artifact::{
@@ -29,8 +30,8 @@ pub use artifact::{
 };
 
 pub(crate) use metadata::{
-    ImageLifecycleMetadata, ProgramHeaderRuntimeInfo, RelocationTableInfo, RelocationTables,
-    RuntimeDynamicInfo, RuntimeImageMetadata,
+    ImageLayout, ImageLifecycleMetadata, ProgramHeaderRuntimeInfo, RelocationTableInfo,
+    RelocationTables, RuntimeDynamicInfo, RuntimeImageMetadata, RuntimeImageState,
 };
 pub(crate) use scope::{ResolvedSymbol, ScopeImage, ScopeSet, SymbolRegionKind, SymbolScope};
 pub(crate) use symbol::{
