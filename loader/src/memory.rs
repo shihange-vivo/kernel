@@ -449,6 +449,22 @@ impl AllocationRollbackLog {
             memory.abort_image(entry.lease, entry.progress);
         }
     }
+
+    /// Number of absorbed allocations.
+    #[inline]
+    pub(crate) fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    /// Move every absorbed lease out of the log in creation order, leaving it
+    /// empty. `sink` must already hold `len()` spare capacity so this cannot
+    /// allocate; the publication commit uses it to transfer the unique leases
+    /// into the publisher's committed owner without a fallible step.
+    pub(crate) fn drain_leases_into(&mut self, sink: &mut Vec<AllocationLease>) {
+        for entry in self.entries.drain(..) {
+            sink.push(entry.lease);
+        }
+    }
 }
 
 fn session_allocation_error(allocation: ImageAllocation) -> LoadError {

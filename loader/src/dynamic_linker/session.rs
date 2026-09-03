@@ -29,7 +29,8 @@ use crate::{
     dynamic_linker::{
         graph::{DependencyGraph, DiscoveryItem, DiscoveryQueue},
         lifecycle::{self, FiniPlan, InitPlan, LifecycleImage},
-        publish::{self, LinkMapImage, PreparedLinkManifest},
+        publish::{self, CommittedImage, CommittingLinkProduct, LinkContext, LinkProduct,
+            LinkPublisher, LinkMapImage, PreparedLinkManifest},
         relocate::{self, RelocationImage, RelocationPolicy},
         ArtifactIdentity, ArtifactResolver, ArtifactRole, DependencyRequest, ImageId, LinkDomainId,
         ResolvedArtifact, RuntimeImageMetadata, RuntimeImageState, ScopeSet, SymbolTable,
@@ -573,7 +574,9 @@ impl<'a, M: ImageMemory + ?Sized, A: ArchRelocator> ScopedSession<'a, M, A> {
             state: RelocatedState { images, scopes },
         })
     }
+}
 
+impl<M: ImageMemory + ?Sized, A: ArchRelocator> RelocatedSession<'_, M, A> {
     /// Build the dependency-first init and reverse fini plans (§12.2).
     ///
     /// Reads the post-relocation init/fini array words back through the
@@ -627,6 +630,76 @@ impl<'a, M: ImageMemory + ?Sized, A: ArchRelocator> ScopedSession<'a, M, A> {
             .collect();
         publish::build_manifest(&self.graph, &images)
     }
+
+    /// Atomically publish the link product (S9, §13).
+    ///
+    /// Builds the lifecycle plans and the prepared manifest, lets the publisher
+    /// complete every fallible check without mutating the visible snapshot,
+    /// then moves the unique allocation leases out of the session rollback log
+    /// into the publisher's committed owner in one infallible commit. On any
+    /// `prepare_batch` failure the session drops and aborts every absorbed
+    /// allocation; after a successful commit the rollback log is empty and the
+    /// publisher's `Receipt` is the long-term owner of the committed images.
+    pub fn publish<P: LinkPublisher>(
+        mut self,
+        publisher: &mut P,
+    ) -> LoadResult<LinkProduct<P::Receipt>> {
+        let (init_plan, fini_plan) = self.build_lifecycle_plans()?;
+        let manifest = self.prepare_link_manifest()?;
+
+        let prepared = publisher
+            .prepare_batch(&manifest)
+            .map_err(|error| error.at_stage(LoadStage::Publish))?;
+
+        let (entry, link_map) = manifest.into_parts();
+
+        // One committed image per id: link-map facts plus the backing
+        // allocation, in the same image-id order the leases are drained in.
+        let mut committed = Vec::new();
+        committed
+            .try_reserve_exact(self.state.images.len())
+            .map_err(|_| publish_oom())?;
+        for (image, map_entry) in self.state.images.iter().zip(link_map.iter()) {
+            committed.push(CommittedImage::new(
+                map_entry.clone(),
+                image.allocation.allocation(),
+            ));
+        }
+
+        // Drain the unique leases in creation order (== image-id order).
+        let mut leases = Vec::new();
+        leases
+            .try_reserve_exact(self.rollback.log.len())
+            .map_err(|_| publish_oom())?;
+        self.rollback.log.drain_leases_into(&mut leases);
+        let product = CommittingLinkProduct::new(leases.into_boxed_slice());
+
+        let LinkSession {
+            rollback: _,
+            graph,
+            limits: _,
+            metrics,
+            profile: _,
+            policy: _,
+            domain: _,
+            arch: _,
+            state,
+        } = self;
+        let RelocatedState {
+            images: _,
+            scopes,
+        } = state;
+
+        let context = LinkContext::new(graph, scopes, committed.into_boxed_slice());
+
+        // SAFETY: `prepared` and `product` were produced by this same live
+        // session; every fallible check completed before the leases moved.
+        let receipt = unsafe { publisher.commit_batch(prepared, product) };
+
+        Ok(LinkProduct::new(
+            context, entry, init_plan, fini_plan, link_map, metrics, receipt,
+        ))
+    }
 }
 
 /// Run the single-image S0–S4 pipeline on `reader` under `profile`/`role`, then
@@ -660,4 +733,9 @@ where
 
 fn session_error(kind: LoadErrorKind, context: ErrorContext) -> LoadError {
     LoadError::new(kind, context)
+}
+
+fn publish_oom() -> LoadError {
+    LoadError::new(LoadErrorKind::OutOfMemory, ErrorContext::None)
+        .at_stage(LoadStage::Publish)
 }
