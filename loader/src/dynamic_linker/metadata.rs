@@ -448,16 +448,19 @@ pub(crate) struct RuntimeImageState {
     load_segments: Box<[LoadSegmentInfo]>,
     metadata: RuntimeImageMetadata,
     load_bias: TargetAddress,
+    entry_vaddr: TargetAddress,
 }
 
 impl RuntimeImageState {
     #[inline]
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
         layout: ImageLayout,
         regions: Box<[LoadedRegion]>,
         load_segments: Box<[LoadSegmentInfo]>,
         metadata: RuntimeImageMetadata,
         load_bias: TargetAddress,
+        entry_vaddr: TargetAddress,
     ) -> Self {
         Self {
             layout,
@@ -465,6 +468,7 @@ impl RuntimeImageState {
             load_segments,
             metadata,
             load_bias,
+            entry_vaddr,
         }
     }
 
@@ -491,5 +495,13 @@ impl RuntimeImageState {
     #[inline]
     pub(crate) const fn load_bias(&self) -> TargetAddress {
         self.load_bias
+    }
+
+    /// The link-time entry vaddr (Thumb bit set on ARM), carried from S2/S3
+    /// through the session so the published product can expose the root's
+    /// runtime entry as `load_bias + entry_vaddr` without re-deriving it.
+    #[inline]
+    pub(crate) const fn entry_vaddr(&self) -> TargetAddress {
+        self.entry_vaddr
     }
 }

@@ -304,6 +304,7 @@ where
         regions,
         load_segments,
         metadata,
+        entry_vaddr,
         ..
     } = decoded;
     let session_allocation = transaction.transfer_to(rollback)?;
@@ -314,6 +315,7 @@ where
         load_segments,
         metadata,
         load_bias,
+        entry_vaddr,
     );
     Ok((session_allocation, state))
 }

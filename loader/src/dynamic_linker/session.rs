@@ -29,6 +29,7 @@ use crate::{
     dynamic_linker::{
         graph::{DependencyGraph, DiscoveryItem, DiscoveryQueue},
         lifecycle::{self, FiniPlan, InitPlan, LifecycleImage},
+        publish::{self, LinkMapImage, PreparedLinkManifest},
         relocate::{self, RelocationImage, RelocationPolicy},
         ArtifactIdentity, ArtifactResolver, ArtifactRole, DependencyRequest, ImageId, LinkDomainId,
         ResolvedArtifact, RuntimeImageMetadata, RuntimeImageState, ScopeSet, SymbolTable,
@@ -206,6 +207,11 @@ impl RelocatedImageState {
     #[inline]
     pub(crate) const fn load_bias(&self) -> TargetAddress {
         self.0.load_bias()
+    }
+
+    #[inline]
+    pub(crate) const fn entry_vaddr(&self) -> TargetAddress {
+        self.0.entry_vaddr()
     }
 }
 
@@ -596,6 +602,30 @@ impl<'a, M: ImageMemory + ?Sized, A: ArchRelocator> ScopedSession<'a, M, A> {
             &self.profile,
             &*self.rollback.memory,
         )
+    }
+
+    /// Build the prepared link manifest (link map + root entry) for atomic
+    /// publication (§13.1).
+    ///
+    /// Emits one [`LinkMapEntry`] per relocated image in image-id order and
+    /// folds the root's `load_bias + entry_vaddr` into the runtime entry. The
+    /// result holds no lease: it is the pure description the host publisher
+    /// validates in `prepare_batch` before the committed snapshot is swapped.
+    pub fn prepare_link_manifest(&self) -> LoadResult<PreparedLinkManifest> {
+        let images: Vec<LinkMapImage<'_>> = self
+            .state
+            .images
+            .iter()
+            .map(|image| {
+                LinkMapImage::new(
+                    image.image_id,
+                    image.state.load_bias(),
+                    image.state.entry_vaddr(),
+                    image.state.regions(),
+                )
+            })
+            .collect();
+        publish::build_manifest(&self.graph, &images)
     }
 }
 
