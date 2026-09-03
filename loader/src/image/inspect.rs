@@ -16,7 +16,7 @@ use alloc::vec::Vec;
 
 use crate::{
     address::{FileRange, TargetAddress, TargetRange},
-    dynamic_linker::ArtifactRole,
+    dynamic_linker::{ArtifactRole, ProgramHeaderGeometry},
     elf::{DynamicSegmentInfo, ElfHeaderInfo, LoadSegmentInfo},
     error::{
         ErrorContext, HeaderField, LoadError, LoadErrorKind, LoadResult, LoadStage,
@@ -48,6 +48,7 @@ pub(crate) struct InspectedImage<R: ElfReader> {
     policy: LoadPolicy,
     role: ArtifactRole,
     summary: DynamicFeatureSummary,
+    phdr_geometry: ProgramHeaderGeometry,
 }
 
 impl<R: ElfReader> InspectedImage<R> {
@@ -64,6 +65,7 @@ impl<R: ElfReader> InspectedImage<R> {
         interpreter: Option<FileRange>,
         tls: Option<TargetRange>,
         summary: DynamicFeatureSummary,
+        phdr_geometry: ProgramHeaderGeometry,
     ) -> Self {
         Self {
             reader,
@@ -78,6 +80,7 @@ impl<R: ElfReader> InspectedImage<R> {
             policy: PHASE0_LOAD_POLICY,
             role: ArtifactRole::ExecutableRoot,
             summary,
+            phdr_geometry,
         }
     }
 
@@ -98,6 +101,11 @@ impl<R: ElfReader> InspectedImage<R> {
     #[inline]
     pub(crate) fn summary(&self) -> &DynamicFeatureSummary {
         &self.summary
+    }
+
+    #[inline]
+    pub(crate) const fn phdr_geometry(&self) -> ProgramHeaderGeometry {
+        self.phdr_geometry
     }
 
     pub fn plan(mut self) -> LoadResult<PlannedImage<R>> {
@@ -280,6 +288,7 @@ impl<R: ElfReader> InspectedImage<R> {
             self.stack,
             self.interpreter,
             self.tls,
+            self.phdr_geometry,
         ))
     }
 }

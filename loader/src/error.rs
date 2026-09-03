@@ -104,6 +104,7 @@ pub enum ProgramHeaderField {
     FileRange,
     VirtualRange,
     DuplicateDynamic,
+    DuplicatePhdr,
     DuplicateRelro,
     DuplicateStack,
     DuplicateInterpreter,

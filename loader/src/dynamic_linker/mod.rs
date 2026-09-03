@@ -41,8 +41,8 @@ pub(crate) use lifecycle::LifecycleImage;
 pub use lifecycle::{FiniPlan, InitPlan, LifecycleEntry};
 pub use metadata::ProgramHeaderRuntimeInfo;
 pub(crate) use metadata::{
-    ImageLayout, ImageLifecycleMetadata, RelocationTableInfo, RelocationTables, RuntimeDynamicInfo,
-    RuntimeImageMetadata, RuntimeImageState,
+    ImageLayout, ImageLifecycleMetadata, ProgramHeaderGeometry, RelocationTableInfo,
+    RelocationTables, RuntimeDynamicInfo, RuntimeImageMetadata, RuntimeImageState,
 };
 pub(crate) use publish::{build_manifest, LinkMapImage};
 pub use publish::{

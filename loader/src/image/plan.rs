@@ -16,6 +16,7 @@ use alloc::vec::Vec;
 
 use crate::{
     address::{FileRange, TargetAddress, TargetRange},
+    dynamic_linker::ProgramHeaderGeometry,
     elf::{DynamicSegmentInfo, LoadSegmentInfo},
     error::{ErrorContext, LoadError, LoadErrorKind, LoadResult, LoadStage},
     identity::{ElfClass, ElfType, LoadRequest},
@@ -39,6 +40,7 @@ pub(crate) struct PlannedImage<R: ElfReader> {
     stack: StackKind,
     interpreter: Option<FileRange>,
     tls: Option<TargetRange>,
+    phdr_geometry: ProgramHeaderGeometry,
 }
 
 impl<R: ElfReader> PlannedImage<R> {
@@ -58,6 +60,7 @@ impl<R: ElfReader> PlannedImage<R> {
         stack: StackKind,
         interpreter: Option<FileRange>,
         tls: Option<TargetRange>,
+        phdr_geometry: ProgramHeaderGeometry,
     ) -> Self {
         Self {
             reader,
@@ -74,6 +77,7 @@ impl<R: ElfReader> PlannedImage<R> {
             stack,
             interpreter,
             tls,
+            phdr_geometry,
         }
     }
 
@@ -157,6 +161,7 @@ impl<R: ElfReader> PlannedImage<R> {
             self.stack,
             self.interpreter,
             self.tls,
+            self.phdr_geometry,
         ))
     }
 }

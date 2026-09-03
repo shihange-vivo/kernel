@@ -27,6 +27,7 @@ use crate::{
     address::{TargetAddress, TargetRange},
     dynamic_linker::{DependencyName, SymbolTable},
     elf::LoadSegmentInfo,
+    error::LoadResult,
     image::{LoadedRegion, RelocationRecord, RelocationTableKind, StackKind},
     memory::ImageAllocation,
 };
@@ -301,10 +302,112 @@ impl ImageLifecycleMetadata {
     }
 }
 
-/// Runtime program-header summary. Skeleton for now: populated once the link
-/// product needs `dl_iterate_phdr`-style runtime introspection (C17-a).
+/// Runtime program-header summary for one decoded image (§7.1/C17-a).
+///
+/// Records the load-biased runtime location of the image's program-header
+/// table so a later link can publish `AT_PHDR/AT_PHENT/AT_PHNUM` auxv entries
+/// without re-decoding the image (§15.3). `AT_PHENT`/`AT_PHNUM` are the raw
+/// ELF header geometry, always available; `AT_PHDR` is present only when the
+/// image names the table with a `PT_PHDR` entry (a static ET_EXEC without one
+/// resolves to `None`, in which case the kernel points `AT_PHDR` at its pinned
+/// program-header copy instead — §15.3).
 #[derive(Clone, Copy, Debug)]
-pub struct ProgramHeaderRuntimeInfo;
+pub struct ProgramHeaderRuntimeInfo {
+    runtime_vaddr: Option<TargetAddress>,
+    entry_size: u16,
+    count: u16,
+}
+
+impl ProgramHeaderRuntimeInfo {
+    /// An empty summary: no table location, zero entries. Used when no dynamic
+    /// segment was decoded (a bare ET_EXEC image has no runtime metadata).
+    #[inline]
+    pub const fn empty() -> Self {
+        Self {
+            runtime_vaddr: None,
+            entry_size: 0,
+            count: 0,
+        }
+    }
+
+    /// Build the summary from the raw ELF header geometry and the mapped
+    /// `PT_PHDR` virtual address (if any), both already validated at admit.
+    ///
+    /// `phdr_vaddr` is the ELF virtual address of `PT_PHDR`; `load_bias` maps
+    /// it to the runtime address actually occupied by the table. Without a
+    /// `PT_PHDR` entry the table location is unknown, so `runtime_vaddr` is
+    /// `None`.
+    #[inline]
+    pub fn from_headers(
+        program_header_entry_size: u16,
+        program_header_count: u16,
+        phdr_vaddr: Option<TargetAddress>,
+        load_bias: TargetAddress,
+    ) -> LoadResult<Self> {
+        let runtime_vaddr = match phdr_vaddr {
+            Some(vaddr) => Some(vaddr.checked_add(load_bias.get())?),
+            None => None,
+        };
+        Ok(Self {
+            runtime_vaddr,
+            entry_size: program_header_entry_size,
+            count: program_header_count,
+        })
+    }
+
+    /// `AT_PHDR`: the load-biased runtime address of the program-header table.
+    #[inline]
+    pub const fn runtime_vaddr(&self) -> Option<TargetAddress> {
+        self.runtime_vaddr
+    }
+
+    /// `AT_PHENT`: the size in bytes of one program-header entry.
+    #[inline]
+    pub const fn entry_size(&self) -> u16 {
+        self.entry_size
+    }
+
+    /// `AT_PHNUM`: the number of program-header entries.
+    #[inline]
+    pub const fn count(&self) -> u16 {
+        self.count
+    }
+}
+
+/// Raw program-header geometry captured at admit, before the load bias is
+/// known. Resolved into a [`ProgramHeaderRuntimeInfo`] once the image is
+/// allocated (the load bias maps ELF vaddrs to runtime addresses).
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct ProgramHeaderGeometry {
+    entry_size: u16,
+    count: u16,
+    phdr_vaddr: Option<TargetAddress>,
+}
+
+impl ProgramHeaderGeometry {
+    #[inline]
+    pub(crate) const fn new(
+        entry_size: u16,
+        count: u16,
+        phdr_vaddr: Option<TargetAddress>,
+    ) -> Self {
+        Self {
+            entry_size,
+            count,
+            phdr_vaddr,
+        }
+    }
+
+    #[inline]
+    pub(crate) fn resolve(self, load_bias: TargetAddress) -> LoadResult<ProgramHeaderRuntimeInfo> {
+        ProgramHeaderRuntimeInfo::from_headers(
+            self.entry_size,
+            self.count,
+            self.phdr_vaddr,
+            load_bias,
+        )
+    }
+}
 
 /// Aggregated, owned runtime metadata for one decoded image (§7.1).
 pub(crate) struct RuntimeImageMetadata {
@@ -348,7 +451,7 @@ impl RuntimeImageMetadata {
             SymbolTable::empty(),
             RelocationTables::empty(),
             ImageLifecycleMetadata::empty(),
-            ProgramHeaderRuntimeInfo,
+            ProgramHeaderRuntimeInfo::empty(),
         )
     }
 
