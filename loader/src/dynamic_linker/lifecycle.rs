@@ -192,7 +192,12 @@ pub(crate) fn build<M: ImageMemory + ?Sized>(
     }
 
     for &image_id in &ordered {
-        let image = image_for(images, image_id)?;
+        // An imported Ready image contributes no constructor (it was already
+        // initialized by the link that first published it — §12.1), so its
+        // image id has no lifecycle entry here and is skipped.
+        let Some(image) = image_for(images, image_id) else {
+            continue;
+        };
         emit_direct(image, image.lifecycle.init(), &decode, &mut init)?;
         read_array(
             image,
@@ -206,7 +211,9 @@ pub(crate) fn build<M: ImageMemory + ?Sized>(
 
     let mut fini = Vec::new();
     for &image_id in ordered.iter().rev() {
-        let image = image_for(images, image_id)?;
+        let Some(image) = image_for(images, image_id) else {
+            continue;
+        };
         read_array(
             image,
             image.lifecycle.fini_array(),
@@ -345,10 +352,8 @@ fn push_entry(
 fn image_for<'a, 'b>(
     images: &'a [LifecycleImage<'b>],
     id: ImageId,
-) -> LoadResult<&'a LifecycleImage<'b>> {
-    images
-        .get(id.get() as usize)
-        .ok_or_else(|| lifecycle_error(LoadErrorKind::BadElf))
+) -> Option<&'a LifecycleImage<'b>> {
+    images.iter().find(|image| image.image_id() == id)
 }
 
 fn function_error(function: TargetAddress) -> LoadError {

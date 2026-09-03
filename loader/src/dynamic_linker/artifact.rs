@@ -282,16 +282,17 @@ impl<R> ResolvedArtifact<R> {
 
 /// Resolves a dependency name to a concrete artifact snapshot.
 ///
-/// `resolve` returns a reader over the exact snapshot identified by the
-/// returned [`ArtifactIdentity`]. A failed resolution must leave no loading
-/// entry behind.
+/// `resolve` returns either a reader over the exact snapshot identified by the
+/// returned [`ArtifactIdentity`] (a fresh `Load`) or a Ready provider the
+/// registry already relocated and sealed (an `Import`, §12.1). A failed
+/// resolution must leave no loading entry behind.
 pub trait ArtifactResolver {
     type Reader: ElfReader;
 
     fn resolve(
         &mut self,
         request: &DependencyRequest<'_>,
-    ) -> LoadResult<ResolvedArtifact<Self::Reader>>;
+    ) -> LoadResult<DependencyResolution<Self::Reader>>;
 }
 
 /// What a [`DependencyRequest`] resolved into (§12.1).

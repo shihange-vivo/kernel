@@ -234,6 +234,41 @@ impl<'a> RelocationImage<'a> {
     }
 }
 
+/// One provider-visible region of an image, used to validate a control-flow or
+/// data target against its owner's mapped ranges (C23-a).
+///
+/// For a loaded image this pairs each `LoadSegmentInfo` permission with the
+/// runtime range of the region mapped from it; for an imported Ready image it
+/// is derived directly from a [`crate::dynamic_linker::PublishedRegion`]. The
+/// relocation engine indexes these by [`ImageId`] over every admitted image —
+/// loaded and imported — so a symbol resolved into an imported provider is
+/// range-checked against the same facts a fresh load would have produced.
+#[derive(Clone, Copy)]
+pub(crate) struct ProviderRegion {
+    permissions: MemoryPermissions,
+    runtime_range: TargetRange,
+}
+
+impl ProviderRegion {
+    #[inline]
+    pub(crate) const fn new(permissions: MemoryPermissions, runtime_range: TargetRange) -> Self {
+        Self {
+            permissions,
+            runtime_range,
+        }
+    }
+
+    #[inline]
+    pub(crate) const fn permissions(&self) -> MemoryPermissions {
+        self.permissions
+    }
+
+    #[inline]
+    pub(crate) const fn runtime_range(&self) -> TargetRange {
+        self.runtime_range
+    }
+}
+
 /// Run the complete session-wide relocation: preflight every record into an
 /// ordered operation list, then apply in the fixed three-pass order.
 ///
@@ -244,6 +279,7 @@ pub(crate) fn run<A, M>(
     arch: &A,
     symbols: &[&SymbolTable],
     images: &[RelocationImage<'_>],
+    provider_regions: &[Vec<ProviderRegion>],
     scopes: &ScopeSet,
     profile: &LoadProfile,
     policy: &RelocationPolicy,
@@ -257,7 +293,16 @@ where
     M: ImageMemory + ?Sized,
 {
     let operations = preflight(
-        arch, symbols, images, scopes, profile, policy, limits, metrics, &*memory,
+        arch,
+        symbols,
+        images,
+        provider_regions,
+        scopes,
+        profile,
+        policy,
+        limits,
+        metrics,
+        &*memory,
     )?;
     apply(&operations, images, profile, memory, log)?;
     Ok(operations)
@@ -271,6 +316,7 @@ fn preflight<A, M>(
     arch: &A,
     symbols: &[&SymbolTable],
     images: &[RelocationImage<'_>],
+    provider_regions: &[Vec<ProviderRegion>],
     scopes: &ScopeSet,
     profile: &LoadProfile,
     policy: &RelocationPolicy,
@@ -306,6 +352,7 @@ where
                 symbols,
                 scopes,
                 images,
+                provider_regions,
                 policy,
                 limits,
                 target_word,
@@ -332,6 +379,7 @@ fn preflight_one<A, M>(
     symbols: &[&SymbolTable],
     scopes: &ScopeSet,
     images: &[RelocationImage<'_>],
+    provider_regions: &[Vec<ProviderRegion>],
     policy: &RelocationPolicy,
     limits: &SessionLimits,
     target_word: TargetWord,
@@ -382,7 +430,7 @@ where
         arch,
         symbols,
         scopes,
-        images,
+        provider_regions,
         policy,
         limits,
         thumb,
@@ -455,7 +503,7 @@ fn resolve_source<A>(
     _arch: &A,
     symbols: &[&SymbolTable],
     scopes: &ScopeSet,
-    images: &[RelocationImage<'_>],
+    provider_regions: &[Vec<ProviderRegion>],
     policy: &RelocationPolicy,
     limits: &SessionLimits,
     thumb: bool,
@@ -517,7 +565,7 @@ where
 
     match resolved {
         Some(symbol) => {
-            validate_symbol_kind(kind, thumb, &symbol, images, policy, record)?;
+            validate_symbol_kind(kind, thumb, &symbol, provider_regions, policy, record)?;
             Ok(RelocationSource::Symbol(symbol))
         }
         None => {
@@ -546,7 +594,7 @@ fn validate_symbol_kind(
     kind: RelocationKind,
     thumb: bool,
     symbol: &ResolvedSymbol,
-    images: &[RelocationImage<'_>],
+    provider_regions: &[Vec<ProviderRegion>],
     policy: &RelocationPolicy,
     record: RelocationRecord,
 ) -> LoadResult<()> {
@@ -561,25 +609,16 @@ fn validate_symbol_kind(
             return Err(relocation_error(record, LoadErrorKind::UnsupportedByProfile));
         }
         if policy.require_control_flow_target_x {
-            let provider = images
+            let provider = provider_regions
                 .get(symbol.owner().get() as usize)
                 .ok_or_else(|| relocation_error(record, LoadErrorKind::BadElf))?;
-            if provider.load_segments.len() != provider.regions.len() {
-                return Err(relocation_error(record, LoadErrorKind::BadElf));
-            }
             let span = core::cmp::max(symbol.size(), 1);
-            let executable = provider
-                .load_segments
-                .iter()
-                .zip(provider.regions.iter())
-                .any(|(segment, region)| {
-                    segment
-                        .permissions()
-                        .contains(MemoryPermissions::EXECUTE)
-                        && region
-                            .runtime_range()
-                            .contains_span(symbol.canonical(), span)
-                });
+            let executable = provider.iter().any(|region| {
+                region.permissions().contains(MemoryPermissions::EXECUTE)
+                    && region
+                        .runtime_range()
+                        .contains_span(symbol.canonical(), span)
+            });
             if !executable {
                 return Err(relocation_error(record, LoadErrorKind::PermissionConflict));
             }

@@ -30,7 +30,7 @@ use crate::{
     address::{TargetAddress, TargetRange},
     dynamic_linker::{
         graph::DependencyGraph, ArtifactIdentity, DependencyName, FiniPlan, ImageId,
-        ImageOwnership, InitPlan, LoadMetrics, PublishedImageDescriptor, ScopeSet,
+        ImageOwnership, InitPlan, LoadMetrics, PublishedImageDescriptor, PublishedRegion, ScopeSet,
     },
     error::{ErrorContext, LoadError, LoadErrorKind, LoadResult, LoadStage},
     image::{LoadedRegion, SealedState},
@@ -148,37 +148,70 @@ impl PreparedLinkManifest {
 }
 
 /// Per-image inputs to manifest construction, borrowed from the session's
-/// relocated images.
-pub(crate) struct LinkMapImage<'a> {
-    image_id: ImageId,
-    load_bias: TargetAddress,
-    runtime_entry: TargetAddress,
-    regions: &'a [LoadedRegion],
+/// relocated and imported images.
+///
+/// A `Loaded` image carries the mapped load regions a manifest span is derived
+/// from; an `Imported` Ready image contributes the published regions it was
+/// first sealed with (§12.1). Both supply the same link-map facts, so an
+/// imported provider joins the map without a second allocation.
+pub(crate) enum LinkMapImage<'a> {
+    Loaded {
+        image_id: ImageId,
+        load_bias: TargetAddress,
+        runtime_entry: TargetAddress,
+        regions: &'a [LoadedRegion],
+    },
+    Imported {
+        image_id: ImageId,
+        load_bias: TargetAddress,
+        regions: &'a [PublishedRegion],
+    },
 }
 
 impl<'a> LinkMapImage<'a> {
     #[inline]
-    pub(crate) const fn new(
+    pub(crate) const fn loaded(
         image_id: ImageId,
         load_bias: TargetAddress,
         runtime_entry: TargetAddress,
         regions: &'a [LoadedRegion],
     ) -> Self {
-        Self {
+        Self::Loaded {
             image_id,
             load_bias,
             runtime_entry,
             regions,
         }
     }
+
+    #[inline]
+    pub(crate) const fn imported(
+        image_id: ImageId,
+        load_bias: TargetAddress,
+        regions: &'a [PublishedRegion],
+    ) -> Self {
+        Self::Imported {
+            image_id,
+            load_bias,
+            regions,
+        }
+    }
+
+    #[inline]
+    pub(crate) const fn image_id(&self) -> ImageId {
+        match self {
+            Self::Loaded { image_id, .. } | Self::Imported { image_id, .. } => *image_id,
+        }
+    }
 }
 
-/// Build the prepared manifest from the closed graph and relocated images.
+/// Build the prepared manifest from the closed graph and every admitted image.
 ///
 /// The link map is emitted in image-id order (root first, then discovery
 /// order). Only the root contributes a runtime entry (§2.3); every entry keeps
 /// its owner and identity so a publisher can validate capacity, identity and
-/// generation without dereferencing a bare address.
+/// generation without dereferencing a bare address. Imported Ready images are
+/// joined at their graph-assigned ids (§12.1).
 pub(crate) fn build_manifest(
     graph: &DependencyGraph,
     images: &[LinkMapImage<'_>],
@@ -190,26 +223,40 @@ pub(crate) fn build_manifest(
 
     let mut root_entry = None;
     for image in images {
+        let image_id = image.image_id();
         let node = graph
-            .node(image.image_id)
+            .node(image_id)
             .ok_or_else(|| publish_error(LoadErrorKind::BadElf, ErrorContext::None))?;
 
-        let entry = if image.image_id.get() == 0 {
-            let runtime = image.runtime_entry;
-            root_entry = Some(runtime);
-            Some(runtime)
-        } else {
-            None
+        let (load_bias, entry, map_span) = match image {
+            LinkMapImage::Loaded {
+                runtime_entry,
+                load_bias,
+                regions,
+                ..
+            } => {
+                let entry = if image_id.get() == 0 {
+                    let runtime = *runtime_entry;
+                    root_entry = Some(runtime);
+                    Some(runtime)
+                } else {
+                    None
+                };
+                (*load_bias, entry, image_span(regions)?)
+            }
+            LinkMapImage::Imported {
+                load_bias, regions, ..
+            } => (*load_bias, None, published_span(regions)?),
         };
 
         entries.push(LinkMapEntry {
-            owner: image.image_id,
+            owner: image_id,
             identity: node.artifact().try_clone()?,
             soname: node.soname().map(DependencyName::try_clone).transpose()?,
             ownership: node.ownership(),
-            load_bias: image.load_bias,
+            load_bias,
             entry,
-            map_span: image_span(image.regions)?,
+            map_span,
         });
     }
 
@@ -225,6 +272,40 @@ pub(crate) fn build_manifest(
 /// ranges. Every mapped image has at least one region (S3 rejects zero), so an
 /// empty region set fails closed rather than fabricating a zero-length span.
 fn image_span(regions: &[LoadedRegion]) -> LoadResult<TargetRange> {
+    let mut start = None;
+    let mut end = None;
+    for region in regions {
+        let range = region.runtime_range();
+        let range_end = range
+            .end()
+            .map_err(|error| error.at_stage(LoadStage::LinkSeal))?;
+        start = Some(match start {
+            Some(current) => core::cmp::min(current, range.start()),
+            None => range.start(),
+        });
+        end = Some(match end {
+            Some(current) => core::cmp::max(current, range_end),
+            None => range_end,
+        });
+    }
+    match (start, end) {
+        (Some(start), Some(end)) => {
+            let len = end
+                .checked_sub(start)
+                .map_err(|error| error.at_stage(LoadStage::LinkSeal))?;
+            Ok(TargetRange::new(start, len))
+        }
+        _ => Err(publish_error(
+            LoadErrorKind::IncorrectLayout,
+            ErrorContext::None,
+        )),
+    }
+}
+
+/// The mapped runtime span of an imported Ready image: the union of its
+/// published regions' runtime ranges (§12.1). Every published image has at
+/// least one region, so an empty region set fails closed.
+fn published_span(regions: &[PublishedRegion]) -> LoadResult<TargetRange> {
     let mut start = None;
     let mut end = None;
     for region in regions {
