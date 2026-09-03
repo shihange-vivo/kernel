@@ -19,7 +19,7 @@
 //! trusted catalog of already-opened snapshots. Phase 1's application resolver
 //! adapts that same contract to signed application packages.
 
-use alloc::boxed::Box;
+use alloc::vec::Vec;
 
 use crate::{
     error::{LoadError, LoadErrorKind, LoadResult},
@@ -32,7 +32,7 @@ use crate::{
 /// backend snapshot; equality never derives from a path or a SONAME string.
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub struct FileIdentity {
-    bytes: Box<[u8]>,
+    bytes: Vec<u8>,
 }
 
 impl FileIdentity {
@@ -42,12 +42,22 @@ impl FileIdentity {
             bytes: bytes.into(),
         }
     }
+
+    fn try_clone(&self) -> LoadResult<Self> {
+        Ok(Self {
+            bytes: try_copy_bytes(&self.bytes)?,
+        })
+    }
+
+    fn metadata_bytes(&self) -> u64 {
+        self.bytes.len() as u64
+    }
 }
 
 /// Opaque build identifier (e.g. a GNU build-id note) attached to an artifact.
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub struct BuildId {
-    bytes: Box<[u8]>,
+    bytes: Vec<u8>,
 }
 
 impl BuildId {
@@ -56,6 +66,16 @@ impl BuildId {
         Self {
             bytes: bytes.into(),
         }
+    }
+
+    fn try_clone(&self) -> LoadResult<Self> {
+        Ok(Self {
+            bytes: try_copy_bytes(&self.bytes)?,
+        })
+    }
+
+    fn metadata_bytes(&self) -> u64 {
+        self.bytes.len() as u64
     }
 }
 
@@ -102,6 +122,20 @@ impl ArtifactIdentity {
     pub const fn build_id(&self) -> Option<&BuildId> {
         self.build_id.as_ref()
     }
+
+    pub(crate) fn try_clone(&self) -> LoadResult<Self> {
+        Ok(Self {
+            file: self.file.try_clone()?,
+            generation: self.generation,
+            build_id: self.build_id.as_ref().map(BuildId::try_clone).transpose()?,
+        })
+    }
+
+    pub(crate) fn metadata_bytes(&self) -> u64 {
+        self.file
+            .metadata_bytes()
+            .saturating_add(self.build_id.as_ref().map_or(0, BuildId::metadata_bytes))
+    }
 }
 
 /// Owned, validated dependency name (a `DT_NEEDED` or `DT_SONAME` value).
@@ -113,7 +147,7 @@ impl ArtifactIdentity {
 /// path separators per layer.
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub struct DependencyName {
-    name: Box<[u8]>,
+    name: Vec<u8>,
 }
 
 impl DependencyName {
@@ -136,7 +170,7 @@ impl DependencyName {
             ));
         }
         Ok(Self {
-            name: bytes[..name_len].into(),
+            name: try_copy_bytes(&bytes[..name_len])?,
         })
     }
 
@@ -144,21 +178,27 @@ impl DependencyName {
     pub fn as_bytes(&self) -> &[u8] {
         &self.name
     }
+
+    pub(crate) fn try_clone(&self) -> LoadResult<Self> {
+        Ok(Self {
+            name: try_copy_bytes(&self.name)?,
+        })
+    }
 }
 
 /// A request for one `DT_NEEDED` dependency, rooted at its requester.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct DependencyRequest {
-    requester: ArtifactIdentity,
-    needed: DependencyName,
+pub struct DependencyRequest<'a> {
+    requester: &'a ArtifactIdentity,
+    needed: &'a DependencyName,
     domain: LinkDomainId,
 }
 
-impl DependencyRequest {
+impl<'a> DependencyRequest<'a> {
     #[inline]
     pub const fn new(
-        requester: ArtifactIdentity,
-        needed: DependencyName,
+        requester: &'a ArtifactIdentity,
+        needed: &'a DependencyName,
         domain: LinkDomainId,
     ) -> Self {
         Self {
@@ -170,12 +210,12 @@ impl DependencyRequest {
 
     #[inline]
     pub const fn requester(&self) -> &ArtifactIdentity {
-        &self.requester
+        self.requester
     }
 
     #[inline]
     pub const fn needed(&self) -> &DependencyName {
-        &self.needed
+        self.needed
     }
 
     #[inline]
@@ -201,11 +241,7 @@ pub struct ResolvedArtifact<R> {
 
 impl<R> ResolvedArtifact<R> {
     #[inline]
-    pub const fn new(
-        identity: ArtifactIdentity,
-        ownership: ImageOwnership,
-        reader: R,
-    ) -> Self {
+    pub const fn new(identity: ArtifactIdentity, ownership: ImageOwnership, reader: R) -> Self {
         Self {
             identity,
             ownership,
@@ -232,6 +268,11 @@ impl<R> ResolvedArtifact<R> {
     pub fn into_reader(self) -> R {
         self.reader
     }
+
+    #[inline]
+    pub fn into_parts(self) -> (ArtifactIdentity, ImageOwnership, R) {
+        (self.identity, self.ownership, self.reader)
+    }
 }
 
 /// Resolves a dependency name to a concrete artifact snapshot.
@@ -244,8 +285,17 @@ pub trait ArtifactResolver {
 
     fn resolve(
         &mut self,
-        request: &DependencyRequest,
+        request: &DependencyRequest<'_>,
     ) -> LoadResult<ResolvedArtifact<Self::Reader>>;
+}
+
+fn try_copy_bytes(bytes: &[u8]) -> LoadResult<Vec<u8>> {
+    let mut copy = Vec::new();
+    copy.try_reserve_exact(bytes.len()).map_err(|_| {
+        LoadError::new(LoadErrorKind::OutOfMemory, crate::error::ErrorContext::None)
+    })?;
+    copy.extend_from_slice(bytes);
+    Ok(copy)
 }
 
 /// Stable identifier of a loaded image within one session.

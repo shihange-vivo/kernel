@@ -24,7 +24,7 @@
 //! and the [`crate::dynamic_linker::LinkProduct`] land with C17-b, where the
 //! session's graph/scopes/images move into the committed owner.
 
-use alloc::{boxed::Box, vec::Vec};
+use alloc::vec::Vec;
 
 use crate::{
     address::{TargetAddress, TargetRange},
@@ -114,7 +114,7 @@ impl LinkMapEntry {
 #[derive(Clone, Debug)]
 pub(crate) struct PreparedLinkManifest {
     entry: TargetAddress,
-    link_map: Box<[LinkMapEntry]>,
+    link_map: Vec<LinkMapEntry>,
 }
 
 impl PreparedLinkManifest {
@@ -130,7 +130,7 @@ impl PreparedLinkManifest {
     }
 
     #[inline]
-    pub(crate) fn into_parts(self) -> (TargetAddress, Box<[LinkMapEntry]>) {
+    pub(crate) fn into_parts(self) -> (TargetAddress, Vec<LinkMapEntry>) {
         (self.entry, self.link_map)
     }
 }
@@ -192,8 +192,8 @@ pub(crate) fn build_manifest(
 
         entries.push(LinkMapEntry {
             owner: image.image_id,
-            identity: node.artifact().clone(),
-            soname: node.soname().cloned(),
+            identity: node.artifact().try_clone()?,
+            soname: node.soname().map(DependencyName::try_clone).transpose()?,
             load_bias: image.load_bias,
             entry,
             map_span: image_span(image.regions)?,
@@ -204,7 +204,7 @@ pub(crate) fn build_manifest(
         root_entry.ok_or_else(|| publish_error(LoadErrorKind::BadElf, ErrorContext::None))?;
     Ok(PreparedLinkManifest {
         entry,
-        link_map: entries.into_boxed_slice(),
+        link_map: entries,
     })
 }
 
@@ -260,7 +260,7 @@ fn publish_oom() -> LoadError {
 /// 必须长期持有 allocation lease").
 #[derive(Debug)]
 pub(crate) struct CommittedImage {
-    entry: LinkMapEntry,
+    owner: ImageId,
     allocation: ImageAllocation,
     sealed: SealedState,
 }
@@ -268,20 +268,20 @@ pub(crate) struct CommittedImage {
 impl CommittedImage {
     #[inline]
     pub(crate) const fn new(
-        entry: LinkMapEntry,
+        owner: ImageId,
         allocation: ImageAllocation,
         sealed: SealedState,
     ) -> Self {
         Self {
-            entry,
+            owner,
             allocation,
             sealed,
         }
     }
 
     #[inline]
-    pub(crate) const fn entry(&self) -> &LinkMapEntry {
-        &self.entry
+    pub(crate) const fn owner(&self) -> ImageId {
+        self.owner
     }
 
     #[inline]
@@ -300,7 +300,7 @@ impl CommittedImage {
 pub(crate) struct LinkContext {
     graph: DependencyGraph,
     scopes: ScopeSet,
-    images: Box<[CommittedImage]>,
+    images: Vec<CommittedImage>,
 }
 
 impl LinkContext {
@@ -308,7 +308,7 @@ impl LinkContext {
     pub(crate) fn new(
         graph: DependencyGraph,
         scopes: ScopeSet,
-        images: Box<[CommittedImage]>,
+        images: Vec<CommittedImage>,
     ) -> Self {
         Self {
             graph,
@@ -341,17 +341,17 @@ impl LinkContext {
 /// must move is the set of unique allocation leases, so this value is exactly
 /// that set, in image-id order.
 pub(crate) struct CommittingLinkProduct {
-    leases: Box<[AllocationLease]>,
+    leases: Vec<AllocationLease>,
 }
 
 impl CommittingLinkProduct {
     #[inline]
-    pub(crate) fn new(leases: Box<[AllocationLease]>) -> Self {
+    pub(crate) fn new(leases: Vec<AllocationLease>) -> Self {
         Self { leases }
     }
 
     #[inline]
-    pub(crate) fn into_leases(self) -> Box<[AllocationLease]> {
+    pub(crate) fn into_leases(self) -> Vec<AllocationLease> {
         self.leases
     }
 }
@@ -393,7 +393,7 @@ pub(crate) struct LinkProduct<Receipt> {
     entry: TargetAddress,
     init_plan: InitPlan,
     fini_plan: FiniPlan,
-    link_map: Box<[LinkMapEntry]>,
+    link_map: Vec<LinkMapEntry>,
     metrics: LoadMetrics,
     publication: Receipt,
 }
@@ -406,7 +406,7 @@ impl<Receipt> LinkProduct<Receipt> {
         entry: TargetAddress,
         init_plan: InitPlan,
         fini_plan: FiniPlan,
-        link_map: Box<[LinkMapEntry]>,
+        link_map: Vec<LinkMapEntry>,
         metrics: LoadMetrics,
         publication: Receipt,
     ) -> Self {

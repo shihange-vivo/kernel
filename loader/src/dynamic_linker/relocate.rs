@@ -286,19 +286,27 @@ where
     let target_word = TargetWord::new(width, profile.endian());
     let thumb = profile.entry_mode().is_thumb();
 
+    let total = images.iter().try_fold(0_u64, |total, image| {
+        total
+            .checked_add(image.metadata.relocations().len() as u64)
+            .ok_or_else(relocation_oom)
+    })?;
+    limits
+        .check_total_relocations(total)
+        .map_err(|error| error.at_stage(LoadStage::LinkRelocate))?;
+    let operation_count = usize::try_from(total).map_err(|_| relocation_oom())?;
     let mut operations = Vec::new();
-    let mut total: u64 = 0;
+    operations
+        .try_reserve_exact(operation_count)
+        .map_err(|_| relocation_oom())?;
     for image in images {
         for record in image.metadata.relocations().records().iter() {
-            total = total.checked_add(1).ok_or_else(relocation_oom)?;
-            limits
-                .check_total_relocations(total)
-                .map_err(|error| error.at_stage(LoadStage::LinkRelocate))?;
             let operation = preflight_one(
                 arch,
                 symbols,
                 scopes,
                 policy,
+                limits,
                 target_word,
                 thumb,
                 image,
@@ -323,6 +331,7 @@ fn preflight_one<A, M>(
     symbols: &[&SymbolTable],
     scopes: &ScopeSet,
     policy: &RelocationPolicy,
+    limits: &SessionLimits,
     target_word: TargetWord,
     thumb: bool,
     image: &RelocationImage<'_>,
@@ -372,6 +381,7 @@ where
         symbols,
         scopes,
         policy,
+        limits,
         thumb,
         image.image_id,
         record,
@@ -443,6 +453,7 @@ fn resolve_source<A>(
     symbols: &[&SymbolTable],
     scopes: &ScopeSet,
     policy: &RelocationPolicy,
+    limits: &SessionLimits,
     thumb: bool,
     owner: ImageId,
     record: RelocationRecord,
@@ -467,8 +478,6 @@ where
     let entry = table
         .entry(record.symbol_index())
         .ok_or_else(|| relocation_error(record, LoadErrorKind::BadElf))?;
-
-    metrics.record_symbol_lookup();
 
     let resolved = match (entry.binding(), entry.visibility(), entry.definition()) {
         // Local references never enter an external scope.
@@ -496,7 +505,9 @@ where
         // Default-visible definitions are preemptible. Search the requester's
         // frozen scope even when the referenced entry is defined locally.
         (SymbolBinding::Global | SymbolBinding::Weak, SymbolVisibility::Default, _) => {
-            scopes.resolve_name(symbols, owner, table.name(entry))
+            let name = table.name(entry);
+            limits.check_symbol_name_len(name.len() as u32)?;
+            scopes.resolve_name(symbols, owner, name, limits, metrics)?
         }
     };
 

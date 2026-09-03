@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use alloc::{boxed::Box, vec::Vec};
+use alloc::vec::Vec;
 use goblin::elf::dynamic::{
     DT_FINI, DT_FINI_ARRAY, DT_FINI_ARRAYSZ, DT_FLAGS, DT_FLAGS_1, DT_GNU_HASH, DT_HASH, DT_INIT,
     DT_INIT_ARRAY, DT_INIT_ARRAYSZ, DT_JMPREL, DT_NEEDED, DT_NULL, DT_PLTREL, DT_PLTRELSZ,
@@ -94,7 +94,7 @@ pub(crate) struct MappedImage<R: ElfReader, M: ImageMemory> {
     request: LoadRequest,
     entry_vaddr: TargetAddress,
     canonical_entry_vaddr: TargetAddress,
-    load_segments: Box<[LoadSegmentInfo]>,
+    load_segments: Vec<LoadSegmentInfo>,
     regions: Vec<LoadedRegion>,
     dynamic: Option<DynamicSegmentInfo>,
     relro: Option<TargetRange>,
@@ -112,7 +112,7 @@ impl<R: ElfReader, M: ImageMemory> MappedImage<R, M> {
         request: LoadRequest,
         entry_vaddr: TargetAddress,
         canonical_entry_vaddr: TargetAddress,
-        load_segments: Box<[LoadSegmentInfo]>,
+        load_segments: Vec<LoadSegmentInfo>,
         regions: Vec<LoadedRegion>,
         dynamic: Option<DynamicSegmentInfo>,
         relro: Option<TargetRange>,
@@ -445,9 +445,9 @@ impl<R: ElfReader, M: ImageMemory> MappedImage<R, M> {
         &self,
         tags: &DynamicTags,
         policy: LoadPolicy,
-    ) -> LoadResult<(SymbolTable, Box<[DependencyName]>, Option<DependencyName>)> {
+    ) -> LoadResult<(SymbolTable, Vec<DependencyName>, Option<DependencyName>)> {
         if !policy.allows_dynamic_symbols() {
-            return Ok((SymbolTable::empty(), Box::new([]), None));
+            return Ok((SymbolTable::empty(), Vec::new(), None));
         }
         let class = self.request.profile().class();
         let endian = self.request.profile().endian();
@@ -467,7 +467,7 @@ impl<R: ElfReader, M: ImageMemory> MappedImage<R, M> {
             || !tags.needed().is_empty()
             || tags.soname().is_some();
         if !any_symbol_tag {
-            return Ok((SymbolTable::empty(), Box::new([]), None));
+            return Ok((SymbolTable::empty(), Vec::new(), None));
         }
 
         // `DT_STRTAB`/`DT_STRSZ` and `DT_SYMTAB`/`DT_SYMENT` are paired tags (§7.2).
@@ -563,7 +563,7 @@ impl<R: ElfReader, M: ImageMemory> MappedImage<R, M> {
         offsets: &[u64],
         dynstr: &[u8],
         tag: u64,
-    ) -> LoadResult<Box<[DependencyName]>> {
+    ) -> LoadResult<Vec<DependencyName>> {
         let mut names = Vec::new();
         names.try_reserve_exact(offsets.len()).map_err(|_| {
             LoadError::new(
@@ -577,7 +577,7 @@ impl<R: ElfReader, M: ImageMemory> MappedImage<R, M> {
         for &offset in offsets {
             names.push(self.decode_dependency_name(offset, dynstr, tag)?);
         }
-        Ok(names.into_boxed_slice())
+        Ok(names)
     }
 
     /// Decode one `DT_NEEDED`/`DT_SONAME` offset into an owned
@@ -675,9 +675,9 @@ impl<R: ElfReader, M: ImageMemory> MappedImage<R, M> {
     /// Read `len` bytes at `vaddr` through the owner-bound transaction into an
     /// owned, bounded buffer. A zero-length read yields an empty box without
     /// touching the allocation.
-    fn read_table_bytes(&self, vaddr: u64, len: u64, tag: u64) -> LoadResult<Box<[u8]>> {
+    fn read_table_bytes(&self, vaddr: u64, len: u64, tag: u64) -> LoadResult<Vec<u8>> {
         if len == 0 {
-            return Ok(Box::new([]));
+            return Ok(Vec::new());
         }
         let offset = self.locate_vaddr_at(TargetAddress::new(vaddr), len)?;
         self.transaction.image_span(offset, len)?;
@@ -691,7 +691,7 @@ impl<R: ElfReader, M: ImageMemory> MappedImage<R, M> {
         })?;
         buffer.resize(len_usize, 0);
         self.transaction.read(offset, &mut buffer)?;
-        Ok(buffer.into_boxed_slice())
+        Ok(buffer)
     }
 
     /// Read exactly the reachable GNU hash extent without relying on section
@@ -705,7 +705,7 @@ impl<R: ElfReader, M: ImageMemory> MappedImage<R, M> {
         endian: ElfData,
         syment: u64,
         known_symbol_count: Option<u32>,
-    ) -> LoadResult<Box<[u8]>> {
+    ) -> LoadResult<Vec<u8>> {
         let header = self.read_table_bytes(vaddr, 16, DT_GNU_HASH)?;
         let nbuckets = read_u32(&header, 0, endian)?;
         let symndx = read_u32(&header, 4, endian)?;

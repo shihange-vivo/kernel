@@ -148,8 +148,8 @@ pub(crate) fn sysv_hash(name: &[u8]) -> u32 {
 /// Validated SysV hash table. The symbol count is `nchain`.
 struct SysVHash {
     nbucket: u32,
-    buckets: Box<[u32]>,
-    chains: Box<[u32]>,
+    buckets: Vec<u32>,
+    chains: Vec<u32>,
 }
 
 impl SysVHash {
@@ -211,8 +211,8 @@ impl SysVHash {
         Ok((
             Self {
                 nbucket,
-                buckets: buckets.into_boxed_slice(),
-                chains: chains.into_boxed_slice(),
+                buckets,
+                chains,
             },
             nchain,
         ))
@@ -224,6 +224,7 @@ impl SysVHash {
         hash: u32,
         dynstr: &[u8],
         entries: &[SymbolEntry],
+        probes: &mut u64,
     ) -> Option<u32> {
         if self.nbucket == 0 {
             return None;
@@ -235,6 +236,7 @@ impl SysVHash {
                 return None;
             }
             remaining -= 1;
+            *probes = probes.saturating_add(1);
             let entry = entries.get(index as usize)?;
             if name_matches(dynstr, entry, name) {
                 return Some(index);
@@ -250,9 +252,9 @@ struct GnuHash {
     symndx: u32,
     shift2: u32,
     class_bits: u32,
-    bloom: Box<[u64]>,
-    buckets: Box<[u32]>,
-    chains: Box<[u32]>,
+    bloom: Vec<u64>,
+    buckets: Vec<u32>,
+    chains: Vec<u32>,
 }
 
 impl GnuHash {
@@ -356,9 +358,9 @@ impl GnuHash {
                 symndx,
                 shift2,
                 class_bits,
-                bloom: bloom.into_boxed_slice(),
-                buckets: buckets.into_boxed_slice(),
-                chains: chains.into_boxed_slice(),
+                bloom,
+                buckets,
+                chains,
             },
             symbol_count,
         ))
@@ -378,16 +380,19 @@ impl GnuHash {
         hash: u32,
         dynstr: &[u8],
         entries: &[SymbolEntry],
+        probes: &mut u64,
     ) -> Option<u32> {
         if self.buckets.is_empty() {
             return None;
         }
         let bucket = self.buckets[(hash % self.buckets.len() as u32) as usize];
+        *probes = probes.saturating_add(1);
         if bucket < self.symndx || !self.bloom_may_match(hash) {
             return None;
         }
         let mut index = (bucket - self.symndx) as usize;
         while index < self.chains.len() {
+            *probes = probes.saturating_add(1);
             let chain = self.chains[index];
             if chain & !1 == hash & !1 {
                 let symbol_index = self.symndx + index as u32;
@@ -408,8 +413,8 @@ impl GnuHash {
 
 /// Owned, validated `.dynstr` plus the decoded symbol entries.
 pub(crate) struct SymbolTable {
-    dynstr: Box<[u8]>,
-    entries: Box<[SymbolEntry]>,
+    dynstr: Vec<u8>,
+    entries: Vec<SymbolEntry>,
     gnu: Option<GnuHash>,
     sysv: Option<SysVHash>,
 }
@@ -418,8 +423,8 @@ impl SymbolTable {
     /// An empty table for images that carry no `DT_SYMTAB`.
     pub(crate) fn empty() -> Self {
         Self {
-            dynstr: Box::new([]),
-            entries: Box::new([]),
+            dynstr: Vec::new(),
+            entries: Vec::new(),
             gnu: None,
             sysv: None,
         }
@@ -435,15 +440,15 @@ impl SymbolTable {
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn decode(
         symtab: &[u8],
-        dynstr: Box<[u8]>,
+        dynstr: Vec<u8>,
         class: ElfClass,
         endian: ElfData,
         load_bias: TargetAddress,
         segments: &[LoadSegmentInfo],
         thumb: bool,
         max_symbol_name_len: u32,
-        gnu_bytes: Option<Box<[u8]>>,
-        sysv_bytes: Option<Box<[u8]>>,
+        gnu_bytes: Option<Vec<u8>>,
+        sysv_bytes: Option<Vec<u8>>,
     ) -> LoadResult<Self> {
         let syment: usize = match class {
             ElfClass::Elf32 => 16,
@@ -507,7 +512,7 @@ impl SymbolTable {
 
         Ok(Self {
             dynstr,
-            entries: entries.into_boxed_slice(),
+            entries,
             gnu,
             sysv,
         })
@@ -559,25 +564,56 @@ impl SymbolTable {
 
     /// Lookup by name through the hash table fast path.
     pub(crate) fn lookup(&self, name: &[u8]) -> Option<u32> {
+        self.lookup_with_probes(name).0
+    }
+
+    pub(crate) fn lookup_with_probes(&self, name: &[u8]) -> (Option<u32>, u64) {
+        let mut probes = 0;
         let hashed = match (&self.gnu, &self.sysv) {
             (Some(gnu), Some(sysv)) => {
-                let gnu = gnu.lookup(name, gnu_hash(name), &self.dynstr, &self.entries);
-                let sysv = sysv.lookup(name, sysv_hash(name), &self.dynstr, &self.entries);
+                let gnu = gnu.lookup(
+                    name,
+                    gnu_hash(name),
+                    &self.dynstr,
+                    &self.entries,
+                    &mut probes,
+                );
+                let sysv = sysv.lookup(
+                    name,
+                    sysv_hash(name),
+                    &self.dynstr,
+                    &self.entries,
+                    &mut probes,
+                );
                 if gnu == sysv {
                     gnu
                 } else {
                     None
                 }
             }
-            (Some(gnu), None) => gnu.lookup(name, gnu_hash(name), &self.dynstr, &self.entries),
-            (None, Some(sysv)) => sysv.lookup(name, sysv_hash(name), &self.dynstr, &self.entries),
+            (Some(gnu), None) => gnu.lookup(
+                name,
+                gnu_hash(name),
+                &self.dynstr,
+                &self.entries,
+                &mut probes,
+            ),
+            (None, Some(sysv)) => sysv.lookup(
+                name,
+                sysv_hash(name),
+                &self.dynstr,
+                &self.entries,
+                &mut probes,
+            ),
             (None, None) => self.lookup_linear(name),
         };
-        if self.gnu.is_none() && self.sysv.is_none() || hashed == self.lookup_linear(name) {
-            hashed
-        } else {
-            None
-        }
+        let result =
+            if self.gnu.is_none() && self.sysv.is_none() || hashed == self.lookup_linear(name) {
+                hashed
+            } else {
+                None
+            };
+        (result, probes)
     }
 
     /// Bounded linear scan — the oracle the hash lookup must agree with.

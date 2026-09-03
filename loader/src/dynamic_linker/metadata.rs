@@ -21,7 +21,7 @@
 //! produced once at decode time and carried through the relocation/cache/seal
 //! typestate chain until the session consumes it (C14/C15).
 
-use alloc::{boxed::Box, vec::Vec};
+use alloc::vec::Vec;
 
 use crate::{
     address::{TargetAddress, TargetRange},
@@ -309,7 +309,7 @@ pub(crate) struct ProgramHeaderRuntimeInfo;
 /// Aggregated, owned runtime metadata for one decoded image (§7.1).
 pub(crate) struct RuntimeImageMetadata {
     dynamic: RuntimeDynamicInfo,
-    needed: Box<[DependencyName]>,
+    needed: Vec<DependencyName>,
     soname: Option<DependencyName>,
     symbols: SymbolTable,
     relocations: RelocationTables,
@@ -321,7 +321,7 @@ impl RuntimeImageMetadata {
     #[inline]
     pub(crate) fn new(
         dynamic: RuntimeDynamicInfo,
-        needed: Box<[DependencyName]>,
+        needed: Vec<DependencyName>,
         soname: Option<DependencyName>,
         symbols: SymbolTable,
         relocations: RelocationTables,
@@ -343,7 +343,7 @@ impl RuntimeImageMetadata {
     pub(crate) fn empty() -> Self {
         Self::new(
             RuntimeDynamicInfo::empty(),
-            Box::new([]),
+            Vec::new(),
             None,
             SymbolTable::empty(),
             RelocationTables::empty(),
@@ -365,6 +365,11 @@ impl RuntimeImageMetadata {
     #[inline]
     pub(crate) const fn soname(&self) -> Option<&DependencyName> {
         self.soname.as_ref()
+    }
+
+    #[inline]
+    pub(crate) fn take_soname(&mut self) -> Option<DependencyName> {
+        self.soname.take()
     }
 
     #[inline]
@@ -449,8 +454,8 @@ impl ImageLayout {
 /// log, never here.
 pub(crate) struct RuntimeImageState {
     layout: ImageLayout,
-    regions: Box<[LoadedRegion]>,
-    load_segments: Box<[LoadSegmentInfo]>,
+    regions: Vec<LoadedRegion>,
+    load_segments: Vec<LoadSegmentInfo>,
     metadata: RuntimeImageMetadata,
     load_bias: TargetAddress,
     runtime_entry: TargetAddress,
@@ -464,8 +469,8 @@ impl RuntimeImageState {
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
         layout: ImageLayout,
-        regions: Box<[LoadedRegion]>,
-        load_segments: Box<[LoadSegmentInfo]>,
+        regions: Vec<LoadedRegion>,
+        load_segments: Vec<LoadSegmentInfo>,
         metadata: RuntimeImageMetadata,
         load_bias: TargetAddress,
         runtime_entry: TargetAddress,
@@ -504,6 +509,11 @@ impl RuntimeImageState {
     #[inline]
     pub(crate) const fn metadata(&self) -> &RuntimeImageMetadata {
         &self.metadata
+    }
+
+    #[inline]
+    pub(crate) fn take_soname(&mut self) -> Option<DependencyName> {
+        self.metadata.take_soname()
     }
 
     #[inline]

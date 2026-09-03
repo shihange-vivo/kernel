@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use alloc::{boxed::Box, vec::Vec};
+use alloc::vec::Vec;
 
 use crate::{
     address::{FileRange, TargetAddress, TargetRange},
@@ -88,7 +88,7 @@ pub(crate) struct DecodedImage<R: ElfReader, M: ImageMemory> {
     request: LoadRequest,
     entry_vaddr: TargetAddress,
     canonical_entry_vaddr: TargetAddress,
-    load_segments: Box<[LoadSegmentInfo]>,
+    load_segments: Vec<LoadSegmentInfo>,
     regions: Vec<LoadedRegion>,
     dynamic: Option<DynamicSegmentInfo>,
     metadata: RuntimeImageMetadata,
@@ -107,7 +107,7 @@ impl<R: ElfReader, M: ImageMemory> DecodedImage<R, M> {
         request: LoadRequest,
         entry_vaddr: TargetAddress,
         canonical_entry_vaddr: TargetAddress,
-        load_segments: Box<[LoadSegmentInfo]>,
+        load_segments: Vec<LoadSegmentInfo>,
         regions: Vec<LoadedRegion>,
         dynamic: Option<DynamicSegmentInfo>,
         metadata: RuntimeImageMetadata,
@@ -336,7 +336,7 @@ where
     let layout = ImageLayout::new(session_allocation.allocation());
     let state = RuntimeImageState::new(
         layout,
-        regions.into_boxed_slice(),
+        regions,
         load_segments,
         metadata,
         load_bias,
