@@ -21,6 +21,7 @@ mod artifact;
 mod graph;
 mod lifecycle;
 mod metadata;
+mod publish;
 mod relocate;
 mod scope;
 mod session;
@@ -32,6 +33,7 @@ pub use artifact::{
 };
 
 pub(crate) use lifecycle::{FiniPlan, InitPlan, LifecycleEntry, LifecycleImage};
+pub(crate) use publish::{build_manifest, LinkMapEntry, LinkMapImage, PreparedLinkManifest};
 pub(crate) use metadata::{
     ImageLayout, ImageLifecycleMetadata, ProgramHeaderRuntimeInfo, RelocationTableInfo,
     RelocationTables, RuntimeDynamicInfo, RuntimeImageMetadata, RuntimeImageState,
