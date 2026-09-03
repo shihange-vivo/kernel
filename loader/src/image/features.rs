@@ -103,7 +103,9 @@ pub(crate) fn validate_dynamic_features<R: ElfReader>(
     let mut needed = Vec::new();
     needed
         .try_reserve_exact(entry_count as usize)
-        .map_err(|_| LoadError::new(LoadErrorKind::OutOfMemory, crate::error::ErrorContext::None))?;
+        .map_err(|_| {
+            LoadError::new(LoadErrorKind::OutOfMemory, crate::error::ErrorContext::None)
+        })?;
     let mut soname = None;
     let mut has_plt_relocations = false;
     let mut has_lifecycle = false;

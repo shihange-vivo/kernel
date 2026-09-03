@@ -17,14 +17,15 @@ use goblin::elf::dynamic::{
     DT_FINI, DT_FINI_ARRAY, DT_FINI_ARRAYSZ, DT_FLAGS, DT_FLAGS_1, DT_GNU_HASH, DT_HASH, DT_INIT,
     DT_INIT_ARRAY, DT_INIT_ARRAYSZ, DT_JMPREL, DT_NEEDED, DT_NULL, DT_PLTREL, DT_PLTRELSZ,
     DT_PREINIT_ARRAY, DT_PREINIT_ARRAYSZ, DT_REL, DT_RELA, DT_RELAENT, DT_RELASZ, DT_RELENT,
-    DT_RELSZ, DT_SONAME, DT_STRTAB, DT_STRSZ, DT_SYMENT, DT_SYMTAB,
+    DT_RELSZ, DT_SONAME, DT_STRSZ, DT_STRTAB, DT_SYMENT, DT_SYMTAB,
 };
 
 use crate::{
     address::{FileRange, TargetAddress, TargetRange},
     dynamic_linker::{
         symbol_count_from_hash, DependencyName, ImageLifecycleMetadata, ProgramHeaderRuntimeInfo,
-        RelocationTableInfo, RelocationTables, RuntimeDynamicInfo, RuntimeImageMetadata, SymbolTable,
+        RelocationTableInfo, RelocationTables, RuntimeDynamicInfo, RuntimeImageMetadata,
+        SymbolTable,
     },
     elf::{DynamicSegmentInfo, LoadSegmentInfo},
     error::{ErrorContext, LoadError, LoadErrorKind, LoadResult, LoadStage},
@@ -368,7 +369,12 @@ impl<R: ElfReader, M: ImageMemory> MappedImage<R, M> {
                 .decode_relocation_table(tags.rel(), RelocationTableKind::Rel, policy, &mut records)
                 .map_err(|error| error.at_stage(LoadStage::Decode))?;
             let rela = self
-                .decode_relocation_table(tags.rela(), RelocationTableKind::Rela, policy, &mut records)
+                .decode_relocation_table(
+                    tags.rela(),
+                    RelocationTableKind::Rela,
+                    policy,
+                    &mut records,
+                )
                 .map_err(|error| error.at_stage(LoadStage::Decode))?;
             let jmp_rel = self.decode_plt_relocations(&tags, policy, &mut records)?;
             let relocations = RelocationTables::new(rel, rela, jmp_rel, records);
@@ -516,7 +522,8 @@ impl<R: ElfReader, M: ImageMemory> MappedImage<R, M> {
             None => None,
         };
 
-        let symbol_count = symbol_count_from_hash(class, endian, gnu_bytes.as_deref(), sysv_bytes.as_deref())?;
+        let symbol_count =
+            symbol_count_from_hash(class, endian, gnu_bytes.as_deref(), sysv_bytes.as_deref())?;
 
         let symtab_len = u64::from(symbol_count)
             .checked_mul(syment)
@@ -524,7 +531,9 @@ impl<R: ElfReader, M: ImageMemory> MappedImage<R, M> {
         // All symbol entries are charged against the total metadata budget
         // *before* parsing, so a malformed table with a huge proven count can
         // never reserve memory past the limit (§7.4).
-        self.request.limits().check_runtime_metadata_bytes(symtab_len)?;
+        self.request
+            .limits()
+            .check_runtime_metadata_bytes(symtab_len)?;
         let symtab_bytes = self.read_table_bytes(symtab, symtab_len, DT_SYMTAB)?;
 
         let symbols = SymbolTable::decode(
@@ -576,7 +585,9 @@ impl<R: ElfReader, M: ImageMemory> MappedImage<R, M> {
     ) -> LoadResult<DependencyName> {
         let max_len = self.request.limits().max_dependency_name_len();
         let start = usize::try_from(offset).map_err(|_| dynamic_error(tag, offset))?;
-        let tail = dynstr.get(start..).ok_or_else(|| dynamic_error(tag, offset))?;
+        let tail = dynstr
+            .get(start..)
+            .ok_or_else(|| dynamic_error(tag, offset))?;
         let scan = core::cmp::min(max_len as usize + 1, tail.len());
         let nul = tail[..scan]
             .iter()
@@ -585,8 +596,7 @@ impl<R: ElfReader, M: ImageMemory> MappedImage<R, M> {
         if nul == 0 {
             return Err(dynamic_error(tag, offset));
         }
-        DependencyName::from_terminated(&tail[..nul + 1])
-            .map_err(|_| dynamic_error(tag, offset))
+        DependencyName::from_terminated(&tail[..nul + 1]).map_err(|_| dynamic_error(tag, offset))
     }
 
     /// S4 stage 4: save the lifecycle targets and array ranges without fixing
@@ -612,8 +622,18 @@ impl<R: ElfReader, M: ImageMemory> MappedImage<R, M> {
             word_size,
             DT_PREINIT_ARRAY,
         )?;
-        let init_array = self.array_range(tags.init_array(), tags.init_arraysz(), word_size, DT_INIT_ARRAY)?;
-        let fini_array = self.array_range(tags.fini_array(), tags.fini_arraysz(), word_size, DT_FINI_ARRAY)?;
+        let init_array = self.array_range(
+            tags.init_array(),
+            tags.init_arraysz(),
+            word_size,
+            DT_INIT_ARRAY,
+        )?;
+        let fini_array = self.array_range(
+            tags.fini_array(),
+            tags.fini_arraysz(),
+            word_size,
+            DT_FINI_ARRAY,
+        )?;
         Ok(ImageLifecycleMetadata::new(
             init,
             fini,
@@ -686,7 +706,11 @@ const fn relocation_entry_size(class: ElfClass, kind: RelocationTableKind) -> u6
     }
 }
 
-pub(crate) fn decode_dynamic_entry(bytes: &[u8], class: ElfClass, endian: ElfData) -> LoadResult<(u64, u64)> {
+pub(crate) fn decode_dynamic_entry(
+    bytes: &[u8],
+    class: ElfClass,
+    endian: ElfData,
+) -> LoadResult<(u64, u64)> {
     Ok(match class {
         ElfClass::Elf32 => (
             u64::from(read_u32(bytes, 0, endian)?),
