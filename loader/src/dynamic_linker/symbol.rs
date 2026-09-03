@@ -257,17 +257,18 @@ struct GnuHash {
 
 impl GnuHash {
     /// Parse a complete `DT_GNU_HASH` table. Returns the table and the symbol
-    /// count. `maskwords` must be a power of two; the final chain entry must
-    /// carry the low "end of chain" bit so the count is provable (§7.4).
+    /// count. `maskwords` must be a power of two and every bucket must reach a
+    /// terminating chain word. The highest reachable terminator must be the
+    /// final supplied word, so padding cannot inflate the symbol count.
     fn parse(bytes: &[u8], endian: ElfData, class: ElfClass) -> LoadResult<(Self, u32)> {
-        if bytes.len() < 20 {
+        if bytes.len() < 16 {
             return Err(hash_error());
         }
         let nbuckets = read_u32(bytes, 0, endian)?;
         let symndx = read_u32(bytes, 4, endian)?;
         let maskwords = read_u32(bytes, 8, endian)?;
         let shift2 = read_u32(bytes, 12, endian)?;
-        if !maskwords.is_power_of_two() || maskwords == 0 {
+        if nbuckets == 0 || !maskwords.is_power_of_two() || maskwords == 0 || shift2 >= u32::BITS {
             return Err(hash_error());
         }
         let class_bits: u32 = match class {
@@ -282,17 +283,15 @@ impl GnuHash {
             .and_then(|v| v.checked_add(buckets_bytes))
             .ok_or_else(hash_error)?;
         let total = u64::try_from(bytes.len()).map_err(|_| hash_error())?;
-        if total < head + 4 {
+        if total < head {
             return Err(hash_error());
         }
         let chains_bytes = total - head;
         if chains_bytes % 4 != 0 {
             return Err(hash_error());
         }
-        let chain_count = chains_bytes / 4;
-        let symbol_count = symndx
-            .checked_add(chain_count as u32)
-            .ok_or_else(hash_error)?;
+        let chain_count = u32::try_from(chains_bytes / 4).map_err(|_| hash_error())?;
+        let symbol_count = symndx.checked_add(chain_count).ok_or_else(hash_error)?;
 
         let mut bloom = Vec::new();
         bloom
@@ -316,7 +315,7 @@ impl GnuHash {
                 16 + maskwords as usize * word_size as usize + 4 * index,
                 endian,
             )?;
-            if bucket >= symbol_count && bucket != 0 {
+            if bucket != 0 && (bucket < symndx || bucket >= symbol_count) {
                 return Err(hash_error());
             }
             buckets.push(bucket);
@@ -329,8 +328,27 @@ impl GnuHash {
         for index in 0..chain_count as usize {
             chains.push(read_u32(bytes, chain_base + 4 * index, endian)?);
         }
-        // A proper GNU hash table ends the final chain with the low bit set.
-        if chain_count == 0 || chains[chain_count as usize - 1] & 1 == 0 {
+
+        let mut highest_end = None;
+        for &bucket in &buckets {
+            if bucket == 0 {
+                continue;
+            }
+            let mut index = (bucket - symndx) as usize;
+            loop {
+                let chain = *chains.get(index).ok_or_else(hash_error)?;
+                if chain & 1 != 0 {
+                    highest_end = Some(highest_end.map_or(index, |end| core::cmp::max(end, index)));
+                    break;
+                }
+                index = index.checked_add(1).ok_or_else(hash_error)?;
+            }
+        }
+        let exact_extent = match highest_end {
+            Some(index) => index.checked_add(1) == Some(chains.len()),
+            None => chains.is_empty(),
+        };
+        if !exact_extent {
             return Err(hash_error());
         }
         Ok((
@@ -541,13 +559,25 @@ impl SymbolTable {
 
     /// Lookup by name through the hash table fast path.
     pub(crate) fn lookup(&self, name: &[u8]) -> Option<u32> {
-        if let Some(gnu) = &self.gnu {
-            return gnu.lookup(name, gnu_hash(name), &self.dynstr, &self.entries);
+        let hashed = match (&self.gnu, &self.sysv) {
+            (Some(gnu), Some(sysv)) => {
+                let gnu = gnu.lookup(name, gnu_hash(name), &self.dynstr, &self.entries);
+                let sysv = sysv.lookup(name, sysv_hash(name), &self.dynstr, &self.entries);
+                if gnu == sysv {
+                    gnu
+                } else {
+                    None
+                }
+            }
+            (Some(gnu), None) => gnu.lookup(name, gnu_hash(name), &self.dynstr, &self.entries),
+            (None, Some(sysv)) => sysv.lookup(name, sysv_hash(name), &self.dynstr, &self.entries),
+            (None, None) => self.lookup_linear(name),
+        };
+        if self.gnu.is_none() && self.sysv.is_none() || hashed == self.lookup_linear(name) {
+            hashed
+        } else {
+            None
         }
-        if let Some(sysv) = &self.sysv {
-            return sysv.lookup(name, sysv_hash(name), &self.dynstr, &self.entries);
-        }
-        self.lookup_linear(name)
     }
 
     /// Bounded linear scan — the oracle the hash lookup must agree with.
