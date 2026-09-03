@@ -126,8 +126,9 @@ impl SymbolEntry {
 /// GNU ELF string hash (`DT_GNU_HASH`), over raw bytes.
 pub(crate) fn gnu_hash(name: &[u8]) -> u32 {
     const SEED: u32 = 5381;
-    name.iter()
-        .fold(SEED, |hash, &byte| hash.wrapping_mul(33).wrapping_add(u32::from(byte)))
+    name.iter().fold(SEED, |hash, &byte| {
+        hash.wrapping_mul(33).wrapping_add(u32::from(byte))
+    })
 }
 
 /// SysV ELF string hash (`DT_HASH`), over raw bytes.
@@ -161,6 +162,9 @@ impl SysVHash {
         }
         let nbucket = read_u32(bytes, 0, endian)?;
         let nchain = read_u32(bytes, 4, endian)?;
+        if nbucket == 0 || nchain == 0 {
+            return Err(hash_error());
+        }
         let expected = 8u64
             .checked_add(4u64 * (u64::from(nbucket) + u64::from(nchain)))
             .ok_or_else(hash_error)?;
@@ -190,6 +194,20 @@ impl SysVHash {
             }
             chains.push(link);
         }
+
+        // Prove that every bucket-reachable chain terminates at STN_UNDEF.
+        // A bounded walk avoids auxiliary allocation while rejecting cycles.
+        for &bucket in &buckets {
+            let mut index = bucket;
+            let mut steps = 0_u32;
+            while index != 0 {
+                steps = steps.checked_add(1).ok_or_else(hash_error)?;
+                if steps > nchain {
+                    return Err(hash_error());
+                }
+                index = chains[index as usize];
+            }
+        }
         Ok((
             Self {
                 nbucket,
@@ -200,19 +218,28 @@ impl SysVHash {
         ))
     }
 
-    fn lookup(&self, name: &[u8], hash: u32, dynstr: &[u8], entries: &[SymbolEntry]) -> Option<u32> {
+    fn lookup(
+        &self,
+        name: &[u8],
+        hash: u32,
+        dynstr: &[u8],
+        entries: &[SymbolEntry],
+    ) -> Option<u32> {
         if self.nbucket == 0 {
             return None;
         }
         let mut index = self.buckets[(hash % self.nbucket) as usize];
+        let mut remaining = self.chains.len();
         while index != 0 {
-            if index < entries.len() as u32 && self.chains[index as usize] == hash {
-                let entry = &entries[index as usize];
-                if name_matches(dynstr, entry, name) {
-                    return Some(index);
-                }
+            if remaining == 0 {
+                return None;
             }
-            index = self.chains[index as usize];
+            remaining -= 1;
+            let entry = entries.get(index as usize)?;
+            if name_matches(dynstr, entry, name) {
+                return Some(index);
+            }
+            index = *self.chains.get(index as usize)?;
         }
         None
     }
@@ -284,7 +311,11 @@ impl GnuHash {
             .try_reserve_exact(nbuckets as usize)
             .map_err(|_| hash_oom())?;
         for index in 0..nbuckets as usize {
-            let bucket = read_u32(bytes, 16 + maskwords as usize * word_size as usize + 4 * index, endian)?;
+            let bucket = read_u32(
+                bytes,
+                16 + maskwords as usize * word_size as usize + 4 * index,
+                endian,
+            )?;
             if bucket >= symbol_count && bucket != 0 {
                 return Err(hash_error());
             }
@@ -323,7 +354,13 @@ impl GnuHash {
         (self.bloom[bloom_index] & bitmask) == bitmask
     }
 
-    fn lookup(&self, name: &[u8], hash: u32, dynstr: &[u8], entries: &[SymbolEntry]) -> Option<u32> {
+    fn lookup(
+        &self,
+        name: &[u8],
+        hash: u32,
+        dynstr: &[u8],
+        entries: &[SymbolEntry],
+    ) -> Option<u32> {
         if self.buckets.is_empty() {
             return None;
         }
