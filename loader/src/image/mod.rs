@@ -29,6 +29,7 @@ pub(crate) use decode::{
 };
 pub(crate) use features::DynamicFeatureSummary;
 pub(crate) use image_loader::{read_u16, read_u32, read_u64, ImageLoader};
+pub(crate) use inspect::StackKind;
 pub(crate) use map::LoadedRegion;
 pub use seal::{
     AppliedProtectionSet, PreparedProtectionPlan, ProtectionBatch, ProtectionCapabilities,

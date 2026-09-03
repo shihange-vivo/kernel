@@ -33,7 +33,7 @@ use crate::{
         LoadMetrics, ScopeSet,
     },
     error::{ErrorContext, LoadError, LoadErrorKind, LoadResult, LoadStage},
-    image::LoadedRegion,
+    image::{LoadedRegion, SealedState},
     memory::{AllocationLease, ImageAllocation},
 };
 
@@ -258,16 +258,25 @@ fn publish_oom() -> LoadError {
 /// allocation lease is transferred into the publisher's `Receipt` at commit,
 /// which is the long-term owner (§13.2 "CommittedImage 或 publisher receipt
 /// 必须长期持有 allocation lease").
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub(crate) struct CommittedImage {
     entry: LinkMapEntry,
     allocation: ImageAllocation,
+    sealed: SealedState,
 }
 
 impl CommittedImage {
     #[inline]
-    pub(crate) const fn new(entry: LinkMapEntry, allocation: ImageAllocation) -> Self {
-        Self { entry, allocation }
+    pub(crate) const fn new(
+        entry: LinkMapEntry,
+        allocation: ImageAllocation,
+        sealed: SealedState,
+    ) -> Self {
+        Self {
+            entry,
+            allocation,
+            sealed,
+        }
     }
 
     #[inline]
@@ -278,6 +287,11 @@ impl CommittedImage {
     #[inline]
     pub(crate) const fn allocation(&self) -> ImageAllocation {
         self.allocation
+    }
+
+    #[inline]
+    pub(crate) const fn sealed(&self) -> &SealedState {
+        &self.sealed
     }
 }
 

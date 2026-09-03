@@ -27,7 +27,7 @@ use crate::{
     address::{TargetAddress, TargetRange},
     dynamic_linker::{DependencyName, SymbolTable},
     elf::LoadSegmentInfo,
-    image::{LoadedRegion, RelocationRecord, RelocationTableKind},
+    image::{LoadedRegion, RelocationRecord, RelocationTableKind, StackKind},
     memory::ImageAllocation,
 };
 
@@ -454,6 +454,9 @@ pub(crate) struct RuntimeImageState {
     metadata: RuntimeImageMetadata,
     load_bias: TargetAddress,
     runtime_entry: TargetAddress,
+    canonical_runtime_entry: TargetAddress,
+    relro: Option<TargetRange>,
+    stack: StackKind,
 }
 
 impl RuntimeImageState {
@@ -466,6 +469,9 @@ impl RuntimeImageState {
         metadata: RuntimeImageMetadata,
         load_bias: TargetAddress,
         runtime_entry: TargetAddress,
+        canonical_runtime_entry: TargetAddress,
+        relro: Option<TargetRange>,
+        stack: StackKind,
     ) -> Self {
         Self {
             layout,
@@ -474,6 +480,9 @@ impl RuntimeImageState {
             metadata,
             load_bias,
             runtime_entry,
+            canonical_runtime_entry,
+            relro,
+            stack,
         }
     }
 
@@ -507,5 +516,20 @@ impl RuntimeImageState {
     #[inline]
     pub(crate) const fn runtime_entry(&self) -> TargetAddress {
         self.runtime_entry
+    }
+
+    #[inline]
+    pub(crate) const fn canonical_runtime_entry(&self) -> TargetAddress {
+        self.canonical_runtime_entry
+    }
+
+    #[inline]
+    pub(crate) const fn relro(&self) -> Option<TargetRange> {
+        self.relro
+    }
+
+    #[inline]
+    pub(crate) const fn stack(&self) -> &StackKind {
+        &self.stack
     }
 }

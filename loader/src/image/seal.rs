@@ -297,6 +297,23 @@ impl PreparedProtectionPlan {
         Ok(prepared)
     }
 
+    pub(crate) fn prepare_for_allocation<M: ImageProtectionMemory + ?Sized>(
+        memory: &M,
+        allocation: &ImageAllocation,
+        logical: &SealPlan,
+    ) -> LoadResult<Self> {
+        let prepared = Self::build(allocation, logical, memory.protection_capabilities())?;
+        memory.validate_protection_aliases(allocation, &prepared)?;
+        for range in prepared.ranges() {
+            memory.image_span(
+                allocation,
+                range.allocation_offset(),
+                range.applied_range().len(),
+            )?;
+        }
+        Ok(prepared)
+    }
+
     fn build(
         allocation: &ImageAllocation,
         logical: &SealPlan,
@@ -427,6 +444,24 @@ pub struct SealedState {
 }
 
 impl SealedState {
+    pub(crate) const fn new(
+        load_bias: TargetAddress,
+        runtime_entry: TargetAddress,
+        canonical_entry: TargetAddress,
+        cache_sync: CacheSyncOutcome,
+        seal_plan: SealPlan,
+        protections: AppliedProtectionSet,
+    ) -> Self {
+        Self {
+            load_bias,
+            runtime_entry,
+            canonical_entry,
+            cache_sync,
+            seal_plan,
+            protections,
+        }
+    }
+
     #[inline]
     pub const fn load_bias(&self) -> TargetAddress {
         self.load_bias
