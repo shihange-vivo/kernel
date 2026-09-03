@@ -302,12 +302,19 @@ where
         transaction,
         load_bias,
         regions,
+        load_segments,
         metadata,
         ..
     } = decoded;
     let session_allocation = transaction.transfer_to(rollback)?;
     let layout = ImageLayout::new(session_allocation.allocation());
-    let state = RuntimeImageState::new(layout, regions.into_boxed_slice(), metadata, load_bias);
+    let state = RuntimeImageState::new(
+        layout,
+        regions.into_boxed_slice(),
+        load_segments,
+        metadata,
+        load_bias,
+    );
     Ok((session_allocation, state))
 }
 
@@ -325,6 +332,16 @@ pub(crate) struct RelocationTableTags {
 }
 
 impl RelocationTableTags {
+    /// Synthesize a JMPREL tag set whose entry size is derived from `DT_PLTREL`
+    /// and the ELF class (JMPREL has no per-table `*ENT` tag).
+    pub(crate) fn with_entry_size(tags: &RelocationTableTags, entry_size: u64) -> Self {
+        Self {
+            address: tags.address,
+            byte_len: tags.byte_len,
+            entry_size: Some(entry_size),
+        }
+    }
+
     #[inline]
     pub fn address(&self) -> Option<u64> {
         self.address
@@ -360,6 +377,8 @@ impl RelocationTableTags {
 pub(crate) struct DynamicTags {
     rel: RelocationTableTags,
     rela: RelocationTableTags,
+    jmp_rel: RelocationTableTags,
+    pltrel: Option<u64>,
     symtab: Option<u64>,
     syment: Option<u64>,
     strtab: Option<u64>,
@@ -398,6 +417,26 @@ impl DynamicTags {
     #[inline]
     pub fn rela_mut(&mut self) -> &mut RelocationTableTags {
         &mut self.rela
+    }
+
+    #[inline]
+    pub fn jmp_rel(&self) -> &RelocationTableTags {
+        &self.jmp_rel
+    }
+
+    #[inline]
+    pub fn jmp_rel_mut(&mut self) -> &mut RelocationTableTags {
+        &mut self.jmp_rel
+    }
+
+    #[inline]
+    pub const fn pltrel(&self) -> Option<u64> {
+        self.pltrel
+    }
+
+    #[inline]
+    pub fn pltrel_mut(&mut self) -> &mut Option<u64> {
+        &mut self.pltrel
     }
 
     #[inline]

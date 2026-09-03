@@ -20,6 +20,7 @@
 mod artifact;
 mod graph;
 mod metadata;
+mod relocate;
 mod scope;
 mod session;
 mod symbol;
@@ -34,6 +35,7 @@ pub(crate) use metadata::{
     RelocationTables, RuntimeDynamicInfo, RuntimeImageMetadata, RuntimeImageState,
 };
 pub(crate) use scope::{ResolvedSymbol, ScopeImage, ScopeSet, SymbolRegionKind, SymbolScope};
+pub(crate) use session::LoadMetrics;
 pub(crate) use symbol::{
     symbol_count_from_hash, SymbolBinding, SymbolDefinition, SymbolEntry, SymbolTable, SymbolType,
     SymbolVisibility,

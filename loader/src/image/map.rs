@@ -15,9 +15,9 @@
 use alloc::{boxed::Box, vec::Vec};
 use goblin::elf::dynamic::{
     DT_FINI, DT_FINI_ARRAY, DT_FINI_ARRAYSZ, DT_FLAGS, DT_FLAGS_1, DT_GNU_HASH, DT_HASH, DT_INIT,
-    DT_INIT_ARRAY, DT_INIT_ARRAYSZ, DT_NEEDED, DT_NULL, DT_PREINIT_ARRAY, DT_PREINIT_ARRAYSZ,
-    DT_REL, DT_RELA, DT_RELAENT, DT_RELASZ, DT_RELENT, DT_RELSZ, DT_SONAME, DT_STRTAB, DT_STRSZ,
-    DT_SYMENT, DT_SYMTAB,
+    DT_INIT_ARRAY, DT_INIT_ARRAYSZ, DT_JMPREL, DT_NEEDED, DT_NULL, DT_PLTREL, DT_PLTRELSZ,
+    DT_PREINIT_ARRAY, DT_PREINIT_ARRAYSZ, DT_REL, DT_RELA, DT_RELAENT, DT_RELASZ, DT_RELENT,
+    DT_RELSZ, DT_SONAME, DT_STRTAB, DT_STRSZ, DT_SYMENT, DT_SYMTAB,
 };
 
 use crate::{
@@ -248,6 +248,7 @@ impl<R: ElfReader, M: ImageMemory> MappedImage<R, M> {
         &self,
         tags: &RelocationTableTags,
         kind: RelocationTableKind,
+        policy: LoadPolicy,
         records: &mut Vec<RelocationRecord>,
     ) -> LoadResult<Option<RelocationTableInfo>> {
         let absent =
@@ -296,7 +297,9 @@ impl<R: ElfReader, M: ImageMemory> MappedImage<R, M> {
                     self.request.profile().endian(),
                     kind,
                 )?;
-                if record.symbol_index() != 0 {
+                // Only the multi-image profile understands symbol-bound
+                // relocations; the Phase 0 relative engine must fail closed.
+                if record.symbol_index() != 0 && !policy.allows_dynamic_symbols() {
                     return Err(unsupported_relocation(record));
                 }
                 records.push(record);
@@ -309,6 +312,38 @@ impl<R: ElfReader, M: ImageMemory> MappedImage<R, M> {
             entry_size,
             count,
         )))
+    }
+
+    /// Decode the `DT_JMPREL`/`DT_PLTREL` PLT relocation table, if present.
+    ///
+    /// JMPREL has no per-table `*ENT` tag: its entry geometry is derived from
+    /// `DT_PLTREL` (`DT_REL` or `DT_RELA`), which must be present and
+    /// self-consistent whenever JMPREL is. The returned [`RelocationTableInfo`]
+    /// keeps the resolved REL/RELA entry kind; the caller stores it under the
+    /// JMPREL slot so the session knows it is the PLT table.
+    fn decode_plt_relocations(
+        &self,
+        tags: &DynamicTags,
+        policy: LoadPolicy,
+        records: &mut Vec<RelocationRecord>,
+    ) -> LoadResult<Option<RelocationTableInfo>> {
+        let jmp_absent = tags.jmp_rel().address().is_none()
+            && tags.jmp_rel().byte_len().is_none()
+            && tags.jmp_rel().entry_size().is_none();
+        match (jmp_absent, tags.pltrel()) {
+            (true, None) => return Ok(None),
+            (true, Some(_)) => return Err(dynamic_error(DT_JMPREL, 0)),
+            (false, None) => return Err(dynamic_error(DT_PLTREL, 0)),
+            (false, Some(_)) => {}
+        }
+        let entry_kind = match tags.pltrel() {
+            Some(DT_REL) => RelocationTableKind::Rel,
+            Some(DT_RELA) => RelocationTableKind::Rela,
+            _ => return Err(dynamic_error(DT_PLTREL, tags.pltrel().unwrap_or(0))),
+        };
+        let entry_size = relocation_entry_size(self.request.profile().class(), entry_kind);
+        let synthesized = RelocationTableTags::with_entry_size(tags.jmp_rel(), entry_size);
+        self.decode_relocation_table(&synthesized, entry_kind, policy, records)
     }
 
     pub fn decode(self) -> LoadResult<DecodedImage<R, M>> {
@@ -330,12 +365,13 @@ impl<R: ElfReader, M: ImageMemory> MappedImage<R, M> {
                 .map_err(|error| error.at_stage(LoadStage::Decode))?;
             let mut records = Vec::new();
             let rel = self
-                .decode_relocation_table(tags.rel(), RelocationTableKind::Rel, &mut records)
+                .decode_relocation_table(tags.rel(), RelocationTableKind::Rel, policy, &mut records)
                 .map_err(|error| error.at_stage(LoadStage::Decode))?;
             let rela = self
-                .decode_relocation_table(tags.rela(), RelocationTableKind::Rela, &mut records)
+                .decode_relocation_table(tags.rela(), RelocationTableKind::Rela, policy, &mut records)
                 .map_err(|error| error.at_stage(LoadStage::Decode))?;
-            let relocations = RelocationTables::new(rel, rela, records);
+            let jmp_rel = self.decode_plt_relocations(&tags, policy, &mut records)?;
+            let relocations = RelocationTables::new(rel, rela, jmp_rel, records);
             let dynamic = self
                 .decode_dynamic_info(&tags)
                 .map_err(|error| error.at_stage(LoadStage::Decode))?;
@@ -724,6 +760,9 @@ fn accept_dynamic_tag(
         DT_RELA => set_once(tags.rela_mut().address_mut(), tag, value),
         DT_RELASZ => set_once(tags.rela_mut().byte_len_mut(), tag, value),
         DT_RELAENT => set_once(tags.rela_mut().entry_size_mut(), tag, value),
+        DT_JMPREL => set_once(tags.jmp_rel_mut().address_mut(), tag, value),
+        DT_PLTRELSZ => set_once(tags.jmp_rel_mut().byte_len_mut(), tag, value),
+        DT_PLTREL => set_once(tags.pltrel_mut(), tag, value),
         DT_SYMTAB => set_once(tags.symtab_mut(), tag, value),
         DT_SYMENT => set_once(tags.syment_mut(), tag, value),
         DT_STRTAB => set_once(tags.strtab_mut(), tag, value),

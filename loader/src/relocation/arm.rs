@@ -12,14 +12,15 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use goblin::elf;
+use goblin::elf::reloc::{R_ARM_ABS32, R_ARM_GLOB_DAT, R_ARM_JUMP_SLOT, R_ARM_RELATIVE};
 
 use crate::{
     identity::{ElfClass, ElfMachine},
-    relocation::{AddendEncoding, ArchRelocator},
+    relocation::{AddendEncoding, ArchRelocator, RelocationKind},
 };
 
 #[repr(transparent)]
+#[derive(Clone, Copy)]
 pub struct ArmRelocator;
 
 impl ArchRelocator for ArmRelocator {
@@ -32,10 +33,20 @@ impl ArchRelocator for ArmRelocator {
     }
 
     fn relative_type(&self) -> u32 {
-        elf::reloc::R_ARM_RELATIVE
+        R_ARM_RELATIVE
     }
 
     fn addend_encoding(&self) -> super::AddendEncoding {
         AddendEncoding::Implicit
+    }
+
+    fn classify_relocation(&self, raw_type: u32) -> Option<RelocationKind> {
+        match raw_type {
+            R_ARM_RELATIVE => Some(RelocationKind::Relative),
+            R_ARM_ABS32 => Some(RelocationKind::Absolute),
+            R_ARM_GLOB_DAT => Some(RelocationKind::GlobalData),
+            R_ARM_JUMP_SLOT => Some(RelocationKind::JumpSlot),
+            _ => None,
+        }
     }
 }

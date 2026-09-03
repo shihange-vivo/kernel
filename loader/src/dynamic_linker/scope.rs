@@ -72,7 +72,7 @@ pub(crate) struct ResolvedSymbol {
 
 impl ResolvedSymbol {
     #[inline]
-    fn from_entry(owner: ImageId, entry: &SymbolEntry) -> Self {
+    pub(crate) fn from_entry(owner: ImageId, entry: &SymbolEntry) -> Self {
         let region = SymbolRegionKind::for_type(entry.symbol_type());
         let address = entry.value();
         let canonical = match entry.symbol_type() {

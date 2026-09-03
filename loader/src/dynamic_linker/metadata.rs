@@ -26,6 +26,7 @@ use alloc::{boxed::Box, vec::Vec};
 use crate::{
     address::{TargetAddress, TargetRange},
     dynamic_linker::{DependencyName, SymbolTable},
+    elf::LoadSegmentInfo,
     image::{LoadedRegion, RelocationRecord, RelocationTableKind},
     memory::ImageAllocation,
 };
@@ -86,15 +87,18 @@ impl RelocationTableInfo {
     }
 }
 
-/// The `DT_REL`/`DT_RELA` table descriptors plus their decoded records.
+/// The `DT_REL`/`DT_RELA`/`DT_JMPREL` table descriptors plus their decoded
+/// records.
 ///
-/// The records are combined in table order (`REL` before `RELA`) and retain
-/// their ELF symbol indices; only the relocation semantics that the current
-/// phase supports survive decode (`symbol_index == 0` for the relative engine
-/// until C14 freezes scopes).
+/// The records are combined in table order (`REL` before `RELA` before
+/// `JMPREL`) and retain their ELF symbol indices; only the relocation
+/// semantics that the current phase supports survive decode (`symbol_index == 0`
+/// for the relative engine until C14 freezes scopes, then symbol-bound records
+/// for the session engine).
 pub(crate) struct RelocationTables {
     rel: Option<RelocationTableInfo>,
     rela: Option<RelocationTableInfo>,
+    jmp_rel: Option<RelocationTableInfo>,
     records: Vec<RelocationRecord>,
 }
 
@@ -103,9 +107,15 @@ impl RelocationTables {
     pub(crate) fn new(
         rel: Option<RelocationTableInfo>,
         rela: Option<RelocationTableInfo>,
+        jmp_rel: Option<RelocationTableInfo>,
         records: Vec<RelocationRecord>,
     ) -> Self {
-        Self { rel, rela, records }
+        Self {
+            rel,
+            rela,
+            jmp_rel,
+            records,
+        }
     }
 
     #[inline]
@@ -113,6 +123,7 @@ impl RelocationTables {
         Self {
             rel: None,
             rela: None,
+            jmp_rel: None,
             records: Vec::new(),
         }
     }
@@ -125,6 +136,11 @@ impl RelocationTables {
     #[inline]
     pub(crate) const fn rela(&self) -> Option<RelocationTableInfo> {
         self.rela
+    }
+
+    #[inline]
+    pub(crate) const fn jmp_rel(&self) -> Option<RelocationTableInfo> {
+        self.jmp_rel
     }
 
     #[inline]
@@ -420,7 +436,8 @@ impl ImageLayout {
 }
 
 /// Owned runtime state of one decoded image (§7.1): the physical allocation
-/// layout, the mapped load regions, the aggregate metadata, and the load bias.
+/// layout, the mapped load regions, the aggregate metadata, the load bias, and
+/// the load segments (for relocation permission checks).
 ///
 /// The session keeps one of these per admitted image inside a
 /// `SessionImage`; the unique allocation lease lives in the session rollback
@@ -428,6 +445,7 @@ impl ImageLayout {
 pub(crate) struct RuntimeImageState {
     layout: ImageLayout,
     regions: Box<[LoadedRegion]>,
+    load_segments: Box<[LoadSegmentInfo]>,
     metadata: RuntimeImageMetadata,
     load_bias: TargetAddress,
 }
@@ -437,12 +455,14 @@ impl RuntimeImageState {
     pub(crate) fn new(
         layout: ImageLayout,
         regions: Box<[LoadedRegion]>,
+        load_segments: Box<[LoadSegmentInfo]>,
         metadata: RuntimeImageMetadata,
         load_bias: TargetAddress,
     ) -> Self {
         Self {
             layout,
             regions,
+            load_segments,
             metadata,
             load_bias,
         }
@@ -456,6 +476,11 @@ impl RuntimeImageState {
     #[inline]
     pub(crate) fn regions(&self) -> &[LoadedRegion] {
         &self.regions
+    }
+
+    #[inline]
+    pub(crate) fn load_segments(&self) -> &[LoadSegmentInfo] {
+        &self.load_segments
     }
 
     #[inline]

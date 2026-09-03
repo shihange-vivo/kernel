@@ -66,6 +66,22 @@ pub enum AddendEncoding {
     Explicit,
 }
 
+/// The four relocation classes the Phase 0.5 session engine understands.
+///
+/// Each arch relocator maps its raw relocation type to one of these; anything
+/// unmapped is fail-closed by the session preflight (§11.2).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RelocationKind {
+    /// `B + A`: the load-bias plus addend, `symbol_index == 0`.
+    Relative,
+    /// `S + A`: a resolved symbol value plus addend (data reference).
+    Absolute,
+    /// `S`: a GOT slot set to the resolved symbol value.
+    GlobalData,
+    /// `S`: a PLT slot set to the resolved function address.
+    JumpSlot,
+}
+
 #[derive(Clone, Copy)]
 pub(crate) struct TargetWord {
     width: WordWidth,
@@ -88,7 +104,7 @@ impl TargetWord {
         self.endian
     }
 
-    pub fn read<M: ImageMemory>(
+    pub fn read<M: ImageMemory + ?Sized>(
         self,
         memory: &M,
         allocation: &ImageAllocation,
@@ -110,7 +126,7 @@ impl TargetWord {
         }
     }
 
-    pub fn write<M: ImageMemory>(
+    pub fn write<M: ImageMemory + ?Sized>(
         self,
         memory: &mut M,
         allocation: &ImageAllocation,
@@ -215,6 +231,14 @@ pub trait ArchRelocator {
     fn relative_type(&self) -> u32;
 
     fn addend_encoding(&self) -> AddendEncoding;
+
+    /// Map a raw relocation type to its session engine class, or `None` when
+    /// the architecture does not (yet) participate in session-wide relocation.
+    /// The ARM32 relocator classifies the four NOW relocations of §11.2;
+    /// everything else stays fail-closed.
+    fn classify_relocation(&self, _raw_type: u32) -> Option<RelocationKind> {
+        None
+    }
 }
 
 impl<A: ArchRelocator + ?Sized> ArchRelocator for &A {
@@ -232,5 +256,9 @@ impl<A: ArchRelocator + ?Sized> ArchRelocator for &A {
 
     fn addend_encoding(&self) -> AddendEncoding {
         (**self).addend_encoding()
+    }
+
+    fn classify_relocation(&self, raw_type: u32) -> Option<RelocationKind> {
+        (**self).classify_relocation(raw_type)
     }
 }
