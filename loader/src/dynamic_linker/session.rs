@@ -35,8 +35,9 @@ use crate::{
             LinkPublisher, PreparedLinkManifest,
         },
         relocate::{self, RelocationImage, RelocationPolicy},
-        ArtifactIdentity, ArtifactResolver, ArtifactRole, DependencyRequest, ImageId, LinkDomainId,
-        ResolvedArtifact, RuntimeImageMetadata, RuntimeImageState, ScopeSet, SymbolTable,
+        ArtifactIdentity, ArtifactResolver, ArtifactRole, DependencyName, DependencyRequest,
+        ImageId, LinkDomainId, ResolvedArtifact, RuntimeImageMetadata, RuntimeImageState, ScopeSet,
+        SymbolTable,
     },
     elf::LoadSegmentInfo,
     error::{ErrorContext, LoadError, LoadErrorKind, LoadResult, LoadStage},
@@ -66,6 +67,8 @@ pub(crate) struct LoadMetrics {
     relocation_operations: u64,
     protection_ranges: u64,
     cache_ranges: u64,
+    image_bytes: u64,
+    runtime_metadata_bytes: u64,
 }
 
 impl LoadMetrics {
@@ -75,9 +78,28 @@ impl LoadMetrics {
     }
 
     #[inline]
-    pub(crate) fn record_image(&mut self, depth: u16) {
+    pub(crate) fn record_image(
+        &mut self,
+        depth: u16,
+        image_bytes: u64,
+        metadata_bytes: u64,
+        limits: &SessionLimits,
+    ) -> LoadResult<()> {
+        let total_image_bytes = self
+            .image_bytes
+            .checked_add(image_bytes)
+            .ok_or_else(session_overflow)?;
+        let total_metadata_bytes = self
+            .runtime_metadata_bytes
+            .checked_add(metadata_bytes)
+            .ok_or_else(session_overflow)?;
+        limits.check_total_image_bytes(total_image_bytes)?;
+        limits.check_total_runtime_metadata_bytes(total_metadata_bytes)?;
         self.images += 1;
         self.max_depth = self.max_depth.max(depth);
+        self.image_bytes = total_image_bytes;
+        self.runtime_metadata_bytes = total_metadata_bytes;
+        Ok(())
     }
 
     #[inline]
@@ -86,13 +108,19 @@ impl LoadMetrics {
     }
 
     #[inline]
-    pub(crate) fn record_symbol_lookup(&mut self) {
-        self.symbol_lookups += 1;
+    pub(crate) fn record_symbol_lookup(&mut self, limits: &SessionLimits) -> LoadResult<()> {
+        let next = self
+            .symbol_lookups
+            .checked_add(1)
+            .ok_or_else(session_overflow)?;
+        limits.check_symbol_lookups(next)?;
+        self.symbol_lookups = next;
+        Ok(())
     }
 
     #[inline]
-    pub(crate) fn record_hash_probe(&mut self) {
-        self.hash_probes += 1;
+    pub(crate) fn record_hash_probes(&mut self, count: u64) {
+        self.hash_probes = self.hash_probes.saturating_add(count);
     }
 
     #[inline]
@@ -164,7 +192,6 @@ impl LoadMetrics {
 /// log (§6.2).
 pub(crate) struct SessionImage<S> {
     image_id: ImageId,
-    artifact: ArtifactIdentity,
     allocation: SessionAllocation,
     state: S,
 }
@@ -327,7 +354,7 @@ pub(crate) struct DynamicLinker<A> {
     policy: LoadPolicy,
 }
 
-impl<A: ArchRelocator + Clone> DynamicLinker<A> {
+impl<A: ArchRelocator> DynamicLinker<A> {
     pub(crate) fn new(arch: A) -> Self {
         Self {
             arch,
@@ -340,14 +367,14 @@ impl<A: ArchRelocator + Clone> DynamicLinker<A> {
     /// The root is always an [`ArtifactRole::ExecutableRoot`]; its reader is
     /// consumed through S0–S4 and the resulting allocation lease is absorbed
     /// into the session rollback log before the session is returned.
-    pub fn begin<'a, R, Memory>(
-        &self,
+    pub fn begin<R, Memory>(
+        self,
         root: ResolvedArtifact<R>,
         profile: LoadProfile,
         domain: LinkDomainId,
         limits: SessionLimits,
-        memory: &'a mut Memory,
-    ) -> LoadResult<BuildingSession<'a, Memory, A>>
+        memory: &mut Memory,
+    ) -> LoadResult<BuildingSession<'_, Memory, A>>
     where
         R: ElfReader,
         Memory: ImageMemory + ?Sized,
@@ -366,10 +393,9 @@ impl<A: ArchRelocator + Clone> DynamicLinker<A> {
         let mut graph = DependencyGraph::new(limits);
         let mut metrics = LoadMetrics::default();
 
-        let artifact = root.identity().clone();
-        let ownership = root.ownership();
-        let (allocation, runtime) = load_runtime(
-            root.into_reader(),
+        let (artifact, ownership, reader) = root.into_parts();
+        let (allocation, mut runtime) = load_runtime(
+            reader,
             profile,
             ArtifactRole::ExecutableRoot,
             self.policy,
@@ -378,9 +404,13 @@ impl<A: ArchRelocator + Clone> DynamicLinker<A> {
             &mut *guard.memory,
         )?;
 
-        let soname = runtime.metadata().soname().cloned();
-        let root_id = graph.insert_root(artifact.clone(), soname, ownership)?;
-        metrics.record_image(0);
+        let soname = runtime.take_soname();
+        let metadata_bytes = session_image_metadata_bytes(&runtime, &artifact, soname.as_ref())?;
+        let root_id = graph.insert_root(artifact, soname, ownership)?;
+        validate_session_symbol_names(&runtime, &limits)?;
+        metrics
+            .record_image(0, allocation.allocation().len(), metadata_bytes, &limits)
+            .map_err(|error| error.at_stage(LoadStage::Beginning))?;
 
         let mut images = Vec::new();
         images
@@ -388,15 +418,18 @@ impl<A: ArchRelocator + Clone> DynamicLinker<A> {
             .map_err(|_| LoadError::new(LoadErrorKind::OutOfMemory, ErrorContext::None))?;
         images.push(SessionImage {
             image_id: root_id,
-            artifact,
             allocation,
             state: runtime,
         });
 
         let mut discovery = DiscoveryQueue::new(limits);
-        for (index, name) in images[0].state.metadata().needed().iter().enumerate() {
-            discovery.push(DiscoveryItem::new(root_id, name.clone(), index as u16))?;
-        }
+        enqueue_dependencies(
+            &mut discovery,
+            root_id,
+            images[0].state.metadata().needed(),
+            &limits,
+            LoadStage::Beginning,
+        )?;
 
         Ok(LinkSession {
             rollback: guard,
@@ -406,7 +439,7 @@ impl<A: ArchRelocator + Clone> DynamicLinker<A> {
             profile,
             policy: self.policy,
             domain,
-            arch: self.arch.clone(),
+            arch: self.arch,
             state: BuildingState {
                 images,
                 discovery,
@@ -449,21 +482,21 @@ impl<'a, M: ImageMemory + ?Sized, A: ArchRelocator> BuildingSession<'a, M, A> {
     ) -> LoadResult<()> {
         while let Some(item) = self.state.discovery.pop() {
             let requester = item.requester();
-            let requester_artifact = self
-                .graph
-                .node(requester)
-                .map(|node| node.artifact().clone())
-                .ok_or_else(|| session_error(LoadErrorKind::BadElf, ErrorContext::None))?;
-            let request =
-                DependencyRequest::new(requester_artifact, item.needed().clone(), self.domain);
-
             self.metrics.record_resolver_call();
-            let resolved = resolver
-                .resolve(&request)
-                .map_err(|error| error.at_stage(LoadStage::Discover))?;
+            let resolved = {
+                let requester_artifact = self
+                    .graph
+                    .node(requester)
+                    .map(|node| node.artifact())
+                    .ok_or_else(|| session_error(LoadErrorKind::BadElf, ErrorContext::None))?;
+                let needed = needed_for(&self.state.images, requester, item.needed_index())?;
+                let request = DependencyRequest::new(requester_artifact, needed, self.domain);
+                resolver
+                    .resolve(&request)
+                    .map_err(|error| error.at_stage(LoadStage::Discover))?
+            };
 
-            let identity = resolved.identity().clone();
-            let ownership = resolved.ownership();
+            let (identity, ownership, reader) = resolved.into_parts();
 
             // Identity de-duplication happens before any allocation (§5.3 rule 1).
             if let Some(existing) = self.graph.find_identity(&identity) {
@@ -474,8 +507,8 @@ impl<'a, M: ImageMemory + ?Sized, A: ArchRelocator> BuildingSession<'a, M, A> {
                 continue;
             }
 
-            let (allocation, runtime) = load_runtime(
-                resolved.into_reader(),
+            let (allocation, mut runtime) = load_runtime(
+                reader,
                 self.profile,
                 ArtifactRole::SharedObject,
                 self.policy,
@@ -485,14 +518,17 @@ impl<'a, M: ImageMemory + ?Sized, A: ArchRelocator> BuildingSession<'a, M, A> {
             )
             .map_err(|error| error.at_stage(LoadStage::Discover))?;
 
-            let soname = runtime.metadata().soname().cloned();
+            let soname = runtime.take_soname();
+            let metadata_bytes =
+                session_image_metadata_bytes(&runtime, &identity, soname.as_ref())?;
+            let needed = needed_for(&self.state.images, requester, item.needed_index())?;
             let provider = self
                 .graph
                 .insert_dependency(
                     requester,
-                    item.needed(),
+                    needed,
                     item.needed_index(),
-                    identity.clone(),
+                    identity,
                     soname,
                     ownership,
                 )
@@ -503,15 +539,25 @@ impl<'a, M: ImageMemory + ?Sized, A: ArchRelocator> BuildingSession<'a, M, A> {
                 .node(provider)
                 .map(|node| node.depth())
                 .unwrap_or(0);
-            self.metrics.record_image(depth);
+            validate_session_symbol_names(&runtime, &self.limits)
+                .map_err(|error| error.at_stage(LoadStage::Discover))?;
+            self.metrics
+                .record_image(
+                    depth,
+                    allocation.allocation().len(),
+                    metadata_bytes,
+                    &self.limits,
+                )
+                .map_err(|error| error.at_stage(LoadStage::Discover))?;
             self.metrics.record_edge();
 
-            for (index, name) in runtime.metadata().needed().iter().enumerate() {
-                self.state
-                    .discovery
-                    .push(DiscoveryItem::new(provider, name.clone(), index as u16))
-                    .map_err(|error| error.at_stage(LoadStage::Discover))?;
-            }
+            enqueue_dependencies(
+                &mut self.state.discovery,
+                provider,
+                runtime.metadata().needed(),
+                &self.limits,
+                LoadStage::Discover,
+            )?;
 
             self.state.images.try_reserve(1).map_err(|_| {
                 LoadError::new(LoadErrorKind::OutOfMemory, ErrorContext::None)
@@ -519,7 +565,6 @@ impl<'a, M: ImageMemory + ?Sized, A: ArchRelocator> BuildingSession<'a, M, A> {
             })?;
             self.state.images.push(SessionImage {
                 image_id: provider,
-                artifact: identity,
                 allocation,
                 state: runtime,
             });
@@ -557,10 +602,13 @@ impl<'a, M: ImageMemory + ?Sized, A: ArchRelocator> BuildingSession<'a, M, A> {
                 .at_stage(LoadStage::Scope));
         }
 
-        let symbols: Vec<&SymbolTable> = images
-            .iter()
-            .map(|image| image.state.metadata().symbols())
-            .collect();
+        let mut symbols = Vec::new();
+        symbols
+            .try_reserve_exact(images.len())
+            .map_err(|_| scope_session_oom())?;
+        for image in &images {
+            symbols.push(image.state.metadata().symbols());
+        }
         let scopes =
             ScopeSet::freeze(&graph, &symbols).map_err(|error| error.at_stage(LoadStage::Scope))?;
 
@@ -585,31 +633,33 @@ impl<'a, M: ImageMemory + ?Sized, A: ArchRelocator> ScopedSession<'a, M, A> {
     /// preflighted and applied against the frozen scopes. On any error the
     /// session is dropped and all absorbed allocations aborted.
     pub fn relocate(mut self) -> LoadResult<RelocatedSession<'a, M, A>> {
-        let symbols: Vec<&SymbolTable> = self
-            .state
-            .images
-            .iter()
-            .map(|image| image.state.metadata().symbols())
-            .collect();
-
-        let relocation_images: Vec<RelocationImage<'_>> = self
-            .state
-            .images
-            .iter()
-            .map(|image| {
-                RelocationImage::new(
-                    image.image_id,
-                    image.allocation,
-                    image.state.regions(),
-                    image.state.load_segments(),
-                    image.state.metadata(),
-                    image.state.load_bias(),
-                )
-            })
-            .collect();
+        let image_count = self.state.images.len();
+        let mut symbols = Vec::new();
+        symbols
+            .try_reserve_exact(image_count)
+            .map_err(|_| link_relocation_oom())?;
+        let mut relocation_images = Vec::new();
+        relocation_images
+            .try_reserve_exact(image_count)
+            .map_err(|_| link_relocation_oom())?;
+        let mut relocated_images = Vec::new();
+        relocated_images
+            .try_reserve_exact(image_count)
+            .map_err(|_| link_relocation_oom())?;
+        for image in &self.state.images {
+            symbols.push(image.state.metadata().symbols());
+            relocation_images.push(RelocationImage::new(
+                image.image_id,
+                image.allocation,
+                image.state.regions(),
+                image.state.load_segments(),
+                image.state.metadata(),
+                image.state.load_bias(),
+            ));
+        }
 
         let policy = RelocationPolicy::for_profile(&self.profile);
-        let _operations = relocate::run(
+        relocate::run(
             &self.arch,
             &symbols,
             &relocation_images,
@@ -623,18 +673,17 @@ impl<'a, M: ImageMemory + ?Sized, A: ArchRelocator> ScopedSession<'a, M, A> {
         )
         .map_err(|error| error.at_stage(LoadStage::LinkRelocate))?;
 
+        drop(relocation_images);
+        drop(symbols);
+
         // Rewrap the decoded state so a second relocation is unrepresentable.
-        let images = self
-            .state
-            .images
-            .into_iter()
-            .map(|image| SessionImage {
+        for image in self.state.images {
+            relocated_images.push(SessionImage {
                 image_id: image.image_id,
-                artifact: image.artifact,
                 allocation: image.allocation,
                 state: RelocatedImageState(image.state),
-            })
-            .collect();
+            });
+        }
         let scopes = self.state.scopes;
 
         Ok(LinkSession {
@@ -646,7 +695,10 @@ impl<'a, M: ImageMemory + ?Sized, A: ArchRelocator> ScopedSession<'a, M, A> {
             policy: self.policy,
             domain: self.domain,
             arch: self.arch,
-            state: RelocatedState { images, scopes },
+            state: RelocatedState {
+                images: relocated_images,
+                scopes,
+            },
         })
     }
 }
@@ -800,7 +852,6 @@ impl<'a, M: ImageProtectionMemory + ?Sized, A: ArchRelocator> RelocatedSession<'
         while let (Some(image), Some(sealed)) = (images.next(), sealed_states.next()) {
             output.push(SessionImage {
                 image_id: image.image_id,
-                artifact: image.artifact,
                 allocation: image.allocation,
                 state: SealedImageState {
                     runtime: image.state.0,
@@ -834,21 +885,20 @@ impl<M: ImageMemory + ?Sized, A: ArchRelocator> SealedSession<'_, M, A> {
     /// against its owner's executable region (and Thumb bit on ARM). The plans
     /// only *name* targets — nothing here calls a constructor.
     pub fn build_lifecycle_plans(&self) -> LoadResult<(InitPlan, FiniPlan)> {
-        let images: Vec<LifecycleImage<'_>> = self
-            .state
-            .images
-            .iter()
-            .map(|image| {
-                LifecycleImage::new(
-                    image.image_id,
-                    image.allocation,
-                    image.state.regions(),
-                    image.state.load_segments(),
-                    image.state.metadata().lifecycle(),
-                    image.state.load_bias(),
-                )
-            })
-            .collect();
+        let mut images = Vec::new();
+        images
+            .try_reserve_exact(self.state.images.len())
+            .map_err(|_| link_seal_oom())?;
+        for image in &self.state.images {
+            images.push(LifecycleImage::new(
+                image.image_id,
+                image.allocation,
+                image.state.regions(),
+                image.state.load_segments(),
+                image.state.metadata().lifecycle(),
+                image.state.load_bias(),
+            ));
+        }
         lifecycle::build(&self.graph, &images, &self.profile, &*self.rollback.memory)
     }
 
@@ -860,19 +910,18 @@ impl<M: ImageMemory + ?Sized, A: ArchRelocator> SealedSession<'_, M, A> {
     /// result holds no lease: it is the pure description the host publisher
     /// validates in `prepare_batch` before the committed snapshot is swapped.
     pub fn prepare_link_manifest(&self) -> LoadResult<PreparedLinkManifest> {
-        let images: Vec<LinkMapImage<'_>> = self
-            .state
-            .images
-            .iter()
-            .map(|image| {
-                LinkMapImage::new(
-                    image.image_id,
-                    image.state.load_bias(),
-                    image.state.runtime_entry(),
-                    image.state.regions(),
-                )
-            })
-            .collect();
+        let mut images = Vec::new();
+        images
+            .try_reserve_exact(self.state.images.len())
+            .map_err(|_| link_seal_oom())?;
+        for image in &self.state.images {
+            images.push(LinkMapImage::new(
+                image.image_id,
+                image.state.load_bias(),
+                image.state.runtime_entry(),
+                image.state.regions(),
+            ));
+        }
         publish::build_manifest(&self.graph, &images)
     }
 
@@ -886,17 +935,11 @@ impl<M: ImageMemory + ?Sized, A: ArchRelocator> SealedSession<'_, M, A> {
     /// allocation; after a successful commit the rollback log is empty and the
     /// publisher's `Receipt` is the long-term owner of the committed images.
     pub fn publish<P: LinkPublisher>(
-        mut self,
+        self,
         publisher: &mut P,
     ) -> LoadResult<LinkProduct<P::Receipt>> {
         let (init_plan, fini_plan) = self.build_lifecycle_plans()?;
         let manifest = self.prepare_link_manifest()?;
-
-        let prepared = publisher
-            .prepare_batch(&manifest)
-            .map_err(|error| error.at_stage(LoadStage::Publish))?;
-
-        let (entry, link_map) = manifest.into_parts();
 
         // One committed image per id: link-map facts plus the backing
         // allocation, in the same image-id order the leases are drained in.
@@ -909,11 +952,9 @@ impl<M: ImageMemory + ?Sized, A: ArchRelocator> SealedSession<'_, M, A> {
         leases
             .try_reserve_exact(self.rollback.log.len())
             .map_err(|_| publish_oom())?;
-        self.rollback.log.drain_leases_into(&mut leases);
-        let product = CommittingLinkProduct::new(leases.into_boxed_slice());
 
         let LinkSession {
-            rollback: _,
+            mut rollback,
             graph,
             limits: _,
             metrics,
@@ -925,15 +966,21 @@ impl<M: ImageMemory + ?Sized, A: ArchRelocator> SealedSession<'_, M, A> {
         } = self;
         let SealedSessionState { images, scopes } = state;
 
-        for (image, map_entry) in images.into_iter().zip(link_map.iter()) {
+        for image in images {
             committed.push(CommittedImage::new(
-                map_entry.clone(),
+                image.image_id,
                 image.allocation.allocation(),
                 image.state.sealed,
             ));
         }
 
-        let context = LinkContext::new(graph, scopes, committed.into_boxed_slice());
+        let context = LinkContext::new(graph, scopes, committed);
+        let prepared = publisher
+            .prepare_batch(&manifest)
+            .map_err(|error| error.at_stage(LoadStage::Publish))?;
+        let (entry, link_map) = manifest.into_parts();
+        rollback.log.drain_leases_into(&mut leases);
+        let product = CommittingLinkProduct::new(leases);
 
         // SAFETY: `prepared` and `product` were produced by this same live
         // session; every fallible check completed before the leases moved.
@@ -978,10 +1025,98 @@ fn session_error(kind: LoadErrorKind, context: ErrorContext) -> LoadError {
     LoadError::new(kind, context)
 }
 
+fn session_overflow() -> LoadError {
+    session_error(LoadErrorKind::IntegerOverflow, ErrorContext::None)
+}
+
+fn validate_session_symbol_names(
+    runtime: &RuntimeImageState,
+    limits: &SessionLimits,
+) -> LoadResult<()> {
+    for entry in runtime.metadata().symbols().entries() {
+        let len = u32::try_from(runtime.metadata().symbols().name(entry).len())
+            .map_err(|_| session_error(LoadErrorKind::ResourceLimit, ErrorContext::None))?;
+        limits.check_symbol_name_len(len)?;
+    }
+    Ok(())
+}
+
+fn session_image_metadata_bytes(
+    runtime: &RuntimeImageState,
+    identity: &ArtifactIdentity,
+    soname: Option<&DependencyName>,
+) -> LoadResult<u64> {
+    runtime
+        .metadata()
+        .metadata_bytes()
+        .checked_add(identity.metadata_bytes())
+        .and_then(|bytes| bytes.checked_add(soname.map_or(0, |name| name.as_bytes().len() as u64)))
+        .and_then(|bytes| {
+            bytes.checked_add(
+                runtime.load_segments().len() as u64
+                    * core::mem::size_of::<LoadSegmentInfo>() as u64,
+            )
+        })
+        .and_then(|bytes| {
+            bytes.checked_add(
+                runtime.regions().len() as u64 * core::mem::size_of::<LoadedRegion>() as u64,
+            )
+        })
+        .ok_or_else(session_overflow)
+}
+
+fn needed_for(
+    images: &[SessionImage<RuntimeImageState>],
+    requester: ImageId,
+    needed_index: u16,
+) -> LoadResult<&DependencyName> {
+    images
+        .get(requester.get() as usize)
+        .and_then(|image| {
+            image
+                .state
+                .metadata()
+                .needed()
+                .get(usize::from(needed_index))
+        })
+        .ok_or_else(|| {
+            session_error(LoadErrorKind::BadElf, ErrorContext::None).at_stage(LoadStage::Discover)
+        })
+}
+
+fn enqueue_dependencies(
+    queue: &mut DiscoveryQueue,
+    requester: ImageId,
+    needed: &[DependencyName],
+    limits: &SessionLimits,
+    stage: LoadStage,
+) -> LoadResult<()> {
+    for (index, name) in needed.iter().enumerate() {
+        limits
+            .check_dependency_name_len(name.as_bytes().len() as u32)
+            .map_err(|error| error.at_stage(stage))?;
+        let index = u16::try_from(index).map_err(|_| {
+            session_error(LoadErrorKind::ResourceLimit, ErrorContext::None).at_stage(stage)
+        })?;
+        queue
+            .push(DiscoveryItem::new(requester, index))
+            .map_err(|error| error.at_stage(stage))?;
+    }
+    Ok(())
+}
+
 fn publish_oom() -> LoadError {
     LoadError::new(LoadErrorKind::OutOfMemory, ErrorContext::None).at_stage(LoadStage::Publish)
 }
 
 fn link_seal_oom() -> LoadError {
     LoadError::new(LoadErrorKind::OutOfMemory, ErrorContext::None).at_stage(LoadStage::LinkSeal)
+}
+
+fn link_relocation_oom() -> LoadError {
+    LoadError::new(LoadErrorKind::OutOfMemory, ErrorContext::None).at_stage(LoadStage::LinkRelocate)
+}
+
+fn scope_session_oom() -> LoadError {
+    LoadError::new(LoadErrorKind::OutOfMemory, ErrorContext::None).at_stage(LoadStage::Scope)
 }

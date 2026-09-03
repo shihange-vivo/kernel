@@ -23,15 +23,16 @@
 //! `max_symbol_lookups` — that counter is mutable session state, so it lives
 //! outside this immutable value.
 
-use alloc::{boxed::Box, vec::Vec};
+use alloc::vec::Vec;
 
 use crate::{
     address::TargetAddress,
     dynamic_linker::{
-        graph::DependencyGraph, ImageId, ImageOwnership, SymbolBinding, SymbolDefinition,
-        SymbolEntry, SymbolTable, SymbolType, SymbolVisibility,
+        graph::DependencyGraph, ImageId, ImageOwnership, LoadMetrics, SymbolBinding,
+        SymbolDefinition, SymbolEntry, SymbolTable, SymbolType, SymbolVisibility,
     },
     error::{ErrorContext, LoadError, LoadErrorKind, LoadResult, LoadStage},
+    identity::SessionLimits,
 };
 
 /// Region a resolved symbol's canonical target must live in, derived from its
@@ -128,7 +129,7 @@ impl ResolvedSymbol {
 pub(crate) struct ScopeImage {
     owner: ImageId,
     ownership: ImageOwnership,
-    protected: Box<[u32]>,
+    protected: Vec<u32>,
 }
 
 impl ScopeImage {
@@ -151,7 +152,7 @@ impl ScopeImage {
 /// An ordered list of images searched left-to-right for a definition (§9.1).
 #[derive(Debug)]
 pub(crate) struct SymbolScope {
-    ordered_images: Box<[ImageId]>,
+    ordered_images: Vec<ImageId>,
 }
 
 impl SymbolScope {
@@ -172,7 +173,7 @@ impl SymbolScope {
 pub(crate) struct ScopeSet {
     application: SymbolScope,
     system: SymbolScope,
-    per_image: Box<[ScopeImage]>,
+    per_image: Vec<ScopeImage>,
 }
 
 impl ScopeSet {
@@ -186,6 +187,12 @@ impl ScopeSet {
         let nodes = graph.nodes();
         let mut session_private = Vec::new();
         let mut system_candidates = Vec::new();
+        session_private
+            .try_reserve_exact(nodes.len())
+            .map_err(|_| scope_oom())?;
+        system_candidates
+            .try_reserve_exact(nodes.len())
+            .map_err(|_| scope_oom())?;
         for node in nodes {
             match node.ownership() {
                 ImageOwnership::SessionPrivate => session_private.push(node.id()),
@@ -220,12 +227,12 @@ impl ScopeSet {
 
         Ok(Self {
             application: SymbolScope {
-                ordered_images: application_order.into_boxed_slice(),
+                ordered_images: application_order,
             },
             system: SymbolScope {
-                ordered_images: system_candidates.into_boxed_slice(),
+                ordered_images: system_candidates,
             },
-            per_image: per_image.into_boxed_slice(),
+            per_image,
         })
     }
 
@@ -244,13 +251,18 @@ impl ScopeSet {
         symbols: &[&SymbolTable],
         requester: ImageId,
         name: &[u8],
-    ) -> Option<ResolvedSymbol> {
+        limits: &SessionLimits,
+        metrics: &mut LoadMetrics,
+    ) -> LoadResult<Option<ResolvedSymbol>> {
         let mut weak = None;
         for &image in self.scope_for(requester).ordered_images() {
             let Some(table) = symbols.get(image.get() as usize) else {
                 continue;
             };
-            let Some(index) = table.lookup(name) else {
+            metrics.record_symbol_lookup(limits)?;
+            let (index, probes) = table.lookup_with_probes(name);
+            metrics.record_hash_probes(probes);
+            let Some(index) = index else {
                 continue;
             };
             let Some(entry) = table.entry(index) else {
@@ -260,14 +272,14 @@ impl ScopeSet {
                 continue;
             }
             match entry.binding() {
-                SymbolBinding::Global => return Some(ResolvedSymbol::from_entry(image, entry)),
+                SymbolBinding::Global => return Ok(Some(ResolvedSymbol::from_entry(image, entry))),
                 SymbolBinding::Weak => {
                     weak.get_or_insert(ResolvedSymbol::from_entry(image, entry));
                 }
                 SymbolBinding::Local => {}
             }
         }
-        weak
+        Ok(weak)
     }
 
     /// Resolve a symbol by index within its owner, used for `STB_LOCAL`
@@ -312,7 +324,7 @@ impl ScopeSet {
 }
 
 /// Indices of an image's protected, defined, exportable symbols.
-fn collect_protected(table: &SymbolTable) -> LoadResult<Box<[u32]>> {
+fn collect_protected(table: &SymbolTable) -> LoadResult<Vec<u32>> {
     let mut protected = Vec::new();
     for (index, entry) in table.entries().iter().enumerate() {
         if entry.definition() == SymbolDefinition::Defined
@@ -323,7 +335,7 @@ fn collect_protected(table: &SymbolTable) -> LoadResult<Box<[u32]>> {
             protected.push(index as u32);
         }
     }
-    Ok(protected.into_boxed_slice())
+    Ok(protected)
 }
 
 #[inline]

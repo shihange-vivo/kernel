@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use alloc::boxed::Box;
+use alloc::vec::Vec;
 
 use crate::{
     address::{FileRange, TargetAddress, TargetRange},
@@ -33,7 +33,7 @@ pub(crate) struct PlannedImage<R: ElfReader> {
     max_align: u64,
     entry_vaddr: TargetAddress,
     canonical_entry_vaddr: TargetAddress,
-    load_segments: Box<[LoadSegmentInfo]>,
+    load_segments: Vec<LoadSegmentInfo>,
     dynamic: Option<DynamicSegmentInfo>,
     relro: Option<TargetRange>,
     stack: StackKind,
@@ -52,7 +52,7 @@ impl<R: ElfReader> PlannedImage<R> {
         max_align: u64,
         entry_vaddr: TargetAddress,
         canonical_entry_vaddr: TargetAddress,
-        load_segments: Box<[LoadSegmentInfo]>,
+        load_segments: Vec<LoadSegmentInfo>,
         dynamic: Option<DynamicSegmentInfo>,
         relro: Option<TargetRange>,
         stack: StackKind,

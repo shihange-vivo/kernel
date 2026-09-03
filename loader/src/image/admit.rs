@@ -342,7 +342,7 @@ impl<R: ElfReader> AdmittedImage<R> {
             self.reader,
             self.request,
             self.header,
-            load_segments.into_boxed_slice(),
+            load_segments,
             dynamic,
             relro,
             stack,

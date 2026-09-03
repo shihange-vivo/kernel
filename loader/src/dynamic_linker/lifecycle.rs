@@ -22,7 +22,7 @@
 //! *generates* the plan; nothing here turns a target address into a host
 //! function pointer or calls a constructor.
 
-use alloc::{boxed::Box, vec::Vec};
+use alloc::vec::Vec;
 
 use crate::{
     address::{TargetAddress, TargetRange},
@@ -67,7 +67,7 @@ impl LifecycleEntry {
 /// The dependency-first constructor order, ready to be executed by the
 /// runtime in S10 (§11.12).
 #[derive(Clone, Debug)]
-pub(crate) struct InitPlan(Box<[LifecycleEntry]>);
+pub(crate) struct InitPlan(Vec<LifecycleEntry>);
 
 impl InitPlan {
     #[inline]
@@ -88,7 +88,7 @@ impl InitPlan {
 
 /// The destructor order — the exact reverse of the init plan (§12.2).
 #[derive(Clone, Debug)]
-pub(crate) struct FiniPlan(Box<[LifecycleEntry]>);
+pub(crate) struct FiniPlan(Vec<LifecycleEntry>);
 
 impl FiniPlan {
     #[inline]
@@ -218,10 +218,7 @@ pub(crate) fn build<M: ImageMemory + ?Sized>(
         emit_direct(image, image.lifecycle.fini(), &decode, &mut fini)?;
     }
 
-    Ok((
-        InitPlan(init.into_boxed_slice()),
-        FiniPlan(fini.into_boxed_slice()),
-    ))
+    Ok((InitPlan(init), FiniPlan(fini)))
 }
 
 /// Flatten the SCC groups into one dependency-first image order.

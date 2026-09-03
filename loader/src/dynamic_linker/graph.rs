@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Bounded dependency graph (S5): stable BFS closure, dual identity/SONAME
+//! Bounded dependency graph (S5): stable BFS closure, identity/SONAME
 //! de-duplication, and a dependency-first SCC condensation.
 //!
 //! The graph records *structure* only: which artifact depends on which. It
@@ -22,7 +22,7 @@
 //! of §14.2, and derives the dependency-first order required by lifecycle
 //! planning (§12.2).
 
-use alloc::{boxed::Box, collections::BTreeMap, vec::Vec};
+use alloc::vec::Vec;
 
 use crate::{
     dynamic_linker::{ArtifactIdentity, DependencyName, ImageId, ImageOwnership},
@@ -99,15 +99,14 @@ impl DependencyEdge {
 
 /// The set of artifacts and the de-duplicated dependency edges between them.
 ///
-/// Nodes are indexed by both their full [`ArtifactIdentity`] and their
-/// `DT_SONAME`. Every growth is charged against the session budget before it is
+/// Identity and SONAME lookup is a bounded linear scan over `max_images`; this
+/// avoids hidden, infallible tree-node allocations while preserving stable BFS
+/// order. Every growth is charged against the session budget before it is
 /// reserved, so a link can never exceed `max_images`/`max_dependency_edges`/
 /// `max_dependency_depth` regardless of the resolver's catalog order.
 pub(crate) struct DependencyGraph {
     nodes: Vec<DependencyNode>,
     edges: Vec<DependencyEdge>,
-    identity_index: BTreeMap<ArtifactIdentity, ImageId>,
-    soname_index: BTreeMap<DependencyName, ImageId>,
     limits: SessionLimits,
 }
 
@@ -116,8 +115,6 @@ impl DependencyGraph {
         Self {
             nodes: Vec::new(),
             edges: Vec::new(),
-            identity_index: BTreeMap::new(),
-            soname_index: BTreeMap::new(),
             limits,
         }
     }
@@ -151,7 +148,10 @@ impl DependencyGraph {
     /// discovery driver can de-duplicate *before* allocating (§5.3 rule 1).
     #[inline]
     pub(crate) fn find_identity(&self, identity: &ArtifactIdentity) -> Option<ImageId> {
-        self.identity_index.get(identity).copied()
+        self.nodes
+            .iter()
+            .find(|node| node.artifact() == identity)
+            .map(DependencyNode::id)
     }
 
     /// Record an edge from `requester` to an already-admitted `provider`.
@@ -184,7 +184,7 @@ impl DependencyGraph {
         self.limits.check_image_count(1)?;
         self.check_soname_len(soname.as_ref())?;
         let id = ImageId::new(0);
-        self.record_node(id, artifact, soname, ownership, 0);
+        self.record_node(id, artifact, soname, ownership, 0)?;
         Ok(id)
     }
 
@@ -213,25 +213,23 @@ impl DependencyGraph {
             .node(requester)
             .map(|node| node.depth())
             .ok_or_else(|| graph_error(LoadErrorKind::BadElf, ErrorContext::None))?;
-        self.limits.check_dependency_name_len(needed.as_bytes().len() as u32)?;
+        self.limits
+            .check_dependency_name_len(needed.as_bytes().len() as u32)?;
         self.check_soname_len(soname.as_ref())?;
 
-        let provider = if let Some(&existing) = self.identity_index.get(&artifact) {
+        let provider = if let Some(existing) = self.find_identity(&artifact) {
             // Same snapshot: reuse, but a re-declared, conflicting SONAME is
             // still malformed rather than silently ignored.
-            if let (Some(declared), Some(new_soname)) =
-                (self.node(existing).and_then(|node| node.soname()), soname.as_ref())
-                && declared != new_soname
+            if let (Some(declared), Some(new_soname)) = (
+                self.node(existing).and_then(|node| node.soname()),
+                soname.as_ref(),
+            ) && declared != new_soname
             {
-                return Err(dependency_error(
-                    LoadErrorKind::BadElf,
-                    requester,
-                    needed,
-                ));
+                return Err(dependency_error(LoadErrorKind::BadElf, requester, needed));
             }
             existing
         } else if let Some(new_soname) = soname.as_ref()
-            && let Some(&existing) = self.soname_index.get(new_soname)
+            && let Some(existing) = self.find_soname(new_soname)
         {
             // A SONAME already claimed by a different identity is a conflict.
             return Err(dependency_error(
@@ -246,7 +244,7 @@ impl DependencyGraph {
                 .checked_add(1)
                 .ok_or_else(|| graph_error(LoadErrorKind::IntegerOverflow, ErrorContext::None))?;
             self.limits.check_dependency_depth(depth)?;
-            self.record_node(id, artifact, soname, ownership, depth);
+            self.record_node(id, artifact, soname, ownership, depth)?;
             id
         };
 
@@ -261,19 +259,26 @@ impl DependencyGraph {
         soname: Option<DependencyName>,
         ownership: ImageOwnership,
         depth: u16,
-    ) {
+    ) -> LoadResult<()> {
+        self.nodes
+            .try_reserve(1)
+            .map_err(|_| graph_error(LoadErrorKind::OutOfMemory, ErrorContext::None))?;
         self.nodes.push(DependencyNode {
             id,
-            artifact: artifact.clone(),
-            soname: soname.clone(),
+            artifact,
+            soname,
             ownership,
             discovery_index: id.get(),
             depth,
         });
-        self.identity_index.insert(artifact, id);
-        if let Some(soname) = soname {
-            self.soname_index.insert(soname, id);
-        }
+        Ok(())
+    }
+
+    fn find_soname(&self, soname: &DependencyName) -> Option<ImageId> {
+        self.nodes
+            .iter()
+            .find(|node| node.soname() == Some(soname))
+            .map(DependencyNode::id)
     }
 
     fn record_edge(
@@ -310,33 +315,26 @@ impl DependencyGraph {
     /// always precedes the SCC that needs it. Within an SCC, members are sorted
     /// by BFS discovery index. The result is stable and independent of the
     /// resolver's map/container iteration order.
-    pub(crate) fn dependency_order(&self) -> LoadResult<Box<[Box<[ImageId]>]>> {
+    pub(crate) fn dependency_order(&self) -> LoadResult<Vec<Vec<ImageId>>> {
         let n = self.nodes.len();
         if n == 0 {
-            return Ok(Box::new([]));
+            return Ok(Vec::new());
         }
 
-        let mut adj: Vec<Vec<u32>> = Vec::new();
-        adj.try_reserve_exact(n).map_err(|_| graph_oom())?;
-        for _ in 0..n {
-            adj.push(Vec::new());
+        let mut out_degrees = zero_counts(n)?;
+        let mut in_degrees = zero_counts(n)?;
+        for edge in &self.edges {
+            increment_count(&mut out_degrees[edge.requester.get() as usize])?;
+            increment_count(&mut in_degrees[edge.provider.get() as usize])?;
         }
+        let mut adj = adjacency_with_capacities(&out_degrees)?;
+        let mut adj_t = adjacency_with_capacities(&in_degrees)?;
         for edge in &self.edges {
             adj[edge.requester.get() as usize].push(edge.provider.get());
+            adj_t[edge.provider.get() as usize].push(edge.requester.get());
         }
         for neighbors in adj.iter_mut() {
             neighbors.sort_unstable();
-        }
-
-        let mut adj_t: Vec<Vec<u32>> = Vec::new();
-        adj_t.try_reserve_exact(n).map_err(|_| graph_oom())?;
-        for _ in 0..n {
-            adj_t.push(Vec::new());
-        }
-        for (u, neighbors) in adj.iter().enumerate() {
-            for &v in neighbors {
-                adj_t[v as usize].push(u as u32);
-            }
         }
         for neighbors in adj_t.iter_mut() {
             neighbors.sort_unstable();
@@ -344,11 +342,15 @@ impl DependencyGraph {
 
         let (scc_count, scc_of) = compute_sccs(&adj, &adj_t)?;
 
-        let mut cond: Vec<Vec<u32>> = Vec::new();
-        cond.try_reserve_exact(scc_count).map_err(|_| graph_oom())?;
-        for _ in 0..scc_count {
-            cond.push(Vec::new());
+        let mut cond_degrees = zero_counts(scc_count)?;
+        for edge in &self.edges {
+            let u = scc_of[edge.requester.get() as usize];
+            let v = scc_of[edge.provider.get() as usize];
+            if u != v {
+                increment_count(&mut cond_degrees[u as usize])?;
+            }
         }
+        let mut cond = adjacency_with_capacities(&cond_degrees)?;
         for edge in &self.edges {
             let u = scc_of[edge.requester.get() as usize];
             let v = scc_of[edge.provider.get() as usize];
@@ -363,13 +365,11 @@ impl DependencyGraph {
 
         let finish = dfs_post_order(&cond, scc_of[0])?;
 
-        let mut members: Vec<Vec<ImageId>> = Vec::new();
-        members
-            .try_reserve_exact(scc_count)
-            .map_err(|_| graph_oom())?;
-        for _ in 0..scc_count {
-            members.push(Vec::new());
+        let mut member_counts = zero_counts(scc_count)?;
+        for &scc in &scc_of {
+            increment_count(&mut member_counts[scc as usize])?;
         }
+        let mut members = image_groups_with_capacities(&member_counts)?;
         for (node, &scc) in self.nodes.iter().zip(scc_of.iter()) {
             members[scc as usize].push(node.id);
         }
@@ -377,15 +377,55 @@ impl DependencyGraph {
             member.sort_unstable();
         }
 
-        let mut groups: Vec<Box<[ImageId]>> = Vec::new();
+        let mut groups = Vec::new();
         groups
             .try_reserve_exact(scc_count)
             .map_err(|_| graph_oom())?;
         for scc in finish {
-            groups.push(members[scc as usize].clone().into_boxed_slice());
+            groups.push(core::mem::take(&mut members[scc as usize]));
         }
-        Ok(groups.into_boxed_slice())
+        Ok(groups)
     }
+}
+
+fn zero_counts(len: usize) -> LoadResult<Vec<usize>> {
+    let mut counts = Vec::new();
+    counts.try_reserve_exact(len).map_err(|_| graph_oom())?;
+    counts.resize(len, 0);
+    Ok(counts)
+}
+
+fn increment_count(count: &mut usize) -> LoadResult<()> {
+    *count = count.checked_add(1).ok_or_else(graph_oom)?;
+    Ok(())
+}
+
+fn adjacency_with_capacities(counts: &[usize]) -> LoadResult<Vec<Vec<u32>>> {
+    let mut adjacency = Vec::new();
+    adjacency
+        .try_reserve_exact(counts.len())
+        .map_err(|_| graph_oom())?;
+    for &count in counts {
+        let mut neighbors = Vec::new();
+        neighbors
+            .try_reserve_exact(count)
+            .map_err(|_| graph_oom())?;
+        adjacency.push(neighbors);
+    }
+    Ok(adjacency)
+}
+
+fn image_groups_with_capacities(counts: &[usize]) -> LoadResult<Vec<Vec<ImageId>>> {
+    let mut groups = Vec::new();
+    groups
+        .try_reserve_exact(counts.len())
+        .map_err(|_| graph_oom())?;
+    for &count in counts {
+        let mut members = Vec::new();
+        members.try_reserve_exact(count).map_err(|_| graph_oom())?;
+        groups.push(members);
+    }
+    Ok(groups)
 }
 
 /// FIFO of pending dependency resolutions, bounded by the session edge budget.
@@ -399,29 +439,19 @@ pub(crate) struct DiscoveryQueue {
 
 pub(crate) struct DiscoveryItem {
     requester: ImageId,
-    needed: DependencyName,
     needed_index: u16,
 }
 
 impl DiscoveryItem {
-    pub(crate) const fn new(
-        requester: ImageId,
-        needed: DependencyName,
-        needed_index: u16,
-    ) -> Self {
+    pub(crate) const fn new(requester: ImageId, needed_index: u16) -> Self {
         Self {
             requester,
-            needed,
             needed_index,
         }
     }
 
     pub(crate) const fn requester(&self) -> ImageId {
         self.requester
-    }
-
-    pub(crate) const fn needed(&self) -> &DependencyName {
-        &self.needed
     }
 
     pub(crate) const fn needed_index(&self) -> u16 {
@@ -581,11 +611,7 @@ fn graph_error(kind: LoadErrorKind, context: ErrorContext) -> LoadError {
     LoadError::new(kind, context)
 }
 
-fn dependency_error(
-    kind: LoadErrorKind,
-    requester: ImageId,
-    needed: &DependencyName,
-) -> LoadError {
+fn dependency_error(kind: LoadErrorKind, requester: ImageId, needed: &DependencyName) -> LoadError {
     LoadError::new(
         kind,
         ErrorContext::Dependency {
