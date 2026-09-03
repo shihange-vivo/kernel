@@ -304,7 +304,7 @@ impl ImageLifecycleMetadata {
 /// Runtime program-header summary. Skeleton for now: populated once the link
 /// product needs `dl_iterate_phdr`-style runtime introspection (C17-a).
 #[derive(Clone, Copy, Debug)]
-pub(crate) struct ProgramHeaderRuntimeInfo;
+pub struct ProgramHeaderRuntimeInfo;
 
 /// Aggregated, owned runtime metadata for one decoded image (§7.1).
 pub(crate) struct RuntimeImageMetadata {

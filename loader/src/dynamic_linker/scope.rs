@@ -203,7 +203,9 @@ impl ScopeSet {
         for node in nodes {
             match node.ownership() {
                 ImageOwnership::SessionPrivate => session_private.push(node.id()),
-                ImageOwnership::SystemCandidate => system_candidates.push(node.id()),
+                ImageOwnership::SystemCandidate | ImageOwnership::ExternalReady => {
+                    system_candidates.push(node.id())
+                }
             }
         }
         // BFS discovery order is the search order (§8.2/§9.1).
@@ -321,7 +323,12 @@ impl ScopeSet {
         let is_system = self
             .per_image
             .get(requester.get() as usize)
-            .is_some_and(|image| image.ownership() == ImageOwnership::SystemCandidate);
+            .is_some_and(|image| {
+                matches!(
+                    image.ownership(),
+                    ImageOwnership::SystemCandidate | ImageOwnership::ExternalReady
+                )
+            });
         if is_system {
             &self.system
         } else {
