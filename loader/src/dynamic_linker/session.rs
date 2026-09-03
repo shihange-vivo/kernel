@@ -58,7 +58,7 @@ use crate::{
 /// updated; symbol/lookup/relocation/protection/cache counters fill in with
 /// C16/C17, whose stages consume the values they record.
 #[derive(Clone, Copy, Debug, Default)]
-pub(crate) struct LoadMetrics {
+pub struct LoadMetrics {
     resolver_calls: u64,
     images: u64,
     edges: u64,
@@ -140,47 +140,47 @@ impl LoadMetrics {
     }
 
     #[inline]
-    pub(crate) const fn resolver_calls(&self) -> u64 {
+    pub const fn resolver_calls(&self) -> u64 {
         self.resolver_calls
     }
 
     #[inline]
-    pub(crate) const fn images(&self) -> u64 {
+    pub const fn images(&self) -> u64 {
         self.images
     }
 
     #[inline]
-    pub(crate) const fn edges(&self) -> u64 {
+    pub const fn edges(&self) -> u64 {
         self.edges
     }
 
     #[inline]
-    pub(crate) const fn max_depth(&self) -> u16 {
+    pub const fn max_depth(&self) -> u16 {
         self.max_depth
     }
 
     #[inline]
-    pub(crate) const fn symbol_lookups(&self) -> u64 {
+    pub const fn symbol_lookups(&self) -> u64 {
         self.symbol_lookups
     }
 
     #[inline]
-    pub(crate) const fn hash_probes(&self) -> u64 {
+    pub const fn hash_probes(&self) -> u64 {
         self.hash_probes
     }
 
     #[inline]
-    pub(crate) const fn relocation_operations(&self) -> u64 {
+    pub const fn relocation_operations(&self) -> u64 {
         self.relocation_operations
     }
 
     #[inline]
-    pub(crate) const fn protection_ranges(&self) -> u64 {
+    pub const fn protection_ranges(&self) -> u64 {
         self.protection_ranges
     }
 
     #[inline]
-    pub(crate) const fn cache_ranges(&self) -> u64 {
+    pub const fn cache_ranges(&self) -> u64 {
         self.cache_ranges
     }
 }
@@ -215,7 +215,7 @@ impl<S> SessionImage<S> {
 }
 
 /// Immutable session state while dependencies are being discovered (S5).
-pub(crate) struct BuildingState {
+pub struct BuildingState {
     images: Vec<SessionImage<RuntimeImageState>>,
     discovery: DiscoveryQueue,
     closed: bool,
@@ -223,7 +223,7 @@ pub(crate) struct BuildingState {
 }
 
 /// Immutable session state once scopes are frozen (S6).
-pub(crate) struct ScopedState {
+pub struct ScopedState {
     images: Vec<SessionImage<RuntimeImageState>>,
     scopes: ScopeSet,
 }
@@ -232,7 +232,7 @@ pub(crate) struct ScopedState {
 /// rewrites memory; the decoded metadata, load regions and segments are
 /// unchanged, so this newtypes the decoded state to make a second relocation
 /// unrepresentable.
-pub(crate) struct RelocatedImageState(RuntimeImageState);
+pub struct RelocatedImageState(RuntimeImageState);
 
 impl RelocatedImageState {
     #[inline]
@@ -262,13 +262,13 @@ impl RelocatedImageState {
 }
 
 /// Immutable session state once every image is relocated (S7).
-pub(crate) struct RelocatedState {
+pub struct RelocatedState {
     images: Vec<SessionImage<RelocatedImageState>>,
     scopes: ScopeSet,
 }
 
 /// Per-image state after cache synchronization and memory protection (S8).
-pub(crate) struct SealedImageState {
+pub struct SealedImageState {
     runtime: RuntimeImageState,
     sealed: SealedState,
 }
@@ -302,7 +302,7 @@ impl SealedImageState {
 
 /// Immutable session state once every image has crossed the S8 cache and
 /// protection boundary.
-pub(crate) struct SealedSessionState {
+pub struct SealedSessionState {
     images: Vec<SessionImage<SealedImageState>>,
     scopes: ScopeSet,
 }
@@ -331,7 +331,7 @@ impl<M: ImageMemory + ?Sized> Drop for RollbackGuard<'_, M> {
 /// rollback log, the session budgets and metrics; the trusted [`LoadProfile`],
 /// [`LoadPolicy`] and the single [`ArchRelocator`] are carried so every image
 /// reuses the same profile and relocation semantics without re-deriving them.
-pub(crate) struct LinkSession<'a, M: ImageMemory + ?Sized, S, A> {
+pub struct LinkSession<'a, M: ImageMemory + ?Sized, S, A> {
     rollback: RollbackGuard<'a, M>,
     graph: DependencyGraph,
     limits: SessionLimits,
@@ -343,24 +343,58 @@ pub(crate) struct LinkSession<'a, M: ImageMemory + ?Sized, S, A> {
     state: S,
 }
 
-pub(crate) type BuildingSession<'a, M, A> = LinkSession<'a, M, BuildingState, A>;
-pub(crate) type ScopedSession<'a, M, A> = LinkSession<'a, M, ScopedState, A>;
-pub(crate) type RelocatedSession<'a, M, A> = LinkSession<'a, M, RelocatedState, A>;
-pub(crate) type SealedSession<'a, M, A> = LinkSession<'a, M, SealedSessionState, A>;
+pub type BuildingSession<'a, M, A> = LinkSession<'a, M, BuildingState, A>;
+pub type ScopedSession<'a, M, A> = LinkSession<'a, M, ScopedState, A>;
+pub type RelocatedSession<'a, M, A> = LinkSession<'a, M, RelocatedState, A>;
+pub type SealedSession<'a, M, A> = LinkSession<'a, M, SealedSessionState, A>;
 
 /// Phase 0.5 entry point (§10.2): a trusted profile, a session budget and the
 /// single [`ArchRelocator`] used by every image in the link.
-pub(crate) struct DynamicLinker<A> {
+pub struct DynamicLinker<A> {
     arch: A,
     policy: LoadPolicy,
 }
 
 impl<A: ArchRelocator> DynamicLinker<A> {
-    pub(crate) fn new(arch: A) -> Self {
+    pub fn new(arch: A) -> Self {
         Self {
             arch,
             policy: PHASE05_LOAD_POLICY,
         }
+    }
+
+    /// Run a complete link in one call: admit the root, close the dependency
+    /// closure, freeze scopes, relocate, seal, and publish.
+    ///
+    /// This is the convenience wrapper over the staged API; it consumes the
+    /// linker because the single [`ArchRelocator`] is moved through every
+    /// session transition (§10.2). The `memory` backend must support protection
+    /// (`ImageProtectionMemory`) so the session can reach the seal stage.
+    pub fn link<R, Resolver, Memory, Cache, Publisher>(
+        self,
+        root: ResolvedArtifact<R>,
+        profile: LoadProfile,
+        domain: LinkDomainId,
+        limits: SessionLimits,
+        resolver: &mut Resolver,
+        memory: &mut Memory,
+        cache: &mut Cache,
+        publisher: &mut Publisher,
+    ) -> LoadResult<LinkProduct<Publisher::Receipt>>
+    where
+        R: ElfReader,
+        Resolver: ArtifactResolver,
+        Memory: ImageProtectionMemory + ?Sized,
+        Cache: CodeCache + ?Sized,
+        Publisher: LinkPublisher,
+    {
+        let mut building = self.begin(root, profile, domain, limits, memory)?;
+        building.close_dependencies(resolver)?;
+        building
+            .freeze_scopes()?
+            .relocate()?
+            .seal(cache)?
+            .publish(publisher)
     }
 
     /// Admit the root and open a building session.

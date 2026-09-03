@@ -42,7 +42,7 @@ use crate::{
 /// runtime function address. The owner (not a bare pointer) is what ties the
 /// entry back to the image allocation that must outlive it (§12.2).
 #[derive(Clone, Copy, Debug)]
-pub(crate) struct LifecycleEntry {
+pub struct LifecycleEntry {
     owner: ImageId,
     function: TargetAddress,
 }
@@ -54,12 +54,12 @@ impl LifecycleEntry {
     }
 
     #[inline]
-    pub(crate) const fn owner(&self) -> ImageId {
+    pub const fn owner(&self) -> ImageId {
         self.owner
     }
 
     #[inline]
-    pub(crate) const fn function(&self) -> TargetAddress {
+    pub const fn function(&self) -> TargetAddress {
         self.function
     }
 }
@@ -67,42 +67,42 @@ impl LifecycleEntry {
 /// The dependency-first constructor order, ready to be executed by the
 /// runtime in S10 (§11.12).
 #[derive(Clone, Debug)]
-pub(crate) struct InitPlan(Vec<LifecycleEntry>);
+pub struct InitPlan(Vec<LifecycleEntry>);
 
 impl InitPlan {
     #[inline]
-    pub(crate) fn iter(&self) -> core::slice::Iter<'_, LifecycleEntry> {
+    pub fn iter(&self) -> core::slice::Iter<'_, LifecycleEntry> {
         self.0.iter()
     }
 
     #[inline]
-    pub(crate) fn len(&self) -> usize {
+    pub fn len(&self) -> usize {
         self.0.len()
     }
 
     #[inline]
-    pub(crate) fn is_empty(&self) -> bool {
+    pub fn is_empty(&self) -> bool {
         self.0.is_empty()
     }
 }
 
 /// The destructor order — the exact reverse of the init plan (§12.2).
 #[derive(Clone, Debug)]
-pub(crate) struct FiniPlan(Vec<LifecycleEntry>);
+pub struct FiniPlan(Vec<LifecycleEntry>);
 
 impl FiniPlan {
     #[inline]
-    pub(crate) fn iter(&self) -> core::slice::Iter<'_, LifecycleEntry> {
+    pub fn iter(&self) -> core::slice::Iter<'_, LifecycleEntry> {
         self.0.iter()
     }
 
     #[inline]
-    pub(crate) fn len(&self) -> usize {
+    pub fn len(&self) -> usize {
         self.0.len()
     }
 
     #[inline]
-    pub(crate) fn is_empty(&self) -> bool {
+    pub fn is_empty(&self) -> bool {
         self.0.is_empty()
     }
 }

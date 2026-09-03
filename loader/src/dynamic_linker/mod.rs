@@ -32,17 +32,22 @@ pub use artifact::{
     FileIdentity, ImageId, ImageOwnership, LinkDomainId, ResolvedArtifact,
 };
 
-pub(crate) use lifecycle::{FiniPlan, InitPlan, LifecycleEntry, LifecycleImage};
-pub(crate) use publish::{
-    build_manifest, CommittedImage, CommittingLinkProduct, LinkContext, LinkMapEntry, LinkMapImage,
-    LinkProduct, LinkPublisher, PreparedLinkManifest,
+pub use lifecycle::{FiniPlan, InitPlan, LifecycleEntry};
+pub use publish::{
+    CommittedImage, CommittingLinkProduct, LinkContext, LinkMapEntry, LinkProduct, LinkPublisher,
+    PreparedLinkManifest,
 };
+pub use session::{
+    BuildingSession, DynamicLinker, LinkSession, LoadMetrics, RelocatedSession, ScopedSession,
+    SealedSession,
+};
+pub(crate) use lifecycle::LifecycleImage;
+pub(crate) use publish::{build_manifest, LinkMapImage};
 pub(crate) use metadata::{
     ImageLayout, ImageLifecycleMetadata, ProgramHeaderRuntimeInfo, RelocationTableInfo,
     RelocationTables, RuntimeDynamicInfo, RuntimeImageMetadata, RuntimeImageState,
 };
 pub(crate) use scope::{ResolvedSymbol, ScopeImage, ScopeSet, SymbolRegionKind, SymbolScope};
-pub(crate) use session::LoadMetrics;
 pub(crate) use symbol::{
     symbol_count_from_hash, SymbolBinding, SymbolDefinition, SymbolEntry, SymbolTable, SymbolType,
     SymbolVisibility,
