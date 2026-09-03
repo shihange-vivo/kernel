@@ -165,8 +165,17 @@ pub struct AllocationLease {
 }
 
 impl AllocationLease {
+    /// Create the unique authority for an allocation recorded by a backend.
+    ///
+    /// # Safety
+    ///
+    /// The caller must be the backend that just created `allocation`, must
+    /// have validated and recorded the complete descriptor, and must ensure no
+    /// other live `AllocationLease` exists for the same backend allocation.
+    /// The lease must subsequently be accepted exactly once by that backend's
+    /// abort, commit, or release path.
     #[inline]
-    pub const fn new(allocation: ImageAllocation) -> Self {
+    pub const unsafe fn new(allocation: ImageAllocation) -> Self {
         Self { allocation }
     }
 
