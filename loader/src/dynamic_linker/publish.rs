@@ -29,8 +29,8 @@ use alloc::vec::Vec;
 use crate::{
     address::{TargetAddress, TargetRange},
     dynamic_linker::{
-        graph::DependencyGraph, ArtifactIdentity, DependencyName, FiniPlan, ImageId, InitPlan,
-        LoadMetrics, ScopeSet,
+        graph::DependencyGraph, ArtifactIdentity, DependencyName, FiniPlan, ImageId,
+        ImageOwnership, InitPlan, LoadMetrics, PublishedImageDescriptor, ScopeSet,
     },
     error::{ErrorContext, LoadError, LoadErrorKind, LoadResult, LoadStage},
     image::{LoadedRegion, SealedState},
@@ -50,6 +50,7 @@ pub struct LinkMapEntry {
     owner: ImageId,
     identity: ArtifactIdentity,
     soname: Option<DependencyName>,
+    ownership: ImageOwnership,
     load_bias: TargetAddress,
     entry: Option<TargetAddress>,
     map_span: TargetRange,
@@ -62,6 +63,7 @@ impl LinkMapEntry {
         owner: ImageId,
         identity: ArtifactIdentity,
         soname: Option<DependencyName>,
+        ownership: ImageOwnership,
         load_bias: TargetAddress,
         entry: Option<TargetAddress>,
         map_span: TargetRange,
@@ -70,6 +72,7 @@ impl LinkMapEntry {
             owner,
             identity,
             soname,
+            ownership,
             load_bias,
             entry,
             map_span,
@@ -89,6 +92,15 @@ impl LinkMapEntry {
     #[inline]
     pub const fn soname(&self) -> Option<&DependencyName> {
         self.soname.as_ref()
+    }
+
+    /// How this image participates in the link (§12.1): a session-private
+    /// artifact, a system candidate, or an externally imported Ready DSO. The
+    /// publisher uses it — never the image id or SONAME — to decide which lease
+    /// owner receives the image's allocation.
+    #[inline]
+    pub const fn ownership(&self) -> ImageOwnership {
+        self.ownership
     }
 
     #[inline]
@@ -194,6 +206,7 @@ pub(crate) fn build_manifest(
             owner: image.image_id,
             identity: node.artifact().try_clone()?,
             soname: node.soname().map(DependencyName::try_clone).transpose()?,
+            ownership: node.ownership(),
             load_bias: image.load_bias,
             entry,
             map_span: image_span(image.regions)?,
@@ -253,30 +266,22 @@ fn publish_oom() -> LoadError {
 /// One image in a published link context (§13.2).
 ///
 /// Unlike [`LinkMapEntry`], this value pairs the link-map facts with the
-/// image's backing allocation descriptor, so a crash/audit consumer can report
-/// the exact address space an image occupies. It holds no lease: the unique
-/// allocation lease is transferred into the publisher's `Receipt` at commit,
-/// which is the long-term owner (§13.2 "CommittedImage 或 publisher receipt
-/// 必须长期持有 allocation lease").
+/// full [`PublishedImageDescriptor`]: the immutable export surface, published
+/// regions, program-header summary, allocation descriptor and sealed state a
+/// later link imports instead of re-loading (C23-a). It holds no lease: the
+/// unique allocation lease is transferred into the publisher's `Receipt` at
+/// commit, which is the long-term owner (§13.2 "CommittedImage 或 publisher
+/// receipt 必须长期持有 allocation lease").
 #[derive(Debug)]
 pub struct CommittedImage {
     owner: ImageId,
-    allocation: ImageAllocation,
-    sealed: SealedState,
+    descriptor: PublishedImageDescriptor,
 }
 
 impl CommittedImage {
     #[inline]
-    pub(crate) const fn new(
-        owner: ImageId,
-        allocation: ImageAllocation,
-        sealed: SealedState,
-    ) -> Self {
-        Self {
-            owner,
-            allocation,
-            sealed,
-        }
+    pub(crate) fn new(owner: ImageId, descriptor: PublishedImageDescriptor) -> Self {
+        Self { owner, descriptor }
     }
 
     #[inline]
@@ -284,14 +289,22 @@ impl CommittedImage {
         self.owner
     }
 
+    /// The immutable descriptor the registry retains for cross-application
+    /// import (C23-a). It is also the source of the allocation and sealed state
+    /// this image occupies.
     #[inline]
-    pub const fn allocation(&self) -> ImageAllocation {
-        self.allocation
+    pub const fn descriptor(&self) -> &PublishedImageDescriptor {
+        &self.descriptor
     }
 
     #[inline]
-    pub const fn sealed(&self) -> &SealedState {
-        &self.sealed
+    pub const fn allocation(&self) -> ImageAllocation {
+        self.descriptor.allocation()
+    }
+
+    #[inline]
+    pub(crate) const fn sealed(&self) -> &SealedState {
+        self.descriptor.sealed()
     }
 }
 

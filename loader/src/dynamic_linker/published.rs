@@ -32,10 +32,13 @@ use crate::{
     address::{TargetAddress, TargetRange},
     dynamic_linker::{
         artifact::{ArtifactIdentity, DependencyName, ImageOwnership},
+        graph::DependencyNode,
         symbol::SymbolTable,
         ProgramHeaderRuntimeInfo,
     },
-    image::SealedState,
+    elf::LoadSegmentInfo,
+    error::{ErrorContext, LoadError, LoadErrorKind, LoadResult},
+    image::{LoadedRegion, SealedState},
     memory::ImageAllocation,
     MemoryPermissions,
 };
@@ -95,7 +98,19 @@ impl PublishedSymbolTable {
     }
 }
 
+// The inner `SymbolTable` owns no debug representation; the table's entry
+// count and owned metadata bytes are the useful audit facts.
+impl core::fmt::Debug for PublishedSymbolTable {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("PublishedSymbolTable")
+            .field("entries", &self.table.symbol_count())
+            .field("metadata_bytes", &self.table.metadata_bytes())
+            .finish()
+    }
+}
+
 /// The immutable, loader-neutral snapshot of a Ready system DSO (§12.1).
+#[derive(Debug)]
 pub struct PublishedImageDescriptor {
     identity: ArtifactIdentity,
     soname: Option<DependencyName>,
@@ -109,30 +124,37 @@ pub struct PublishedImageDescriptor {
 }
 
 impl PublishedImageDescriptor {
+    /// Build the descriptor for one sealed session image (C23-a).
+    ///
+    /// `node` supplies the graph facts (identity, SONAME, ownership);
+    /// `allocation`/`sealed` are the published allocation and sealed state; the
+    /// remaining arguments are the decoded facts `into_publish_parts` split out
+    /// of the `RuntimeImageState`: the mapped regions, the load segments (whose
+    /// permissions pair with each region), the load bias, the program-header
+    /// summary and the owned symbol table.
     #[inline]
-    #[allow(clippy::too_many_arguments)]
-    pub(crate) fn new(
-        identity: ArtifactIdentity,
-        soname: Option<DependencyName>,
-        ownership: ImageOwnership,
+    pub(crate) fn from_node_and_state(
+        node: &DependencyNode,
         allocation: ImageAllocation,
-        load_bias: TargetAddress,
-        regions: Vec<PublishedRegion>,
-        exports: PublishedSymbolTable,
-        program_headers: ProgramHeaderRuntimeInfo,
         sealed: SealedState,
-    ) -> Self {
-        Self {
-            identity,
-            soname,
-            ownership,
+        regions: Vec<LoadedRegion>,
+        load_segments: Vec<LoadSegmentInfo>,
+        load_bias: TargetAddress,
+        program_headers: ProgramHeaderRuntimeInfo,
+        symbols: SymbolTable,
+    ) -> LoadResult<Self> {
+        let published_regions = publish_regions(&load_segments, &regions)?;
+        Ok(Self {
+            identity: node.artifact().try_clone()?,
+            soname: node.soname().map(DependencyName::try_clone).transpose()?,
+            ownership: node.ownership(),
             allocation,
             load_bias,
-            regions,
-            exports,
+            regions: published_regions,
+            exports: PublishedSymbolTable::new(symbols),
             program_headers,
             sealed,
-        }
+        })
     }
 
     #[inline]
@@ -210,4 +232,29 @@ impl ImportedImageDescriptor {
     pub(crate) fn into_descriptor(self) -> PublishedImageDescriptor {
         *self.descriptor
     }
+}
+
+/// Pair each load segment's permissions with the runtime range of the region
+/// mapped from it, producing the `PublishedRegion` list a later import uses for
+/// control-flow and data target range checks (§12.1). Load segments and regions
+/// are decoded in lockstep (one region per PT_LOAD), so a length mismatch fails
+/// closed rather than silently truncating.
+fn publish_regions(
+    load_segments: &[LoadSegmentInfo],
+    regions: &[LoadedRegion],
+) -> LoadResult<Vec<PublishedRegion>> {
+    if load_segments.len() != regions.len() {
+        return Err(LoadError::new(LoadErrorKind::BadElf, ErrorContext::None));
+    }
+    let mut published = Vec::new();
+    published
+        .try_reserve_exact(regions.len())
+        .map_err(|_| LoadError::new(LoadErrorKind::OutOfMemory, ErrorContext::None))?;
+    for (segment, region) in load_segments.iter().zip(regions.iter()) {
+        published.push(PublishedRegion::new(
+            region.runtime_range(),
+            segment.permissions(),
+        ));
+    }
+    Ok(published)
 }

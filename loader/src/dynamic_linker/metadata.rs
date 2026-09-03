@@ -480,6 +480,14 @@ impl RuntimeImageMetadata {
         &self.symbols
     }
 
+    /// Move the owned symbol table out of this metadata. Used at publication
+    /// (C23-a), when the export surface must be retained long-term rather than
+    /// dropped with the decoded metadata.
+    #[inline]
+    pub(crate) fn into_symbols(self) -> SymbolTable {
+        self.symbols
+    }
+
     #[inline]
     pub(crate) const fn relocations(&self) -> &RelocationTables {
         &self.relocations
@@ -644,5 +652,32 @@ impl RuntimeImageState {
     #[inline]
     pub(crate) const fn stack(&self) -> &StackKind {
         &self.stack
+    }
+
+    /// Split this decoded state into the facts a published descriptor keeps
+    /// (C23-a): the mapped load regions, the load segments (for permission
+    /// checks), the load bias, the program-header summary, and the owned export
+    /// surface. The rest (needed names, relocation records, lifecycle entries,
+    /// entry addresses) has served its purpose by publish time and is dropped.
+    #[inline]
+    pub(crate) fn into_publish_parts(
+        self,
+    ) -> (
+        Vec<LoadedRegion>,
+        Vec<LoadSegmentInfo>,
+        TargetAddress,
+        ProgramHeaderRuntimeInfo,
+        SymbolTable,
+    ) {
+        let program_headers = *self.metadata.program_headers();
+        let load_bias = self.load_bias;
+        let symbols = self.metadata.into_symbols();
+        (
+            self.regions,
+            self.load_segments,
+            load_bias,
+            program_headers,
+            symbols,
+        )
     }
 }
