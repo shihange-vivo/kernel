@@ -33,7 +33,10 @@ pub use artifact::{
 };
 
 pub(crate) use lifecycle::{FiniPlan, InitPlan, LifecycleEntry, LifecycleImage};
-pub(crate) use publish::{build_manifest, LinkMapEntry, LinkMapImage, PreparedLinkManifest};
+pub(crate) use publish::{
+    build_manifest, CommittedImage, CommittingLinkProduct, LinkContext, LinkMapEntry, LinkMapImage,
+    LinkProduct, LinkPublisher, PreparedLinkManifest,
+};
 pub(crate) use metadata::{
     ImageLayout, ImageLifecycleMetadata, ProgramHeaderRuntimeInfo, RelocationTableInfo,
     RelocationTables, RuntimeDynamicInfo, RuntimeImageMetadata, RuntimeImageState,

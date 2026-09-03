@@ -28,9 +28,13 @@ use alloc::{boxed::Box, vec::Vec};
 
 use crate::{
     address::{TargetAddress, TargetRange},
-    dynamic_linker::{graph::DependencyGraph, ArtifactIdentity, DependencyName, ImageId},
+    dynamic_linker::{
+        graph::DependencyGraph, ArtifactIdentity, DependencyName, FiniPlan, ImageId, InitPlan,
+        LoadMetrics, ScopeSet,
+    },
     error::{ErrorContext, LoadError, LoadErrorKind, LoadResult, LoadStage},
     image::LoadedRegion,
+    memory::{AllocationLease, ImageAllocation},
 };
 
 /// One entry of the published link map, in stable image-id order (§13.2).
@@ -52,6 +56,26 @@ pub(crate) struct LinkMapEntry {
 }
 
 impl LinkMapEntry {
+    #[inline]
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) const fn new(
+        owner: ImageId,
+        identity: ArtifactIdentity,
+        soname: Option<DependencyName>,
+        load_bias: TargetAddress,
+        entry: Option<TargetAddress>,
+        map_span: TargetRange,
+    ) -> Self {
+        Self {
+            owner,
+            identity,
+            soname,
+            load_bias,
+            entry,
+            map_span,
+        }
+    }
+
     #[inline]
     pub(crate) const fn owner(&self) -> ImageId {
         self.owner
@@ -103,6 +127,11 @@ impl PreparedLinkManifest {
     #[inline]
     pub(crate) fn link_map(&self) -> &[LinkMapEntry] {
         &self.link_map
+    }
+
+    #[inline]
+    pub(crate) fn into_parts(self) -> (TargetAddress, Box<[LinkMapEntry]>) {
+        (self.entry, self.link_map)
     }
 }
 
@@ -216,4 +245,200 @@ fn publish_error(kind: LoadErrorKind, context: ErrorContext) -> LoadError {
 
 fn publish_oom() -> LoadError {
     publish_error(LoadErrorKind::OutOfMemory, ErrorContext::None)
+}
+
+/// One image in a published link context (§13.2).
+///
+/// Unlike [`LinkMapEntry`], this value pairs the link-map facts with the
+/// image's backing allocation descriptor, so a crash/audit consumer can report
+/// the exact address space an image occupies. It holds no lease: the unique
+/// allocation lease is transferred into the publisher's `Receipt` at commit,
+/// which is the long-term owner (§13.2 "CommittedImage 或 publisher receipt
+/// 必须长期持有 allocation lease").
+#[derive(Clone, Debug)]
+pub(crate) struct CommittedImage {
+    entry: LinkMapEntry,
+    allocation: ImageAllocation,
+}
+
+impl CommittedImage {
+    #[inline]
+    pub(crate) const fn new(entry: LinkMapEntry, allocation: ImageAllocation) -> Self {
+        Self { entry, allocation }
+    }
+
+    #[inline]
+    pub(crate) const fn entry(&self) -> &LinkMapEntry {
+        &self.entry
+    }
+
+    #[inline]
+    pub(crate) const fn allocation(&self) -> ImageAllocation {
+        self.allocation
+    }
+}
+
+/// The owned, immutable context a [`LinkProduct`] exposes (§13.2): the closed
+/// dependency graph, the frozen scopes, and one committed image per id.
+pub(crate) struct LinkContext {
+    graph: DependencyGraph,
+    scopes: ScopeSet,
+    images: Box<[CommittedImage]>,
+}
+
+impl LinkContext {
+    #[inline]
+    pub(crate) fn new(
+        graph: DependencyGraph,
+        scopes: ScopeSet,
+        images: Box<[CommittedImage]>,
+    ) -> Self {
+        Self {
+            graph,
+            scopes,
+            images,
+        }
+    }
+
+    #[inline]
+    pub(crate) const fn graph(&self) -> &DependencyGraph {
+        &self.graph
+    }
+
+    #[inline]
+    pub(crate) const fn scopes(&self) -> &ScopeSet {
+        &self.scopes
+    }
+
+    #[inline]
+    pub(crate) fn images(&self) -> &[CommittedImage] {
+        &self.images
+    }
+}
+
+/// The lease payload handed to [`LinkPublisher::commit_batch`](LinkPublisher::commit_batch).
+///
+/// Every fallible check (capacity, identity, generation, entry, link-map slot)
+/// already happened in `prepare_batch`; the publisher's prepared state encodes
+/// the entry and link-map slots. The only thing the infallible commit step
+/// must move is the set of unique allocation leases, so this value is exactly
+/// that set, in image-id order.
+pub(crate) struct CommittingLinkProduct {
+    leases: Box<[AllocationLease]>,
+}
+
+impl CommittingLinkProduct {
+    #[inline]
+    pub(crate) fn new(leases: Box<[AllocationLease]>) -> Self {
+        Self { leases }
+    }
+
+    #[inline]
+    pub(crate) fn into_leases(self) -> Box<[AllocationLease]> {
+        self.leases
+    }
+}
+
+/// The atomic publication boundary between the loader and the external system
+/// (S9, §13.1).
+///
+/// `prepare_batch` performs every fallible check without mutating the visible
+/// snapshot; `commit_batch` only moves the prepared state and the leases, and
+/// must not allocate, validate, panic, or otherwise fail. The returned
+/// `Receipt` is the publisher's long-term owner of the committed images.
+pub(crate) trait LinkPublisher {
+    type PreparedBatch;
+    type Receipt;
+
+    fn prepare_batch(
+        &mut self,
+        manifest: &PreparedLinkManifest,
+    ) -> LoadResult<Self::PreparedBatch>;
+
+    /// # Safety
+    ///
+    /// `prepared` and `product` must come from the same active link session on
+    /// this publisher. Implementations must move the leases into the committed
+    /// owner and must not allocate, validate, panic, or otherwise fail.
+    unsafe fn commit_batch(
+        &mut self,
+        prepared: Self::PreparedBatch,
+        product: CommittingLinkProduct,
+    ) -> Self::Receipt;
+}
+
+/// The published result of a link session (§13.2).
+///
+/// This is the immutable snapshot a reader observes after commit: the owned
+/// context, the root entry, the constructor/destructor plans, the flat link
+/// map, the session metrics, and the publisher's receipt (the long-term owner
+/// of every committed allocation lease).
+pub(crate) struct LinkProduct<Receipt> {
+    context: LinkContext,
+    entry: TargetAddress,
+    init_plan: InitPlan,
+    fini_plan: FiniPlan,
+    link_map: Box<[LinkMapEntry]>,
+    metrics: LoadMetrics,
+    publication: Receipt,
+}
+
+impl<Receipt> LinkProduct<Receipt> {
+    #[inline]
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn new(
+        context: LinkContext,
+        entry: TargetAddress,
+        init_plan: InitPlan,
+        fini_plan: FiniPlan,
+        link_map: Box<[LinkMapEntry]>,
+        metrics: LoadMetrics,
+        publication: Receipt,
+    ) -> Self {
+        Self {
+            context,
+            entry,
+            init_plan,
+            fini_plan,
+            link_map,
+            metrics,
+            publication,
+        }
+    }
+
+    #[inline]
+    pub(crate) const fn context(&self) -> &LinkContext {
+        &self.context
+    }
+
+    /// The root's runtime entry (Thumb bit preserved on ARM).
+    #[inline]
+    pub(crate) const fn entry(&self) -> TargetAddress {
+        self.entry
+    }
+
+    #[inline]
+    pub(crate) const fn init_plan(&self) -> &InitPlan {
+        &self.init_plan
+    }
+
+    #[inline]
+    pub(crate) const fn fini_plan(&self) -> &FiniPlan {
+        &self.fini_plan
+    }
+
+    #[inline]
+    pub(crate) fn link_map(&self) -> &[LinkMapEntry] {
+        &self.link_map
+    }
+
+    #[inline]
+    pub(crate) fn metrics(&self) -> LoadMetrics {
+        self.metrics
+    }
+
+    #[inline]
+    pub(crate) const fn publication(&self) -> &Receipt {
+        &self.publication
+    }
 }
