@@ -134,7 +134,10 @@ impl<R: ElfReader> InspectedImage<R> {
                 )
                 .at_stage(LoadStage::Plan));
             }
-            if !self.policy.allows_segment_permissions(segment.permissions()) {
+            if !self
+                .policy
+                .allows_segment_permissions(segment.permissions())
+            {
                 return Err(LoadError::new(
                     LoadErrorKind::UnsupportedByProfile,
                     ErrorContext::ProgramHeader {
@@ -204,44 +207,44 @@ impl<R: ElfReader> InspectedImage<R> {
         // entry, so `e_entry == 0` is accepted; a non-zero DSO entry still gets
         // the same format and range checks but is never published as the
         // application entry point.
-        let canonical_entry_vaddr = if self.role == ArtifactRole::SharedObject && self.header.entry() == 0
-        {
-            entry_vaddr
-        } else {
-            let canonical = canonical_entry(entry_vaddr, entry_mode)
-                .map_err(|error| error.at_stage(LoadStage::Plan))?;
-            // A whole instruction must lie inside an executable segment, and
-            // the canonical entry must satisfy the profile's instruction
-            // alignment.
-            if instruction_alignment != 0 && canonical.get() % instruction_alignment != 0 {
-                return Err(LoadError::new(
-                    LoadErrorKind::InvalidAlignment,
-                    ErrorContext::TargetRange {
-                        start: canonical,
-                        len: minimum_instruction_size,
-                        align: instruction_alignment,
-                    },
-                )
-                .at_stage(LoadStage::Plan));
-            }
-            let executable = self.load_segments.iter().any(|segment| {
-                segment.permissions().contains(MemoryPermissions::EXECUTE)
-                    && TargetRange::new(segment.vaddr(), segment.memory_size())
-                        .contains_span(canonical, minimum_instruction_size)
-            });
-            if !executable {
-                return Err(LoadError::new(
-                    LoadErrorKind::PermissionConflict,
-                    ErrorContext::TargetRange {
-                        start: canonical,
-                        len: minimum_instruction_size,
-                        align: instruction_alignment,
-                    },
-                )
-                .at_stage(LoadStage::Plan));
-            }
-            canonical
-        };
+        let canonical_entry_vaddr =
+            if self.role == ArtifactRole::SharedObject && self.header.entry() == 0 {
+                entry_vaddr
+            } else {
+                let canonical = canonical_entry(entry_vaddr, entry_mode)
+                    .map_err(|error| error.at_stage(LoadStage::Plan))?;
+                // A whole instruction must lie inside an executable segment, and
+                // the canonical entry must satisfy the profile's instruction
+                // alignment.
+                if instruction_alignment != 0 && canonical.get() % instruction_alignment != 0 {
+                    return Err(LoadError::new(
+                        LoadErrorKind::InvalidAlignment,
+                        ErrorContext::TargetRange {
+                            start: canonical,
+                            len: minimum_instruction_size,
+                            align: instruction_alignment,
+                        },
+                    )
+                    .at_stage(LoadStage::Plan));
+                }
+                let executable = self.load_segments.iter().any(|segment| {
+                    segment.permissions().contains(MemoryPermissions::EXECUTE)
+                        && TargetRange::new(segment.vaddr(), segment.memory_size())
+                            .contains_span(canonical, minimum_instruction_size)
+                });
+                if !executable {
+                    return Err(LoadError::new(
+                        LoadErrorKind::PermissionConflict,
+                        ErrorContext::TargetRange {
+                            start: canonical,
+                            len: minimum_instruction_size,
+                            align: instruction_alignment,
+                        },
+                    )
+                    .at_stage(LoadStage::Plan));
+                }
+                canonical
+            };
 
         if let Some(relro) = self.relro {
             let valid_relro = self.load_segments.iter().any(|segment| {
