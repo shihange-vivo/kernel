@@ -147,6 +147,18 @@ pub struct CacheSyncOutcome {
 }
 
 impl CacheSyncOutcome {
+    pub(crate) const fn from_synchronized_ranges(
+        executable_ranges: Vec<TargetRange>,
+        scope: ExecutionScope,
+        maintenance: CacheMaintenance,
+    ) -> Self {
+        Self {
+            executable_ranges,
+            scope,
+            maintenance,
+        }
+    }
+
     pub fn executable_ranges(&self) -> &[TargetRange] {
         &self.executable_ranges
     }

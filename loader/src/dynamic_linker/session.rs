@@ -26,6 +26,7 @@ use alloc::vec::Vec;
 
 use crate::{
     address::TargetAddress,
+    cache::{CacheSyncOutcome, CodeCache},
     dynamic_linker::{
         graph::{DependencyGraph, DiscoveryItem, DiscoveryQueue},
         lifecycle::{self, FiniPlan, InitPlan, LifecycleImage},
@@ -42,8 +43,11 @@ use crate::{
     identity::{
         LoadLimits, LoadPolicy, LoadProfile, LoadRequest, SessionLimits, PHASE05_LOAD_POLICY,
     },
-    image::{absorb_into_session, ImageLoader, LoadedRegion},
-    memory::{AllocationRollbackLog, ImageMemory, SessionAllocation},
+    image::{
+        absorb_into_session, AppliedProtectionSet, ImageLoader, LoadedRegion,
+        PreparedProtectionPlan, ProtectionBatch, SealPlan, SealedState,
+    },
+    memory::{AllocationRollbackLog, ImageMemory, ImageProtectionMemory, SessionAllocation},
     reader::ElfReader,
     relocation::ArchRelocator,
 };
@@ -94,6 +98,16 @@ impl LoadMetrics {
     #[inline]
     pub(crate) fn record_relocation_operation(&mut self) {
         self.relocation_operations += 1;
+    }
+
+    #[inline]
+    pub(crate) fn record_protection_ranges(&mut self, count: usize) {
+        self.protection_ranges = self.protection_ranges.saturating_add(count as u64);
+    }
+
+    #[inline]
+    pub(crate) fn record_cache_ranges(&mut self, count: usize) {
+        self.cache_ranges = self.cache_ranges.saturating_add(count as u64);
     }
 
     #[inline]
@@ -224,6 +238,46 @@ pub(crate) struct RelocatedState {
     scopes: ScopeSet,
 }
 
+/// Per-image state after cache synchronization and memory protection (S8).
+pub(crate) struct SealedImageState {
+    runtime: RuntimeImageState,
+    sealed: SealedState,
+}
+
+impl SealedImageState {
+    #[inline]
+    pub(crate) fn regions(&self) -> &[LoadedRegion] {
+        self.runtime.regions()
+    }
+
+    #[inline]
+    pub(crate) fn load_segments(&self) -> &[LoadSegmentInfo] {
+        self.runtime.load_segments()
+    }
+
+    #[inline]
+    pub(crate) const fn metadata(&self) -> &RuntimeImageMetadata {
+        self.runtime.metadata()
+    }
+
+    #[inline]
+    pub(crate) const fn load_bias(&self) -> TargetAddress {
+        self.runtime.load_bias()
+    }
+
+    #[inline]
+    pub(crate) const fn runtime_entry(&self) -> TargetAddress {
+        self.runtime.runtime_entry()
+    }
+}
+
+/// Immutable session state once every image has crossed the S8 cache and
+/// protection boundary.
+pub(crate) struct SealedSessionState {
+    images: Vec<SessionImage<SealedImageState>>,
+    scopes: ScopeSet,
+}
+
 /// The rollback authority for a live session: it owns the memory backend it
 /// aborts against and the unique allocation leases absorbed so far.
 ///
@@ -263,6 +317,7 @@ pub(crate) struct LinkSession<'a, M: ImageMemory + ?Sized, S, A> {
 pub(crate) type BuildingSession<'a, M, A> = LinkSession<'a, M, BuildingState, A>;
 pub(crate) type ScopedSession<'a, M, A> = LinkSession<'a, M, ScopedState, A>;
 pub(crate) type RelocatedSession<'a, M, A> = LinkSession<'a, M, RelocatedState, A>;
+pub(crate) type SealedSession<'a, M, A> = LinkSession<'a, M, SealedSessionState, A>;
 
 /// Phase 0.5 entry point (§10.2): a trusted profile, a session budget and the
 /// single [`ArchRelocator`] used by every image in the link.
@@ -578,7 +633,182 @@ impl<'a, M: ImageMemory + ?Sized, A: ArchRelocator> ScopedSession<'a, M, A> {
     }
 }
 
-impl<M: ImageMemory + ?Sized, A: ArchRelocator> RelocatedSession<'_, M, A> {
+impl<'a, M: ImageProtectionMemory + ?Sized, A: ArchRelocator> RelocatedSession<'a, M, A> {
+    /// Complete the session-wide cache and protection boundary (S8).
+    ///
+    /// Every logical seal plan, backend protection plan and executable range
+    /// is prepared before the first cache/protection mutation. Publication is
+    /// available only on the returned [`SealedSession`].
+    pub fn seal<C: CodeCache + ?Sized>(
+        mut self,
+        cache: &mut C,
+    ) -> LoadResult<SealedSession<'a, M, A>> {
+        let image_count = self.state.images.len();
+        let total_executable_ranges =
+            self.state.images.iter().try_fold(0usize, |total, image| {
+                let count = image
+                    .state
+                    .load_segments()
+                    .iter()
+                    .filter(|segment| {
+                        segment
+                            .permissions()
+                            .contains(crate::MemoryPermissions::EXECUTE)
+                            && segment.memory_size() != 0
+                    })
+                    .count();
+                total.checked_add(count).ok_or_else(|| {
+                    session_error(LoadErrorKind::IntegerOverflow, ErrorContext::None)
+                        .at_stage(LoadStage::LinkSeal)
+                })
+            })?;
+
+        let mut executable_ranges = Vec::new();
+        executable_ranges
+            .try_reserve_exact(total_executable_ranges)
+            .map_err(|_| link_seal_oom())?;
+        let mut prepared_seals = Vec::new();
+        prepared_seals
+            .try_reserve_exact(image_count)
+            .map_err(|_| link_seal_oom())?;
+        let mut sealed_images = Vec::new();
+        sealed_images
+            .try_reserve_exact(image_count)
+            .map_err(|_| link_seal_oom())?;
+        let mut output = Vec::new();
+        output
+            .try_reserve_exact(image_count)
+            .map_err(|_| link_seal_oom())?;
+
+        for image in &self.state.images {
+            let runtime = &image.state.0;
+            let allocation = image.allocation.allocation();
+            let seal_plan = SealPlan::build(
+                &allocation,
+                runtime.load_bias(),
+                self.profile.class(),
+                runtime.load_segments(),
+                runtime.regions(),
+                runtime.relro(),
+                runtime.stack(),
+                runtime.metadata().relocations().records(),
+            )
+            .map_err(|error| error.at_stage(LoadStage::LinkSeal))?;
+            let prepared = PreparedProtectionPlan::prepare_for_allocation(
+                &*self.rollback.memory,
+                &allocation,
+                &seal_plan,
+            )
+            .map_err(|error| error.at_stage(LoadStage::LinkSeal))?;
+
+            let executable_count = runtime
+                .load_segments()
+                .iter()
+                .filter(|segment| {
+                    segment
+                        .permissions()
+                        .contains(crate::MemoryPermissions::EXECUTE)
+                        && segment.memory_size() != 0
+                })
+                .count();
+            let mut image_executable_ranges = Vec::new();
+            image_executable_ranges
+                .try_reserve_exact(executable_count)
+                .map_err(|_| link_seal_oom())?;
+            for (segment, region) in runtime.load_segments().iter().zip(runtime.regions().iter()) {
+                if segment
+                    .permissions()
+                    .contains(crate::MemoryPermissions::EXECUTE)
+                    && !region.runtime_range().is_empty()
+                {
+                    image_executable_ranges.push(region.runtime_range());
+                    executable_ranges.push(region.runtime_range());
+                }
+            }
+            prepared_seals.push((seal_plan, prepared, image_executable_ranges));
+        }
+
+        let requirements = cache.requirements();
+        let prepared_cache = cache
+            .prepare(&executable_ranges)
+            .map_err(|error| error.at_stage(LoadStage::LinkSeal))?;
+        requirements
+            .validate_prepared(&executable_ranges, &prepared_cache)
+            .map_err(|error| error.at_stage(LoadStage::LinkSeal))?;
+        let cache_scope = prepared_cache.scope();
+        let cache_maintenance = prepared_cache.maintenance();
+        let cache_sync = cache
+            .synchronize(prepared_cache)
+            .map_err(|error| error.at_stage(LoadStage::LinkSeal))?;
+        cache_sync
+            .validate_completion(&executable_ranges, cache_scope, cache_maintenance)
+            .map_err(|error| error.at_stage(LoadStage::LinkSeal))?;
+        self.metrics.record_cache_ranges(executable_ranges.len());
+
+        for (image, (seal_plan, prepared, image_executable_ranges)) in
+            self.state.images.iter().zip(prepared_seals.into_iter())
+        {
+            let protection_count = prepared.ranges().len();
+            let allocation = image.allocation.allocation();
+            let mut protection_records = prepared.into_ranges();
+            self.rollback
+                .log
+                .mark_protection_modified(image.allocation)
+                .map_err(|error| error.at_stage(LoadStage::LinkSeal))?;
+            self.rollback
+                .memory
+                .apply_protection(&allocation, ProtectionBatch::new(&mut protection_records))
+                .map_err(|error| error.at_stage(LoadStage::LinkSeal))?;
+            self.metrics.record_protection_ranges(protection_count);
+
+            let image_cache_sync = CacheSyncOutcome::from_synchronized_ranges(
+                image_executable_ranges,
+                cache_scope,
+                cache_maintenance,
+            );
+            sealed_images.push(SealedState::new(
+                image.state.load_bias(),
+                image.state.runtime_entry(),
+                image.state.0.canonical_runtime_entry(),
+                image_cache_sync,
+                seal_plan,
+                AppliedProtectionSet::new(protection_records),
+            ));
+        }
+
+        let RelocatedState { images, scopes } = self.state;
+        let mut images = images.into_iter();
+        let mut sealed_states = sealed_images.into_iter();
+        while let (Some(image), Some(sealed)) = (images.next(), sealed_states.next()) {
+            output.push(SessionImage {
+                image_id: image.image_id,
+                artifact: image.artifact,
+                allocation: image.allocation,
+                state: SealedImageState {
+                    runtime: image.state.0,
+                    sealed,
+                },
+            });
+        }
+
+        Ok(LinkSession {
+            rollback: self.rollback,
+            graph: self.graph,
+            limits: self.limits,
+            metrics: self.metrics,
+            profile: self.profile,
+            policy: self.policy,
+            domain: self.domain,
+            arch: self.arch,
+            state: SealedSessionState {
+                images: output,
+                scopes,
+            },
+        })
+    }
+}
+
+impl<M: ImageMemory + ?Sized, A: ArchRelocator> SealedSession<'_, M, A> {
     /// Build the dependency-first init and reverse fini plans (§12.2).
     ///
     /// Reads the post-relocation init/fini array words back through the
@@ -656,13 +886,6 @@ impl<M: ImageMemory + ?Sized, A: ArchRelocator> RelocatedSession<'_, M, A> {
         committed
             .try_reserve_exact(self.state.images.len())
             .map_err(|_| publish_oom())?;
-        for (image, map_entry) in self.state.images.iter().zip(link_map.iter()) {
-            committed.push(CommittedImage::new(
-                map_entry.clone(),
-                image.allocation.allocation(),
-            ));
-        }
-
         // Drain the unique leases in creation order (== image-id order).
         let mut leases = Vec::new();
         leases
@@ -682,7 +905,15 @@ impl<M: ImageMemory + ?Sized, A: ArchRelocator> RelocatedSession<'_, M, A> {
             arch: _,
             state,
         } = self;
-        let RelocatedState { images: _, scopes } = state;
+        let SealedSessionState { images, scopes } = state;
+
+        for (image, map_entry) in images.into_iter().zip(link_map.iter()) {
+            committed.push(CommittedImage::new(
+                map_entry.clone(),
+                image.allocation.allocation(),
+                image.state.sealed,
+            ));
+        }
 
         let context = LinkContext::new(graph, scopes, committed.into_boxed_slice());
 
@@ -731,4 +962,8 @@ fn session_error(kind: LoadErrorKind, context: ErrorContext) -> LoadError {
 
 fn publish_oom() -> LoadError {
     LoadError::new(LoadErrorKind::OutOfMemory, ErrorContext::None).at_stage(LoadStage::Publish)
+}
+
+fn link_seal_oom() -> LoadError {
+    LoadError::new(LoadErrorKind::OutOfMemory, ErrorContext::None).at_stage(LoadStage::LinkSeal)
 }
