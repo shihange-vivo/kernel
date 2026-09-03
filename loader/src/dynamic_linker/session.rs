@@ -36,13 +36,14 @@ use crate::{
         },
         relocate::{self, RelocationImage, RelocationPolicy},
         ArtifactIdentity, ArtifactResolver, ArtifactRole, DependencyName, DependencyRequest,
-        ImageId, LinkDomainId, ResolvedArtifact, RuntimeImageMetadata, RuntimeImageState, ScopeSet,
-        SymbolTable,
+        ImageId, ImageOwnership, LinkDomainId, ResolvedArtifact, RuntimeImageMetadata,
+        RuntimeImageState, ScopeSet, SymbolTable,
     },
     elf::LoadSegmentInfo,
     error::{ErrorContext, LoadError, LoadErrorKind, LoadResult, LoadStage},
     identity::{
-        LoadLimits, LoadPolicy, LoadProfile, LoadRequest, SessionLimits, PHASE05_LOAD_POLICY,
+        ElfType, LoadLimits, LoadPolicy, LoadProfile, LoadRequest, SessionLimits,
+        PHASE05_LOAD_POLICY,
     },
     image::{
         absorb_into_session, AppliedProtectionSet, ImageLoader, LoadedRegion,
@@ -384,6 +385,27 @@ impl<A: ArchRelocator> DynamicLinker<A> {
                 LoadError::new(LoadErrorKind::UnsupportedByProfile, ErrorContext::None)
                     .at_stage(LoadStage::Beginning),
             );
+        }
+        // The Phase 0.5 link root is always an allocated `ET_DYN` image owned by
+        // this session: a fixed `ET_EXEC` stays on the Phase 0 single-image path,
+        // and a system-candidate root would let an application reserve system
+        // symbol space it cannot own (§12.1).
+        if profile.r#type() != ElfType::Dyn {
+            return Err(LoadError::new(
+                LoadErrorKind::UnsupportedByProfile,
+                ErrorContext::HeaderField {
+                    field: crate::error::HeaderField::Type,
+                    value: u64::from(profile.r#type()),
+                },
+            )
+            .at_stage(LoadStage::Beginning));
+        }
+        if root.ownership() != ImageOwnership::SessionPrivate {
+            return Err(LoadError::new(
+                LoadErrorKind::UnsupportedByProfile,
+                ErrorContext::None,
+            )
+            .at_stage(LoadStage::Beginning));
         }
 
         let mut guard = RollbackGuard {
