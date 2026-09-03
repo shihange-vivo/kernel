@@ -231,12 +231,12 @@ impl ScopeSet {
 
     /// Resolve a global/weak reference by name for `requester` (§9.2).
     ///
-    /// A protected owner-local reference binds to the requester's own
-    /// definition first (rule 2); otherwise the frozen scope is walked and the
-    /// first strong definition wins, falling back to the first weak when no
-    /// strong exists (rules 5–6). Hidden/internal and local definitions are not
-    /// exported and are skipped (rule 4). Returns `None` when no definition is
-    /// found — the caller decides how to treat an undefined strong versus an
+    /// The frozen scope is walked and the first strong definition wins,
+    /// falling back to the first weak when no strong exists (rules 5–6).
+    /// Hidden/internal and local definitions are not exported and are skipped
+    /// (rule 4). Owner-local protected references are resolved by exact index
+    /// before this method is called. Returns `None` when no definition is found
+    /// — the caller decides how to treat an undefined strong versus an
     /// undefined weak (rules 7–8), since that depends on the reference's own
     /// binding in the requester's table.
     pub(crate) fn resolve_name(
@@ -245,18 +245,6 @@ impl ScopeSet {
         requester: ImageId,
         name: &[u8],
     ) -> Option<ResolvedSymbol> {
-        if let Some(table) = symbols.get(requester.get() as usize)
-            && let Some(index) = table.lookup(name)
-            && self
-                .per_image
-                .get(requester.get() as usize)
-                .is_some_and(|image| image.is_protected(index))
-        {
-            return table
-                .entry(index)
-                .map(|entry| ResolvedSymbol::from_entry(requester, entry));
-        }
-
         let mut weak = None;
         for &image in self.scope_for(requester).ordered_images() {
             let Some(table) = symbols.get(image.get() as usize) else {
