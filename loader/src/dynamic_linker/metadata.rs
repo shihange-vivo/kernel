@@ -401,9 +401,14 @@ impl RuntimeImageMetadata {
             .needed
             .iter()
             .map(|name| name.as_bytes().len() as u64)
-            .chain(self.soname.as_ref().map(|name| name.as_bytes().len() as u64))
+            .chain(
+                self.soname
+                    .as_ref()
+                    .map(|name| name.as_bytes().len() as u64),
+            )
             .fold(0u64, |acc, len| acc.saturating_add(len));
-        let records = self.relocations.len() as u64 * core::mem::size_of::<RelocationRecord>() as u64;
+        let records =
+            self.relocations.len() as u64 * core::mem::size_of::<RelocationRecord>() as u64;
         symbols
             .checked_add(names)
             .and_then(|v| v.checked_add(records))
@@ -448,7 +453,7 @@ pub(crate) struct RuntimeImageState {
     load_segments: Box<[LoadSegmentInfo]>,
     metadata: RuntimeImageMetadata,
     load_bias: TargetAddress,
-    entry_vaddr: TargetAddress,
+    runtime_entry: TargetAddress,
 }
 
 impl RuntimeImageState {
@@ -460,7 +465,7 @@ impl RuntimeImageState {
         load_segments: Box<[LoadSegmentInfo]>,
         metadata: RuntimeImageMetadata,
         load_bias: TargetAddress,
-        entry_vaddr: TargetAddress,
+        runtime_entry: TargetAddress,
     ) -> Self {
         Self {
             layout,
@@ -468,7 +473,7 @@ impl RuntimeImageState {
             load_segments,
             metadata,
             load_bias,
-            entry_vaddr,
+            runtime_entry,
         }
     }
 
@@ -497,11 +502,10 @@ impl RuntimeImageState {
         self.load_bias
     }
 
-    /// The link-time entry vaddr (Thumb bit set on ARM), carried from S2/S3
-    /// through the session so the published product can expose the root's
-    /// runtime entry as `load_bias + entry_vaddr` without re-deriving it.
+    /// The mapped runtime entry (Thumb bit set on ARM). S3 has already applied
+    /// the load bias, so publication must not add it a second time.
     #[inline]
-    pub(crate) const fn entry_vaddr(&self) -> TargetAddress {
-        self.entry_vaddr
+    pub(crate) const fn runtime_entry(&self) -> TargetAddress {
+        self.runtime_entry
     }
 }
