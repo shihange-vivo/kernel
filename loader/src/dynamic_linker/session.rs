@@ -34,10 +34,11 @@ use crate::{
             self, CommittedImage, CommittingLinkProduct, LinkContext, LinkMapImage, LinkProduct,
             LinkPublisher, PreparedLinkManifest,
         },
-        relocate::{self, RelocationImage, RelocationPolicy},
+        relocate::{self, ProviderRegion, RelocationImage, RelocationPolicy},
         ArtifactIdentity, ArtifactResolver, ArtifactRole, DependencyName, DependencyRequest,
-        ImageId, ImageOwnership, LinkDomainId, PublishedImageDescriptor, ResolvedArtifact,
-        RuntimeImageMetadata, RuntimeImageState, ScopeSet, SymbolTable,
+        DependencyResolution, ImageId, ImageOwnership, LinkDomainId, PublishedImageDescriptor,
+        PublishedRegion, ResolvedArtifact, RuntimeImageMetadata, RuntimeImageState, ScopeSet,
+        SymbolTable,
     },
     elf::LoadSegmentInfo,
     error::{ErrorContext, LoadError, LoadErrorKind, LoadResult, LoadStage},
@@ -214,9 +215,34 @@ impl<S> SessionImage<S> {
     }
 }
 
+/// One Ready system image imported from the registry instead of loaded (§12.1).
+///
+/// It joins the dependency graph, the symbol scopes, the link map and the
+/// committed context, but is never allocated, relocated, sealed or
+/// re-initialized here — its unique lease lives in the system registry, not in
+/// this session's rollback log. The owned descriptor supplies the export
+/// surface and published regions the later stages read from.
+pub(crate) struct ImportedImage {
+    image_id: ImageId,
+    descriptor: PublishedImageDescriptor,
+}
+
+impl ImportedImage {
+    #[inline]
+    pub(crate) const fn image_id(&self) -> ImageId {
+        self.image_id
+    }
+
+    #[inline]
+    pub(crate) const fn descriptor(&self) -> &PublishedImageDescriptor {
+        &self.descriptor
+    }
+}
+
 /// Immutable session state while dependencies are being discovered (S5).
 pub struct BuildingState {
     images: Vec<SessionImage<RuntimeImageState>>,
+    imported: Vec<ImportedImage>,
     discovery: DiscoveryQueue,
     closed: bool,
     poisoned: bool,
@@ -225,6 +251,7 @@ pub struct BuildingState {
 /// Immutable session state once scopes are frozen (S6).
 pub struct ScopedState {
     images: Vec<SessionImage<RuntimeImageState>>,
+    imported: Vec<ImportedImage>,
     scopes: ScopeSet,
 }
 
@@ -264,6 +291,7 @@ impl RelocatedImageState {
 /// Immutable session state once every image is relocated (S7).
 pub struct RelocatedState {
     images: Vec<SessionImage<RelocatedImageState>>,
+    imported: Vec<ImportedImage>,
     scopes: ScopeSet,
 }
 
@@ -304,6 +332,7 @@ impl SealedImageState {
 /// protection boundary.
 pub struct SealedSessionState {
     images: Vec<SessionImage<SealedImageState>>,
+    imported: Vec<ImportedImage>,
     scopes: ScopeSet,
 }
 
@@ -498,6 +527,7 @@ impl<A: ArchRelocator> DynamicLinker<A> {
             arch: self.arch,
             state: BuildingState {
                 images,
+                imported: Vec::new(),
                 discovery,
                 closed: false,
                 poisoned: false,
@@ -552,78 +582,127 @@ impl<'a, M: ImageMemory + ?Sized, A: ArchRelocator> BuildingSession<'a, M, A> {
                     .map_err(|error| error.at_stage(LoadStage::Discover))?
             };
 
-            let (identity, ownership, reader) = resolved.into_parts();
+            match resolved {
+                DependencyResolution::Load(artifact) => {
+                    let (identity, ownership, reader) = artifact.into_parts();
 
-            // Identity de-duplication happens before any allocation (§5.3 rule 1).
-            if let Some(existing) = self.graph.find_identity(&identity) {
-                self.graph
-                    .link_existing(requester, existing, item.needed_index())
+                    // Identity de-duplication happens before any allocation
+                    // (§5.3 rule 1).
+                    if let Some(existing) = self.graph.find_identity(&identity) {
+                        self.graph
+                            .link_existing(requester, existing, item.needed_index())
+                            .map_err(|error| error.at_stage(LoadStage::Discover))?;
+                        self.metrics.record_edge();
+                        continue;
+                    }
+
+                    let (allocation, mut runtime) = load_runtime(
+                        reader,
+                        self.profile,
+                        ArtifactRole::SharedObject,
+                        self.policy,
+                        self.limits.per_image(),
+                        &mut self.rollback.log,
+                        &mut *self.rollback.memory,
+                    )
                     .map_err(|error| error.at_stage(LoadStage::Discover))?;
-                self.metrics.record_edge();
-                continue;
+
+                    let soname = runtime.take_soname();
+                    let metadata_bytes =
+                        session_image_metadata_bytes(&runtime, &identity, soname.as_ref())?;
+                    let needed = needed_for(&self.state.images, requester, item.needed_index())?;
+                    let provider = self
+                        .graph
+                        .insert_dependency(
+                            requester,
+                            needed,
+                            item.needed_index(),
+                            identity,
+                            soname,
+                            ownership,
+                        )
+                        .map_err(|error| error.at_stage(LoadStage::Discover))?;
+
+                    let depth = self
+                        .graph
+                        .node(provider)
+                        .map(|node| node.depth())
+                        .unwrap_or(0);
+                    validate_session_symbol_names(&runtime, &self.limits)
+                        .map_err(|error| error.at_stage(LoadStage::Discover))?;
+                    self.metrics
+                        .record_image(
+                            depth,
+                            allocation.allocation().len(),
+                            metadata_bytes,
+                            &self.limits,
+                        )
+                        .map_err(|error| error.at_stage(LoadStage::Discover))?;
+                    self.metrics.record_edge();
+
+                    enqueue_dependencies(
+                        &mut self.state.discovery,
+                        provider,
+                        runtime.metadata().needed(),
+                        &self.limits,
+                        LoadStage::Discover,
+                    )?;
+
+                    self.state.images.try_reserve(1).map_err(|_| {
+                        LoadError::new(LoadErrorKind::OutOfMemory, ErrorContext::None)
+                            .at_stage(LoadStage::Discover)
+                    })?;
+                    self.state.images.push(SessionImage {
+                        image_id: provider,
+                        allocation,
+                        state: runtime,
+                    });
+                }
+
+                DependencyResolution::Import(imported) => {
+                    let descriptor = imported.into_descriptor();
+
+                    // An imported Ready image is joined to the graph and scopes
+                    // without a fresh allocation, relocation, seal or init
+                    // (§12.1). It never contributes a `DT_NEEDED` of its own
+                    // here: its dependency closure was fixed by the link that
+                    // first published it.
+                    let needed = needed_for(&self.state.images, requester, item.needed_index())?;
+                    let identity = descriptor.identity().try_clone()?;
+                    let soname = descriptor.soname().map(DependencyName::try_clone).transpose()?;
+                    let provider = self
+                        .graph
+                        .insert_dependency(
+                            requester,
+                            needed,
+                            item.needed_index(),
+                            identity,
+                            soname,
+                            descriptor.ownership(),
+                        )
+                        .map_err(|error| error.at_stage(LoadStage::Discover))?;
+
+                    let metadata_bytes = imported_metadata_bytes(&descriptor)?;
+                    let depth = self
+                        .graph
+                        .node(provider)
+                        .map(|node| node.depth())
+                        .unwrap_or(0);
+                    self.metrics
+                        .record_image(depth, 0, metadata_bytes, &self.limits)
+                        .map_err(|error| error.at_stage(LoadStage::Discover))?;
+                    self.metrics.record_edge();
+
+                    self.state.imported.try_reserve(1).map_err(|_| {
+                        LoadError::new(LoadErrorKind::OutOfMemory, ErrorContext::None)
+                            .at_stage(LoadStage::Discover)
+                    })?;
+                    self.state.imported.push(ImportedImage {
+                        image_id: provider,
+                        descriptor,
+                    });
+                }
             }
-
-            let (allocation, mut runtime) = load_runtime(
-                reader,
-                self.profile,
-                ArtifactRole::SharedObject,
-                self.policy,
-                self.limits.per_image(),
-                &mut self.rollback.log,
-                &mut *self.rollback.memory,
-            )
-            .map_err(|error| error.at_stage(LoadStage::Discover))?;
-
-            let soname = runtime.take_soname();
-            let metadata_bytes =
-                session_image_metadata_bytes(&runtime, &identity, soname.as_ref())?;
-            let needed = needed_for(&self.state.images, requester, item.needed_index())?;
-            let provider = self
-                .graph
-                .insert_dependency(
-                    requester,
-                    needed,
-                    item.needed_index(),
-                    identity,
-                    soname,
-                    ownership,
-                )
-                .map_err(|error| error.at_stage(LoadStage::Discover))?;
-
-            let depth = self
-                .graph
-                .node(provider)
-                .map(|node| node.depth())
-                .unwrap_or(0);
-            validate_session_symbol_names(&runtime, &self.limits)
-                .map_err(|error| error.at_stage(LoadStage::Discover))?;
-            self.metrics
-                .record_image(
-                    depth,
-                    allocation.allocation().len(),
-                    metadata_bytes,
-                    &self.limits,
-                )
-                .map_err(|error| error.at_stage(LoadStage::Discover))?;
-            self.metrics.record_edge();
-
-            enqueue_dependencies(
-                &mut self.state.discovery,
-                provider,
-                runtime.metadata().needed(),
-                &self.limits,
-                LoadStage::Discover,
-            )?;
-
-            self.state.images.try_reserve(1).map_err(|_| {
-                LoadError::new(LoadErrorKind::OutOfMemory, ErrorContext::None)
-                    .at_stage(LoadStage::Discover)
-            })?;
-            self.state.images.push(SessionImage {
-                image_id: provider,
-                allocation,
-                state: runtime,
-            });
         }
 
         self.state.closed = true;
@@ -648,6 +727,7 @@ impl<'a, M: ImageMemory + ?Sized, A: ArchRelocator> BuildingSession<'a, M, A> {
         } = self;
         let BuildingState {
             images,
+            imported,
             discovery: _,
             closed,
             poisoned,
@@ -658,12 +738,29 @@ impl<'a, M: ImageMemory + ?Sized, A: ArchRelocator> BuildingSession<'a, M, A> {
                 .at_stage(LoadStage::Scope));
         }
 
+        // The symbol table array is image-id indexed and must include imported
+        // Ready images at their graph-assigned positions (§12.1), so a lookup
+        // into an imported provider resolves against its retained export table.
         let mut symbols = Vec::new();
         symbols
-            .try_reserve_exact(images.len())
+            .try_reserve_exact(images.len() + imported.len())
             .map_err(|_| scope_session_oom())?;
+        let mut tables: Vec<Option<&SymbolTable>> = Vec::new();
+        tables
+            .try_reserve_exact(images.len() + imported.len())
+            .map_err(|_| scope_session_oom())?;
+        tables.resize_with(images.len() + imported.len(), || None);
         for image in &images {
-            symbols.push(image.state.metadata().symbols());
+            tables[image.image_id.get() as usize] = Some(image.state.metadata().symbols());
+        }
+        for imported in &imported {
+            tables[imported.image_id.get() as usize] = Some(imported.descriptor().exports());
+        }
+        for table in tables {
+            symbols.push(table.ok_or_else(|| {
+                LoadError::new(LoadErrorKind::BadElf, ErrorContext::None)
+                    .at_stage(LoadStage::Scope)
+            })?);
         }
         let scopes =
             ScopeSet::freeze(&graph, &symbols).map_err(|error| error.at_stage(LoadStage::Scope))?;
@@ -677,7 +774,11 @@ impl<'a, M: ImageMemory + ?Sized, A: ArchRelocator> BuildingSession<'a, M, A> {
             policy,
             domain,
             arch,
-            state: ScopedState { images, scopes },
+            state: ScopedState {
+                images,
+                imported,
+                scopes,
+            },
         })
     }
 }
@@ -690,9 +791,10 @@ impl<'a, M: ImageMemory + ?Sized, A: ArchRelocator> ScopedSession<'a, M, A> {
     /// session is dropped and all absorbed allocations aborted.
     pub fn relocate(mut self) -> LoadResult<RelocatedSession<'a, M, A>> {
         let image_count = self.state.images.len();
+        let total_images = image_count + self.state.imported.len();
         let mut symbols = Vec::new();
         symbols
-            .try_reserve_exact(image_count)
+            .try_reserve_exact(total_images)
             .map_err(|_| link_relocation_oom())?;
         let mut relocation_images = Vec::new();
         relocation_images
@@ -714,11 +816,43 @@ impl<'a, M: ImageMemory + ?Sized, A: ArchRelocator> ScopedSession<'a, M, A> {
             ));
         }
 
+        // The provider-region array is image-id indexed over every admitted
+        // image, loaded and imported (§12.1), so a symbol resolved into an
+        // imported provider is range-checked against the same facts a fresh
+        // load would have produced.
+        let mut provider_regions = Vec::new();
+        provider_regions
+            .try_reserve_exact(total_images)
+            .map_err(|_| link_relocation_oom())?;
+        provider_regions.resize_with(total_images, Vec::new);
+        for image in &self.state.images {
+            let regions = image
+                .state
+                .load_segments()
+                .iter()
+                .zip(image.state.regions().iter())
+                .map(|(segment, region)| {
+                    ProviderRegion::new(segment.permissions(), region.runtime_range())
+                })
+                .collect();
+            provider_regions[image.image_id.get() as usize] = regions;
+        }
+        for imported in &self.state.imported {
+            let regions = imported
+                .descriptor()
+                .regions()
+                .iter()
+                .map(|region| ProviderRegion::new(region.permissions(), region.runtime_range()))
+                .collect();
+            provider_regions[imported.image_id.get() as usize] = regions;
+        }
+
         let policy = RelocationPolicy::for_profile(&self.profile);
         relocate::run(
             &self.arch,
             &symbols,
             &relocation_images,
+            &provider_regions,
             &self.state.scopes,
             &self.profile,
             &policy,
@@ -741,6 +875,7 @@ impl<'a, M: ImageMemory + ?Sized, A: ArchRelocator> ScopedSession<'a, M, A> {
             });
         }
         let scopes = self.state.scopes;
+        let imported = self.state.imported;
 
         Ok(LinkSession {
             rollback: self.rollback,
@@ -753,6 +888,7 @@ impl<'a, M: ImageMemory + ?Sized, A: ArchRelocator> ScopedSession<'a, M, A> {
             arch: self.arch,
             state: RelocatedState {
                 images: relocated_images,
+                imported,
                 scopes,
             },
         })
@@ -902,7 +1038,11 @@ impl<'a, M: ImageProtectionMemory + ?Sized, A: ArchRelocator> RelocatedSession<'
             ));
         }
 
-        let RelocatedState { images, scopes } = self.state;
+        let RelocatedState {
+            images,
+            imported,
+            scopes,
+        } = self.state;
         let mut images = images.into_iter();
         let mut sealed_states = sealed_images.into_iter();
         while let (Some(image), Some(sealed)) = (images.next(), sealed_states.next()) {
@@ -927,6 +1067,7 @@ impl<'a, M: ImageProtectionMemory + ?Sized, A: ArchRelocator> RelocatedSession<'
             arch: self.arch,
             state: SealedSessionState {
                 images: output,
+                imported,
                 scopes,
             },
         })
@@ -966,17 +1107,40 @@ impl<M: ImageMemory + ?Sized, A: ArchRelocator> SealedSession<'_, M, A> {
     /// result holds no lease: it is the pure description the host publisher
     /// validates in `prepare_batch` before the committed snapshot is swapped.
     pub fn prepare_link_manifest(&self) -> LoadResult<PreparedLinkManifest> {
-        let mut images = Vec::new();
-        images
-            .try_reserve_exact(self.state.images.len())
+        let total = self.state.images.len() + self.state.imported.len();
+        // Image-id indexed: the root and every loaded image contribute a
+        // `Loaded` entry, and every imported Ready image a `Imported` entry at
+        // its graph-assigned id, so the link map stays in stable id order even
+        // when discovery interleaves loads and imports (§12.1).
+        let mut slots: Vec<Option<LinkMapImage<'_>>> = Vec::new();
+        slots
+            .try_reserve_exact(total)
             .map_err(|_| link_seal_oom())?;
+        slots.resize_with(total, || None);
         for image in &self.state.images {
-            images.push(LinkMapImage::new(
+            slots[image.image_id.get() as usize] = Some(LinkMapImage::loaded(
                 image.image_id,
                 image.state.load_bias(),
                 image.state.runtime_entry(),
                 image.state.regions(),
             ));
+        }
+        for imported in &self.state.imported {
+            slots[imported.image_id.get() as usize] = Some(LinkMapImage::imported(
+                imported.image_id,
+                imported.descriptor().load_bias(),
+                imported.descriptor().regions(),
+            ));
+        }
+        let mut images = Vec::new();
+        images
+            .try_reserve_exact(total)
+            .map_err(|_| link_seal_oom())?;
+        for slot in slots {
+            images.push(slot.ok_or_else(|| {
+                LoadError::new(LoadErrorKind::BadElf, ErrorContext::None)
+                    .at_stage(LoadStage::LinkSeal)
+            })?);
         }
         publish::build_manifest(&self.graph, &images)
     }
@@ -998,12 +1162,13 @@ impl<M: ImageMemory + ?Sized, A: ArchRelocator> SealedSession<'_, M, A> {
         let manifest = self.prepare_link_manifest()?;
 
         // One committed image per id: link-map facts plus the backing
-        // allocation, in the same image-id order the leases are drained in.
-        let mut committed = Vec::new();
-        committed
-            .try_reserve_exact(self.state.images.len())
-            .map_err(|_| publish_oom())?;
-        // Drain the unique leases in creation order (== image-id order).
+        // allocation, in image-id order. Imported Ready images join the
+        // committed context at their graph-assigned ids so their retained
+        // export surface stays resolvable after publication (§12.1); they
+        // contribute no lease here — their unique lease lives in the registry.
+        let total = self.state.images.len() + self.state.imported.len();
+        // Drain the unique leases in creation order (== image-id order of the
+        // loaded images only).
         let mut leases = Vec::new();
         leases
             .try_reserve_exact(self.rollback.log.len())
@@ -1020,7 +1185,17 @@ impl<M: ImageMemory + ?Sized, A: ArchRelocator> SealedSession<'_, M, A> {
             arch: _,
             state,
         } = self;
-        let SealedSessionState { images, scopes } = state;
+        let SealedSessionState {
+            images,
+            imported,
+            scopes,
+        } = state;
+
+        let mut slots: Vec<Option<CommittedImage>> = Vec::new();
+        slots
+            .try_reserve_exact(total)
+            .map_err(|_| publish_oom())?;
+        slots.resize_with(total, || None);
 
         for image in images {
             let node = graph.node(image.image_id).ok_or_else(|| {
@@ -1041,7 +1216,22 @@ impl<M: ImageMemory + ?Sized, A: ArchRelocator> SealedSession<'_, M, A> {
                 symbols,
             )
             .map_err(|error| error.at_stage(LoadStage::Publish))?;
-            committed.push(CommittedImage::new(image.image_id, descriptor));
+            slots[image.image_id.get() as usize] = Some(CommittedImage::new(image.image_id, descriptor));
+        }
+        for imported in imported {
+            let image_id = imported.image_id;
+            slots[image_id.get() as usize] = Some(CommittedImage::new(image_id, imported.descriptor));
+        }
+
+        let mut committed = Vec::new();
+        committed
+            .try_reserve_exact(total)
+            .map_err(|_| publish_oom())?;
+        for slot in slots {
+            committed.push(slot.ok_or_else(|| {
+                LoadError::new(LoadErrorKind::BadElf, ErrorContext::None)
+                    .at_stage(LoadStage::Publish)
+            })?);
         }
 
         let context = LinkContext::new(graph, scopes, committed);
@@ -1130,6 +1320,30 @@ fn session_image_metadata_bytes(
         .and_then(|bytes| {
             bytes.checked_add(
                 runtime.regions().len() as u64 * core::mem::size_of::<LoadedRegion>() as u64,
+            )
+        })
+        .ok_or_else(session_overflow)
+}
+
+/// The retained runtime metadata bytes an imported Ready image keeps in the
+/// session: its frozen export surface, its identity/SONAME copy, and its
+/// published regions. Charged against
+/// `SessionLimits::total_runtime_metadata_bytes` on import (§12.1).
+fn imported_metadata_bytes(descriptor: &PublishedImageDescriptor) -> LoadResult<u64> {
+    descriptor
+        .exports()
+        .metadata_bytes()
+        .checked_add(descriptor.identity().metadata_bytes())
+        .and_then(|bytes| {
+            bytes.checked_add(
+                descriptor
+                    .soname()
+                    .map_or(0, |name| name.as_bytes().len() as u64),
+            )
+        })
+        .and_then(|bytes| {
+            bytes.checked_add(
+                descriptor.regions().len() as u64 * core::mem::size_of::<PublishedRegion>() as u64,
             )
         })
         .ok_or_else(session_overflow)
