@@ -191,6 +191,7 @@ pub(crate) struct BuildingState {
     images: Vec<SessionImage<RuntimeImageState>>,
     discovery: DiscoveryQueue,
     closed: bool,
+    poisoned: bool,
 }
 
 /// Immutable session state once scopes are frozen (S6).
@@ -410,6 +411,7 @@ impl<A: ArchRelocator + Clone> DynamicLinker<A> {
                 images,
                 discovery,
                 closed: false,
+                poisoned: false,
             },
         })
     }
@@ -426,10 +428,25 @@ impl<'a, M: ImageMemory + ?Sized, A: ArchRelocator> BuildingSession<'a, M, A> {
         &mut self,
         resolver: &mut Resolver,
     ) -> LoadResult<()> {
+        if self.state.poisoned {
+            return Err(session_error(LoadErrorKind::BadElf, ErrorContext::None)
+                .at_stage(LoadStage::Discover));
+        }
         if self.state.closed {
             return Ok(());
         }
 
+        let result = self.close_dependencies_inner(resolver);
+        if result.is_err() {
+            self.state.poisoned = true;
+        }
+        result
+    }
+
+    fn close_dependencies_inner<Resolver: ArtifactResolver>(
+        &mut self,
+        resolver: &mut Resolver,
+    ) -> LoadResult<()> {
         while let Some(item) = self.state.discovery.pop() {
             let requester = item.requester();
             let requester_artifact = self
@@ -532,9 +549,10 @@ impl<'a, M: ImageMemory + ?Sized, A: ArchRelocator> BuildingSession<'a, M, A> {
             images,
             discovery: _,
             closed,
+            poisoned,
         } = state;
 
-        if !closed {
+        if !closed || poisoned {
             return Err(LoadError::new(LoadErrorKind::BadElf, ErrorContext::None)
                 .at_stage(LoadStage::Scope));
         }
