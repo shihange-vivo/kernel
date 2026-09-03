@@ -14,8 +14,9 @@
 
 use alloc::vec::Vec;
 use goblin::elf::dynamic::{
-    DT_FINI, DT_FINI_ARRAY, DT_FINI_ARRAYSZ, DT_INIT, DT_INIT_ARRAY, DT_INIT_ARRAYSZ, DT_JMPREL,
-    DT_NEEDED, DT_NULL, DT_PLTREL, DT_PLTRELSZ, DT_PREINIT_ARRAY, DT_PREINIT_ARRAYSZ, DT_SONAME,
+    DF_1_NOW, DF_BIND_NOW, DT_BIND_NOW, DT_FINI, DT_FINI_ARRAY, DT_FINI_ARRAYSZ, DT_FLAGS,
+    DT_FLAGS_1, DT_INIT, DT_INIT_ARRAY, DT_INIT_ARRAYSZ, DT_JMPREL, DT_NEEDED, DT_NULL, DT_PLTREL,
+    DT_PLTRELSZ, DT_PREINIT_ARRAY, DT_PREINIT_ARRAYSZ, DT_SONAME,
 };
 
 use crate::{
@@ -108,6 +109,7 @@ pub(crate) fn validate_dynamic_features<R: ElfReader>(
         })?;
     let mut soname = None;
     let mut has_plt_relocations = false;
+    let mut bind_now = false;
     let mut has_lifecycle = false;
 
     let mut raw = [0; 16];
@@ -151,6 +153,9 @@ pub(crate) fn validate_dynamic_features<R: ElfReader>(
                 }
             }
             DT_PLTRELSZ | DT_PLTREL | DT_JMPREL => has_plt_relocations = true,
+            DT_BIND_NOW => bind_now = true,
+            DT_FLAGS if value & DF_BIND_NOW != 0 => bind_now = true,
+            DT_FLAGS_1 if value & DF_1_NOW != 0 => bind_now = true,
             DT_INIT | DT_FINI | DT_INIT_ARRAY | DT_FINI_ARRAY | DT_INIT_ARRAYSZ
             | DT_FINI_ARRAYSZ | DT_PREINIT_ARRAY | DT_PREINIT_ARRAYSZ => has_lifecycle = true,
             _ => {}
@@ -165,6 +170,9 @@ pub(crate) fn validate_dynamic_features<R: ElfReader>(
     // later, in S4.
     if role == ArtifactRole::SharedObject && soname.is_none() {
         return Err(dynamic_error(DT_SONAME, 0));
+    }
+    if has_plt_relocations && policy.requires_now_for_plt() && !bind_now {
+        return Err(unsupported_dynamic(DT_JMPREL, 0));
     }
 
     Ok(DynamicFeatureSummary {

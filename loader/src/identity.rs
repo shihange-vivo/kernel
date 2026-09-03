@@ -728,6 +728,7 @@ pub(crate) struct LoadPolicy {
 
     allow_needed: bool,
     allow_plt_relocations: bool,
+    require_now_for_plt: bool,
     allow_relr: bool,
     allow_lifecycle: bool,
     allow_search_paths: bool,
@@ -755,6 +756,7 @@ impl LoadPolicy {
 
             allow_needed: false,
             allow_plt_relocations: false,
+            require_now_for_plt: false,
             allow_relr: false,
             allow_lifecycle: false,
             allow_search_paths: false,
@@ -777,6 +779,7 @@ impl LoadPolicy {
         Self {
             allow_needed: true,
             allow_plt_relocations: true,
+            require_now_for_plt: true,
             allow_lifecycle: true,
             allow_dynamic_symbols: true,
             ..Self::phase0()
@@ -811,6 +814,11 @@ impl LoadPolicy {
     #[inline]
     pub const fn allows_lifecycle(&self) -> bool {
         self.allow_lifecycle
+    }
+
+    #[inline]
+    pub const fn requires_now_for_plt(&self) -> bool {
+        self.require_now_for_plt
     }
 
     /// Returns whether a non-empty PT_LOAD permission set is supported.
