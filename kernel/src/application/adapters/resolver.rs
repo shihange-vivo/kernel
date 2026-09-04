@@ -58,11 +58,21 @@ struct SystemCandidateClaim {
     snapshot: FileSnapshotId,
 }
 
+/// One `SystemCandidate` this link must load and publish, paired with the
+/// `DT_NEEDED` SONAME its permit was minted for. The `ApplicationLoader` uses
+/// the SONAME to match the permit to the candidate's published descriptor and
+/// per-image fini plan when it advances the registry to `Ready` (§13.3).
+pub struct SystemCandidatePermit {
+    pub soname: DependencyName,
+    pub permit: LoadPermit,
+}
+
 /// The registry authorities a staged link accumulated (C26 hands them to the
 /// kernel link publisher's receipt).
 pub struct ResolverAuthorities {
-    /// Publication permits for every `SystemCandidate` this link must load.
-    pub permits: Vec<LoadPermit>,
+    /// Publication permits for every `SystemCandidate` this link must load,
+    /// each paired with its SONAME so the publisher can advance the registry.
+    pub permits: Vec<SystemCandidatePermit>,
     /// Counted references to every Ready instance this link imported.
     pub leases: Vec<SystemDsoLease>,
 }
@@ -92,7 +102,10 @@ impl ApplicationArtifactResolver {
     pub fn finish_resolution(&mut self) -> ResolverAuthorities {
         let permits = core::mem::take(&mut self.candidates)
             .into_iter()
-            .map(|claim| claim.permit)
+            .map(|claim| SystemCandidatePermit {
+                soname: claim.soname,
+                permit: claim.permit,
+            })
             .collect();
         let leases = core::mem::take(&mut self.leases);
         ResolverAuthorities { permits, leases }
