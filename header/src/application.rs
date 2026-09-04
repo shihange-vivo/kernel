@@ -37,6 +37,9 @@ pub const APPLICATION_START_INFO_ABI_VERSION: u32 = 1;
 /// v1 of the application launch request (§9.2).
 pub const APPLICATION_LAUNCH_REQUEST_ABI_VERSION: u32 = 1;
 
+/// v1 of a [`BlueOsFunctionPlan`] constructor/destructor block.
+pub const FUNCTION_PLAN_ABI_VERSION: u32 = 1;
+
 /// A launch/query handle: slot index plus the generation that slot had when the
 /// handle was minted. Generation makes a stale handle fail after the slot is
 /// recycled (§14.3 ABA protection). Two `u32`s, never a pointer.
@@ -140,9 +143,10 @@ pub mod auxv {
     pub const AT_ENTRY: usize = 9;
     pub const AT_EXECFN: usize = 31;
 
-    /// The application's [`ApplicationHandle`] encoded as a single `usize`
-    /// (`slot` in the low half, `generation` in the high half on 64-bit;
-    /// both halves compressed on 32-bit).
+    /// The application's [`ApplicationHandle`]. The handle itself is carried in
+    /// [`BlueOsApplicationStartInfo::handle`]; `librs` resolves this synthetic
+    /// key from that field in `getauxval` rather than from a packed auxv value,
+    /// because `slot`+`generation` do not both fit a 32-bit `usize`.
     pub const AT_BLUEOS_HANDLE: usize = 0x1000;
     /// The `abi_version` of the start-information block this app received.
     pub const AT_BLUEOS_ABI_VERSION: usize = 0x1001;
