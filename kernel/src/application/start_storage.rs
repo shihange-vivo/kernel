@@ -54,7 +54,11 @@ pub struct ApplicationStartStorage {
     _auxv: Box<[BlueOsAuxvEntry]>,
     _init_targets: Box<[usize]>,
     _fini_targets: Box<[usize]>,
-    start_info: BlueOsApplicationStartInfo,
+    // Keep the start-info block in its own allocation. `ApplicationService`
+    // takes its address before moving this storage into the thread group; an
+    // inline field would move with `Self` and leave the new thread holding a
+    // pointer into the launcher's dead stack frame.
+    start_info: Box<[BlueOsApplicationStartInfo]>,
 }
 
 // SAFETY: every raw pointer in this struct (including the nested ones inside
@@ -126,6 +130,11 @@ impl ApplicationStartStorage {
             fini_plan,
             execfn,
         };
+        let mut pinned_start_info = Vec::new();
+        pinned_start_info
+            .try_reserve_exact(1)
+            .map_err(|_| StartStorageError::OutOfMemory)?;
+        pinned_start_info.push(start_info);
 
         Ok(Self {
             _argv_bytes: argv_bytes,
@@ -136,29 +145,30 @@ impl ApplicationStartStorage {
             _auxv: auxv,
             _init_targets: init_targets,
             _fini_targets: fini_targets,
-            start_info,
+            start_info: pinned_start_info.into_boxed_slice(),
         })
     }
 
     /// The pinned start-information block handed to `blueos_scrt1::_start`.
     #[inline]
     pub fn start_info(&self) -> &BlueOsApplicationStartInfo {
-        &self.start_info
+        // `build` always creates exactly one element.
+        &self.start_info[0]
     }
 
     /// A stable raw pointer to the block, for the thread entry argument.
     #[inline]
     pub fn start_info_ptr(&self) -> *const BlueOsApplicationStartInfo {
-        &self.start_info as *const BlueOsApplicationStartInfo
+        self.start_info.as_ptr()
     }
 }
+
+type OwnedStrings = (Box<[u8]>, Box<[*const core::ffi::c_char]>);
 
 /// Build the NUL-terminated string pool and C-style pointer array for a set of
 /// bounded string views. The returned pointer array is `len + 1` slots with a
 /// null terminator, matching the POSIX `main(argc, argv)` shape (§15.3).
-fn build_strings(
-    views: &[BlueOsStringView],
-) -> Result<(Box<[u8]>, Box<[*const core::ffi::c_char]>), StartStorageError> {
+fn build_strings(views: &[BlueOsStringView]) -> Result<OwnedStrings, StartStorageError> {
     let mut total = 0usize;
     for view in views {
         total = total
