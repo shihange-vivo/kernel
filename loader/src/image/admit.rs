@@ -18,7 +18,7 @@ use goblin::{
         dynamic::DT_SONAME,
         program_header::{
             PF_R, PF_W, PF_X, PT_ARM_EXIDX, PT_DYNAMIC, PT_GNU_EH_FRAME, PT_GNU_RELRO,
-            PT_GNU_STACK, PT_INTERP, PT_LOAD, PT_PHDR, PT_TLS,
+            PT_GNU_STACK, PT_INTERP, PT_LOAD, PT_NOTE, PT_PHDR, PT_TLS,
         },
     },
     elf64,
@@ -279,6 +279,10 @@ impl<R: ElfReader> AdmittedImage<R> {
                     phdr_vaddr = Some(program_header.vaddr());
                 }
                 PT_GNU_EH_FRAME => {}
+                // Phase 1 artifacts carry a build-id/ABI note in PT_NOTE; the
+                // program header itself is structurally harmless, and the
+                // note content is the artifact policy's admission concern.
+                PT_NOTE => {}
                 PT_ARM_EXIDX if self.header.machine() == ElfMachine::Arm => {}
                 PT_RISCV_ATTRIBUTES if self.header.machine() == ElfMachine::Riscv => {}
                 t => {
