@@ -390,6 +390,21 @@ create_thread(spawn_args_ptr: *const SpawnArgs) -> c_long {
     let t = Builder::new(Entry::Posix(spawn_args.entry, spawn_args.arg))
                 .set_stack(stack)
                 .build();
+    #[cfg(enable_vfs)]
+    {
+        // C27: a thread created from inside an application inherits the creator's
+        // thread-group membership; the application never supplies a group id
+        // (§16.1). The group holds a strong reference to this new member, and the
+        // member holds only a weak reference back, so there is no reference cycle.
+        let current = scheduler::current_thread();
+        let group = current.lock().membership().and_then(|m| m.upgrade());
+        if let Some(group) = group {
+            let membership =
+                crate::application::group::ThreadGroupMembership::downgrade(&group);
+            t.lock().set_membership(membership);
+            let _ = group.add_member(t.clone());
+        }
+    }
     if let Some(cleanup) = spawn_args.cleanup {
         t.lock().set_cleanup(Entry::Posix(cleanup, spawn_args.arg));
     };

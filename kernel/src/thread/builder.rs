@@ -105,6 +105,8 @@ pub struct Builder {
     stack: Option<Stack>,
     entry: Entry,
     priority: ThreadPriority,
+    #[cfg(enable_vfs)]
+    membership: Option<crate::application::group::ThreadGroupMembership>,
 }
 
 impl Builder {
@@ -113,6 +115,8 @@ impl Builder {
             stack: None,
             entry,
             priority: config::MAX_THREAD_PRIORITY / 2,
+            #[cfg(enable_vfs)]
+            membership: None,
         }
     }
 
@@ -128,6 +132,18 @@ impl Builder {
         self
     }
 
+    /// Attach the built thread to an application thread group (C27, §16.1).
+    ///
+    /// Only the group backend and `CreateThread` (which inherits from the
+    /// creator) set this; it is never exposed as an application-supplied group
+    /// id. A static kernel thread leaves it unset.
+    #[cfg(enable_vfs)]
+    #[inline]
+    pub fn set_membership(mut self, membership: crate::application::group::ThreadGroupMembership) -> Self {
+        self.membership = Some(membership);
+        self
+    }
+
     pub fn build(mut self) -> ThreadNode {
         let thread = ThreadNode::new(Thread::new(ThreadKind::Normal));
         let mut w = thread.lock();
@@ -138,6 +154,10 @@ impl Builder {
         w.init(stack, self.entry);
         w.set_origin_priority(self.priority);
         w.set_priority(self.priority);
+        #[cfg(enable_vfs)]
+        if let Some(membership) = self.membership.take() {
+            w.set_membership(membership);
+        }
         drop(w);
         GlobalQueueVisitor::add(thread.clone());
 

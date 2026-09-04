@@ -41,6 +41,9 @@ use core::{
     sync::atomic::{AtomicI32, AtomicUsize, Ordering},
 };
 
+#[cfg(enable_vfs)]
+use crate::application::group::ThreadGroupMembership;
+
 mod builder;
 pub use builder::*;
 
@@ -197,6 +200,11 @@ pub struct Thread {
     // Cleanup function will be invoked when retiring.
     cleanup: Option<Entry>,
     kind: ThreadKind,
+    // Which application thread group this thread belongs to, if any (C27,
+    // §16.1). `None` for a static kernel thread. A `pthread` created inside an
+    // application inherits this from its creator.
+    #[cfg(enable_vfs)]
+    membership: Option<ThreadGroupMembership>,
     // Thread owns Stack::Alloc. It calls dealloc when dropping its self.
     stack: Stack,
     // If saved_sp is 0, the thread should be in RUNNING state. Otherwise, it's
@@ -402,6 +410,24 @@ impl Thread {
         self.cleanup = Some(cleanup);
     }
 
+    /// The application thread group this thread belongs to, if any (C27,
+    /// §16.1). Static kernel threads return `None`.
+    #[cfg(enable_vfs)]
+    #[inline]
+    pub fn membership(&self) -> Option<&ThreadGroupMembership> {
+        self.membership.as_ref()
+    }
+
+    /// Attach a thread to an application thread group. Only ever set by the
+    /// group backend (main thread) or inherited from the creating thread
+    /// (`CreateThread`); never supplied by the application itself (§16.1).
+    #[cfg(enable_vfs)]
+    #[inline]
+    pub fn set_membership(&mut self, membership: ThreadGroupMembership) -> &mut Self {
+        self.membership = Some(membership);
+        self
+    }
+
     #[inline]
     pub fn add_acquired_mutex(&self, mu: Arc<Mutex>) -> bool {
         self.acquired_mutexes.irqsave_write().push_back(mu)
@@ -433,6 +459,8 @@ impl Thread {
     const fn new(kind: ThreadKind) -> Self {
         Self {
             cleanup: None,
+            #[cfg(enable_vfs)]
+            membership: None,
             stack: Stack::new(),
             state: AtomicUint::new(IDLE),
             lock: ISpinLock::new(),
