@@ -667,8 +667,20 @@ impl<'a, M: ImageMemory + ?Sized, A: ArchRelocator> BuildingSession<'a, M, A> {
                     // (§12.1). It never contributes a `DT_NEEDED` of its own
                     // here: its dependency closure was fixed by the link that
                     // first published it.
-                    let needed = needed_for(&self.state.images, requester, item.needed_index())?;
+                    //
+                    // Identity de-duplication mirrors the Load path (§5.3 rule
+                    // 1): an already-present imported provider only records an
+                    // extra edge, never a second `ImportedImage` entry.
                     let identity = descriptor.identity().try_clone()?;
+                    if let Some(existing) = self.graph.find_identity(&identity) {
+                        self.graph
+                            .link_existing(requester, existing, item.needed_index())
+                            .map_err(|error| error.at_stage(LoadStage::Discover))?;
+                        self.metrics.record_edge();
+                        continue;
+                    }
+
+                    let needed = needed_for(&self.state.images, requester, item.needed_index())?;
                     let soname = descriptor.soname().map(DependencyName::try_clone).transpose()?;
                     let provider = self
                         .graph
@@ -1381,8 +1393,13 @@ fn needed_for(
     requester: ImageId,
     needed_index: u16,
 ) -> LoadResult<&DependencyName> {
+    // Loaded images are stored in discovery order, not image-id order, so a
+    // requester id can outrun its dense position once an import interleaves.
+    // Look up by id (only loaded images enqueue `DT_NEEDED`, so a requester is
+    // always present here).
     images
-        .get(requester.get() as usize)
+        .iter()
+        .find(|image| image.image_id == requester)
         .and_then(|image| {
             image
                 .state
