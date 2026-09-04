@@ -25,7 +25,7 @@
 //! same membership set from the manager's slot table without holding the
 //! manager's lock.
 
-use alloc::sync::Arc;
+use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
 use spin::Mutex;
 
@@ -73,6 +73,50 @@ impl Clone for ThreadGroup {
         Self {
             inner: Arc::clone(&self.inner),
         }
+    }
+}
+
+/// A thread's membership in an application thread group (C27, §16.1).
+///
+/// Held by every thread that runs inside a dynamic application; a static kernel
+/// thread carries `None` instead. `Clone` yields another weak handle onto the
+/// same [`ThreadGroup`], so a `pthread` created while running inside an
+/// application inherits the creator's membership and joins the same group.
+///
+/// The handle is *weak* by design: the group holds a strong [`ThreadNode`] for
+/// every member, so a strong membership back-reference would form a reference
+/// cycle and leak the whole group (§16.1 "group 在 Draining 后拒绝创建新线程").
+/// [`ThreadGroupMembership::upgrade`] re-acquires the group while it is still
+/// live; once the last strong reference (the manager slot + live members) drops,
+/// the group is reclaimed and `upgrade` returns `None`.
+///
+/// The `Debug` impl prints only a marker: the wrapped group owns a live link
+/// product and member list that must never be formatted under a derived `Debug`
+/// reachable from the scheduler's interrupt context.
+#[derive(Clone)]
+pub struct ThreadGroupMembership {
+    inner: Weak<Mutex<GroupInner>>,
+}
+
+impl ThreadGroupMembership {
+    /// A weak handle onto `group`, minted by the group's owner when a thread
+    /// joins it.
+    pub fn downgrade(group: &ThreadGroup) -> Self {
+        Self {
+            inner: Arc::downgrade(&group.inner),
+        }
+    }
+
+    /// Re-acquire the group if it is still live. Returns `None` once the last
+    /// strong reference has dropped and the group has been reclaimed.
+    pub fn upgrade(&self) -> Option<ThreadGroup> {
+        self.inner.upgrade().map(|inner| ThreadGroup { inner })
+    }
+}
+
+impl core::fmt::Debug for ThreadGroupMembership {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str("ThreadGroupMembership { .. }")
     }
 }
 
