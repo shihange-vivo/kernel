@@ -123,6 +123,7 @@ impl Inner {
 ///
 /// `Clone` yields another handle onto the same ring, so the scheduler cleanup
 /// and the exit coordinator reach the same events without transferring the queue.
+#[derive(Clone)]
 pub struct ApplicationEventQueue {
     inner: Arc<Mutex<Inner>>,
 }

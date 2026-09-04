@@ -32,7 +32,10 @@ use spin::Mutex;
 use blueos_loader::LinkProduct;
 
 use crate::{
-    application::publication::KernelLinkReceipt,
+    application::{
+        event_queue::{ApplicationEvent, ApplicationEventQueue},
+        publication::KernelLinkReceipt,
+    },
     thread::{Thread, ThreadNode},
 };
 
@@ -77,6 +80,8 @@ pub enum ThreadGroupError {
     AlreadyLinked,
     /// `add_member` while the group is draining or reaped (§16.1).
     Draining,
+    /// `add_member` could not reserve the member's exit-event slot (§16.3).
+    EventReservationFailed,
     /// `begin_exit` on a group that has not installed a link product.
     NotLinked,
     /// A duplicate `begin_exit` on a group already draining (§16.5).
@@ -101,6 +106,10 @@ struct GroupInner {
     product: Option<LinkProduct<KernelLinkReceipt>>,
     /// The fini-plan disposition, set only once draining begins (§16.4).
     fini: ExitFini,
+    /// The bounded, capacity-guaranteed exit-event queue the scheduler's
+    /// context-switch cleanup delivers into (§16.3). One slot per member is
+    /// reserved up front, so the cleanup path never allocates.
+    events: ApplicationEventQueue,
 }
 
 /// A per-application thread group. `Clone` yields another handle onto the same
@@ -169,6 +178,7 @@ impl ThreadGroup {
                 members: Vec::new(),
                 product: None,
                 fini: ExitFini::Pending,
+                events: ApplicationEventQueue::default(),
             })),
         }
     }
@@ -217,6 +227,14 @@ impl ThreadGroup {
         {
             return Err(ThreadGroupError::AlreadyMember);
         }
+        // Reserve the exit-event slot before counting the member, so the
+        // scheduler's cleanup path always has capacity to record this thread's
+        // exit (§16.3). On allocation failure the member is rejected rather than
+        // admitted without a slot — the alternative would risk dropping its
+        // last-exit notification under OOM.
+        if !inner.events.reserve_capacity(1) {
+            return Err(ThreadGroupError::EventReservationFailed);
+        }
         inner.members.push(thread);
         Ok(())
     }
@@ -232,6 +250,37 @@ impl ThreadGroup {
             .ok_or(ThreadGroupError::NotMember)?;
         inner.members.swap_remove(index);
         Ok(())
+    }
+
+    /// Retire a member from the coordinator side: remove it from the membership
+    /// set and enqueue an [`ApplicationEvent::ExecutionUnitExited`] into the
+    /// group's exit-event queue (§16.3).
+    ///
+    /// This is the coordinator's counterpart to the scheduler's lock-free post
+    /// into [`ThreadGroup::events`]: the coordinator drains posted exits under
+    /// the group lock, retiring the member so [`ThreadGroup::take_resources_for_reap`]
+    /// can observe an empty membership set. The enqueue never allocates —
+    /// capacity was reserved by [`ThreadGroup::add_member`] — so it can only
+    /// fail if a member was admitted without a slot (a programming error).
+    pub fn record_member_exit(&self, id: usize) -> Result<(), ThreadGroupError> {
+        let mut inner = self.inner.lock();
+        let index = inner
+            .members
+            .iter()
+            .position(|member| Thread::id(member) == id)
+            .ok_or(ThreadGroupError::NotMember)?;
+        inner.members.swap_remove(index);
+        let evicted = inner.events.enqueue_or_oldest(ApplicationEvent::ExecutionUnitExited {
+            thread_id: id,
+        });
+        debug_assert!(evicted.is_none(), "exit-event slot was not reserved");
+        Ok(())
+    }
+
+    /// A cloneable handle onto the group's exit-event queue, for the exit
+    /// coordinator to drain member exits (§16.3).
+    pub fn events(&self) -> ApplicationEventQueue {
+        self.inner.lock().events.clone()
     }
 
     /// The number of live member threads.
