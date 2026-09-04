@@ -42,18 +42,23 @@ use blueos_loader::{
     LoadError, LoadErrorKind, LoadResult, PreparedLinkManifest,
 };
 
-use crate::application::group::{GroupState, ThreadGroup};
+use crate::application::{
+    group::{GroupState, ThreadGroup},
+    registry::SystemDsoLease,
+};
 
 /// The long-term owner of a committed link's raw allocation leases (§15.1).
 ///
-/// The counted [`SystemDsoLease`](crate::application::registry::SystemDsoLease)
-/// set a link acquires for its *imported* Ready DSOs is not carried here: those
-/// references are minted by the resolver after the link resolves and are moved
-/// into the application's start storage by the loader (C26-b), alongside the
-/// link-map generation.
+/// Besides the raw [`AllocationLease`]s (split by residency), the receipt holds
+/// the counted [`SystemDsoLease`] set the resolver minted for every Ready DSO
+/// this link *imported*. Those references keep the imported provider leased for
+/// the whole application lifetime — invariant #10: the root and every provider
+/// lease stay valid across `main`/fini — and their `Drop` is what delivers the
+/// registry's quiescence event after the last application releases them (§13.3).
 pub struct KernelLinkReceipt {
     private_allocations: Vec<AllocationLease>,
     system_allocations: Vec<AllocationLease>,
+    system_leases: Vec<SystemDsoLease>,
 }
 
 impl KernelLinkReceipt {
@@ -67,6 +72,13 @@ impl KernelLinkReceipt {
     #[inline]
     pub fn system_allocations(&self) -> &[AllocationLease] {
         &self.system_allocations
+    }
+
+    /// The counted references to every Ready DSO this link imported, held for
+    /// the application lifetime (§13.3, §15.1).
+    #[inline]
+    pub fn system_leases(&self) -> &[SystemDsoLease] {
+        &self.system_leases
     }
 }
 
@@ -83,17 +95,33 @@ pub struct KernelLinkPreparedBatch {
 
 /// The kernel publication boundary (S9, §15.1).
 ///
-/// `prepare_batch` re-verifies the target group is still unlinked and
-/// precomputes the private/system split from the manifest; `commit_batch` then
-/// only moves the leases into their owning side of the receipt.
+/// `prepare_batch` re-verifies the target group is still unlinked, checks the
+/// imported Ready leases against the manifest's imported nodes, and precomputes
+/// the private/system split from the manifest; `commit_batch` then only moves
+/// the raw leases and the imported leases into the receipt.
 pub struct KernelLinkPublisher {
     group: ThreadGroup,
+    /// The counted references to every Ready DSO this link imported, minted by
+    /// the resolver and moved in by [`KernelLinkPublisher::import_leases`]
+    /// before `publish` is driven. `commit_batch` moves them into the receipt.
+    system_leases: Vec<SystemDsoLease>,
 }
 
 impl KernelLinkPublisher {
     /// Build a publisher that will publish into `group`.
     pub fn new(group: ThreadGroup) -> Self {
-        Self { group }
+        Self {
+            group,
+            system_leases: Vec::new(),
+        }
+    }
+
+    /// Hand over the imported Ready DSO leases the resolver accumulated, for the
+    /// receipt to own across the application lifetime (§15.1). Must be called
+    /// after dependency resolution and before `publish`; `prepare_batch` verifies
+    /// they correspond one-to-one with the manifest's imported nodes.
+    pub fn import_leases(&mut self, leases: Vec<SystemDsoLease>) {
+        self.system_leases = leases;
     }
 
     /// The group this publisher installs into, for the `ApplicationLoader` to
@@ -116,16 +144,20 @@ impl LinkPublisher for KernelLinkPublisher {
 
         // The rollback log drains in creation order, which is exactly the order
         // the manifest lists loaded images (the root id 0 first, then each
-        // discovered dependency in id order); imported Ready images carry no
-        // lease and are skipped here (§12.1). Record the residency of each
+        // discovered dependency in id order); imported Ready images carry no raw
+        // lease and are skipped here (§12.1). Record the residency of each raw
         // lease so `commit_batch` can partition without re-deriving it, and
-        // reserve the commit sinks up front.
+        // reserve the commit sinks up front. Every imported node must have a
+        // matching counted lease minted by the resolver — a mismatch means the
+        // resolver hand-off was skipped and the link must not publish (§15.1).
+        let mut imported_nodes = 0usize;
         let mut owners = Vec::new();
         let mut private_cap = 0usize;
         let mut system_cap = 0usize;
         for entry in manifest.link_map() {
             let ownership = entry.ownership();
             if ownership == ImageOwnership::ExternalReady {
+                imported_nodes += 1;
                 continue;
             }
             owners.try_reserve(1).map_err(|_| publish_oom())?;
@@ -135,6 +167,9 @@ impl LinkPublisher for KernelLinkPublisher {
             } else {
                 system_cap += 1;
             }
+        }
+        if imported_nodes != self.system_leases.len() {
+            return Err(publish_error());
         }
 
         let mut private = Vec::new();
@@ -179,6 +214,7 @@ impl LinkPublisher for KernelLinkPublisher {
         KernelLinkReceipt {
             private_allocations: private,
             system_allocations: system,
+            system_leases: core::mem::take(&mut self.system_leases),
         }
     }
 }
