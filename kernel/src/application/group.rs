@@ -190,18 +190,17 @@ impl core::fmt::Debug for ThreadGroupMembership {
 
 impl ThreadGroup {
     fn with_state(state: GroupState) -> Self {
-        Self {
-            inner: Arc::new(Mutex::new(GroupInner {
-                state,
-                members: Vec::new(),
-                handle: None,
-                product: None,
-                start_storage: None,
-                fini: ExitFini::Pending,
-                events: ApplicationEventQueue::default(),
-                members_epoch: Arc::new(AtomicUsize::new(0)),
-            })),
-        }
+        let inner = Arc::new(Mutex::new(GroupInner {
+            state,
+            members: Vec::new(),
+            handle: None,
+            product: None,
+            start_storage: None,
+            fini: ExitFini::Pending,
+            events: ApplicationEventQueue::default(),
+            members_epoch: Arc::new(AtomicUsize::new(0)),
+        }));
+        Self { inner }
     }
 
     /// The group's current state.
@@ -348,7 +347,7 @@ impl ThreadGroup {
             // The epoch reference is owned by the group and only bumped
             // monotonically; parking on a stale value is safe because a member
             // exit re-checks the count after the wake.
-            let _ = crate::sync::atomic_wait(&*epoch, epoch_value, crate::time::Tick::MAX);
+            let _ = crate::sync::atomic_wait(&epoch, epoch_value, crate::time::Tick::MAX);
         }
     }
 
@@ -465,7 +464,7 @@ impl ThreadGroup {
 /// lock-free: safe in the scheduler's interrupt-disabled cleanup path.
 fn bump_members_epoch(epoch: &Arc<AtomicUsize>) {
     epoch.fetch_add(1, Ordering::Release);
-    let _ = crate::sync::atomic_wake(&**epoch, usize::MAX);
+    let _ = crate::sync::atomic_wake(epoch, usize::MAX);
 }
 
 /// The backend that mints fresh, not-yet-running thread groups (§14.1).

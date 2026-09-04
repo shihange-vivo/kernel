@@ -166,6 +166,12 @@ impl ArtifactResolver for ApplicationArtifactResolver {
                         soname: needed.clone(),
                         snapshot,
                     });
+                    // C29 oracle: this link is the first loading generation
+                    // for the SONAME (§18.5).
+                    log::info!(
+                        "DSO_LOAD soname={}",
+                        core::str::from_utf8(needed.as_bytes()).unwrap_or("<non-utf8>")
+                    );
                     return Ok(DependencyResolution::Load(ResolvedArtifact::new(
                         identity_from_snapshot(snapshot, entry.build_id),
                         ImageOwnership::SystemCandidate,
@@ -180,6 +186,11 @@ impl ArtifactResolver for ApplicationArtifactResolver {
                         .descriptor(domain, needed)
                         .ok_or_else(backend_error)?;
                     self.leases.push(lease);
+                    // C29 oracle: the mapped Ready instance is reused (§18.5).
+                    log::info!(
+                        "DSO_REUSE soname={}",
+                        core::str::from_utf8(needed.as_bytes()).unwrap_or("<non-utf8>")
+                    );
                     return Ok(DependencyResolution::Import(
                         ImportedImageDescriptor::new(descriptor),
                     ));

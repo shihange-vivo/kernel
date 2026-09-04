@@ -1021,7 +1021,16 @@ mod application_syscalls {
             return -(libc::ENOSYS as c_long);
         };
         match service.manager().complete_init(handle) {
-            Ok(()) => 0,
+            Ok(()) => {
+                // C29 oracle (§18.5): init completion marks the public
+                // Loading → Running transition.
+                log::info!(
+                    "APP_INIT_COMPLETE handle={}:{}",
+                    handle.slot,
+                    handle.generation
+                );
+                0
+            }
             Err(_) => -(libc::EINVAL as c_long),
         }
     }

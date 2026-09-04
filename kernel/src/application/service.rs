@@ -139,6 +139,16 @@ impl ApplicationService {
         if let Some(group) = handle.and_then(|handle| self.manager.group(handle)) {
             self.reaper.register(&group);
         }
+        if let Ok(handle) = result {
+            // C29 oracle (§18.5): the launch path for the shell/checker to
+            // correlate applications, DSO generations and reaps.
+            log::info!(
+                "APP_LAUNCHED handle={}:{} path={}",
+                handle.slot,
+                handle.generation,
+                path
+            );
+        }
         result
     }
 

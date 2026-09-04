@@ -97,7 +97,7 @@ impl ApplicationReaper {
     pub fn register(&self, group: &ThreadGroup) {
         self.pending.lock().push(group.clone());
         self.wake.fetch_add(1, Ordering::Release);
-        let _ = crate::sync::atomic_wake(&*self.wake, usize::MAX);
+        let _ = crate::sync::atomic_wake(&self.wake, usize::MAX);
     }
 
     /// Spawn the kernel reaper thread. It owns clones of the reaper and the
@@ -122,7 +122,7 @@ impl ApplicationReaper {
             // shared state with no wake plumbing into this thread, so the poll
             // bound is what makes the reaper eventually observe them (§16.4).
             let _ = crate::sync::atomic_wait(
-                &*self.wake,
+                &self.wake,
                 epoch,
                 crate::time::Tick::from_millis(REAPER_POLL_MILLIS),
             );
@@ -177,9 +177,25 @@ impl ApplicationReaper {
                 }
             }
         }
-        if self.reap(group).is_err() {
-            // Not ready after all (a member raced back in); retry next scan.
-            return false;
+        match self.reap(group) {
+            Ok(report) => {
+                // C29 oracle (§18.5): the checker asserts the private image
+                // count and the imported-DSO count of every reap.
+                if let Some(handle) = group.handle() {
+                    log::info!(
+                        "APP_REAP handle={}:{} private_images={} imported_dsos={}",
+                        handle.slot,
+                        handle.generation,
+                        report.private_images,
+                        report.imported_dsos
+                    );
+                }
+            }
+            Err(_) => {
+                // Not ready after all (a member raced back in); retry next
+                // scan.
+                return false;
+            }
         }
         self.finish_slot(group, manager)
     }
