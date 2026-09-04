@@ -76,6 +76,7 @@ impl TmpFileSystem {
                         0,
                     ),
                     data: TmpFileData::Directory(TmpDir::new(weak_root)),
+                    generation: 0,
                 }),
                 this: weak_root.clone(),
                 fs: weak_fs.clone(),
@@ -177,6 +178,7 @@ impl TmpInode {
             inner: RwLock::new(InnerNode {
                 attr: InodeAttr::new(inode_no, InodeFileType::Regular, mode, uid, gid, 0),
                 data: TmpFileData::File(Vec::new()),
+                generation: 0,
             }),
             this: weak_inode.clone(),
             fs: fs.clone(),
@@ -195,6 +197,7 @@ impl TmpInode {
             inner: RwLock::new(InnerNode {
                 attr: InodeAttr::new(inode_no, InodeFileType::Directory, mode, uid, gid, 0),
                 data: TmpFileData::Directory(TmpDir::new(parent)),
+                generation: 0,
             }),
             this: weak_inode.clone(),
             fs: fs.clone(),
@@ -220,6 +223,7 @@ impl TmpInode {
                     0,
                 ),
                 data: TmpFileData::Device(device),
+                generation: 0,
             }),
             this: weak_inode.clone(),
             fs: fs.clone(),
@@ -237,6 +241,7 @@ impl TmpInode {
             inner: RwLock::new(InnerNode {
                 attr: InodeAttr::new(inode_no, InodeFileType::Socket, mode, uid, gid, 0),
                 data: TmpFileData::Socket(),
+                generation: 0,
             }),
             this: weak_inode.clone(),
             fs: fs.clone(),
@@ -248,6 +253,10 @@ impl TmpInode {
 struct InnerNode {
     attr: InodeAttr,
     data: TmpFileData,
+    /// Monotonic content-generation counter (§11.2), bumped on every write
+    /// or resize. Readers snapshot this value and re-validate it to detect a
+    /// source that changed mid-load.
+    generation: u64,
 }
 
 impl InnerNode {
@@ -466,6 +475,7 @@ impl InodeOps for TmpInode {
         if need_resize {
             inner.attr.size = write_end;
         }
+        inner.generation = inner.generation.wrapping_add(1);
 
         Ok(buf.len())
     }
@@ -637,6 +647,7 @@ impl InodeOps for TmpInode {
         };
         data.resize(size, 0);
         inner.attr.size = size;
+        inner.generation = inner.generation.wrapping_add(1);
         Ok(())
     }
 
@@ -682,6 +693,10 @@ impl InodeOps for TmpInode {
 
     fn size(&self) -> usize {
         self.inner.read().reported_size()
+    }
+
+    fn content_generation(&self) -> u64 {
+        self.inner.read().generation
     }
 
     delegate! {

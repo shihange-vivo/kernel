@@ -229,6 +229,14 @@ pub trait InodeOps: Any + Sync + Send {
     fn file_attr(&self) -> FileAttr;
     fn mode(&self) -> InodeMode;
     fn size(&self) -> usize;
+    /// Monotonic content-generation counter, bumped by every content mutation
+    /// (write, truncate, replace). Returns `0` when the filesystem cannot
+    /// provide a stable generation; such files may only serve as immutable
+    /// build-time catalog artifacts, never as writable executable sources
+    /// (§11.2).
+    fn content_generation(&self) -> u64 {
+        0
+    }
     fn atime(&self) -> Duration;
     fn set_atime(&self, time: Duration);
     fn mtime(&self) -> Duration;
