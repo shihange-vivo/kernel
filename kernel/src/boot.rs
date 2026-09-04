@@ -128,6 +128,13 @@ extern "C" fn init() {
 
     scheduler::init();
     logger::logger_init();
+    // C29 §18.2: seed the embedded dynamic system image and assemble the
+    // application stack (VFS/flat memory/registry/manager/reaper) before the
+    // first thread runs.
+    #[cfg(boot_dynamic_seed)]
+    {
+        crate::application::seed::init();
+    }
     time::timer::init();
     #[cfg(kernel_async)]
     asynk::init();

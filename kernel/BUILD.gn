@@ -177,6 +177,10 @@ build_rust("blueos") {
   deps = _shared_deps
   public_deps = board_deps
   public_deps += [ "//kernel/kconfig:generate_rustflags_file" ]
+  if (defined(boot_dynamic_seed) && boot_dynamic_seed) {
+    public_deps += [ ":boot_seed_blobs" ]
+    cfgs += [ "boot_dynamic_seed" ]
+  }
   public_configs += [
     "//kernel/kconfig:kconfigs",
     "//build/boards/${board}:kernel_config",
@@ -185,6 +189,35 @@ build_rust("blueos") {
 
 run_clippy("blueos_clippy") {
   deps = [ ":blueos" ]
+}
+
+# C29 §18.1: embed the dynamic system image (the hello PIE and libc.so.1)
+# into the kernel so boot can seed the root tmpfs without semihosting.
+# Gated per board via `boot_dynamic_seed` (only qemu_mps2_an385 for Phase 1).
+if (defined(boot_dynamic_seed) && boot_dynamic_seed) {
+  action("gen_boot_seed_blob_asm") {
+    script = "//build/scripts/gen_seed_blob_asm.py"
+    deps = [
+      "//apps/example/dynamic/hello:hello",
+      "//librs:libc",
+    ]
+    outfile = "${target_gen_dir}/boot_seed_blobs.S"
+    args = [
+      "--out",
+      rebase_path(outfile),
+      "--blob",
+      "hello," + rebase_path("${root_out_dir}/bin/hello"),
+      "--blob",
+      "libc," + rebase_path("${root_out_dir}/lib/liblibrs.so"),
+    ]
+    outputs = [ outfile ]
+  }
+
+  static_library("boot_seed_blobs") {
+    sources = get_target_outputs(":gen_boot_seed_blob_asm")
+    deps = [ ":gen_boot_seed_blob_asm" ]
+    configs += [ "//build/boards/${board}:kernel_config" ]
+  }
 }
 
 cbindgen("rust_wrapper") {
