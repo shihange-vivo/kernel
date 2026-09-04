@@ -13,7 +13,8 @@
 // limitations under the License.
 
 //! Platform adapters that bind the loader's neutral contracts to the kernel's
-//! VFS, memory and cache services (C23-b).
+//! VFS, memory and cache services (C23-b/C23-c).
 
+pub mod flat_memory;
 pub mod system_paths;
 pub mod vfs_reader;
