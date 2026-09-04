@@ -36,13 +36,37 @@ use crate::{
     thread::{Thread, ThreadNode},
 };
 
-/// The lifecycle of a thread group's internal state.
+/// The lifecycle of a thread group's internal state (§6.3).
+///
+/// This is the execution backend's internal state, distinct from the public
+/// [`crate::application::manager::ApplicationState`]: the backend tracks the
+/// link install and the two-phase exit, while the public state tracks the
+/// application's `Loading → Running → Stopping → Terminated/Failed` lifecycle.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum GroupState {
     /// Created, no threads running, no link product installed (§14.2 step 3).
     New,
-    /// A link product is installed (C26); the entry is publishable.
+    /// A link product is installed (C26); threads may join and the entry is
+    /// publishable.
     Linked,
+    /// `ApplicationBeginExit` has run: no new threads may join, and the exit
+    /// coordinator is waiting for members to leave before reaping (§16.1).
+    Draining,
+    /// The reaper took the group's resources; no further lifecycle calls are
+    /// valid (§16.4).
+    Reaped,
+}
+
+/// Whether the application's destructors ran before reaping (§16.4).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ExitFini {
+    /// Not yet run and not yet skipped.
+    Pending,
+    /// Normal path: the exit coordinator ran the fini plan and completed.
+    Complete,
+    /// Abnormal path: the coordinator recorded `SkipFini` and destructors will
+    /// not run.
+    Skipped,
 }
 
 /// Errors the group reports without panicking.
@@ -51,6 +75,20 @@ pub enum ThreadGroupError {
     AlreadyMember,
     NotMember,
     AlreadyLinked,
+    /// `add_member` while the group is draining or reaped (§16.1).
+    Draining,
+    /// `begin_exit` on a group that has not installed a link product.
+    NotLinked,
+    /// A duplicate `begin_exit` on a group already draining (§16.5).
+    AlreadyDraining,
+    /// A lifecycle call that requires a draining group was made too early.
+    NotDraining,
+    /// `take_resources_for_reap` before fini completed or was skipped (§16.4).
+    FiniPending,
+    /// `take_resources_for_reap` while member threads remain (§16.4).
+    MembersRemaining,
+    /// The group's resources were already taken (§16.4).
+    AlreadyReaped,
 }
 
 struct GroupInner {
@@ -58,8 +96,11 @@ struct GroupInner {
     members: Vec<ThreadNode>,
     /// The committed link product (C26). Owned here so its `KernelLinkReceipt`
     /// keeps every private/system allocation lease alive until the C27 reaper
-    /// takes them; `None` while the group is [`GroupState::New`].
+    /// takes them; `None` while the group is [`GroupState::New`] or after the
+    /// reaper moved it out.
     product: Option<LinkProduct<KernelLinkReceipt>>,
+    /// The fini-plan disposition, set only once draining begins (§16.4).
+    fini: ExitFini,
 }
 
 /// A per-application thread group. `Clone` yields another handle onto the same
@@ -127,6 +168,7 @@ impl ThreadGroup {
                 state,
                 members: Vec::new(),
                 product: None,
+                fini: ExitFini::Pending,
             })),
         }
     }
@@ -159,9 +201,14 @@ impl ThreadGroup {
 
     /// Record `thread` as a member of this group. A thread may join a group at
     /// most once; a duplicate id is rejected so membership stays countable for
-    /// the C27 reaper.
+    /// the C27 reaper. Once the group is draining (or reaped) it rejects new
+    /// members, so the membership set can only shrink after `begin_exit` (§16.1).
     pub fn add_member(&self, thread: ThreadNode) -> Result<(), ThreadGroupError> {
         let mut inner = self.inner.lock();
+        match inner.state {
+            GroupState::Draining | GroupState::Reaped => return Err(ThreadGroupError::Draining),
+            _ => {}
+        }
         let id = Thread::id(&thread);
         if inner
             .members
@@ -195,6 +242,83 @@ impl ThreadGroup {
     /// Whether the group has no live members (§16.5 quiescence precondition).
     pub fn is_empty(&self) -> bool {
         self.member_count() == 0
+    }
+
+    /// Begin the two-phase exit: atomically forbid new threads and move the
+    /// group from `Linked` to `Draining` (§16.2). Only the exit coordinator for
+    /// this group may call it; a duplicate or out-of-order call is rejected.
+    pub fn begin_exit(&self) -> Result<(), ThreadGroupError> {
+        let mut inner = self.inner.lock();
+        match inner.state {
+            GroupState::Linked => {
+                inner.state = GroupState::Draining;
+                Ok(())
+            }
+            GroupState::Draining => Err(ThreadGroupError::AlreadyDraining),
+            GroupState::New => Err(ThreadGroupError::NotLinked),
+            GroupState::Reaped => Err(ThreadGroupError::AlreadyReaped),
+        }
+    }
+
+    /// Record that the normal-path destructor plan completed (§16.4). Must be
+    /// called exactly once, while draining.
+    pub fn finish_fini(&self) -> Result<(), ThreadGroupError> {
+        let mut inner = self.inner.lock();
+        if inner.state != GroupState::Draining {
+            return Err(ThreadGroupError::NotDraining);
+        }
+        if inner.fini != ExitFini::Pending {
+            return Err(ThreadGroupError::AlreadyReaped);
+        }
+        inner.fini = ExitFini::Complete;
+        Ok(())
+    }
+
+    /// Record that the destructors are intentionally skipped with a recorded
+    /// reason (abnormal path, §16.4). Must be called exactly once, while
+    /// draining, and only before a normal `finish_fini`.
+    pub fn skip_fini(&self) -> Result<(), ThreadGroupError> {
+        let mut inner = self.inner.lock();
+        if inner.state != GroupState::Draining {
+            return Err(ThreadGroupError::NotDraining);
+        }
+        if inner.fini != ExitFini::Pending {
+            return Err(ThreadGroupError::AlreadyReaped);
+        }
+        inner.fini = ExitFini::Skipped;
+        Ok(())
+    }
+
+    /// Take the group's committed link product for reaping, exactly once
+    /// (§16.4). Succeeds only when new threads are forbidden (`Draining`), no
+    /// member threads remain, and the fini disposition is resolved (complete or
+    /// skipped). The returned product owns every allocation lease the reaper
+    /// must release; the group moves to `Reaped` and no further lifecycle calls
+    /// are valid.
+    pub fn take_resources_for_reap(
+        &self,
+    ) -> Result<LinkProduct<KernelLinkReceipt>, ThreadGroupError> {
+        let mut inner = self.inner.lock();
+        if inner.state != GroupState::Draining {
+            return Err(match inner.state {
+                GroupState::Reaped => ThreadGroupError::AlreadyReaped,
+                GroupState::New => ThreadGroupError::NotLinked,
+                GroupState::Linked => ThreadGroupError::NotDraining,
+                GroupState::Draining => unreachable!(),
+            });
+        }
+        if !inner.members.is_empty() {
+            return Err(ThreadGroupError::MembersRemaining);
+        }
+        if inner.fini == ExitFini::Pending {
+            return Err(ThreadGroupError::FiniPending);
+        }
+        let product = inner
+            .product
+            .take()
+            .ok_or(ThreadGroupError::AlreadyReaped)?;
+        inner.state = GroupState::Reaped;
+        Ok(product)
     }
 }
 
