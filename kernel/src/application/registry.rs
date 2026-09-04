@@ -127,6 +127,15 @@ impl SystemDsoRegistry {
         }
     }
 
+    /// A handle onto the same slot table, for a resolver or reaper running on a
+    /// different thread than the one that created the registry (§14.2).
+    #[inline]
+    pub fn clone_handle(&self) -> Self {
+        Self {
+            inner: Arc::clone(&self.inner),
+        }
+    }
+
     /// Request `soname` in `domain` (§13.3).
     ///
     /// Vacant → `Permit` (the sole publication authority for a fresh
