@@ -221,7 +221,16 @@ impl ImportedImageDescriptor {
     /// resolver (§12.1). The resolver owns the source descriptor and clones it
     /// before wrapping so the registry's long-term copy stays intact.
     #[inline]
-    pub fn new(descriptor: PublishedImageDescriptor) -> Self {
+    pub fn new(mut descriptor: PublishedImageDescriptor) -> Self {
+        // `PublishedImageDescriptor` records how the provider participated in
+        // the session that first published it (`SystemCandidate`). Wrapping a
+        // registry snapshot for a later session changes that participation to
+        // `ExternalReady`: it joins the graph and link map, but contributes no
+        // raw allocation lease, relocation, sealing, init, or fini work.
+        // Normalize this at the import boundary so graph construction and
+        // publisher lease accounting cannot mistake a reused provider for a
+        // newly loaded candidate.
+        descriptor.ownership = ImageOwnership::ExternalReady;
         Self {
             descriptor: Box::new(descriptor),
         }
