@@ -257,6 +257,22 @@ impl ApplicationManager {
         slot.transition(ApplicationState::Loading, ApplicationState::Running)
     }
 
+    /// Move a running application's public state to `Stopping` when its exit
+    /// coordinator calls `ApplicationBeginExit` (S11). The syscall path derives
+    /// the handle from the current thread's membership, so a foreign thread
+    /// cannot stop another application.
+    pub fn begin_exit(&self, handle: ApplicationHandle) -> Result<(), ApplicationLaunchError> {
+        let mut inner = self.inner.lock();
+        let slot = inner
+            .slots
+            .get_mut(handle.slot as usize)
+            .ok_or(ApplicationLaunchError::StaleGeneration)?;
+        if slot.generation != handle.generation {
+            return Err(ApplicationLaunchError::StaleGeneration);
+        }
+        slot.transition(ApplicationState::Running, ApplicationState::Stopping)
+    }
+
     /// The thread group of a live application, for C26/C27.
     ///
     /// Unlike the snapshot query, this returns the shared handle (the one C26

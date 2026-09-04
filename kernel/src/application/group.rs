@@ -27,6 +27,7 @@
 
 use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
+use core::sync::atomic::{AtomicUsize, Ordering};
 use spin::Mutex;
 
 use blueos_loader::LinkProduct;
@@ -122,6 +123,11 @@ struct GroupInner {
     /// context-switch cleanup delivers into (§16.3). One slot per member is
     /// reserved up front, so the cleanup path never allocates.
     events: ApplicationEventQueue,
+    /// A membership epoch, bumped (and woken) every time a member leaves, so
+    /// the exit coordinator and the reaper can park without polling the
+    /// membership set (§16.2). Kept behind its own `Arc` so a waiter can hold
+    /// it across the group lock.
+    members_epoch: Arc<AtomicUsize>,
 }
 
 /// A per-application thread group. `Clone` yields another handle onto the same
@@ -193,6 +199,7 @@ impl ThreadGroup {
                 start_storage: None,
                 fini: ExitFini::Pending,
                 events: ApplicationEventQueue::default(),
+                members_epoch: Arc::new(AtomicUsize::new(0)),
             })),
         }
     }
@@ -283,6 +290,7 @@ impl ThreadGroup {
             .position(|member| Thread::id(member) == id)
             .ok_or(ThreadGroupError::NotMember)?;
         inner.members.swap_remove(index);
+        bump_members_epoch(&inner.members_epoch);
         Ok(())
     }
 
@@ -313,7 +321,35 @@ impl ThreadGroup {
             thread_id: id,
         });
         debug_assert!(evicted.is_none(), "exit-event slot was not reserved");
+        bump_members_epoch(&inner.members_epoch);
         Ok(())
+    }
+
+    /// Park the calling (exit-coordinator) thread until at most one member
+    /// remains — itself (§16.2). Only valid while the group is draining; the
+    /// wait never holds the group lock and wakes on the membership epoch that
+    /// every member exit bumps.
+    pub fn wait_for_member_exit(&self) -> Result<(), ThreadGroupError> {
+        loop {
+            let (count, epoch, epoch_value) = {
+                let inner = self.inner.lock();
+                if inner.state != GroupState::Draining {
+                    return Err(ThreadGroupError::NotDraining);
+                }
+                (
+                    inner.members.len(),
+                    Arc::clone(&inner.members_epoch),
+                    inner.members_epoch.load(Ordering::Acquire),
+                )
+            };
+            if count <= 1 {
+                return Ok(());
+            }
+            // The epoch reference is owned by the group and only bumped
+            // monotonically; parking on a stale value is safe because a member
+            // exit re-checks the count after the wake.
+            let _ = crate::sync::atomic_wait(&*epoch, epoch_value, crate::time::Tick::MAX);
+        }
     }
 
     /// A cloneable handle onto the group's exit-event queue, for the exit
@@ -415,6 +451,13 @@ impl ThreadGroup {
         inner.state = GroupState::Reaped;
         Ok((product, start_storage))
     }
+}
+
+/// Bump the membership epoch and wake every parked waiter. Allocation-free and
+/// lock-free: safe in the scheduler's interrupt-disabled cleanup path.
+fn bump_members_epoch(epoch: &Arc<AtomicUsize>) {
+    epoch.fetch_add(1, Ordering::Release);
+    let _ = crate::sync::atomic_wake(&**epoch, usize::MAX);
 }
 
 /// The backend that mints fresh, not-yet-running thread groups (§14.1).

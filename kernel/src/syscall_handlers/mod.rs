@@ -33,7 +33,11 @@ use crate::{
 pub use crate::sync::posix_mqueue;
 use alloc::boxed::Box;
 use blueos_header::{
-    application::BlueOsApplicationLaunchRequest, syscalls::NR, thread::SpawnArgs,
+    application::{
+        BlueOsApplicationLaunchRequest, BlueOsStringView, APPLICATION_LAUNCH_REQUEST_ABI_VERSION,
+    },
+    syscalls::NR,
+    thread::SpawnArgs,
 };
 use core::{
     ffi::{c_size_t, c_ssize_t},
@@ -857,52 +861,208 @@ define_syscall_handler!(
     }
 );
 
-// Application lifecycle syscalls (C20-b, §9.3). The two exit syscalls are fully
-// wired through the current thread's membership (C27); the launch/init syscalls
-// return ENOSYS until the ApplicationLoader glue (C26/C28) lands.
+// Application lifecycle syscalls (C20-b, §9.3). All four handlers derive the
+// authoritative thread group from the current thread's membership, never from
+// an application-supplied handle (§16.2).
 #[cfg(enable_vfs)]
 mod application_syscalls {
     use super::*;
+    use alloc::vec::Vec;
 
-    /// Launch an application from a versioned, bounded request (§9.2). The full
-    /// copy-in + `ApplicationManager::launch` path lands with the
-    /// `ApplicationLoader` glue; until then the syscall is registered but
-    /// returns `ENOSYS`.
-    pub fn launch(_request: *const BlueOsApplicationLaunchRequest) -> c_long {
-        -(libc::ENOSYS as c_long)
+    /// Kernel-side bounds for the launch copy-in (§9.2). These mirror (and
+    /// tighten) librs's own scan limits and are the authoritative gate on the
+    /// pointed-to content.
+    const MAX_ARGC: usize = 128;
+    const MAX_TOTAL_STRING_BYTES: usize = 4096;
+    const MAX_PATH_LEN: usize = 256;
+
+    /// Launch an application from a versioned, bounded request (§9.2): copy the
+    /// fixed header, validate counts/byte totals/NUL rules, copy every string
+    /// into owned storage, then run the whole launch through the assembled
+    /// application service (§14.2). Returns the minted slot as a positive
+    /// `c_long` on success — the full slot+generation handle does not fit a
+    /// 32-bit syscall result and travels inside the launched application's
+    /// start info instead (§17.6) — or a negative errno.
+    pub fn launch(request_ptr: *const BlueOsApplicationLaunchRequest) -> c_long {
+        if request_ptr.is_null() {
+            return -(libc::EINVAL as c_long);
+        }
+        // SAFETY: the caller passes a pointer into its own shared address
+        // space; Phase 1 has no fault-safe copy-in, so a wild pointer is the
+        // caller's own bug (design §9.2). The bounded validation below is the
+        // authoritative gate on the pointed-to content.
+        let request = unsafe { &*request_ptr };
+        if request.abi_version != APPLICATION_LAUNCH_REQUEST_ABI_VERSION
+            || (request.struct_size as usize)
+                < core::mem::size_of::<BlueOsApplicationLaunchRequest>()
+        {
+            return -(libc::EINVAL as c_long);
+        }
+        if request.argc > MAX_ARGC || request.envc > MAX_ARGC {
+            return -(libc::E2BIG as c_long);
+        }
+        if request.argc != 0 && request.argv.is_null() {
+            return -(libc::EINVAL as c_long);
+        }
+        if request.envc != 0 && request.envp.is_null() {
+            return -(libc::EINVAL as c_long);
+        }
+
+        let mut budget = MAX_TOTAL_STRING_BYTES;
+        let mut path = Vec::new();
+        if copy_in_string(&request.path, &mut path, &mut budget).is_err()
+            || path.is_empty()
+            || path.len() > MAX_PATH_LEN
+            || path.contains(&0)
+        {
+            return -(libc::EINVAL as c_long);
+        }
+        let Ok(path) = core::str::from_utf8(&path) else {
+            return -(libc::EINVAL as c_long);
+        };
+
+        let mut argv = Vec::new();
+        let mut envp = Vec::new();
+        if copy_in_strings(request.argv, request.argc, &mut argv, &mut budget).is_err()
+            || copy_in_strings(request.envp, request.envc, &mut envp, &mut budget).is_err()
+        {
+            return -(libc::E2BIG as c_long);
+        }
+
+        let Some(service) = crate::application::service::ApplicationService::get() else {
+            return -(libc::ENOSYS as c_long);
+        };
+        match service.spawn(path, argv, envp) {
+            Ok(handle) => {
+                if handle.slot >= (i32::MAX as u32) {
+                    return -(libc::E2BIG as c_long);
+                }
+                handle.slot as c_long
+            }
+            Err(crate::application::manager::ApplicationLaunchError::UnsupportedExecutionModel(
+                _,
+            )) => -(libc::ENOSYS as c_long),
+            Err(_) => -(libc::ENOENT as c_long),
+        }
     }
 
-    /// Signal that the application's init plan completed (§9.3). Wired together
-    /// with the manager/loader glue; `ENOSYS` until then.
+    /// Copy `count` string views from `head` into owned buffers, charging each
+    /// string's bytes against the shared budget. Rejects a null `data` with a
+    /// non-zero `len`, an embedded NUL and any budget/arithmetic overflow
+    /// (§9.2).
+    fn copy_in_strings(
+        head: *const BlueOsStringView,
+        count: usize,
+        out: &mut Vec<Vec<u8>>,
+        budget: &mut usize,
+    ) -> Result<(), ()> {
+        if count == 0 {
+            return Ok(());
+        }
+        let mut cursor = head;
+        for _ in 0..count {
+            // SAFETY: same shared-address-space contract as the header copy;
+            // `count` was validated against the caller-declared array length.
+            let view = unsafe { &*cursor };
+            let mut bytes = Vec::new();
+            copy_in_string(view, &mut bytes, budget)?;
+            if bytes.contains(&0) {
+                return Err(());
+            }
+            out.push(bytes);
+            cursor = unsafe { cursor.add(1) };
+        }
+        Ok(())
+    }
+
+    /// Copy one string view into `out`, charging its length against `budget`.
+    fn copy_in_string(
+        view: &BlueOsStringView,
+        out: &mut Vec<u8>,
+        budget: &mut usize,
+    ) -> Result<(), ()> {
+        if view.data.is_null() {
+            return if view.len == 0 { Ok(()) } else { Err(()) };
+        }
+        if view.len > *budget {
+            return Err(());
+        }
+        *budget -= view.len;
+        // SAFETY: `len` is bounded by the validated budget; the pointer range
+        // is the caller's responsibility in the shared address space (§9.2).
+        let src = unsafe { core::slice::from_raw_parts(view.data, view.len) };
+        out.try_reserve_exact(view.len).map_err(|_| ())?;
+        out.extend_from_slice(src);
+        Ok(())
+    }
+
+    /// The current thread's owning thread group, from the membership alone.
+    fn current_membership_group() -> Option<crate::application::group::ThreadGroup> {
+        let current = scheduler::current_thread();
+        current
+            .lock()
+            .membership()
+            .cloned()
+            .and_then(|membership| membership.upgrade())
+    }
+
+    /// Signal that the application's init plan completed (§9.3). The
+    /// authoritative handle is recovered from the current thread's membership;
+    /// the application-supplied argument is advisory and ignored for
+    /// authorisation.
     pub fn init_complete(_handle: usize) -> c_long {
-        -(libc::ENOSYS as c_long)
+        let Some(group) = current_membership_group() else {
+            return -(libc::EINVAL as c_long);
+        };
+        let Some(handle) = group.handle() else {
+            return -(libc::EINVAL as c_long);
+        };
+        let Some(service) = crate::application::service::ApplicationService::get() else {
+            return -(libc::ENOSYS as c_long);
+        };
+        match service.manager().complete_init(handle) {
+            Ok(()) => 0,
+            Err(_) => -(libc::EINVAL as c_long),
+        }
     }
 
-    /// Begin the two-phase exit: the exit coordinator atomically forbids new
-    /// threads (C27, §16.2). The membership is derived from the current thread,
+    /// Begin the two-phase exit: move the public state to `Stopping`, atomically
+    /// forbid new threads, then park the coordinator until every other member
+    /// exited (C27, §16.2). The membership is derived from the current thread,
     /// never from an application-supplied handle (§16.2).
     pub fn begin_exit(_status: c_int) -> c_long {
-        let current = scheduler::current_thread();
-        let membership = current.lock().membership().cloned();
-        let Some(group) = membership.and_then(|m| m.upgrade()) else {
-            return -(EINVAL as c_long);
+        let Some(group) = current_membership_group() else {
+            return -(libc::EINVAL as c_long);
         };
-        match group.begin_exit() {
-            Ok(()) => 0,
-            Err(_) => -(EINVAL as c_long),
+        let Some(handle) = group.handle() else {
+            return -(libc::EINVAL as c_long);
+        };
+        let Some(service) = crate::application::service::ApplicationService::get() else {
+            return -(libc::ENOSYS as c_long);
+        };
+        if service.manager().begin_exit(handle).is_err() {
+            return -(libc::EINVAL as c_long);
         }
+        if group.begin_exit().is_err() {
+            return -(libc::EINVAL as c_long);
+        }
+        // The exit coordinator runs atexit/fini only after every other member
+        // left; parking here makes the syscall itself the wait primitive
+        // (§17.2 step 7).
+        if group.wait_for_member_exit().is_err() {
+            return -(libc::EINVAL as c_long);
+        }
+        0
     }
 
     /// Finish the two-phase exit after fini/TCB cleanup, then retire this
     /// thread (C27, §16.2). Never returns.
     pub fn finish_exit() -> c_long {
-        let current = scheduler::current_thread();
-        let membership = current.lock().membership().cloned();
-        let Some(group) = membership.and_then(|m| m.upgrade()) else {
-            return -(EINVAL as c_long);
+        let Some(group) = current_membership_group() else {
+            return -(libc::EINVAL as c_long);
         };
         if group.finish_fini().is_err() {
-            return -(EINVAL as c_long);
+            return -(libc::EINVAL as c_long);
         }
         scheduler::retire_me();
         -1
