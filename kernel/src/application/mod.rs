@@ -19,8 +19,12 @@
 //! Phase 1 is delivered slice-by-slice. C23-b lands the read-only
 //! [`adapters::vfs_reader::VfsElfReader`] and the fixed
 //! [`adapters::system_paths::SystemLibraryPaths`] catalog; C23-c adds the
-//! [`adapters::flat_memory::FlatImageMemory`] shared-flat backend. The
-//! [`ArtifactResolver`] adaptation and the system-DSO registry follow in
-//! C24/C25, once the permit/lease state machine exists.
+//! [`adapters::flat_memory::FlatImageMemory`] shared-flat backend. C24 adds the
+//! [`registry::SystemDsoRegistry`] permit/lease/generation state machine that
+//! turns a relocated system image into a shareable Ready instance and hands
+//! back either a load permit or an import lease (§13). The
+//! [`ArtifactResolver`] adaptation and the manager/group orchestration follow
+//! in C24/C25.
 
 pub mod adapters;
+pub mod registry;
