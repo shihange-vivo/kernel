@@ -12,10 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::{arch, kprintln, scheduler, sync::SpinLock, thread::Thread, time};
+use crate::{arch, drivers::serial, kprintln, scheduler, thread::Thread, time};
 use log::{LevelFilter, Metadata, Record};
-
-static LOGGER_MUTEX: SpinLock<()> = SpinLock::new(());
 
 struct Logger;
 
@@ -49,6 +47,11 @@ impl log::Log for Logger {
         if !self.enabled(record.metadata()) {
             return;
         }
+        // Hold the scheduler-aware UART writer lock for the whole formatted
+        // record. Individual `write_str` calls lock it recursively; ordinary
+        // TTY writers sleep rather than spin if a record is in progress.
+        #[cfg(not(test))]
+        let _guard = serial::lock_tx();
         let timestamp = time::now().as_millis();
         let tid = scheduler::current_thread_id();
         let cpu = arch::current_cpu_id();

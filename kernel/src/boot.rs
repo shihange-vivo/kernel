@@ -97,6 +97,7 @@ extern "C" fn init() {
     uart.configure(&UartConfig::default()).unwrap();
     uart.enable();
 
+    crate::drivers::serial::init();
     let tty0 = Tty::init(&crate::drivers::serial::TTY_SERIAL, Termios::default());
     DeviceManager::get().register_device(String::from("ttyS0"), tty0.clone());
     match console::init_console(tty0.clone()) {

@@ -14,6 +14,7 @@
 
 use core::{
     cell::{Cell, RefCell},
+    marker::PhantomData,
     sync::atomic::{AtomicUsize, Ordering},
 };
 
@@ -23,12 +24,12 @@ use crate::{
     irq::is_in_irq,
     kearly_println,
     scheduler::{self, is_schedule_ready, yield_me},
+    static_arc,
     support::DisableInterruptGuard,
-    sync::{atomic_wait, atomic_wake, SpinLock},
+    sync::{atomic_wait, atomic_wake, Mutex, SpinLock},
     time::{self, Tick},
 };
 use blueos_driver::uart::{InterruptType, UartConfig, UartCtrlStatus};
-use blueos_infra::tinyrwlock::RwLock;
 use blueos_kconfig::{CONFIG_SERIAL_RX_FIFO_SIZE, CONFIG_SERIAL_TX_FIFO_SIZE};
 use embedded_io::ErrorKind;
 use libc::{TCIFLUSH, TCIOFF, TCIOFLUSH, TCION, TCOFLUSH, TCOOFF, TCOON};
@@ -36,12 +37,15 @@ use libc::{TCIFLUSH, TCIOFF, TCIOFLUSH, TCION, TCOFLUSH, TCOOFF, TCOON};
 const DEFAULT_BREAK_DURATION_MS: usize = 250;
 const DEFAULT_TX_DRAIN_TIMEOUT_MS: usize = 5000;
 
+static_arc! {
+    TX_LOCK(Mutex, Mutex::new()),
+}
+
 pub struct Serial {
     dev: &'static dyn blueos_hal::uart::Uart<UartConfig, (), InterruptType, UartCtrlStatus>,
     tx_buffer: RefCell<[u8; CONFIG_SERIAL_TX_FIFO_SIZE as usize]>,
     tx_end: Cell<u32>,
     tx_head: Cell<u32>,
-    tx_lock: RwLock<()>,
     rx_buffer: RefCell<[u8; CONFIG_SERIAL_RX_FIFO_SIZE as usize]>,
     rx_head: Cell<u32>,
     rx_end: Cell<u32>,
@@ -52,14 +56,16 @@ pub struct Serial {
 }
 
 /// Safety:
-/// - Single-core: thread-side enqueue is serialized by `tx_lock`; TX IRQ is disabled around
+/// - Single-core: thread-side enqueue is serialized by `TX_LOCK`; TX IRQ is disabled around
 ///   enqueue/retry critical region to avoid producer-side interleaving with TX ISR.
 ///
 /// - SMP: accesses to `tx_buffer/tx_head/tx_end` in TX producer/consumer paths are additionally
 ///   serialized by `critical_section_guard` so these shared fields are not concurrently mutated.
 /// - Pending TX IRQ may still run once after a disable operation due to interrupt timing, but this
 ///   is treated as timing jitter (observable send time variation), not a duplicated-byte data race.
-/// - Thread-side enqueue is serialized by `tx_lock`.
+/// - Thread-side enqueue is serialized by the scheduler-aware `TX_LOCK`. The lock may be held
+///   while a full TX ring waits for IRQ-driven progress, so a spin lock would deadlock when a
+///   second writer preempts or wakes ahead of its owner.
 /// - TX-side dequeue only advances `tx_end` and runs with interrupt context rules.
 /// - `send_bytes` disables TX interrupt around enqueue/retry critical region, so producer-side
 ///   updates to `tx_buffer/tx_head` are not interleaved by TX ISR.
@@ -70,7 +76,6 @@ pub static TTY_SERIAL: Serial = Serial {
     tx_buffer: RefCell::new([0; CONFIG_SERIAL_TX_FIFO_SIZE as usize]),
     tx_end: Cell::new(0),
     tx_head: Cell::new(0),
-    tx_lock: RwLock::new(()),
     rx_buffer: RefCell::new([0; CONFIG_SERIAL_RX_FIFO_SIZE as usize]),
     rx_head: Cell::new(0),
     rx_end: Cell::new(0),
@@ -79,6 +84,29 @@ pub static TTY_SERIAL: Serial = Serial {
     owner_cnts: Cell::new(0),
     critical_section_guard: SpinLock::new(()),
 };
+
+pub(crate) fn init() {
+    assert!(TX_LOCK.init(), "serial TX lock initialized more than once");
+}
+
+pub(crate) struct TxLockGuard(PhantomData<*mut ()>);
+
+impl Drop for TxLockGuard {
+    fn drop(&mut self) {
+        TX_LOCK.post();
+    }
+}
+
+/// Serialize a complete thread-context console record with ordinary TTY writes.
+/// IRQ and pre-scheduler output uses the polling path and must never sleep here.
+pub(crate) fn lock_tx() -> Option<TxLockGuard> {
+    if is_in_irq() || !is_schedule_ready() {
+        return None;
+    }
+    let acquired = TX_LOCK.pend_for(Tick::MAX);
+    debug_assert!(acquired);
+    Some(TxLockGuard(PhantomData))
+}
 
 impl Serial {
     pub fn send_bytes(&self, bytes: &[u8], is_nonblocking: bool) -> Result<usize, ErrorKind> {
@@ -110,59 +138,67 @@ impl Serial {
             }
             Ok(bytes.len())
         } else {
-            let mut nbytes = 0;
-            let _spinlock = self.tx_lock.write();
-            self.dev.disable_interrupt(InterruptType::Tx);
-            'e: for &b in bytes {
-                #[cfg(smp)]
-                let _lock = self.critical_section_guard.irqsave_lock();
+            let _guard = lock_tx().expect("scheduler-ready serial write must acquire TX lock");
+            self.send_bytes_buffered(bytes, is_nonblocking)
+        }
+    }
 
-                match self.send_byte_fifo(b) {
-                    Ok(()) => {
+    fn send_bytes_buffered(
+        &self,
+        bytes: &[u8],
+        is_nonblocking: bool,
+    ) -> Result<usize, ErrorKind> {
+        let mut nbytes = 0;
+        self.dev.disable_interrupt(InterruptType::Tx);
+        'e: for &b in bytes {
+            #[cfg(smp)]
+            let _lock = self.critical_section_guard.irqsave_lock();
+
+            match self.send_byte_fifo(b) {
+                Ok(()) => {
+                    nbytes += 1;
+                }
+                Err(ErrorKind::OutOfMemory) => {
+                    if !is_nonblocking {
+                        #[cfg(smp)]
+                        drop(_lock);
+                        'i: loop {
+                            let tx_seq = self.tx_futex.load(Ordering::Acquire);
+                            // If the FIFO is full and we're in blocking mode, we need to
+                            // trigger the TX interrupt to start sending out the data in FIFO.
+                            self.trigger_tx_interrupt();
+                            if is_schedule_ready() {
+                                match atomic_wait(&self.tx_futex, tx_seq, Tick::MAX) {
+                                    Ok(()) | Err(code::EAGAIN) => {}
+                                    Err(code::ETIMEDOUT) => return Err(ErrorKind::TimedOut),
+                                    Err(_) => return Err(ErrorKind::Other),
+                                }
+                            } else {
+                                while (self.is_tx_full()) {}
+                            }
+                            self.dev.disable_interrupt(InterruptType::Tx);
+                            #[cfg(smp)]
+                            let _lock = self.critical_section_guard.irqsave_lock();
+                            match self.send_byte_fifo(b) {
+                                Ok(()) => break 'i,
+                                Err(ErrorKind::OutOfMemory) => {
+                                    continue 'i;
+                                }
+                                Err(_) => break 'e,
+                            }
+                        }
                         nbytes += 1;
                     }
-                    Err(ErrorKind::OutOfMemory) => {
-                        if !is_nonblocking {
-                            #[cfg(smp)]
-                            drop(_lock);
-                            'i: loop {
-                                let tx_seq = self.tx_futex.load(Ordering::Acquire);
-                                // If the FIFO is full and we're in blocking mode, we need to
-                                // trigger the TX interrupt to start sending out the data in FIFO.
-                                self.trigger_tx_interrupt();
-                                if is_schedule_ready() {
-                                    match atomic_wait(&self.tx_futex, tx_seq, Tick::MAX) {
-                                        Ok(()) | Err(code::EAGAIN) => {}
-                                        Err(code::ETIMEDOUT) => return Err(ErrorKind::TimedOut),
-                                        Err(_) => return Err(ErrorKind::Other),
-                                    }
-                                } else {
-                                    while (self.is_tx_full()) {}
-                                }
-                                self.dev.disable_interrupt(InterruptType::Tx);
-                                #[cfg(smp)]
-                                let _lock = self.critical_section_guard.irqsave_lock();
-                                match self.send_byte_fifo(b) {
-                                    Ok(()) => break 'i,
-                                    Err(ErrorKind::OutOfMemory) => {
-                                        continue 'i;
-                                    }
-                                    Err(_) => break 'e,
-                                }
-                            }
-                            nbytes += 1;
-                        }
-                    }
-                    Err(_) => {
-                        // For any other error, we just stop sending
-                        // and return the number of bytes sent so far.
-                        break;
-                    }
+                }
+                Err(_) => {
+                    // For any other error, we just stop sending
+                    // and return the number of bytes sent so far.
+                    break;
                 }
             }
-            self.trigger_tx_interrupt();
-            Ok(nbytes)
         }
+        self.trigger_tx_interrupt();
+        Ok(nbytes)
     }
 
     pub fn read_bytes(&self, bytes: &mut [u8], is_nonblocking: bool) -> Result<usize, ErrorKind> {
