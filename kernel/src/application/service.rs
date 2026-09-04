@@ -79,8 +79,13 @@ impl ApplicationService {
             let registry = SystemDsoRegistry::new();
             let loader = ApplicationLoader::new(catalog, registry.clone(), memory.clone(), domain);
             let reaper = ApplicationReaper::new(registry, memory);
+            let manager = ApplicationManager::new();
+            // The deferred reaper thread owns clones of the reaper and the
+            // manager and releases drained groups outside every manager lock
+            // (§16.4).
+            reaper.spawn(manager.clone());
             Self {
-                manager: ApplicationManager::new(),
+                manager,
                 loader,
                 reaper,
             }
@@ -116,10 +121,25 @@ impl ApplicationService {
         envp: Vec<Vec<u8>>,
     ) -> Result<ApplicationHandle, ApplicationLaunchError> {
         let identity = path.as_bytes().to_vec();
-        self.manager.launch(
-            OwnedLaunchRequest::new(ExecutionModel::ThreadGroup, identity),
+        let result = self.manager.launch(
+            OwnedLaunchRequest::new(ExecutionModel::ThreadGroup, identity.clone()),
             |group| self.prepare(group, path, &argv, &envp),
-        )
+        );
+        // Either way the group now belongs to the deferred reaper: a live
+        // group is released after its members left and its fini resolved, a
+        // failed launch's group (nothing installed, or installed-then-drained)
+        // is recycled together with its `Failed` slot (§16.4).
+        let handle = match result {
+            Ok(handle) => Some(handle),
+            Err(_) => self
+                .manager
+                .query_by_identity(&identity)
+                .map(|snapshot| snapshot.handle),
+        };
+        if let Some(group) = handle.and_then(|handle| self.manager.group(handle)) {
+            self.reaper.register(&group);
+        }
+        result
     }
 
     /// The manager's slow prepare closure: VFS open, staged link, start

@@ -368,6 +368,14 @@ impl ThreadGroup {
         self.member_count() == 0
     }
 
+    /// Whether the fini disposition is resolved (ran to completion, or
+    /// explicitly skipped on the abnormal path) — the reaper's precondition
+    /// next to an empty membership (§16.4).
+    pub fn fini_resolved(&self) -> bool {
+        let inner = self.inner.lock();
+        inner.fini != ExitFini::Pending
+    }
+
     /// Begin the two-phase exit: atomically forbid new threads and move the
     /// group from `Linked` to `Draining` (§16.2). Only the exit coordinator for
     /// this group may call it; a duplicate or out-of-order call is rejected.

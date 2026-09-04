@@ -273,6 +273,32 @@ impl ApplicationManager {
         slot.transition(ApplicationState::Running, ApplicationState::Stopping)
     }
 
+    /// Close an application's public lifecycle once its group resources were
+    /// released: `Stopping` becomes the `Terminated` terminal state, and a
+    /// launch that already failed keeps its `Failed` terminal state (§14.4).
+    /// Called by the deferred reaper; it also reaches this point for the
+    /// abnormal paths where the main thread died without reporting exit
+    /// (`Loading`/`Running` → `Terminated`, the group's fini was skipped by the
+    /// reaper). The slot then becomes releasable.
+    pub fn finish(&self, handle: ApplicationHandle) -> Result<(), ApplicationLaunchError> {
+        let mut inner = self.inner.lock();
+        let slot = inner
+            .slots
+            .get_mut(handle.slot as usize)
+            .ok_or(ApplicationLaunchError::StaleGeneration)?;
+        if slot.generation != handle.generation {
+            return Err(ApplicationLaunchError::StaleGeneration);
+        }
+        match slot.state {
+            SlotState::Vacant => Err(ApplicationLaunchError::AlreadyReleased),
+            SlotState::Occupied(ApplicationState::Failed) => Ok(()),
+            SlotState::Occupied(_) => {
+                slot.state = SlotState::Occupied(ApplicationState::Terminated);
+                Ok(())
+            }
+        }
+    }
+
     /// The thread group of a live application, for C26/C27.
     ///
     /// Unlike the snapshot query, this returns the shared handle (the one C26
@@ -331,10 +357,10 @@ impl ApplicationManager {
     }
 
     /// Return a finished application's slot to `Vacant` so a later launch of the
-    /// same identity reuses it with a bumped generation (§14.3 ABA). C25 exposes
-    /// this recycle primitive directly; the C27 reaper will gate it behind the
-    /// two-phase exit (`Running → Stopping → Terminated`) and quiescence
-    /// evidence before recycling (§14.4).
+    /// same identity reuses it with a bumped generation (§14.3 ABA). Only the
+    /// deferred reaper may call this, and only after [`ApplicationManager::finish`]
+    /// moved the slot into a terminal state — the two-phase exit
+    /// (`Running → Stopping → Terminated`) or a recorded `Failed` (§14.4).
     pub fn release(&self, handle: ApplicationHandle) -> Result<(), ApplicationLaunchError> {
         let mut inner = self.inner.lock();
         let slot = inner
@@ -346,10 +372,15 @@ impl ApplicationManager {
         }
         match slot.state {
             SlotState::Vacant => Err(ApplicationLaunchError::AlreadyReleased),
-            SlotState::Occupied(_) => {
+            SlotState::Occupied(ApplicationState::Terminated)
+            | SlotState::Occupied(ApplicationState::Failed) => {
                 slot.state = SlotState::Vacant;
                 Ok(())
             }
+            SlotState::Occupied(state) => Err(ApplicationLaunchError::InvalidTransition {
+                from: state,
+                to: ApplicationState::Terminated,
+            }),
         }
     }
 }
@@ -357,6 +388,15 @@ impl ApplicationManager {
 impl Default for ApplicationManager {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+impl Clone for ApplicationManager {
+    fn clone(&self) -> Self {
+        Self {
+            inner: Arc::clone(&self.inner),
+            thread_groups: ThreadGroupBackend::new(),
+        }
     }
 }
 
@@ -441,6 +481,14 @@ mod tests {
         assert_eq!(manager.query(first).unwrap().state, ApplicationState::Loading);
         manager.complete_init(first).unwrap();
         assert_eq!(manager.query(first).unwrap().state, ApplicationState::Running);
+        // The full two-phase exit runs before the slot is recyclable (§14.4).
+        manager.begin_exit(first).unwrap();
+        assert_eq!(manager.query(first).unwrap().state, ApplicationState::Stopping);
+        manager.finish(first).unwrap();
+        assert_eq!(
+            manager.query(first).unwrap().state,
+            ApplicationState::Terminated
+        );
         manager.release(first).unwrap();
 
         let second = manager.launch(request(b"app"), |_| Ok(())).unwrap();
@@ -501,10 +549,38 @@ mod tests {
     fn releasing_an_already_released_slot_is_rejected() {
         let manager = ApplicationManager::new();
         let handle = manager.launch(request(b"app"), |_| Ok(())).unwrap();
+        manager.complete_init(handle).unwrap();
+        manager.begin_exit(handle).unwrap();
+        manager.finish(handle).unwrap();
         manager.release(handle).unwrap();
         assert!(matches!(
             manager.release(handle),
             Err(ApplicationLaunchError::AlreadyReleased)
         ));
+    }
+
+    #[test]
+    fn release_requires_a_terminal_state() {
+        let manager = ApplicationManager::new();
+        let handle = manager.launch(request(b"app"), |_| Ok(())).unwrap();
+        // A live application cannot be released out from under its group.
+        assert!(matches!(
+            manager.release(handle),
+            Err(ApplicationLaunchError::InvalidTransition { .. })
+        ));
+        manager.complete_init(handle).unwrap();
+        assert!(matches!(
+            manager.release(handle),
+            Err(ApplicationLaunchError::InvalidTransition { .. })
+        ));
+        // A failed launch, however, is already terminal and recyclable.
+        let err = manager
+            .launch(request(b"broken"), |_| Err(ApplicationLaunchError::PrepareFailed))
+            .unwrap_err();
+        assert!(matches!(err, ApplicationLaunchError::PrepareFailed));
+        let failed = manager.query_by_identity(b"broken").unwrap().handle;
+        assert_eq!(manager.query(failed).unwrap().state, ApplicationState::Failed);
+        manager.release(failed).unwrap();
+        assert!(manager.query(failed).is_none());
     }
 }
