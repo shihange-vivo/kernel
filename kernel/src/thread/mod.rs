@@ -56,6 +56,13 @@ pub enum Entry {
         *mut core::ffi::c_void,
     ),
     Closure(Box<dyn FnOnce()>),
+    /// A runtime-resolved code address plus its argument, for entries that only
+    /// exist after relocation (a dynamic application's `e_entry`, which carries
+    /// the Thumb bit on ARM). The address is installed directly as the initial
+    /// PC; no trampoline runs, so the target must end the thread itself (the
+    /// dynamic `scrt1` never returns and exits through the application
+    /// lifecycle syscalls).
+    Raw(usize, *mut core::ffi::c_void),
 }
 
 impl core::fmt::Debug for Entry {
@@ -663,6 +670,7 @@ impl Thread {
                 .set_return_address(run_posix as usize)
                 .set_arg(0, unsafe { f as usize })
                 .set_arg(1, unsafe { arg as usize }),
+            Entry::Raw(pc, arg) => ctx.set_return_address(pc).set_arg(0, arg as usize),
         };
         self
     }

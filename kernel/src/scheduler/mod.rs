@@ -245,6 +245,10 @@ fn switch_current_thread(next: ThreadNode, old_sp: usize) -> usize {
                 Entry::C(f) => f(),
                 Entry::Closure(f) => f(),
                 Entry::Posix(f, arg) => f(arg),
+                // A raw entry is never installed as a cleanup handler: the
+                // dynamic application ends itself through the lifecycle
+                // syscalls before the scheduler ever reaps it.
+                Entry::Raw(..) => debug_assert!(false, "raw entry installed as cleanup"),
             }
         };
         // C27 §16.3: once the member's kernel cleanup completed, deliver its
