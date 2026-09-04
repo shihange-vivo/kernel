@@ -80,6 +80,24 @@ impl KernelLinkReceipt {
     pub fn system_leases(&self) -> &[SystemDsoLease] {
         &self.system_leases
     }
+
+    /// Destructure the receipt so the reaper can release each owned resource
+    /// exactly once (§16.4): the private image leases (the root), the
+    /// first-loading system DSO leases, and the counted imported DSO leases.
+    #[inline]
+    pub fn into_parts(
+        self,
+    ) -> (
+        Vec<AllocationLease>,
+        Vec<AllocationLease>,
+        Vec<SystemDsoLease>,
+    ) {
+        (
+            self.private_allocations,
+            self.system_allocations,
+            self.system_leases,
+        )
+    }
 }
 
 /// Fallible state produced by [`KernelLinkPublisher::prepare_batch`].

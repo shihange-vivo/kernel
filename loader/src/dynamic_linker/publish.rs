@@ -550,4 +550,17 @@ impl<Receipt> LinkProduct<Receipt> {
     pub const fn publication(&self) -> &Receipt {
         &self.publication
     }
+
+    /// Consume the product and hand back the publisher's receipt, the long-term
+    /// owner of every committed allocation lease (§16.4).
+    ///
+    /// Dropping the rest of the product — the context, frozen scopes, plans,
+    /// link map and metrics — releases only metadata: no allocation lease or
+    /// counted DSO lease authority lives outside the receipt, so the reaper can
+    /// destructure the receipt after this call and release the backing exactly
+    /// once.
+    #[inline]
+    pub fn into_publication(self) -> Receipt {
+        self.publication
+    }
 }

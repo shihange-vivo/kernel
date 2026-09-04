@@ -165,6 +165,8 @@ impl SystemDsoRegistry {
                     inner: Arc::clone(&self.inner),
                     slot: index,
                     generation: slot.generation,
+                    domain: slot.domain,
+                    soname: slot.soname.clone(),
                 })
             }
             InstanceState::Loading
@@ -436,6 +438,23 @@ pub struct SystemDsoLease {
     inner: Arc<Mutex<Inner>>,
     slot: usize,
     generation: u32,
+    domain: LinkDomainId,
+    soname: DependencyName,
+}
+
+impl SystemDsoLease {
+    /// The link domain this lease was minted for, so the reaper can address the
+    /// registry's quiescence decision for the right slot (§16.4).
+    #[inline]
+    pub const fn domain(&self) -> LinkDomainId {
+        self.domain
+    }
+
+    /// The SONAME this lease was minted for (§16.4).
+    #[inline]
+    pub fn soname(&self) -> &DependencyName {
+        &self.soname
+    }
 }
 
 impl Drop for SystemDsoLease {
