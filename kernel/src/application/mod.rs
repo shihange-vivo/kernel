@@ -27,4 +27,5 @@
 //! in C24/C25.
 
 pub mod adapters;
+pub mod manager;
 pub mod registry;
