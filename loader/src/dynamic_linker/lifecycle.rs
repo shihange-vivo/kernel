@@ -105,6 +105,29 @@ impl FiniPlan {
     pub fn is_empty(&self) -> bool {
         self.0.is_empty()
     }
+
+    /// The sub-plan for one owning image, preserving the original relative
+    /// order of that image's entries (§13.3).
+    ///
+    /// The registry retains a per-SONAME `FiniPlan` at `mark_ready`, but a
+    /// `LinkProduct` only exposes the combined plan. The publisher filters the
+    /// combined plan here — the relative order of a single image's
+    /// `DT_FINI_ARRAY` (reverse) then `DT_FINI` is unchanged by dropping the
+    /// other images' entries — so the reaper runs exactly one image's
+    /// destructors. An image with no destructors yields an empty plan.
+    pub fn for_image(&self, owner: ImageId) -> LoadResult<FiniPlan> {
+        let mut entries = Vec::new();
+        // The plan is bounded by the session's total lifecycle entries; the
+        // filtered view can only shrink, so reserving the full count is a
+        // safe upper bound and never exceeds the already-charged metadata.
+        entries.try_reserve(self.0.len()).map_err(|_| lifecycle_oom())?;
+        for entry in &self.0 {
+            if entry.owner() == owner {
+                entries.push(*entry);
+            }
+        }
+        Ok(FiniPlan(entries))
+    }
 }
 
 /// Per-image inputs to plan generation, borrowed from the session's relocated
