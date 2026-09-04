@@ -31,3 +31,4 @@ pub mod group;
 pub mod manager;
 pub mod publication;
 pub mod registry;
+pub mod start_storage;
