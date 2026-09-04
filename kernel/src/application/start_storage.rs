@@ -57,6 +57,13 @@ pub struct ApplicationStartStorage {
     start_info: BlueOsApplicationStartInfo,
 }
 
+// SAFETY: every raw pointer in this struct (including the nested ones inside
+// `start_info`) points into one of the `Box`-owned buffers above, which are
+// exclusively owned, never moved after `build`, and only ever read through
+// the pointers. Moving the struct to another thread therefore moves the
+// backing allocations along with it; no pointer aliases thread-local state.
+unsafe impl Send for ApplicationStartStorage {}
+
 impl ApplicationStartStorage {
     /// Build the start storage from an owned launch request's content plus the
     /// committed link product (§15.3).

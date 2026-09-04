@@ -83,13 +83,18 @@ impl ApplicationLoader {
         }
     }
 
+    /// The shared-flat memory service the loader links into (§15).
+    pub fn memory(&self) -> &crate::application::adapters::flat_memory::FlatImageMemory {
+        &self.memory
+    }
+
     /// Open `path`, freeze its snapshot and derive the session-private root
     /// artifact identity from that same snapshot (§12.2). The root is always
     /// [`ImageOwnership::SessionPrivate`]; system candidates are produced only
     /// by the resolver during dependency closure.
     pub fn open_root(
         &self,
-        path: &'static str,
+        path: &str,
         build_id: Option<&'static [u8]>,
     ) -> LoadResult<ResolvedArtifact<VfsElfReader>> {
         let file = open_path(path, libc::O_RDONLY, 0).map_err(|_| loader_error())?;

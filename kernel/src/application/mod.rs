@@ -34,4 +34,5 @@ pub mod manager;
 pub mod publication;
 pub mod reaper;
 pub mod registry;
+pub mod service;
 pub mod start_storage;

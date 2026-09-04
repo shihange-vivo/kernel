@@ -65,12 +65,10 @@ pub enum ApplicationState {
 
 /// A launch/query handle: slot index plus the generation that slot had when the
 /// handle was minted. Generation makes a stale handle fail after the slot is
-/// recycled (§14.3 ABA protection).
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct ApplicationHandle {
-    pub slot: u32,
-    pub generation: u32,
-}
+/// recycled (§14.3 ABA protection). The manager reuses the versioned wire type
+/// so the kernel and `librs` pass the same two-`u32` handle across the SWI
+/// boundary without a second layout source (§9.1).
+pub use blueos_header::application::ApplicationHandle;
 
 /// A copy of an application's observable status (§14.3: queries return copies,
 /// never interior `Arc`s, leases or writable state).
