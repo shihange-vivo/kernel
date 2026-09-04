@@ -147,6 +147,40 @@ impl FileAttr {
     }
 }
 
+/// A provable content snapshot token for a file (§11.2).
+///
+/// Holding an `Arc<File>` alone does not make its content immutable: a
+/// concurrent write or truncate can change bytes underneath a reader. This
+/// token freezes the filesystem instance, the inode, the content generation
+/// and the length at a point in time. A reader re-validates
+/// [`FileSnapshotId::content_generation`] before and after each positional
+/// read; any change means the source was modified mid-load and must be
+/// treated as `SourceChanged` (§11.2), not silently read as a mixed version.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct FileSnapshotId {
+    pub fs_instance: u64,
+    pub inode: u64,
+    pub content_generation: u64,
+    pub len: u64,
+}
+
+impl FileSnapshotId {
+    #[inline]
+    pub const fn new(
+        fs_instance: u64,
+        inode: u64,
+        content_generation: u64,
+        len: u64,
+    ) -> Self {
+        Self {
+            fs_instance,
+            inode,
+            content_generation,
+            len,
+        }
+    }
+}
+
 pub trait FileOps: Send + Sync + Any {
     fn read(&self, buf: &mut [u8]) -> Result<usize, Error> {
         warn!("read is not implemented");
@@ -154,6 +188,25 @@ pub trait FileOps: Send + Sync + Any {
     }
     fn write(&self, buf: &[u8]) -> Result<usize, Error> {
         warn!("write is not implemented");
+        Err(code::EINVAL)
+    }
+    /// Length of the underlying file, in bytes (§11.1).
+    fn len(&self) -> Result<u64, Error> {
+        warn!("len is not implemented");
+        Err(code::EINVAL)
+    }
+    /// Positional read that never reads or modifies the shared [`File`] offset
+    /// (§11.1). Returns the number of bytes copied (possibly a legal short
+    /// read) and does not update `File.offset`.
+    fn read_at(&self, offset: u64, dst: &mut [u8]) -> Result<usize, Error> {
+        warn!("read_at is not implemented");
+        Err(code::EINVAL)
+    }
+    /// Positional read that fills `dst` entirely, looping over legal short
+    /// reads (§11.1). Returns a distinguishable error on zero progress (EOF),
+    /// an I/O error, or an offset overflow; never mutates `File.offset`.
+    fn read_exact_at(&self, offset: u64, dst: &mut [u8]) -> Result<(), Error> {
+        warn!("read_exact_at is not implemented");
         Err(code::EINVAL)
     }
     fn seek(&self, seek_from: SeekFrom) -> Result<usize, Error> {
@@ -254,6 +307,26 @@ impl File {
         self.dcache.fs_info()
     }
 
+    /// A provable content snapshot token for this file (§11.2).
+    ///
+    /// Freezes the filesystem instance (the mounted `FileSystem` pointer), the
+    /// inode, the content generation and the length at this instant. A reader
+    /// re-validates `content_generation` before/after each read to detect a
+    /// source that changed mid-load.
+    pub fn snapshot_id(&self) -> FileSnapshotId {
+        let fs_instance = self
+            .dcache
+            .fs()
+            .map(|fs| Arc::as_ptr(&fs) as *const () as usize as u64)
+            .unwrap_or_else(|| self.dcache.fs_info().dev as u64);
+        FileSnapshotId::new(
+            fs_instance,
+            self.dcache.inode().ino() as u64,
+            self.dcache.inode().content_generation(),
+            self.dcache.inode().size() as u64,
+        )
+    }
+
     delegate! {
         to self.dcache {
             pub fn type_(&self) -> InodeFileType;
@@ -291,6 +364,40 @@ impl FileOps for File {
             .write_at(*offset, buf, self.is_nonblock())?;
         *offset += ret;
         Ok(ret)
+    }
+
+    fn len(&self) -> Result<u64, Error> {
+        Ok(self.dcache.size() as u64)
+    }
+
+    fn read_at(&self, offset: u64, dst: &mut [u8]) -> Result<usize, Error> {
+        if !self.access_mode().is_readable() {
+            return Err(code::EACCES);
+        }
+        let offset = usize::try_from(offset).map_err(|_| code::EOVERFLOW)?;
+        self.dcache
+            .inode()
+            .read_at(offset, dst, self.is_nonblock())
+    }
+
+    fn read_exact_at(&self, offset: u64, dst: &mut [u8]) -> Result<(), Error> {
+        if !self.access_mode().is_readable() {
+            return Err(code::EACCES);
+        }
+        let mut read = 0;
+        while read < dst.len() {
+            let delta = u64::try_from(read).map_err(|_| code::EOVERFLOW)?;
+            let at = offset.checked_add(delta).ok_or(code::EOVERFLOW)?;
+            let n = self.read_at(at, &mut dst[read..])?;
+            // A zero-progress read means we hit EOF short of `dst`; report the
+            // distinguishable "no data available" errno rather than a generic
+            // I/O error (§11.1).
+            if n == 0 {
+                return Err(code::ENODATA);
+            }
+            read += n;
+        }
+        Ok(())
     }
 
     fn seek(&self, pos: SeekFrom) -> Result<usize, Error> {
