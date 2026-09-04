@@ -85,7 +85,7 @@ impl SealRange {
     }
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub struct SealPlan {
     ranges: Vec<SealRange>,
 }
@@ -398,7 +398,7 @@ impl PreparedProtectionPlan {
     }
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub struct AppliedProtectionSet {
     ranges: Vec<ProtectionRecord>,
 }
@@ -433,7 +433,7 @@ impl AppliedProtectionSet {
 /// This value carries no allocation authority by itself. In the public API it
 /// is always kept private inside `PreparedImage`/`ReadyImageCommit` until the
 /// same transaction transfers its unique lease to the committed owner.
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub struct SealedState {
     load_bias: TargetAddress,
     runtime_entry: TargetAddress,

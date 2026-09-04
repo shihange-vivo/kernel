@@ -75,6 +75,7 @@ impl PublishedRegion {
 /// resolve symbols against it without re-decoding the image (§12.1).
 ///
 /// The inner table is kept crate-private: only the loader performs lookups.
+#[derive(Clone)]
 pub struct PublishedSymbolTable {
     table: SymbolTable,
 }
@@ -110,7 +111,7 @@ impl core::fmt::Debug for PublishedSymbolTable {
 }
 
 /// The immutable, loader-neutral snapshot of a Ready system DSO (§12.1).
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub struct PublishedImageDescriptor {
     identity: ArtifactIdentity,
     soname: Option<DependencyName>,
@@ -216,8 +217,11 @@ pub struct ImportedImageDescriptor {
 }
 
 impl ImportedImageDescriptor {
+    /// Wrap a published descriptor into an import provider handed back by a
+    /// resolver (§12.1). The resolver owns the source descriptor and clones it
+    /// before wrapping so the registry's long-term copy stays intact.
     #[inline]
-    pub(crate) fn new(descriptor: PublishedImageDescriptor) -> Self {
+    pub fn new(descriptor: PublishedImageDescriptor) -> Self {
         Self {
             descriptor: Box::new(descriptor),
         }

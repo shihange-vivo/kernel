@@ -139,7 +139,7 @@ impl PreparedCacheSync {
     }
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub struct CacheSyncOutcome {
     executable_ranges: Vec<TargetRange>,
     scope: ExecutionScope,
