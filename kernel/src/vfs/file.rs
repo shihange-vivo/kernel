@@ -195,6 +195,10 @@ pub trait FileOps: Send + Sync + Any {
         warn!("len is not implemented");
         Err(code::EINVAL)
     }
+    /// Whether the underlying file is empty, derived from [`FileOps::len`].
+    fn is_empty(&self) -> Result<bool, Error> {
+        Ok(self.len()? == 0)
+    }
     /// Positional read that never reads or modifies the shared [`File`] offset
     /// (§11.1). Returns the number of bytes copied (possibly a legal short
     /// read) and does not update `File.offset`.

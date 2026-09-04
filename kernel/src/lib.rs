@@ -56,6 +56,8 @@
 
 extern crate alloc;
 pub mod allocator;
+#[cfg(enable_vfs)]
+pub mod application;
 pub mod arch;
 #[cfg(kernel_async)]
 pub mod asynk;

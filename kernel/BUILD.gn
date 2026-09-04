@@ -69,6 +69,7 @@ _shared_deps = [
   "//kernel/infra:blueos_infra",
   "//kernel/kconfig:blueos_kconfig",
   "//kernel/kconfig:generate_rustflags_file",
+  "//kernel/loader:blueos_loader",
   "//libc",
 ]
 
