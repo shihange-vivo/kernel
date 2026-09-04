@@ -28,6 +28,7 @@
 
 pub mod adapters;
 pub mod group;
+pub mod loader;
 pub mod manager;
 pub mod publication;
 pub mod registry;

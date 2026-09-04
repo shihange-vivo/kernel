@@ -198,7 +198,7 @@ impl ArtifactResolver for ApplicationArtifactResolver {
 /// generation, len)`. The snapshot's content generation doubles as the
 /// [`ArtifactIdentity`] generation: a reload of the same path after a write
 /// yields a fresh identity rather than aliasing the old one.
-fn identity_from_snapshot(
+pub(crate) fn identity_from_snapshot(
     snapshot: FileSnapshotId,
     build_id: Option<&'static [u8]>,
 ) -> ArtifactIdentity {
