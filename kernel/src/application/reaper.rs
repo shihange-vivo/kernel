@@ -67,7 +67,10 @@ impl ApplicationReaper {
     /// (§16.4). Returns [`ThreadGroupError`] when the group is not yet ready to
     /// reap (still draining, members remain, fini pending, or already reaped).
     pub fn reap(&self, group: &ThreadGroup) -> Result<ReapReport, ThreadGroupError> {
-        let product: LinkProduct<KernelLinkReceipt> = group.take_resources_for_reap()?;
+        let (product, start_storage) = group.take_resources_for_reap()?;
+        // The start storage holds no leases; dropping it releases the pinned
+        // argv/envp/auxv/init/fini backing once no thread can read it.
+        drop(start_storage);
         let receipt = product.into_publication();
         let (private, _system, system_leases) = receipt.into_parts();
 

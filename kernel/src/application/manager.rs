@@ -178,8 +178,11 @@ impl ApplicationManager {
     /// `prepare` then runs *outside* the lock (slow VFS/link/cache/thread start
     /// must not block other queries or launches), receiving the group so C26 can
     /// install the link product and C27 can create the main thread. On success
-    /// the slot transitions to `Running`; on `prepare` failure it is left
-    /// queryable as `Failed`. `Process` requests are rejected up front and
+    /// the slot *stays* `Loading`: the public state only becomes `Running` when
+    /// the application's init plan completed and it reported
+    /// `ApplicationInitComplete` (S10), accepted through
+    /// [`ApplicationManager::complete_init`]. On `prepare` failure the slot is
+    /// left queryable as `Failed`. `Process` requests are rejected up front and
     /// reserve nothing.
     pub fn launch<F>(
         &self,
@@ -200,6 +203,24 @@ impl ApplicationManager {
             let mut inner = self.inner.lock();
             reserve_slot(&mut inner.slots, request.identity, request.model, group)
         };
+        let handle = ApplicationHandle {
+            slot: slot as u32,
+            generation,
+        };
+        // Bind the minted handle before the prepare closure runs: the C26
+        // start storage carries the handle, and a C27 member thread must be
+        // able to recover the manager slot from its membership alone.
+        if prepare_group.set_handle(handle).is_err() {
+            // A fresh group always accepts its first handle; failure here means
+            // an internal invariant broke, not a caller error.
+            let mut inner = self.inner.lock();
+            let instance = inner
+                .slots
+                .get_mut(slot)
+                .expect("a reserved slot stays present");
+            instance.state = SlotState::Occupied(ApplicationState::Failed);
+            return Err(ApplicationLaunchError::PrepareFailed);
+        }
 
         let result = prepare(&prepare_group);
 
@@ -212,19 +233,30 @@ impl ApplicationManager {
             return Err(ApplicationLaunchError::StaleGeneration);
         }
         match result {
-            Ok(()) => {
-                instance
-                    .transition(ApplicationState::Loading, ApplicationState::Running)?;
-                Ok(ApplicationHandle {
-                    slot: slot as u32,
-                    generation,
-                })
-            }
+            Ok(()) => Ok(handle),
             Err(error) => {
                 instance.state = SlotState::Occupied(ApplicationState::Failed);
                 Err(error)
             }
         }
+    }
+
+    /// Accept the application's init completion and move its public state from
+    /// `Loading` to `Running` (S10). Only the validated
+    /// `ApplicationInitComplete` syscall path may call this — the syscall
+    /// derives the group from the current thread's membership and checks the
+    /// handle against the group, so a foreign thread cannot complete another
+    /// application's init.
+    pub fn complete_init(&self, handle: ApplicationHandle) -> Result<(), ApplicationLaunchError> {
+        let mut inner = self.inner.lock();
+        let slot = inner
+            .slots
+            .get_mut(handle.slot as usize)
+            .ok_or(ApplicationLaunchError::StaleGeneration)?;
+        if slot.generation != handle.generation {
+            return Err(ApplicationLaunchError::StaleGeneration);
+        }
+        slot.transition(ApplicationState::Loading, ApplicationState::Running)
     }
 
     /// The thread group of a live application, for C26/C27.
@@ -391,6 +423,9 @@ mod tests {
     fn relaunch_after_release_bumps_the_generation() {
         let manager = ApplicationManager::new();
         let first = manager.launch(request(b"app"), |_| Ok(())).unwrap();
+        // A prepared launch stays Loading until the init plan completed (S10).
+        assert_eq!(manager.query(first).unwrap().state, ApplicationState::Loading);
+        manager.complete_init(first).unwrap();
         assert_eq!(manager.query(first).unwrap().state, ApplicationState::Running);
         manager.release(first).unwrap();
 
@@ -399,6 +434,19 @@ mod tests {
         assert_eq!(first.slot, second.slot);
         assert_ne!(first.generation, second.generation);
         assert!(manager.query(first).is_none());
+    }
+
+    #[test]
+    fn init_completion_requires_the_loading_state() {
+        let manager = ApplicationManager::new();
+        let handle = manager.launch(request(b"app"), |_| Ok(())).unwrap();
+        manager.complete_init(handle).unwrap();
+        // A second init completion on a Running application is an illegal
+        // transition, not an idempotent no-op.
+        assert!(matches!(
+            manager.complete_init(handle),
+            Err(ApplicationLaunchError::InvalidTransition { .. })
+        ));
     }
 
     #[test]

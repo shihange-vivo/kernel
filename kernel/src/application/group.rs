@@ -34,7 +34,9 @@ use blueos_loader::LinkProduct;
 use crate::{
     application::{
         event_queue::{ApplicationEvent, ApplicationEventQueue},
+        manager::ApplicationHandle,
         publication::KernelLinkReceipt,
+        start_storage::ApplicationStartStorage,
     },
     thread::{Thread, ThreadNode},
 };
@@ -99,11 +101,21 @@ pub enum ThreadGroupError {
 struct GroupInner {
     state: GroupState,
     members: Vec<ThreadNode>,
+    /// The application handle the manager minted for this group (§14.3). Set
+    /// once at slot reservation, before the prepare closure runs, so the
+    /// exit/init syscalls can reach the manager's slot state from a member's
+    /// membership alone.
+    handle: Option<ApplicationHandle>,
     /// The committed link product (C26). Owned here so its `KernelLinkReceipt`
     /// keeps every private/system allocation lease alive until the C27 reaper
     /// takes them; `None` while the group is [`GroupState::New`] or after the
     /// reaper moved it out.
     product: Option<LinkProduct<KernelLinkReceipt>>,
+    /// The pinned start-information storage (§15.3). Owned here for the
+    /// application's lifetime so every nested pointer in
+    /// [`blueos_header::application::BlueOsApplicationStartInfo`] stays valid
+    /// until the last thread exits.
+    start_storage: Option<ApplicationStartStorage>,
     /// The fini-plan disposition, set only once draining begins (§16.4).
     fini: ExitFini,
     /// The bounded, capacity-guaranteed exit-event queue the scheduler's
@@ -176,7 +188,9 @@ impl ThreadGroup {
             inner: Arc::new(Mutex::new(GroupInner {
                 state,
                 members: Vec::new(),
+                handle: None,
                 product: None,
+                start_storage: None,
                 fini: ExitFini::Pending,
                 events: ApplicationEventQueue::default(),
             })),
@@ -188,8 +202,26 @@ impl ThreadGroup {
         self.inner.lock().state
     }
 
-    /// Install a committed link product, moving the group from `New` to
-    /// `Linked` (§15.2).
+    /// Record the application handle the manager minted for this group. Set
+    /// once, before the prepare closure runs; a duplicate call is rejected so
+    /// a forged second handle cannot rebind the group (§14.3).
+    pub fn set_handle(&self, handle: ApplicationHandle) -> Result<(), ThreadGroupError> {
+        let mut inner = self.inner.lock();
+        if inner.handle.is_some() {
+            return Err(ThreadGroupError::AlreadyLinked);
+        }
+        inner.handle = Some(handle);
+        Ok(())
+    }
+
+    /// The application handle the manager minted for this group; `None` before
+    /// the manager reserved the slot.
+    pub fn handle(&self) -> Option<ApplicationHandle> {
+        self.inner.lock().handle
+    }
+
+    /// Install a committed link product and its pinned start storage, moving
+    /// the group from `New` to `Linked` (§15.2).
     ///
     /// This is the infallible second half of the two-phase install: the
     /// `KernelLinkPublisher::prepare_batch` check already proved the group was
@@ -199,12 +231,14 @@ impl ThreadGroup {
     pub fn install_link_product(
         &self,
         product: LinkProduct<KernelLinkReceipt>,
+        start_storage: ApplicationStartStorage,
     ) -> Result<(), ThreadGroupError> {
         let mut inner = self.inner.lock();
         if inner.state != GroupState::New {
             return Err(ThreadGroupError::AlreadyLinked);
         }
         inner.state = GroupState::Linked;
+        inner.start_storage = Some(start_storage);
         inner.product = Some(product);
         Ok(())
     }
@@ -343,15 +377,21 @@ impl ThreadGroup {
         Ok(())
     }
 
-    /// Take the group's committed link product for reaping, exactly once
-    /// (§16.4). Succeeds only when new threads are forbidden (`Draining`), no
-    /// member threads remain, and the fini disposition is resolved (complete or
-    /// skipped). The returned product owns every allocation lease the reaper
-    /// must release; the group moves to `Reaped` and no further lifecycle calls
-    /// are valid.
+    /// Take the group's committed link product and start storage for reaping,
+    /// exactly once (§16.4). Succeeds only when new threads are forbidden
+    /// (`Draining`), no member threads remain, and the fini disposition is
+    /// resolved (complete or skipped). The returned product owns every
+    /// allocation lease the reaper must release; the group moves to `Reaped`
+    /// and no further lifecycle calls are valid.
     pub fn take_resources_for_reap(
         &self,
-    ) -> Result<LinkProduct<KernelLinkReceipt>, ThreadGroupError> {
+    ) -> Result<
+        (
+            LinkProduct<KernelLinkReceipt>,
+            Option<ApplicationStartStorage>,
+        ),
+        ThreadGroupError,
+    > {
         let mut inner = self.inner.lock();
         if inner.state != GroupState::Draining {
             return Err(match inner.state {
@@ -371,8 +411,9 @@ impl ThreadGroup {
             .product
             .take()
             .ok_or(ThreadGroupError::AlreadyReaped)?;
+        let start_storage = inner.start_storage.take();
         inner.state = GroupState::Reaped;
-        Ok(product)
+        Ok((product, start_storage))
     }
 }
 
