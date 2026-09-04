@@ -16,5 +16,6 @@
 //! VFS, memory and cache services (C23-b/C23-c).
 
 pub mod flat_memory;
+pub mod resolver;
 pub mod system_paths;
 pub mod vfs_reader;
