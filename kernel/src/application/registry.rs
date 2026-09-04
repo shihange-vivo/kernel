@@ -34,6 +34,9 @@
 //!   re-relocates or re-runs init (§13.3, §12.5). Its `Drop` only decrements
 //!   the counter and, when the last lease goes, moves the slot to `Quiescing`:
 //!   it never executes application code and never releases the image (§13.3).
+//! * [`WaitHandle`] — a waiter's ticket for an in-flight generation. A resolver
+//!   that loses the race blocks on it outside any loader/manager lock; the
+//!   slot's resolution signal wakes it so it can re-acquire (§13.3, §13.5).
 //!
 //! The registry keeps no [`AllocationLease`](blueos_loader::AllocationLease)
 //! and owns no raw memory: the unique allocation lease for the mapped image
@@ -45,6 +48,7 @@
 
 use alloc::sync::Arc;
 use alloc::vec::Vec;
+use core::sync::atomic::{AtomicUsize, Ordering};
 
 use blueos_loader::{
     DependencyName, ErrorContext, FiniPlan, LinkDomainId, LoadError, LoadErrorKind, LoadResult,
@@ -52,17 +56,23 @@ use blueos_loader::{
 };
 use spin::Mutex;
 
+use crate::{
+    sync::{atomic_wait, atomic_wake},
+    time::Tick,
+};
+
 /// The outcome of asking the registry for a system dependency (§13.3).
 ///
 /// `Permit` means the caller won the vacant slot and must load the image;
 /// `Lease` means a Ready instance already exists and was borrowed;
-/// `Pending(generation)` means some other link is mid-construction at
-/// `generation`, and the caller must wait for that generation to resolve and
-/// re-acquire. A caller never treats `Pending` as "the image is loaded".
+/// `Pending(handle)` means some other link is mid-construction at the handle's
+/// generation, and the caller must block on the handle for that generation to
+/// resolve and then re-acquire. A caller never treats `Pending` as "the image
+/// is loaded".
 pub enum AcquireOutcome {
     Permit(LoadPermit),
     Lease(SystemDsoLease),
-    Pending(u32),
+    Pending(WaitHandle),
 }
 
 /// Per-`(domain, soname)` construction state (§13.2).
@@ -93,6 +103,10 @@ struct Slot {
     soname: DependencyName,
     generation: u32,
     state: InstanceState,
+    /// Resolution signal: bumped (and its waiters woken) whenever the slot
+    /// leaves an in-flight or quiescing state for a re-acquirable one (`Vacant`
+    /// or `Ready`). Waiters key off this atom's stable heap address.
+    waiter: Arc<AtomicUsize>,
 }
 
 struct Inner {
@@ -147,7 +161,11 @@ impl SystemDsoRegistry {
             }
             InstanceState::Loading
             | InstanceState::Relocated
-            | InstanceState::Quiescing { .. } => AcquireOutcome::Pending(slot.generation),
+            | InstanceState::Quiescing { .. } => AcquireOutcome::Pending(WaitHandle {
+                generation: slot.generation,
+                observed: slot.waiter.load(Ordering::Acquire),
+                signal: Arc::clone(&slot.waiter),
+            }),
         }
     }
 
@@ -187,22 +205,26 @@ impl SystemDsoRegistry {
         fini_plan: FiniPlan,
     ) -> LoadResult<u32> {
         let (inner, slot, generation) = relocated.consume();
-        let mut guard = inner.lock();
-        let instance = guard.slots.get_mut(slot).ok_or_else(stale_error)?;
-        if instance.generation != generation {
-            return Err(stale_error());
-        }
-        match instance.state {
-            InstanceState::Relocated => {
-                instance.state = InstanceState::Ready {
-                    leases: 0,
-                    descriptor,
-                    fini_plan,
-                };
-                Ok(generation)
+        let signal = {
+            let mut guard = inner.lock();
+            let instance = guard.slots.get_mut(slot).ok_or_else(stale_error)?;
+            if instance.generation != generation {
+                return Err(stale_error());
             }
-            _ => Err(stale_error()),
-        }
+            match instance.state {
+                InstanceState::Relocated => {
+                    instance.state = InstanceState::Ready {
+                        leases: 0,
+                        descriptor,
+                        fini_plan,
+                    };
+                    Arc::clone(&instance.waiter)
+                }
+                _ => return Err(stale_error()),
+            }
+        };
+        wake_waiters(&signal);
+        Ok(generation)
     }
 
     /// Resolve a `Quiescing` slot once the reaper has evidence it is safe to
@@ -215,31 +237,40 @@ impl SystemDsoRegistry {
         soname: &DependencyName,
         keep_cached: bool,
     ) -> Option<u32> {
-        let mut inner = self.inner.lock();
-        let index = inner
-            .slots
-            .iter()
-            .position(|s| s.domain == domain && &s.soname == soname)?;
-        let slot = &mut inner.slots[index];
-        let state = core::mem::replace(&mut slot.state, InstanceState::Vacant);
-        match state {
-            InstanceState::Quiescing { descriptor, fini_plan } => {
-                if keep_cached {
-                    // KeepCached: stay Ready with zero leases so a later import
-                    // takes the fast path without a reload (§13.3).
-                    slot.state = InstanceState::Ready {
-                        leases: 0,
-                        descriptor,
-                        fini_plan,
-                    };
+        let resolved = {
+            let mut inner = self.inner.lock();
+            let index = inner
+                .slots
+                .iter()
+                .position(|s| s.domain == domain && &s.soname == soname)?;
+            let slot = &mut inner.slots[index];
+            let state = core::mem::replace(&mut slot.state, InstanceState::Vacant);
+            match state {
+                InstanceState::Quiescing { descriptor, fini_plan } => {
+                    if keep_cached {
+                        // KeepCached: stay Ready with zero leases so a later import
+                        // takes the fast path without a reload (§13.3).
+                        slot.state = InstanceState::Ready {
+                            leases: 0,
+                            descriptor,
+                            fini_plan,
+                        };
+                    }
+                    // Otherwise the pre-replace `Vacant` is already correct.
+                    Some((slot.generation, Arc::clone(&slot.waiter)))
                 }
-                // Otherwise the pre-replace `Vacant` is already correct.
-                Some(slot.generation)
+                other => {
+                    slot.state = other;
+                    None
+                }
             }
-            other => {
-                slot.state = other;
-                None
+        };
+        match resolved {
+            Some((generation, signal)) => {
+                wake_waiters(&signal);
+                Some(generation)
             }
+            None => None,
         }
     }
 
@@ -328,12 +359,20 @@ impl Drop for LoadPermit {
         if !self.armed {
             return;
         }
-        let mut guard = self.inner.lock();
-        if let Some(slot) = guard.slots.get_mut(self.slot) {
-            if slot.generation == self.generation && matches!(slot.state, InstanceState::Loading) {
-                slot.state = InstanceState::Vacant;
+        let signal = {
+            let mut guard = self.inner.lock();
+            let Some(slot) = guard.slots.get_mut(self.slot) else {
+                return;
+            };
+            if slot.generation != self.generation || !matches!(slot.state, InstanceState::Loading) {
+                return;
             }
-        }
+            slot.state = InstanceState::Vacant;
+            Arc::clone(&slot.waiter)
+        };
+        // Cancelling back to `Vacant` makes the slot re-acquirable: wake any
+        // waiter blocked on this in-flight generation (§13.5).
+        wake_waiters(&signal);
     }
 }
 
@@ -361,12 +400,20 @@ impl Drop for RelocatedPermit {
         if !self.armed {
             return;
         }
-        let mut guard = self.inner.lock();
-        if let Some(slot) = guard.slots.get_mut(self.slot) {
-            if slot.generation == self.generation && matches!(slot.state, InstanceState::Relocated) {
-                slot.state = InstanceState::Vacant;
+        let signal = {
+            let mut guard = self.inner.lock();
+            let Some(slot) = guard.slots.get_mut(self.slot) else {
+                return;
+            };
+            if slot.generation != self.generation
+                || !matches!(slot.state, InstanceState::Relocated)
+            {
+                return;
             }
-        }
+            slot.state = InstanceState::Vacant;
+            Arc::clone(&slot.waiter)
+        };
+        wake_waiters(&signal);
     }
 }
 
@@ -413,6 +460,58 @@ impl Drop for SystemDsoLease {
     }
 }
 
+/// A waiter blocked on an in-flight generation (§13.3).
+///
+/// A resolver that receives [`AcquireOutcome::Pending`] holds this handle and
+/// calls [`WaitHandle::wait`] *outside* any loader-memory or manager lock. The
+/// handle records both the generation it observed and the resolution-signal
+/// epoch current at mint time, so a wake that resolves a *different* generation
+/// is still safe: after unblocking, the resolver simply re-requests and observes
+/// the current state rather than trusting a stale result.
+pub struct WaitHandle {
+    generation: u32,
+    /// Signal epoch captured while the generation was still in flight. `wait`
+    /// blocks until the signal moves past this value.
+    observed: usize,
+    signal: Arc<AtomicUsize>,
+}
+
+impl WaitHandle {
+    /// The generation that was mid-construction when this handle was minted.
+    #[inline]
+    pub const fn generation(&self) -> u32 {
+        self.generation
+    }
+
+    /// Block until the in-flight generation resolves (the slot becomes `Vacant`
+    /// or `Ready`), then return so the caller can re-acquire.
+    ///
+    /// The waiter sleeps while the resolution signal is unchanged and returns
+    /// once a [`wake_waiters`] bump moves it past the observed epoch. A spurious
+    /// or stale wake only causes a harmless re-check: `atomic_wait` re-validates
+    /// under the wait-queue lock, so a bump racing this check is observed as
+    /// `EAGAIN` and re-looped rather than lost.
+    pub fn wait(&self) {
+        loop {
+            let current = self.signal.load(Ordering::Acquire);
+            if current != self.observed {
+                break;
+            }
+            let _ = atomic_wait(&self.signal, current, Tick::MAX);
+        }
+    }
+}
+
+/// Bump a slot's resolution signal and wake every waiter blocked on it (§13.5).
+///
+/// The bump happens-before the wake so a waiter that has not yet slept observes
+/// the new value via `atomic_wait`'s re-check and returns immediately, while a
+/// sleeping waiter is woken and re-checks the same way.
+fn wake_waiters(signal: &AtomicUsize) {
+    signal.fetch_add(1, Ordering::Release);
+    let _ = atomic_wake(signal, usize::MAX);
+}
+
 fn ensure_slot(slots: &mut Vec<Slot>, domain: LinkDomainId, soname: DependencyName) -> usize {
     if let Some(index) = slots
         .iter()
@@ -425,6 +524,7 @@ fn ensure_slot(slots: &mut Vec<Slot>, domain: LinkDomainId, soname: DependencyNa
         soname,
         generation: 0,
         state: InstanceState::Vacant,
+        waiter: Arc::new(AtomicUsize::new(0)),
     });
     slots.len() - 1
 }
@@ -451,10 +551,12 @@ mod tests {
         let first = registry.acquire_or_begin_load(domain, soname.clone());
         assert!(matches!(first, AcquireOutcome::Permit(_)));
         // A second request while Loading must not mint a second permit.
-        assert!(matches!(
-            registry.acquire_or_begin_load(domain, soname.clone()),
-            AcquireOutcome::Pending(1)
-        ));
+        let AcquireOutcome::Pending(handle) =
+            registry.acquire_or_begin_load(domain, soname.clone())
+        else {
+            panic!("expected pending");
+        };
+        assert_eq!(handle.generation(), 1);
         // The permit is the sole publication authority for generation 1.
         assert_eq!(registry.generation(domain, &soname), Some(1));
     }
@@ -508,11 +610,42 @@ mod tests {
 
         // Hold the permit so the slot stays Loading across the second request.
         let _permit = registry.acquire_or_begin_load(domain, soname.clone());
-        let AcquireOutcome::Pending(generation) =
+        let AcquireOutcome::Pending(handle) =
             registry.acquire_or_begin_load(domain, soname.clone())
         else {
             panic!("expected pending");
         };
-        assert_eq!(generation, 1);
+        assert_eq!(handle.generation(), 1);
+    }
+
+    // §13.5: a permit owner that drops before publication must wake the waiter
+    // blocked on that generation. Single-threaded here, so we resolve first and
+    // then observe `wait` return immediately (the signal has already advanced
+    // past the epoch the handle observed); the sleeping path is covered by the
+    // multi-threaded QEMU integration fixtures.
+    #[test]
+    fn dropping_a_permit_wakes_a_waiting_resolver() {
+        let registry = SystemDsoRegistry::new();
+        let domain = LinkDomainId::new(7);
+        let soname = name(b"libc.so.1\0");
+
+        let AcquireOutcome::Permit(permit) =
+            registry.acquire_or_begin_load(domain, soname.clone())
+        else {
+            panic!("expected permit");
+        };
+        let AcquireOutcome::Pending(handle) =
+            registry.acquire_or_begin_load(domain, soname.clone())
+        else {
+            panic!("expected pending");
+        };
+        drop(permit);
+        // Must not deadlock: the permit's cancellation bumped the signal.
+        handle.wait();
+        // The waiter can now re-acquire on the fresh generation.
+        assert!(matches!(
+            registry.acquire_or_begin_load(domain, soname.clone()),
+            AcquireOutcome::Permit(_)
+        ));
     }
 }
