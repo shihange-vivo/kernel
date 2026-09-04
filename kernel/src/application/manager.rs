@@ -38,6 +38,8 @@ use alloc::sync::Arc;
 use alloc::vec::Vec;
 use spin::Mutex;
 
+use crate::application::group::{ThreadGroup, ThreadGroupBackend};
+
 /// How an application executes (§14.1).
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ExecutionModel {
@@ -128,6 +130,7 @@ struct Slot {
     model: ExecutionModel,
     generation: u32,
     state: SlotState,
+    group: ThreadGroup,
 }
 
 impl Slot {
@@ -157,41 +160,48 @@ struct Inner {
 /// table; each thread keeps an independent clone.
 pub struct ApplicationManager {
     inner: Arc<Mutex<Inner>>,
+    thread_groups: ThreadGroupBackend,
 }
 
 impl ApplicationManager {
     pub fn new() -> Self {
         Self {
             inner: Arc::new(Mutex::new(Inner { slots: Vec::new() })),
+            thread_groups: ThreadGroupBackend::new(),
         }
     }
 
     /// Launch an application (§14.2).
     ///
-    /// The slot is reserved (→ `Loading`) under the short table lock, then the
-    /// caller's `prepare` runs *outside* the lock (slow VFS/link/cache/thread
-    /// start must not block other queries or launches). On success the slot
-    /// transitions to `Running`; on `prepare` failure it is left queryable as
-    /// `Failed`. `Process` requests are rejected up front and reserve nothing.
+    /// The slot is reserved (→ `Loading`) and a fresh not-yet-running
+    /// [`ThreadGroup`] is minted under the short table lock; the caller's
+    /// `prepare` then runs *outside* the lock (slow VFS/link/cache/thread start
+    /// must not block other queries or launches), receiving the group so C26 can
+    /// install the link product and C27 can create the main thread. On success
+    /// the slot transitions to `Running`; on `prepare` failure it is left
+    /// queryable as `Failed`. `Process` requests are rejected up front and
+    /// reserve nothing.
     pub fn launch<F>(
         &self,
         request: OwnedLaunchRequest,
         prepare: F,
     ) -> Result<ApplicationHandle, ApplicationLaunchError>
     where
-        F: FnOnce() -> Result<(), ApplicationLaunchError>,
+        F: FnOnce(&ThreadGroup) -> Result<(), ApplicationLaunchError>,
     {
         if request.model == ExecutionModel::Process {
             return Err(ApplicationLaunchError::UnsupportedExecutionModel(
                 request.model,
             ));
         }
+        let group = self.thread_groups.create_group();
+        let prepare_group = group.clone();
         let (slot, generation) = {
             let mut inner = self.inner.lock();
-            reserve_slot(&mut inner.slots, request.identity, request.model)
+            reserve_slot(&mut inner.slots, request.identity, request.model, group)
         };
 
-        let result = prepare();
+        let result = prepare(&prepare_group);
 
         let mut inner = self.inner.lock();
         let instance = inner
@@ -214,6 +224,23 @@ impl ApplicationManager {
                 instance.state = SlotState::Occupied(ApplicationState::Failed);
                 Err(error)
             }
+        }
+    }
+
+    /// The thread group of a live application, for C26/C27.
+    ///
+    /// Unlike the snapshot query, this returns the shared handle (the one C26
+    /// installs into and C27 attaches threads to); it is an `Arc<Mutex<_>>` clone,
+    /// not the manager's lock-held slot.
+    pub fn group(&self, handle: ApplicationHandle) -> Option<ThreadGroup> {
+        let inner = self.inner.lock();
+        let slot = inner.slots.get(handle.slot as usize)?;
+        if slot.generation != handle.generation {
+            return None;
+        }
+        match slot.state {
+            SlotState::Vacant => None,
+            SlotState::Occupied(_) => Some(slot.group.clone()),
         }
     }
 
@@ -295,16 +322,23 @@ fn occupied_state(state: &SlotState) -> ApplicationState {
 }
 
 /// Reserve a slot for `identity` and return `(index, generation)`, setting the
-/// slot to `Loading`. Prefers a `Vacant` slot already bound to this identity
-/// (so re-launch reuses the slot with a bumped generation), then any `Vacant`
-/// slot, then appends a fresh one (§14.3).
-fn reserve_slot(slots: &mut Vec<Slot>, identity: Vec<u8>, model: ExecutionModel) -> (usize, u32) {
+/// slot to `Loading` and installing `group` as its thread group. Prefers a
+/// `Vacant` slot already bound to this identity (so re-launch reuses the slot
+/// with a bumped generation), then any `Vacant` slot, then appends a fresh one
+/// (§14.3).
+fn reserve_slot(
+    slots: &mut Vec<Slot>,
+    identity: Vec<u8>,
+    model: ExecutionModel,
+    group: ThreadGroup,
+) -> (usize, u32) {
     if let Some(index) = slots
         .iter()
         .position(|s| matches!(s.state, SlotState::Vacant) && s.identity == identity)
     {
         let slot = &mut slots[index];
         slot.model = model;
+        slot.group = group;
         slot.generation = slot.generation.wrapping_add(1);
         slot.state = SlotState::Occupied(ApplicationState::Loading);
         return (index, slot.generation);
@@ -316,6 +350,7 @@ fn reserve_slot(slots: &mut Vec<Slot>, identity: Vec<u8>, model: ExecutionModel)
         let slot = &mut slots[index];
         slot.identity = identity;
         slot.model = model;
+        slot.group = group;
         slot.generation = slot.generation.wrapping_add(1);
         slot.state = SlotState::Occupied(ApplicationState::Loading);
         return (index, slot.generation);
@@ -325,6 +360,7 @@ fn reserve_slot(slots: &mut Vec<Slot>, identity: Vec<u8>, model: ExecutionModel)
         model,
         generation: 1,
         state: SlotState::Occupied(ApplicationState::Loading),
+        group,
     });
     (slots.len() - 1, 1)
 }
@@ -342,7 +378,7 @@ mod tests {
     fn process_request_is_unsupported() {
         let manager = ApplicationManager::new();
         let req = OwnedLaunchRequest::new(ExecutionModel::Process, b"app".to_vec());
-        let err = manager.launch(req, || Ok(())).unwrap_err();
+        let err = manager.launch(req, |_| Ok(())).unwrap_err();
         assert!(matches!(
             err,
             ApplicationLaunchError::UnsupportedExecutionModel(ExecutionModel::Process)
@@ -354,11 +390,11 @@ mod tests {
     #[test]
     fn relaunch_after_release_bumps_the_generation() {
         let manager = ApplicationManager::new();
-        let first = manager.launch(request(b"app"), || Ok(())).unwrap();
+        let first = manager.launch(request(b"app"), |_| Ok(())).unwrap();
         assert_eq!(manager.query(first).unwrap().state, ApplicationState::Running);
         manager.release(first).unwrap();
 
-        let second = manager.launch(request(b"app"), || Ok(())).unwrap();
+        let second = manager.launch(request(b"app"), |_| Ok(())).unwrap();
         // Same slot reused, generation bumped: distinct ABA handle (§14.4).
         assert_eq!(first.slot, second.slot);
         assert_ne!(first.generation, second.generation);
@@ -368,7 +404,7 @@ mod tests {
     #[test]
     fn stale_and_forged_handles_are_rejected() {
         let manager = ApplicationManager::new();
-        let handle = manager.launch(request(b"app"), || Ok(())).unwrap();
+        let handle = manager.launch(request(b"app"), |_| Ok(())).unwrap();
         assert!(manager.query(handle).is_some());
 
         // Forged generation.
@@ -391,7 +427,7 @@ mod tests {
     fn failed_prepare_leaves_a_queryable_failed_slot() {
         let manager = ApplicationManager::new();
         let err = manager
-            .launch(request(b"app"), || Err(ApplicationLaunchError::PrepareFailed))
+            .launch(request(b"app"), |_| Err(ApplicationLaunchError::PrepareFailed))
             .unwrap_err();
         assert!(matches!(err, ApplicationLaunchError::PrepareFailed));
 
@@ -402,7 +438,7 @@ mod tests {
     #[test]
     fn releasing_an_already_released_slot_is_rejected() {
         let manager = ApplicationManager::new();
-        let handle = manager.launch(request(b"app"), || Ok(())).unwrap();
+        let handle = manager.launch(request(b"app"), |_| Ok(())).unwrap();
         manager.release(handle).unwrap();
         assert!(matches!(
             manager.release(handle),
