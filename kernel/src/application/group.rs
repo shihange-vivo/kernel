@@ -29,7 +29,12 @@ use alloc::sync::Arc;
 use alloc::vec::Vec;
 use spin::Mutex;
 
-use crate::thread::{Thread, ThreadNode};
+use blueos_loader::LinkProduct;
+
+use crate::{
+    application::publication::KernelLinkReceipt,
+    thread::{Thread, ThreadNode},
+};
 
 /// The lifecycle of a thread group's internal state.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -45,11 +50,16 @@ pub enum GroupState {
 pub enum ThreadGroupError {
     AlreadyMember,
     NotMember,
+    AlreadyLinked,
 }
 
 struct GroupInner {
     state: GroupState,
     members: Vec<ThreadNode>,
+    /// The committed link product (C26). Owned here so its `KernelLinkReceipt`
+    /// keeps every private/system allocation lease alive until the C27 reaper
+    /// takes them; `None` while the group is [`GroupState::New`].
+    product: Option<LinkProduct<KernelLinkReceipt>>,
 }
 
 /// A per-application thread group. `Clone` yields another handle onto the same
@@ -72,6 +82,7 @@ impl ThreadGroup {
             inner: Arc::new(Mutex::new(GroupInner {
                 state,
                 members: Vec::new(),
+                product: None,
             })),
         }
     }
@@ -79,6 +90,27 @@ impl ThreadGroup {
     /// The group's current state.
     pub fn state(&self) -> GroupState {
         self.inner.lock().state
+    }
+
+    /// Install a committed link product, moving the group from `New` to
+    /// `Linked` (§15.2).
+    ///
+    /// This is the infallible second half of the two-phase install: the
+    /// `KernelLinkPublisher::prepare_batch` check already proved the group was
+    /// unlinked, and this move only swaps the fully-built product into place.
+    /// A reader therefore observes either the old `New` state or a complete
+    /// product, never a half-written link map.
+    pub fn install_link_product(
+        &self,
+        product: LinkProduct<KernelLinkReceipt>,
+    ) -> Result<(), ThreadGroupError> {
+        let mut inner = self.inner.lock();
+        if inner.state != GroupState::New {
+            return Err(ThreadGroupError::AlreadyLinked);
+        }
+        inner.state = GroupState::Linked;
+        inner.product = Some(product);
+        Ok(())
     }
 
     /// Record `thread` as a member of this group. A thread may join a group at
