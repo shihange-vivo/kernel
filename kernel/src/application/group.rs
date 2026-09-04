@@ -252,16 +252,21 @@ impl ThreadGroup {
         Ok(())
     }
 
-    /// Retire a member from the coordinator side: remove it from the membership
-    /// set and enqueue an [`ApplicationEvent::ExecutionUnitExited`] into the
-    /// group's exit-event queue (§16.3).
+    /// Deliver a member's exit from the scheduler's context-switch cleanup:
+    /// remove it from the membership set and enqueue an
+    /// [`ApplicationEvent::ExecutionUnitExited`] into the group's exit-event
+    /// queue (§16.3).
     ///
-    /// This is the coordinator's counterpart to the scheduler's lock-free post
-    /// into [`ThreadGroup::events`]: the coordinator drains posted exits under
-    /// the group lock, retiring the member so [`ThreadGroup::take_resources_for_reap`]
-    /// can observe an empty membership set. The enqueue never allocates —
-    /// capacity was reserved by [`ThreadGroup::add_member`] — so it can only
-    /// fail if a member was admitted without a slot (a programming error).
+    /// This is the *only* work the scheduler does once the member's stack and
+    /// cleanup completed. It takes the short group lock (never an
+    /// `ApplicationManager`/`SystemDsoRegistry` long lock), runs no fini,
+    /// deletes no link map, and releases no image (§16.3). The enqueue never
+    /// allocates — capacity was reserved by [`ThreadGroup::add_member`] — so the
+    /// pre-reserved slot guarantees the last-exit notification is never dropped.
+    ///
+    /// It is safe in the cleanup path: the caller runs with interrupts disabled
+    /// and preemption off, so on this single-core board no other execution
+    /// context can contend for, or hold, the group lock.
     pub fn record_member_exit(&self, id: usize) -> Result<(), ThreadGroupError> {
         let mut inner = self.inner.lock();
         let index = inner
