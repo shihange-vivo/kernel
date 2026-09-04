@@ -30,7 +30,6 @@ mod memory_mapper;
 mod reader;
 mod relocation;
 
-use cache::ArchitectureCodeCache;
 use goblin::elf::header::{
     EI_CLASS, EI_DATA, ELFCLASS32, ELFCLASS64, ELFDATA2LSB, ELFDATA2MSB, EM_AARCH64, EM_ARM,
     EM_RISCV,
@@ -41,8 +40,8 @@ use reader::SliceElfReader;
 
 pub use address::{TargetAddress, TargetRange};
 pub use cache::{
-    CacheMaintenance, CacheRequirements, CacheSyncOutcome, CodeCache, ExecutionScope,
-    PreparedCacheSync,
+    ArchitectureCodeCache, CacheMaintenance, CacheRequirements, CacheSyncOutcome, CodeCache,
+    ExecutionScope, PreparedCacheSync,
 };
 pub use dynamic_linker::{
     ArtifactIdentity, ArtifactResolver, ArtifactRole, BuildId, BuildingSession, CommittedImage,

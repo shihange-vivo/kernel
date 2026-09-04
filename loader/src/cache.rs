@@ -210,7 +210,7 @@ impl<C: CodeCache + ?Sized> CodeCache for &mut C {
     }
 }
 
-pub(crate) struct ArchitectureCodeCache {
+pub struct ArchitectureCodeCache {
     requirements: CacheRequirements,
 }
 
@@ -281,13 +281,16 @@ fn architecture_cache_capability() -> LoadResult<(ExecutionScope, CacheMaintenan
         CacheMaintenance::InstructionFence,
     ));
 
-    #[cfg(all(target_arch = "arm", cortex_m))]
+    #[cfg(all(target_arch = "arm", armv7m))]
     return Ok((
         ExecutionScope::CurrentExecutionContext,
         CacheMaintenance::BarrierOnly,
     ));
 
-    #[cfg(all(target_arch = "arm", not(cortex_m)))]
+    // Cache-enabled Cortex-M (v8-M and later) requires a D-clean/I-invalidate
+    // sequence we do not implement yet; failing closed here prevents the
+    // cache-less MPS2 barrier path from being silently reused (§12.4).
+    #[cfg(all(target_arch = "arm", not(armv7m)))]
     return Err(cache_capability_error());
 
     #[cfg(target_arch = "aarch64")]
