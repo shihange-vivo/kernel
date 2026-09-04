@@ -152,6 +152,7 @@ pub(crate) fn sysv_hash(name: &[u8]) -> u32 {
 }
 
 /// Validated SysV hash table. The symbol count is `nchain`.
+#[derive(Clone)]
 struct SysVHash {
     nbucket: u32,
     buckets: Vec<u32>,
@@ -254,6 +255,7 @@ impl SysVHash {
 }
 
 /// Validated GNU hash table. The symbol count is `symndx + chains.len()`.
+#[derive(Clone)]
 struct GnuHash {
     symndx: u32,
     shift2: u32,
@@ -418,6 +420,7 @@ impl GnuHash {
 }
 
 /// Owned, validated `.dynstr` plus the decoded symbol entries.
+#[derive(Clone)]
 pub(crate) struct SymbolTable {
     dynstr: Vec<u8>,
     entries: Vec<SymbolEntry>,
