@@ -404,7 +404,13 @@ create_thread(spawn_args_ptr: *const SpawnArgs) -> c_long {
             let membership =
                 crate::application::group::ThreadGroupMembership::downgrade(&group);
             t.lock().set_membership(membership);
-            let _ = group.add_member(t.clone());
+            // Once the group is draining it forbids new members (§16.1); a
+            // thread creation that races `ApplicationBeginExit` must fail and
+            // drop `t` unqueued, freeing its stack, rather than slipping a
+            // live member past the exit coordinator's quiescence barrier.
+            if group.add_member(t.clone()).is_err() {
+                return -1;
+            }
         }
     }
     if let Some(cleanup) = spawn_args.cleanup {
