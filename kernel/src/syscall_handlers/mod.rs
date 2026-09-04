@@ -32,7 +32,9 @@ use crate::{
 
 pub use crate::sync::posix_mqueue;
 use alloc::boxed::Box;
-use blueos_header::{syscalls::NR, thread::SpawnArgs};
+use blueos_header::{
+    application::BlueOsApplicationLaunchRequest, syscalls::NR, thread::SpawnArgs,
+};
 use core::{
     ffi::{c_size_t, c_ssize_t},
     sync::atomic::AtomicUsize,
@@ -852,6 +854,95 @@ define_syscall_handler!(
     }
 );
 
+// Application lifecycle syscalls (C20-b, §9.3). The two exit syscalls are fully
+// wired through the current thread's membership (C27); the launch/init syscalls
+// return ENOSYS until the ApplicationLoader glue (C26/C28) lands.
+#[cfg(enable_vfs)]
+mod application_syscalls {
+    use super::*;
+
+    /// Launch an application from a versioned, bounded request (§9.2). The full
+    /// copy-in + `ApplicationManager::launch` path lands with the
+    /// `ApplicationLoader` glue; until then the syscall is registered but
+    /// returns `ENOSYS`.
+    pub fn launch(_request: *const BlueOsApplicationLaunchRequest) -> c_long {
+        -(libc::ENOSYS as c_long)
+    }
+
+    /// Signal that the application's init plan completed (§9.3). Wired together
+    /// with the manager/loader glue; `ENOSYS` until then.
+    pub fn init_complete(_handle: usize) -> c_long {
+        -(libc::ENOSYS as c_long)
+    }
+
+    /// Begin the two-phase exit: the exit coordinator atomically forbids new
+    /// threads (C27, §16.2). The membership is derived from the current thread,
+    /// never from an application-supplied handle (§16.2).
+    pub fn begin_exit(_status: c_int) -> c_long {
+        let current = scheduler::current_thread();
+        let membership = current.lock().membership().cloned();
+        let Some(group) = membership.and_then(|m| m.upgrade()) else {
+            return -(EINVAL as c_long);
+        };
+        match group.begin_exit() {
+            Ok(()) => 0,
+            Err(_) => -(EINVAL as c_long),
+        }
+    }
+
+    /// Finish the two-phase exit after fini/TCB cleanup, then retire this
+    /// thread (C27, §16.2). Never returns.
+    pub fn finish_exit() -> c_long {
+        let current = scheduler::current_thread();
+        let membership = current.lock().membership().cloned();
+        let Some(group) = membership.and_then(|m| m.upgrade()) else {
+            return -(EINVAL as c_long);
+        };
+        if group.finish_fini().is_err() {
+            return -(EINVAL as c_long);
+        }
+        scheduler::retire_me();
+        -1
+    }
+}
+
+#[cfg(not(enable_vfs))]
+mod application_syscalls {
+    use super::*;
+
+    pub fn launch(_request: *const BlueOsApplicationLaunchRequest) -> c_long {
+        -(libc::ENOSYS as c_long)
+    }
+
+    pub fn init_complete(_handle: usize) -> c_long {
+        -(libc::ENOSYS as c_long)
+    }
+
+    pub fn begin_exit(_status: c_int) -> c_long {
+        -(libc::ENOSYS as c_long)
+    }
+
+    pub fn finish_exit() -> c_long {
+        -(libc::ENOSYS as c_long)
+    }
+}
+
+define_syscall_handler!(application_launch(request: *const BlueOsApplicationLaunchRequest) -> c_long {
+    application_syscalls::launch(request)
+});
+
+define_syscall_handler!(application_init_complete(handle: usize) -> c_long {
+    application_syscalls::init_complete(handle)
+});
+
+define_syscall_handler!(application_begin_exit(status: c_int) -> c_long {
+    application_syscalls::begin_exit(status)
+});
+
+define_syscall_handler!(application_finish_exit() -> c_long {
+    application_syscalls::finish_exit()
+});
+
 #[cfg(enable_syscall)]
 syscall_table! {
     (Echo, echo),
@@ -925,6 +1016,10 @@ syscall_table! {
     (MqTimedReceive, mq_timedreceive),
     (MqGetSetAttr, mq_getsetattr),
     (Ioctl, ioctl),
+    (ApplicationLaunch, application_launch),
+    (ApplicationInitComplete, application_init_complete),
+    (ApplicationBeginExit, application_begin_exit),
+    (ApplicationFinishExit, application_finish_exit),
 }
 
 #[cfg(not(enable_syscall))]
