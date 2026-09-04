@@ -163,7 +163,11 @@ pub unsafe fn used_block_hdr_for_allocation(
     if block_hdr.as_ref().common.size & SIZE_USED == 0
         || block_hdr.as_ref().common.size & SIZE_SENTINEL == SIZE_SENTINEL
     {
-        panic!("Double free detected")
+        panic!(
+            "Double free detected at 0x{:x} size=0x{:x}",
+            ptr.as_ptr() as usize,
+            block_hdr.as_ref().common.size
+        )
     }
 
     debug_assert_ne!(block_hdr.as_ref().common.size & SIZE_SIZE_MASK, 0);
@@ -227,7 +231,11 @@ pub unsafe fn used_block_hdr_for_allocation_unknown_align(
     if block_hdr.as_ref().common.size & SIZE_USED == 0
         || block_hdr.as_ref().common.size & SIZE_SENTINEL == SIZE_SENTINEL
     {
-        panic!("Double free detected")
+        panic!(
+            "Double free detected at 0x{:x} size=0x{:x}",
+            ptr.as_ptr() as usize,
+            block_hdr.as_ref().common.size
+        )
     }
 
     debug_assert_ne!(block_hdr.as_ref().common.size & SIZE_SIZE_MASK, 0);
