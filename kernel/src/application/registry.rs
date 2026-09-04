@@ -119,20 +119,19 @@ pub struct SystemDsoRegistry {
     inner: Arc<Mutex<Inner>>,
 }
 
+impl Clone for SystemDsoRegistry {
+    fn clone(&self) -> Self {
+        Self {
+            inner: Arc::clone(&self.inner),
+        }
+    }
+}
+
 impl SystemDsoRegistry {
     /// Create an empty registry.
     pub fn new() -> Self {
         Self {
             inner: Arc::new(Mutex::new(Inner { slots: Vec::new() })),
-        }
-    }
-
-    /// A handle onto the same slot table, for a resolver or reaper running on a
-    /// different thread than the one that created the registry (§14.2).
-    #[inline]
-    pub fn clone_handle(&self) -> Self {
-        Self {
-            inner: Arc::clone(&self.inner),
         }
     }
 
