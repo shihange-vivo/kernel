@@ -27,6 +27,7 @@
 //! in C24/C25.
 
 pub mod adapters;
+pub mod event_queue;
 pub mod group;
 pub mod loader;
 pub mod manager;
