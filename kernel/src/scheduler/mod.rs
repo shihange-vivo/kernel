@@ -247,6 +247,20 @@ fn switch_current_thread(next: ThreadNode, old_sp: usize) -> usize {
                 Entry::Posix(f, arg) => f(arg),
             }
         };
+        // C27 §16.3: once the member's kernel cleanup completed, deliver its
+        // exit into the owning group. This is the scheduler's only post-exit
+        // work: no fini, no link-map deletion, no image release. It runs with
+        // interrupts disabled and preemption off, so the short group lock is
+        // uncontended and cannot be held by a preempted holder (single-core,
+        // non-round-robin). The enqueue never allocates: capacity was reserved
+        // when the member was admitted.
+        #[cfg(enable_vfs)]
+        if let Some(membership) = old.membership() {
+            let id = Thread::id(&old);
+            if let Some(group) = membership.upgrade() {
+                let _ = group.record_member_exit(id);
+            }
+        }
     }
     old.set_saved_sp(old_sp);
     next_saved_sp
