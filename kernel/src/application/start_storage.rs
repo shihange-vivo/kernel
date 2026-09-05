@@ -97,8 +97,11 @@ impl ApplicationStartStorage {
 
         let entry = product.entry();
         let program_headers = root_program_headers(product);
-        let init_targets = build_plan_targets(product.init_plan().iter())?;
-        let fini_targets = build_plan_targets(product.fini_plan().iter())?;
+        // C31-b (§8.2): the application runs the startup plan and, at exit,
+        // only the root/private fini — a system DSO's destructors belong to
+        // the registry's instance reap, never to an application exit.
+        let init_targets = build_plan_targets(product.lifecycle_plans().startup().iter())?;
+        let fini_targets = build_plan_targets(product.lifecycle_plans().group_fini().iter())?;
 
         let (auxv, auxv_count) = build_auxv(entry, program_headers, execfn_ptr, page_granule)?;
 

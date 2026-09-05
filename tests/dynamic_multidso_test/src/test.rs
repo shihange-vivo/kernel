@@ -12,6 +12,13 @@
 // COUNT: APP_REAP handle=.*:1 private_images=4 imported_dsos=1 == 1
 // COUNT: APP_REAP handle=.*:2 private_images=4 imported_dsos=1 == 1
 // COUNT: multi: foo=42 bar=80 == 2
+// COUNT: LIFECYCLE_INIT index=0 owner=4 == 2
+// COUNT: LIFECYCLE_INIT index=1 owner=3 == 2
+// COUNT: LIFECYCLE_INIT index=2 owner=2 == 2
+// COUNT: LIFECYCLE_GROUP_FINI index=0 owner=2 == 2
+// COUNT: LIFECYCLE_GROUP_FINI index=1 owner=3 == 2
+// COUNT: LIFECYCLE_GROUP_FINI index=2 owner=4 == 2
+// COUNT: LIFECYCLE_SYSTEM_FINI .* == 0
 
 #![no_main]
 #![no_std]

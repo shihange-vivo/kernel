@@ -87,7 +87,7 @@ impl InitPlan {
 }
 
 /// The destructor order — the exact reverse of the init plan (§12.2).
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Default)]
 pub struct FiniPlan(Vec<LifecycleEntry>);
 
 impl FiniPlan {
@@ -127,6 +127,77 @@ impl FiniPlan {
             }
         }
         Ok(FiniPlan(entries))
+    }
+}
+
+/// One image's destructor plan (C31-b, §8.2): the registry retains one per
+/// new system candidate, so a system image's fini runs only when the
+/// registry reaps the instance — never at an application exit.
+#[derive(Clone, Debug)]
+pub struct ImageFiniPlan {
+    owner: ImageId,
+    plan: FiniPlan,
+}
+
+impl ImageFiniPlan {
+    #[inline]
+    pub(crate) fn new(owner: ImageId, plan: FiniPlan) -> Self {
+        Self { owner, plan }
+    }
+
+    #[inline]
+    pub const fn owner(&self) -> ImageId {
+        self.owner
+    }
+
+    #[inline]
+    pub fn plan(&self) -> &FiniPlan {
+        &self.plan
+    }
+}
+
+/// The session's lifecycle, partitioned by ownership (C31-b, §8.2).
+///
+/// * `startup` — every constructor this session runs: the root's
+///   `DT_PREINIT_ARRAY`, then each *loaded* image (private and new system
+///   candidates) in dependency-first SCC order. Imported Ready images never
+///   appear (their generation already initialized them).
+/// * `group_fini` — only root/private destructors, in the exact reverse of
+///   the startup order; this is what an application exit runs. A system DSO's
+///   fini is never executed at application exit.
+/// * `system_fini` — one plan per new system candidate, for the registry to
+///   retain and run when the instance quiesces.
+/// * `sccs` — the frozen SCC snapshot: the SCC groups in dependency-first
+///   order, each in the stable discovery order chosen at freeze time.
+#[derive(Clone, Debug)]
+pub struct LifecyclePlans {
+    startup: InitPlan,
+    group_fini: FiniPlan,
+    system_fini: Vec<ImageFiniPlan>,
+    sccs: Vec<Vec<ImageId>>,
+}
+
+impl LifecyclePlans {
+    #[inline]
+    pub fn startup(&self) -> &InitPlan {
+        &self.startup
+    }
+
+    #[inline]
+    pub fn group_fini(&self) -> &FiniPlan {
+        &self.group_fini
+    }
+
+    #[inline]
+    pub fn system_fini(&self) -> &[ImageFiniPlan] {
+        &self.system_fini
+    }
+
+    /// The frozen SCC snapshot (§8.2): groups in dependency-first order,
+    /// each in stable discovery order.
+    #[inline]
+    pub fn sccs(&self) -> &[Vec<ImageId>] {
+        &self.sccs
     }
 }
 
@@ -186,7 +257,7 @@ pub(crate) fn build<M: ImageMemory + ?Sized>(
     images: &[LifecycleImage<'_>],
     profile: &LoadProfile,
     memory: &M,
-) -> LoadResult<(InitPlan, FiniPlan)> {
+) -> LoadResult<LifecyclePlans> {
     let width = WordWidth::for_elf_class(profile.class());
     let decode = Decode {
         target_word: TargetWord::new(width, profile.endian()),
@@ -248,7 +319,56 @@ pub(crate) fn build<M: ImageMemory + ?Sized>(
         emit_direct(image, image.lifecycle.fini(), &decode, &mut fini)?;
     }
 
-    Ok((InitPlan(init), FiniPlan(fini)))
+    // C31-b partition (§8.2): split the combined fini by ownership so an
+    // application exit runs only root/private destructors and the registry
+    // retains one plan per new system candidate. Partitioning preserves the
+    // relative order of each image's own entries.
+    let mut group_fini = Vec::new();
+    let mut system_fini = Vec::new();
+    group_fini
+        .try_reserve_exact(fini.len())
+        .map_err(|_| lifecycle_oom())?;
+    system_fini
+        .try_reserve_exact(fini.len())
+        .map_err(|_| lifecycle_oom())?;
+    for entry in &fini {
+        let ownership = graph
+            .node(entry.owner())
+            .ok_or_else(|| lifecycle_error(LoadErrorKind::BadElf))?
+            .ownership();
+        match ownership {
+            crate::dynamic_linker::ImageOwnership::SessionPrivate => {
+                group_fini.push(*entry);
+            }
+            crate::dynamic_linker::ImageOwnership::SystemCandidate => {
+                match system_fini
+                    .iter_mut()
+                    .find(|plan: &&mut (ImageId, Vec<LifecycleEntry>)| plan.0 == entry.owner())
+                {
+                    Some((_, entries)) => entries.push(*entry),
+                    None => system_fini.push((entry.owner(), alloc::vec![*entry])),
+                }
+            }
+            crate::dynamic_linker::ImageOwnership::ExternalReady => {
+                // Imported images carry no fini entries by construction.
+            }
+        }
+    }
+    let mut system_fini = system_fini
+        .into_iter()
+        .map(|(owner, entries)| ImageFiniPlan::new(owner, FiniPlan(entries)))
+        .collect::<Vec<_>>();
+
+    // The frozen SCC snapshot: the exact groups and in-group order the
+    // plans above were generated from (§8.2).
+    let sccs = graph.dependency_order()?;
+
+    Ok(LifecyclePlans {
+        startup: InitPlan(init),
+        group_fini: FiniPlan(group_fini),
+        system_fini,
+        sccs,
+    })
 }
 
 /// Flatten the SCC groups into one dependency-first image order.

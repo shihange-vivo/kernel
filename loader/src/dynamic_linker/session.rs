@@ -29,7 +29,7 @@ use crate::{
     cache::{CacheSyncOutcome, CodeCache},
     dynamic_linker::{
         graph::{DependencyGraph, DiscoveryItem, DiscoveryQueue},
-        lifecycle::{self, FiniPlan, InitPlan, LifecycleImage},
+        lifecycle::{self, FiniPlan, InitPlan, LifecycleImage, LifecyclePlans},
         publish::{
             self, CommittedImage, CommittingLinkProduct, LinkContext, LinkMapImage, LinkProduct,
             LinkPublisher, PreparedLinkManifest,
@@ -1171,7 +1171,7 @@ impl<M: ImageMemory + ?Sized, A: ArchRelocator> SealedSession<'_, M, A> {
     /// session memory backend and validates each non-sentinel function target
     /// against its owner's executable region (and Thumb bit on ARM). The plans
     /// only *name* targets — nothing here calls a constructor.
-    pub fn build_lifecycle_plans(&self) -> LoadResult<(InitPlan, FiniPlan)> {
+    pub fn build_lifecycle_plans(&self) -> LoadResult<LifecyclePlans> {
         let mut images = Vec::new();
         images
             .try_reserve_exact(self.state.images.len())
@@ -1248,7 +1248,7 @@ impl<M: ImageMemory + ?Sized, A: ArchRelocator> SealedSession<'_, M, A> {
         self,
         publisher: &mut P,
     ) -> LoadResult<LinkProduct<P::Receipt>> {
-        let (init_plan, fini_plan) = self.build_lifecycle_plans()?;
+        let plans = self.build_lifecycle_plans()?;
         let manifest = self.prepare_link_manifest()?;
 
         // One committed image per id: link-map facts plus the backing
@@ -1340,8 +1340,7 @@ impl<M: ImageMemory + ?Sized, A: ArchRelocator> SealedSession<'_, M, A> {
         Ok(LinkProduct::new(
             context,
             entry,
-            init_plan,
-            fini_plan,
+            plans,
             link_map,
             metrics,
             bindings,

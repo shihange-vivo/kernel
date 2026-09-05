@@ -39,7 +39,7 @@ pub use published::{
 };
 
 pub(crate) use lifecycle::LifecycleImage;
-pub use lifecycle::{FiniPlan, InitPlan, LifecycleEntry};
+pub use lifecycle::{FiniPlan, ImageFiniPlan, InitPlan, LifecycleEntry, LifecyclePlans};
 pub use metadata::ProgramHeaderRuntimeInfo;
 pub(crate) use metadata::{
     ImageLayout, ImageLifecycleMetadata, ProgramHeaderGeometry, RelocationTableInfo,

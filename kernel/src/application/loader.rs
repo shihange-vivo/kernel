@@ -182,6 +182,7 @@ impl ApplicationLoader {
 
         self.hand_off(permits, &product)?;
         log_bindings(&product);
+        log_lifecycle(&product);
 
         Ok(product)
     }
@@ -207,7 +208,15 @@ impl ApplicationLoader {
                 .registry
                 .publish_relocated(candidate.permit)
                 .map_err(|_| loader_error())?;
-            let fini = product.fini_plan().for_image(image.owner())?;
+            // A system candidate with no destructors has no plan entry; the
+            // registry stores an empty plan for it.
+            let fini = product
+                .lifecycle_plans()
+                .system_fini()
+                .iter()
+                .find(|plan| plan.owner() == image.owner())
+                .map(|plan| plan.plan().clone())
+                .unwrap_or_default();
             self.registry
                 .mark_ready(relocated, image.descriptor().clone(), fini)
                 .map_err(|_| loader_error())?;
@@ -238,6 +247,39 @@ impl ResolverFinish
 
 fn loader_error() -> LoadError {
     LoadError::new(LoadErrorKind::Backend, blueos_loader::ErrorContext::None)
+}
+
+/// C31-b lifecycle oracle (§17.1, §8.2): surface the ownership-partitioned
+/// plans and the frozen SCC snapshot so QEMU checkers can assert the init and
+/// group/system fini sequences.
+fn log_lifecycle(product: &LinkProduct<KernelLinkReceipt>) {
+    let plans = product.lifecycle_plans();
+    for (index, entry) in plans.startup().iter().enumerate() {
+        log::info!(
+            "LIFECYCLE_INIT index={} owner={}",
+            index,
+            entry.owner().get()
+        );
+    }
+    for (index, entry) in plans.group_fini().iter().enumerate() {
+        log::info!(
+            "LIFECYCLE_GROUP_FINI index={} owner={}",
+            index,
+            entry.owner().get()
+        );
+    }
+    for plan in plans.system_fini() {
+        for entry in plan.plan().iter() {
+            log::info!("LIFECYCLE_SYSTEM_FINI owner={}", entry.owner().get());
+        }
+    }
+    for (group, members) in plans.sccs().iter().enumerate() {
+        log::info!(
+            "LIFECYCLE_SCC group={} members={:?}",
+            group,
+            members.iter().map(|id| id.get()).collect::<alloc::vec::Vec<_>>()
+        );
+    }
 }
 
 /// C31-a scope oracle (§17.1): surface each relocation's frozen scope decision

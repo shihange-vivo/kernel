@@ -30,7 +30,7 @@ use crate::{
     address::{TargetAddress, TargetRange},
     dynamic_linker::{
         graph::DependencyGraph, scope::RelocationBinding, ArtifactIdentity, DependencyName,
-        FiniPlan, ImageId, ImageOwnership, InitPlan, LoadMetrics, PublishedImageDescriptor,
+        ImageId, ImageOwnership, LifecyclePlans, LoadMetrics, PublishedImageDescriptor,
         PublishedRegion, ScopeSet,
     },
     error::{ErrorContext, LoadError, LoadErrorKind, LoadResult, LoadStage},
@@ -486,8 +486,8 @@ pub trait LinkPublisher {
 pub struct LinkProduct<Receipt> {
     context: LinkContext,
     entry: TargetAddress,
-    init_plan: InitPlan,
-    fini_plan: FiniPlan,
+    /// The ownership-partitioned lifecycle (C31-b, §8.2).
+    plans: LifecyclePlans,
     link_map: Vec<LinkMapEntry>,
     metrics: LoadMetrics,
     /// C31-a oracle (§17.1): the recorded scope decision per relocation.
@@ -501,8 +501,7 @@ impl<Receipt> LinkProduct<Receipt> {
     pub(crate) fn new(
         context: LinkContext,
         entry: TargetAddress,
-        init_plan: InitPlan,
-        fini_plan: FiniPlan,
+        plans: LifecyclePlans,
         link_map: Vec<LinkMapEntry>,
         metrics: LoadMetrics,
         bindings: Vec<crate::dynamic_linker::scope::RelocationBinding>,
@@ -511,8 +510,7 @@ impl<Receipt> LinkProduct<Receipt> {
         Self {
             context,
             entry,
-            init_plan,
-            fini_plan,
+            plans,
             link_map,
             metrics,
             bindings,
@@ -531,14 +529,10 @@ impl<Receipt> LinkProduct<Receipt> {
         self.entry
     }
 
+    /// The ownership-partitioned lifecycle plans (C31-b, §8.2).
     #[inline]
-    pub const fn init_plan(&self) -> &InitPlan {
-        &self.init_plan
-    }
-
-    #[inline]
-    pub const fn fini_plan(&self) -> &FiniPlan {
-        &self.fini_plan
+    pub const fn lifecycle_plans(&self) -> &LifecyclePlans {
+        &self.plans
     }
 
     #[inline]
