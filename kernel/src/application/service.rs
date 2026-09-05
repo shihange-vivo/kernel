@@ -78,7 +78,7 @@ impl ApplicationService {
             let memory = FlatImageMemory::new();
             let registry = SystemDsoRegistry::new();
             let loader = ApplicationLoader::new(catalog, registry.clone(), memory.clone(), domain);
-            let reaper = ApplicationReaper::new(registry.clone(), memory);
+            let reaper = ApplicationReaper::new(registry.clone(), memory, catalog);
             let manager = ApplicationManager::new(registry);
             // The deferred reaper thread owns clones of the reaper and the
             // manager and releases drained groups outside every manager lock

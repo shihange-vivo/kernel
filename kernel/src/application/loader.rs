@@ -312,9 +312,10 @@ fn log_lifecycle(product: &LinkProduct<KernelLinkReceipt>) {
     let plans = product.lifecycle_plans();
     for (index, entry) in plans.startup().iter().enumerate() {
         log::info!(
-            "LIFECYCLE_INIT index={} owner={}",
+            "LIFECYCLE_INIT index={} owner={} address={:#x}",
             index,
-            entry.owner().get()
+            entry.owner().get(),
+            entry.function().get()
         );
     }
     for (index, entry) in plans.group_fini().iter().enumerate() {
@@ -328,6 +329,17 @@ fn log_lifecycle(product: &LinkProduct<KernelLinkReceipt>) {
         for entry in plan.plan().iter() {
             log::info!("LIFECYCLE_SYSTEM_FINI owner={}", entry.owner().get());
         }
+    }
+    for entry in product.link_map() {
+        log::info!(
+            "LINK_MAP owner={} soname={} bias={:#x}",
+            entry.owner().get(),
+            entry
+                .soname()
+                .map(|s| core::str::from_utf8(s.as_bytes()).unwrap_or("<non-utf8>"))
+                .unwrap_or("-"),
+            entry.load_bias().get()
+        );
     }
     for (group, members) in plans.sccs().iter().enumerate() {
         log::info!(

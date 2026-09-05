@@ -2,18 +2,22 @@
 // ASSERT-SUCC: Dynamic scope test ended
 // ASSERT-FAIL: Backtrace in Panic.*
 // ASSERT-FAIL: ASSERTION FAILED.*
-// COUNT: DSO_LOAD soname=libscope_sys\.so\.1 == 1
-// COUNT: DSO_REUSE soname=libc\.so\.1 == 2
-// COUNT: PKG_LOAD soname=libweak\.so\.1 path=/apps/scope_demo/lib/libweak\.so\.1 == 1
-// COUNT: PKG_LOAD soname=libstrong\.so\.1 path=/apps/scope_demo/lib/libstrong\.so\.1 == 1
-// COUNT: PKG_LOAD soname=libhidden\.so\.1 path=/apps/scope_demo/lib/libhidden\.so\.1 == 1
-// COUNT: PKG_LOAD soname=libprotected\.so\.1 path=/apps/scope_demo/lib/libprotected\.so\.1 == 1
-// COUNT: PKG_LOAD soname=libweakdata\.so\.1 path=/apps/scope_demo/lib/libweakdata\.so\.1 == 1
+// COUNT: DSO_LOAD soname=libscope_sys\.so\.1 == 2
+// COUNT: DSO_UNLOAD soname=libscope_sys\.so\.1 == 2
+// COUNT: DSO_REUSE soname=libc\.so\.1 == 3
+// COUNT: PKG_LOAD soname=libweak\.so\.1 path=/apps/scope_demo/lib/libweak\.so\.1 == 2
+// COUNT: PKG_LOAD soname=libstrong\.so\.1 path=/apps/scope_demo/lib/libstrong\.so\.1 == 2
+// COUNT: PKG_LOAD soname=libhidden\.so\.1 path=/apps/scope_demo/lib/libhidden\.so\.1 == 2
+// COUNT: PKG_LOAD soname=libprotected\.so\.1 path=/apps/scope_demo/lib/libprotected\.so\.1 == 2
+// COUNT: PKG_LOAD soname=libweakdata\.so\.1 path=/apps/scope_demo/lib/libweakdata\.so\.1 == 2
 // COUNT: APP_LAUNCHED handle=.*:1 path=/apps/scope_demo/app\.elf == 1
 // COUNT: APP_REAP handle=.*:1 private_images=6 imported_dsos=2 == 1
-// COUNT: scope: value=111 fn=1110 hidden=555 hidden_report=999 protected=333 self=444 sys=777 sys_target=42 weakdata=0 == 1
-// COUNT: SCOPE_BIND requester=.* name=missing_data provider=none == 1
-// COUNT: SCOPE_BIND requester=7 name=sys_target provider=7 == 1
+// COUNT: APP_LAUNCHED handle=.*:2 path=/apps/scope_demo/app\.elf == 1
+// COUNT: APP_REAP handle=.*:2 private_images=6 imported_dsos=2 == 1
+// COUNT: scope: value=111 fn=1110 hidden=555 hidden_report=999 protected=333 self=444 sys=777 sys_target=42 sys_ctor=1 weakdata=0 == 2
+// COUNT: DSO_FINI soname=libscope_sys\.so\.1 == 2
+// COUNT: SCOPE_BIND requester=.* name=missing_data provider=none == 2
+// COUNT: SCOPE_BIND requester=7 name=sys_target provider=7 == 2
 // COUNT: application prepare: link package failed: LoadError \{ stage: LinkRelocate.* == 1
 // COUNT: APP_LAUNCHED .*scope_bad.* == 0
 
@@ -93,8 +97,20 @@ fn scope_visibility_vertical() {
 
     // The scope corpus package: all bindings are asserted by the checker
     // through the app's printed values and the SCOPE_BIND oracle lines.
-    let handle = launch_and_wait(service, "/apps/scope_demo/app.elf");
-    assert_eq!(handle.slot, 1, "shell holds slot 0, package takes slot 1");
+    // First launch: loads libscope_sys fresh (constructor runs); after the
+    // group exits, the reaper runs the system fini on its worker thread and
+    // unloads the instance (§8.5).
+    let first = launch_and_wait(service, "/apps/scope_demo/app.elf");
+    assert_eq!(first.slot, 1, "shell holds slot 0, package takes slot 1");
+
+    // Second launch: the unloaded slot reloads generation+1 (constructor runs
+    // again); the checker asserts the init/fini/unload oracle lines.
+    let second = launch_and_wait(service, "/apps/scope_demo/app.elf");
+    assert_eq!(first.slot, second.slot, "slot must be recycled");
+    assert_ne!(
+        first.generation, second.generation,
+        "generation must bump on relaunch"
+    );
 
     // The negative package: an undefined weak control-flow target must fail
     // closed at relocation, so the application never launches.

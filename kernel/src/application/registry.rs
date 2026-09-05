@@ -75,6 +75,18 @@ pub enum AcquireOutcome {
     Pending(WaitHandle),
 }
 
+/// The outcome of resolving a quiescent slot (C31-d, §8.5).
+pub enum QuiescenceResolution {
+    /// The zero-lease instance stays `Ready` for a later import.
+    KeptCached,
+    /// The instance unloaded: the worker must run the fini plan (outside the
+    /// registry lock) and then release the unique backing.
+    Unloaded {
+        allocation: AllocationLease,
+        fini_plan: FiniPlan,
+    },
+}
+
 /// The outcome of a batch acquire over a whole declared system closure
 /// (C30, §7.3).
 pub enum AcquireBatchOutcome {
@@ -607,14 +619,15 @@ impl SystemDsoRegistry {
 
     /// Resolve a `Quiescing` slot once the reaper has evidence it is safe to
     /// either keep cached (no unload) or unload and allow `generation + 1` to
-    /// reload (§13.3). Returns the resulting generation, or `None` if the slot
-    /// was not `Quiescing`.
+    /// reload (§13.3, C31-d §8.5). `Unloaded` hands the worker the unique
+    /// backing and the fini plan it must run *outside* the registry lock —
+    /// the allocation must stay mapped until the fini completed.
     pub fn resolve_quiescence(
         &self,
         domain: LinkDomainId,
         soname: &DependencyName,
         keep_cached: bool,
-    ) -> Option<u32> {
+    ) -> Option<QuiescenceResolution> {
         let mut inner = self.inner.lock();
         let resolution = Arc::clone(&inner.resolution);
         let index = inner
@@ -630,6 +643,7 @@ impl SystemDsoRegistry {
                 allocation,
                 dependencies,
             } => {
+                wake_waiters(&slot.waiter, &resolution);
                 if keep_cached {
                     // KeepCached: stay Ready with zero leases so a later import
                     // takes the fast path without a reload (§13.3).
@@ -640,22 +654,29 @@ impl SystemDsoRegistry {
                         allocation,
                         dependencies,
                     };
-                } else {
-                    // The unique backing and dependency leases drop here; the
-                    // C31-d worker performs the actual release outside the
-                    // registry lock.
-                    drop(allocation);
-                    drop(dependencies);
+                    return Some(QuiescenceResolution::KeptCached);
                 }
-                // Otherwise the pre-replace `Vacant` is already correct.
-                wake_waiters(&slot.waiter, &resolution);
-                Some(slot.generation)
+                // Unload: the instance's dependency leases drop, and the
+                // unique backing moves to the worker for fini + release
+                // (§8.5). The pre-replace `Vacant` is already correct.
+                drop(dependencies);
+                Some(QuiescenceResolution::Unloaded {
+                    allocation,
+                    fini_plan,
+                })
             }
             other => {
                 slot.state = other;
                 None
             }
         }
+    }
+
+    /// Drain the failed constructor batches' retained backings (C31-c, §8.6):
+    /// the C31-d worker releases them once it has quiescence evidence.
+    pub fn drain_failed_backings(&self) -> Vec<AllocationLease> {
+        let mut inner = self.inner.lock();
+        core::mem::take(&mut inner.failed_backings)
     }
 
     /// The current generation of `soname` in `domain`, if any.

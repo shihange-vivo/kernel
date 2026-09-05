@@ -37,11 +37,18 @@ static SYSTEM_LIBRARIES: &[SystemLibraryEntry] = &[
         soname: b"libc.so.1",
         path: "/system/lib/libc.so.1",
         build_id: None,
+        // The shared libc has unmodeled escapes (kernel callbacks, global
+        // function pointers): never unload it (§8.5).
+        keep_cached: true,
     },
     SystemLibraryEntry {
         soname: b"libscope_sys.so.1",
         path: "/system/lib/libscope_sys.so.1",
         build_id: None,
+        // The scope corpus's test system DSO has no escapes: the C31-d
+        // reaper runs its fini and unloads it on quiescence, and the next
+        // launch reloads generation+1.
+        keep_cached: false,
     },
 ];
 static CATALOG: SystemLibraryPaths = SystemLibraryPaths::new(SYSTEM_LIBRARIES);

@@ -41,11 +41,11 @@ use blueos_loader::{ImageMemory, LinkProduct};
 
 use crate::{
     application::{
-        adapters::flat_memory::FlatImageMemory,
+        adapters::{flat_memory::FlatImageMemory, system_paths::SystemLibraryPaths},
         group::{GroupState, ThreadGroup, ThreadGroupError},
         manager::ApplicationManager,
         publication::KernelLinkReceipt,
-        registry::SystemDsoRegistry,
+        registry::{QuiescenceResolution, SystemDsoRegistry},
     },
     thread::{self, Builder, Entry},
 };
@@ -71,6 +71,9 @@ const REAPER_POLL_MILLIS: u64 = 10;
 pub struct ApplicationReaper {
     registry: SystemDsoRegistry,
     memory: FlatImageMemory,
+    /// The fixed system library catalog, for the per-SONAME quiescence
+    /// policy (C31-d, §8.5): cached forever vs. fini + unload.
+    catalog: &'static SystemLibraryPaths,
     /// Every group a launch handed over — successfully or failed — waiting to
     /// be reaped once its members left and its fini resolved.
     pending: Arc<spin::Mutex<Vec<ThreadGroup>>>,
@@ -80,11 +83,17 @@ pub struct ApplicationReaper {
 }
 
 impl ApplicationReaper {
-    /// Build a reaper over the shared registry and shared-flat memory service.
-    pub fn new(registry: SystemDsoRegistry, memory: FlatImageMemory) -> Self {
+    /// Build a reaper over the shared registry, shared-flat memory service
+    /// and the fixed system catalog.
+    pub fn new(
+        registry: SystemDsoRegistry,
+        memory: FlatImageMemory,
+        catalog: &'static SystemLibraryPaths,
+    ) -> Self {
         Self {
             registry,
             memory,
+            catalog,
             pending: Arc::new(spin::Mutex::new(Vec::new())),
             wake: Arc::new(AtomicUsize::new(0)),
         }
@@ -131,6 +140,13 @@ impl ApplicationReaper {
 
     /// One pass over every pending group.
     fn scan(&self, manager: &ApplicationManager) {
+        // Release failed constructor batches' backings: the batch aborted
+        // before any constructor ran, so the mapping has no live user by the
+        // time the owning group drained (C31-c §8.6, C31-d §8.5).
+        let mut memory = self.memory.clone();
+        for allocation in self.registry.drain_failed_backings() {
+            memory.release_committed(allocation);
+        }
         let mut pending = self.pending.lock();
         pending.retain(|group| !self.try_reap(group, manager));
     }
@@ -248,11 +264,45 @@ impl ApplicationReaper {
             // slot to `Quiescing`, which retains the SONAME, but the reaper must
             // resolve using the values it held, not a stale reference.
             let soname = lease.soname().clone();
+            let keep_cached = self
+                .catalog
+                .resolve(soname.as_bytes())
+                .map(|entry| entry.keep_cached)
+                .unwrap_or(true);
             drop(lease);
-            // KeepCached: the last counted reference is gone but the image stays
-            // mapped and importable (§13.3). The slot returns to `Ready` with
-            // zero leases rather than being unloaded.
-            self.registry.resolve_quiescence(domain, &soname, true);
+            // The catalog's quiescence policy decides the slot's future: stay
+            // cached for later imports, or run the system fini on this worker
+            // thread (outside every registry lock) and release the backing so
+            // generation+1 reloads (§8.5).
+            match self.registry.resolve_quiescence(domain, &soname, keep_cached) {
+                Some(QuiescenceResolution::KeptCached) => {}
+                Some(QuiescenceResolution::Unloaded {
+                    allocation,
+                    fini_plan,
+                }) => {
+                    for entry in fini_plan.iter() {
+                        // SAFETY: the fini targets were validated against the
+                        // owner's executable region at plan build time, and the
+                        // allocation is still mapped — it is released only
+                        // after every destructor completed (§8.5).
+                        unsafe {
+                            let function: extern "C" fn() =
+                                core::mem::transmute(entry.function().get() as usize);
+                            function();
+                        }
+                    }
+                    log::info!(
+                        "DSO_FINI soname={}",
+                        core::str::from_utf8(soname.as_bytes()).unwrap_or("<non-utf8>")
+                    );
+                    memory.release_committed(allocation);
+                    log::info!(
+                        "DSO_UNLOAD soname={}",
+                        core::str::from_utf8(soname.as_bytes()).unwrap_or("<non-utf8>")
+                    );
+                }
+                None => {}
+            }
         }
 
         Ok(ReapReport {

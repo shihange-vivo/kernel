@@ -30,6 +30,13 @@ pub struct SystemLibraryEntry {
     /// Expected build-id bytes when policy requires one; `None` accepts any
     /// build-id (or none) for this entry.
     pub build_id: Option<&'static [u8]>,
+    /// Quiescence policy (C31-d, §8.5): `true` keeps the zero-lease instance
+    /// cached for later imports (a DSO with unmodeled escapes, like the
+    /// shared libc); `false` allows the reaper to run the instance's fini on
+    /// its worker thread and release the backing, so `generation + 1` reloads
+    /// it. Only set `false` for DSOs with no kernel callbacks or escaped
+    /// function pointers.
+    pub keep_cached: bool,
 }
 
 /// A fixed, board/product-configured system library catalog.
