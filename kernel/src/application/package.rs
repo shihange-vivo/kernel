@@ -56,9 +56,10 @@ pub fn find_edge(
     entry.needed.iter().find(|edge| edge.soname == soname)
 }
 
-/// Map a package's target profile id to its loader profile. Phase 2 knows the
-/// ARM32 v7-M soft-float profile; anything else fails closed until the
-/// architecture-common profile split lands (C32–C35, §9).
+/// Map a package's target profile id to its loader profile (§9.1: the board
+/// policy picks the profile; the package records it in the manifest). The two
+/// Phase-2 ARM profiles — v7-M soft-float and v8-M hard-float — are known;
+/// anything else fails closed until the remaining C33–C35 profiles land.
 pub fn profile_for(
     package: &ApplicationPackageManifest,
 ) -> Result<blueos_loader::LoadProfile, ()> {
@@ -66,6 +67,9 @@ pub fn profile_for(
         "thumbv7m-vivo-blueos-newlibeabi" => Ok(blueos_loader::LoadProfile::arm_thumb_soft_float(
             blueos_loader::ElfType::Dyn,
         )),
+        "thumbv8m-main-vivo-blueos-newlibeabihf" => Ok(
+            blueos_loader::LoadProfile::arm_thumb_hard_float(blueos_loader::ElfType::Dyn),
+        ),
         _ => Err(()),
     }
 }

@@ -26,6 +26,19 @@
 //! [`ArtifactResolver`] adaptation and the manager/group orchestration follow
 //! in C24/C25.
 
+/// The board policy's dynamic-application profile (§9.1): the single place
+/// where the board ABI decides which loader profile a bare (non-package)
+/// application links with.
+#[cfg(target_board = "qemu_mps2_an385")]
+pub fn board_dynamic_profile() -> blueos_loader::LoadProfile {
+    blueos_loader::LoadProfile::arm_thumb_soft_float(blueos_loader::ElfType::Dyn)
+}
+
+#[cfg(target_board = "qemu_mps3_an547")]
+pub fn board_dynamic_profile() -> blueos_loader::LoadProfile {
+    blueos_loader::LoadProfile::arm_thumb_hard_float(blueos_loader::ElfType::Dyn)
+}
+
 pub mod adapters;
 pub mod event_queue;
 pub mod group;

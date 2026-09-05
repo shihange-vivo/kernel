@@ -216,7 +216,10 @@ impl ApplicationService {
                     .map_err(|error| prepare_failed("link package", &error))?
             }
             None => {
-                let profile = LoadProfile::arm_thumb_soft_float(ElfType::Dyn);
+                // §9.1: the board policy picks the dynamic profile; a
+                // manifest-closed package records it, a bare application
+                // uses the board's default.
+                let profile = crate::application::board_dynamic_profile();
                 self.loader
                     .link(root, profile, group)
                     .map_err(|error| prepare_failed("link application", &error))?
@@ -224,7 +227,7 @@ impl ApplicationService {
         };
         #[cfg(not(boot_dynamic_seed))]
         let product = {
-            let profile = LoadProfile::arm_thumb_soft_float(ElfType::Dyn);
+            let profile = crate::application::board_dynamic_profile();
             self.loader
                 .link(root, profile, group)
                 .map_err(|error| prepare_failed("link application", &error))?
