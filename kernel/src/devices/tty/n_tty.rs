@@ -324,31 +324,31 @@ impl Device for Tty {
 
     fn ioctl(&self, request: u32, arg: usize) -> Result<(), ErrorKind> {
         match request {
-            TCGETS => {
+            req if req == TCGETS as u32 => {
                 let termios = *self.termios.lock();
                 unsafe { store_user_termios(arg as *mut Termios, &termios) }
             }
-            TCSETS => {
+            req if req == TCSETS as u32 => {
                 let termios = unsafe { load_user_termios(arg as *const Termios)? };
                 self.apply_termios_atomically(termios)
             }
-            TCSETSW => {
+            req if req == TCSETSW as u32 => {
                 let termios = unsafe { load_user_termios(arg as *const Termios)? };
                 self.dev.wait_for_tx_drain_complete()?;
                 self.apply_termios_atomically(termios)
             }
-            TCSETSF => {
+            req if req == TCSETSF as u32 => {
                 let termios = unsafe { load_user_termios(arg as *const Termios)? };
                 self.dev.wait_for_tx_drain_complete()?;
                 self.dev.handle_tcflsh(TCIFLUSH)?;
                 self.apply_termios_atomically(termios)
             }
-            TCFLSH => self.dev.handle_tcflsh(arg as c_int),
-            TCXONC => {
+            req if req == TCFLSH as u32 => self.dev.handle_tcflsh(arg as c_int),
+            req if req == TCXONC as u32 => {
                 let cc = &self.termios.lock().cc;
                 self.dev.handle_tcxonc(arg as c_int, cc)
             }
-            TCSBRK => self.dev.handle_tcsbrk(arg as c_int),
+            req if req == TCSBRK as u32 => self.dev.handle_tcsbrk(arg as c_int),
             req => match DeviceRequest::from(req) {
                 DeviceRequest::Config => Ok(()),
                 DeviceRequest::Close => Ok(()),

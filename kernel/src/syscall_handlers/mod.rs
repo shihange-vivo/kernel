@@ -999,11 +999,12 @@ mod application_syscalls {
     /// The current thread's owning thread group, from the membership alone.
     fn current_membership_group() -> Option<crate::application::group::ThreadGroup> {
         let current = scheduler::current_thread();
-        current
+        let group = current
             .lock()
             .membership()
             .cloned()
-            .and_then(|membership| membership.upgrade())
+            .and_then(|membership| membership.upgrade());
+        group
     }
 
     /// Signal that the application's init plan completed (§9.3). The

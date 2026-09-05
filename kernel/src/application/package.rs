@@ -57,9 +57,8 @@ pub fn find_edge(
 }
 
 /// Map a package's target profile id to its loader profile (§9.1: the board
-/// policy picks the profile; the package records it in the manifest). The two
-/// Phase-2 ARM profiles — v7-M soft-float and v8-M hard-float — are known;
-/// anything else fails closed until the remaining C33–C35 profiles land.
+/// policy picks the profile; the package records it in the manifest). Unknown
+/// ids fail closed rather than deriving ABI policy from an untrusted ELF.
 pub fn profile_for(
     package: &ApplicationPackageManifest,
 ) -> Result<blueos_loader::LoadProfile, ()> {
@@ -69,6 +68,15 @@ pub fn profile_for(
         )),
         "thumbv8m-main-vivo-blueos-newlibeabihf" => Ok(
             blueos_loader::LoadProfile::arm_thumb_hard_float(blueos_loader::ElfType::Dyn),
+        ),
+        "riscv64-vivo-blueos" => Ok(blueos_loader::LoadProfile::riscv64(
+            blueos_loader::ElfType::Dyn,
+        )),
+        "aarch64-vivo-blueos" => Ok(blueos_loader::LoadProfile::aarch64(
+            blueos_loader::ElfType::Dyn,
+        )),
+        "riscv32-vivo-blueos-imac" | "riscv32-vivo-blueos-imc" => Ok(
+            blueos_loader::LoadProfile::riscv32(blueos_loader::ElfType::Dyn),
         ),
         _ => Err(()),
     }

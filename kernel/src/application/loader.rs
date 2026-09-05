@@ -35,10 +35,19 @@
 use alloc::vec::Vec;
 
 use blueos_loader::{
-    AllocationLease, ArchitectureCodeCache, ArmRelocator, CacheRequirements, DependencyName,
-    DynamicLinker, ImageOwnership, LinkDomainId, LinkProduct, LoadError, LoadErrorKind,
-    LoadProfile, LoadResult, ResolvedArtifact, SessionLimits,
+    AllocationLease, ArchitectureCodeCache, CacheRequirements, DependencyName, DynamicLinker,
+    ImageOwnership, LinkDomainId, LinkProduct, LoadError, LoadErrorKind, LoadProfile, LoadResult,
+    ResolvedArtifact, SessionLimits,
 };
+
+#[cfg(target_arch = "aarch64")]
+use blueos_loader::AArch64Relocator as PlatformRelocator;
+#[cfg(target_arch = "arm")]
+use blueos_loader::ArmRelocator as PlatformRelocator;
+#[cfg(target_arch = "riscv32")]
+use blueos_loader::Riscv32Relocator as PlatformRelocator;
+#[cfg(target_arch = "riscv64")]
+use blueos_loader::Riscv64Relocator as PlatformRelocator;
 
 use crate::{
     application::{
@@ -166,7 +175,11 @@ impl ApplicationLoader {
     where
         Resolver: blueos_loader::ArtifactResolver<Reader = VfsElfReader> + ResolverFinish,
     {
-        let linker = DynamicLinker::new(ArmRelocator);
+        // The package-selected LoadProfile and the relocator must describe the
+        // same machine/class. DynamicLinker::begin enforces that pairing, so a
+        // foreign package fails before mapping even if its manifest was
+        // accidentally included in this board image.
+        let linker = DynamicLinker::new(PlatformRelocator);
         let mut memory = self.memory.clone();
         let mut cache = ArchitectureCodeCache::new(CacheRequirements::CURRENT_EXECUTION_CONTEXT);
         let mut publisher = KernelLinkPublisher::new(group.clone());
@@ -362,6 +375,13 @@ fn log_lifecycle(product: &LinkProduct<KernelLinkReceipt>) {
 /// checker to assert normalized binding triples.
 fn log_bindings(product: &LinkProduct<KernelLinkReceipt>) {
     for binding in product.relocation_bindings() {
+        // Local/anonymous dynamic-symbol entries have no externally visible
+        // scope decision. Logging them produced hundreds of indistinguishable
+        // `name= provider=none` lines for libc and obscured the bindings this
+        // oracle is meant to expose.
+        if binding.name().is_empty() {
+            continue;
+        }
         let name = core::str::from_utf8(binding.name()).unwrap_or("<non-utf8>");
         match binding.provider() {
             Some(provider) => log::info!(

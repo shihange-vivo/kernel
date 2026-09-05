@@ -67,6 +67,14 @@ SECTIONS
     PROVIDE_HIDDEN(__bk_app_array_end = .);
   }
 
+  /* Firmware-embedded dynamic artifacts must live before _end. Otherwise the
+   * physical allocator treats this orphan section as free RAM and can erase
+   * the ELF bytes before boot seeding copies them into tmpfs. */
+  .bk_seed : {
+    . = ALIGN(16);
+    KEEP (*(.bk_seed))
+  }
+
   .heap : {
     . = ALIGN(4096);
     __heap_start = .;

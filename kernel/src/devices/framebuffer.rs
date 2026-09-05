@@ -311,17 +311,17 @@ impl<T: FramebufferOps + 'static> Device for FramebufferDevice<T> {
 
     fn ioctl(&self, request: u32, arg: usize) -> Result<(), ErrorKind> {
         match request {
-            req if req == FBIOGET_FSCREENINFO => {
+            req if req == FBIOGET_FSCREENINFO as u32 => {
                 let fixed_info = self.ops.read().fixed_info()?;
                 unsafe { store_user_fixed_info(arg as *mut FramebufferFixedInfo, &fixed_info) }
             }
-            req if req == FBIOGET_VSCREENINFO => {
+            req if req == FBIOGET_VSCREENINFO as u32 => {
                 let variable_info = self.ops.read().variable_info()?;
                 unsafe {
                     store_user_variable_info(arg as *mut FramebufferVariableInfo, &variable_info)
                 }
             }
-            req if req == FBIOPUT_VSCREENINFO => {
+            req if req == FBIOPUT_VSCREENINFO as u32 => {
                 let requested_info =
                     unsafe { load_user_variable_info(arg as *const FramebufferVariableInfo)? };
                 let effective_info = self.ops.write().set_variable_info(&requested_info)?;

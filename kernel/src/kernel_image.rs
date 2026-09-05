@@ -31,8 +31,7 @@ extern crate rsrt;
 /// arch module — so without this anchor the linker would garbage-collect the
 /// whole kernel out of the image.
 #[used]
-static KERNEL_ANCHOR: extern "C" fn(&'static blueos::arch::Context) -> usize =
-    blueos::arch::bk_debug_syscall;
+static KERNEL_ANCHOR: extern "C" fn() -> usize = blueos::arch::current_sp;
 
 #[no_mangle]
 pub extern "C" fn main() {
