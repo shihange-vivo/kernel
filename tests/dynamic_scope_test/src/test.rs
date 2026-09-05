@@ -122,9 +122,10 @@ fn scope_visibility_vertical() {
     );
 
     // NOTE: the tls_demo emutls corpus package (§8.7) builds and passes its
-    // package check; the runtime driver is deferred until the worker-thread
-    // pthread/emutls interaction is diagnosed (a fault inside the libc
-    // alloc path on the first sub-thread TLS access).
+    // package check; its runtime driver is deferred until the sub-thread
+    // pthread/emutls context inheritance is diagnosed — the first worker
+    // thread's TLS access faults inside the libc alloc path on a corrupted
+    // per-thread emutls array (pre-existing, needs a dedicated fix).
 }
 
 #[no_mangle]
