@@ -36,6 +36,7 @@ use crate::{
         },
         relocate::{self, ProviderRegion, RelocationImage, RelocationPolicy},
         ArtifactIdentity, ArtifactResolver, ArtifactRole, DependencyName, DependencyRequest,
+        DependencyRequester,
         DependencyResolution, ImageId, ImageOwnership, LinkDomainId, PublishedImageDescriptor,
         PublishedRegion, ResolvedArtifact, RuntimeImageMetadata, RuntimeImageState, ScopeSet,
         SymbolTable,
@@ -570,16 +571,31 @@ impl<'a, M: ImageMemory + ?Sized, A: ArchRelocator> BuildingSession<'a, M, A> {
             let requester = item.requester();
             self.metrics.record_resolver_call();
             let resolved = {
-                let requester_artifact = self
+                let requester_node = self
                     .graph
                     .node(requester)
-                    .map(|node| node.artifact())
                     .ok_or_else(|| session_error(LoadErrorKind::BadElf, ErrorContext::None))?;
                 let needed = needed_for(&self.state.images, requester, item.needed_index())?;
-                let request = DependencyRequest::new(requester_artifact, needed, self.domain);
-                resolver
-                    .resolve(&request)
-                    .map_err(|error| error.at_stage(LoadStage::Discover))?
+                // C30 §7.1: the resolver sees the full requester context — the
+                // session-local image id, its identity and its ownership — so
+                // package/system resolution can be decided per requester.
+                let request = DependencyRequest::new(
+                    DependencyRequester::new(
+                        requester,
+                        requester_node.artifact(),
+                        requester_node.ownership(),
+                    ),
+                    needed,
+                    self.domain,
+                );
+                resolver.resolve(&request).map_err(|error| {
+                    error
+                        .at_stage(LoadStage::Discover)
+                        .with_context(ErrorContext::Dependency {
+                            requester: requester.get(),
+                            needed: needed.as_bytes().into(),
+                        })
+                })?
             };
 
             match resolved {

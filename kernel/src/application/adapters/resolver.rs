@@ -234,11 +234,7 @@ fn source_changed() -> LoadError {
 }
 
 fn unresolved(needed: &DependencyName) -> LoadError {
-    LoadError::new(
-        LoadErrorKind::Backend,
-        ErrorContext::Dependency {
-            requester: 0,
-            needed: needed.as_bytes().into(),
-        },
-    )
+    // C30 §7.1: the session attaches the real requester image id when the
+    // resolver leaves the context empty; the resolver no longer fakes `0`.
+    LoadError::new(LoadErrorKind::Backend, ErrorContext::None)
 }

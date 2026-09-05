@@ -186,10 +186,51 @@ impl DependencyName {
     }
 }
 
+/// The requester of one dependency edge: the graph node asking for a
+/// `DT_NEEDED` and the ownership that decides how the resolver may satisfy it
+/// (C30, §7.1). This carries no VFS, path or registry types into the loader
+/// crate — just the session-local image id, its identity and its ownership.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct DependencyRequester<'a> {
+    image: ImageId,
+    identity: &'a ArtifactIdentity,
+    ownership: ImageOwnership,
+}
+
+impl<'a> DependencyRequester<'a> {
+    #[inline]
+    pub const fn new(
+        image: ImageId,
+        identity: &'a ArtifactIdentity,
+        ownership: ImageOwnership,
+    ) -> Self {
+        Self {
+            image,
+            identity,
+            ownership,
+        }
+    }
+
+    #[inline]
+    pub const fn image(&self) -> ImageId {
+        self.image
+    }
+
+    #[inline]
+    pub const fn identity(&self) -> &ArtifactIdentity {
+        self.identity
+    }
+
+    #[inline]
+    pub const fn ownership(&self) -> ImageOwnership {
+        self.ownership
+    }
+}
+
 /// A request for one `DT_NEEDED` dependency, rooted at its requester.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct DependencyRequest<'a> {
-    requester: &'a ArtifactIdentity,
+    requester: DependencyRequester<'a>,
     needed: &'a DependencyName,
     domain: LinkDomainId,
 }
@@ -197,7 +238,7 @@ pub struct DependencyRequest<'a> {
 impl<'a> DependencyRequest<'a> {
     #[inline]
     pub const fn new(
-        requester: &'a ArtifactIdentity,
+        requester: DependencyRequester<'a>,
         needed: &'a DependencyName,
         domain: LinkDomainId,
     ) -> Self {
@@ -209,7 +250,7 @@ impl<'a> DependencyRequest<'a> {
     }
 
     #[inline]
-    pub const fn requester(&self) -> &ArtifactIdentity {
+    pub const fn requester(&self) -> DependencyRequester<'a> {
         self.requester
     }
 

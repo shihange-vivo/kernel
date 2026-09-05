@@ -201,6 +201,15 @@ impl LoadError {
         self
     }
 
+    /// Attach an error context, keeping any context the error already has.
+    #[inline]
+    pub fn with_context(mut self, context: ErrorContext) -> Self {
+        if matches!(self.context, ErrorContext::None) {
+            self.context = context;
+        }
+        self
+    }
+
     #[inline]
     pub const fn stage(&self) -> Option<LoadStage> {
         self.stage

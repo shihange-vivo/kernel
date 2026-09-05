@@ -30,6 +30,7 @@ mod symbol;
 
 pub use artifact::{
     ArtifactIdentity, ArtifactResolver, ArtifactRole, BuildId, DependencyName, DependencyRequest,
+    DependencyRequester,
     DependencyResolution, FileIdentity, ImageId, ImageOwnership, LinkDomainId, ResolvedArtifact,
 };
 
