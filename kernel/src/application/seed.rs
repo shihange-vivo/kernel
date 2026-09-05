@@ -43,6 +43,8 @@ static CATALOG: SystemLibraryPaths = SystemLibraryPaths::new(SYSTEM_LIBRARIES);
 extern "C" {
     static __bk_seed_hello_start: u8;
     static __bk_seed_hello_end: u8;
+    static __bk_seed_shell_start: u8;
+    static __bk_seed_shell_end: u8;
     static __bk_seed_libc_start: u8;
     static __bk_seed_libc_end: u8;
 }
@@ -119,10 +121,25 @@ pub fn init() -> &'static ApplicationService {
     seed_file("/apps/hello/app.elf", unsafe {
         blob(&__bk_seed_hello_start, &__bk_seed_hello_end)
     });
+    seed_file("/apps/shell/app.elf", unsafe {
+        blob(&__bk_seed_shell_start, &__bk_seed_shell_end)
+    });
     seed_file("/system/lib/libc.so.1", unsafe {
         blob(&__bk_seed_libc_start, &__bk_seed_libc_end)
     });
     ApplicationService::init(&CATALOG, LinkDomainId::new(1))
+}
+
+/// Boot bootstrap (§18.2): seed the system image, assemble the application
+/// stack and launch the dynamic shell. A launch failure is logged, not
+/// fatal — the kernel keeps running with the service assembled.
+pub fn bootstrap() -> &'static ApplicationService {
+    let service = init();
+    let argv = alloc::vec![b"/apps/shell/app.elf".to_vec()];
+    if let Err(error) = service.spawn("/apps/shell/app.elf", argv, Vec::new()) {
+        log::error!("boot: bootstrap shell launch failed: {:?}", error);
+    }
+    service
 }
 
 /// The fixed catalog for callers that build their own service view (the

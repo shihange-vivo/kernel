@@ -191,6 +191,31 @@ run_clippy("blueos_clippy") {
   deps = [ ":blueos" ]
 }
 
+# C29 §18.2: the bootable kernel image without static applications. The boot
+# seed path assembles the application stack and launches the dynamic
+# bootstrap shell, so the image only needs the kernel, the rsrt runtime and a
+# stub `main` that retires after the scheduler takes over.
+build_rust("kernel_image") {
+  crate_type = "bin"
+  edition = "2021"
+  sources = [ "src/kernel_image.rs" ]
+  deps = [
+    ":blueos",
+    "//kernel/rsrt",
+    "//libc",
+    "//librs",
+  ]
+  # The board runners read the generated rustflags file, so the kconfig
+  # generation must be reachable through public deps.
+  public_deps = [ "//kernel/kconfig:generate_rustflags_file" ]
+  cfgs = _kernel_default_cfgs
+  linker_script = default_linker_script
+  public_configs += [
+    "//kernel/kconfig:kconfigs",
+    "//build/boards/${board}:kernel_config",
+  ]
+}
+
 # C29 §18.1: embed the dynamic system image (the hello PIE and libc.so.1)
 # into the kernel so boot can seed the root tmpfs without semihosting.
 # Gated per board via `boot_dynamic_seed` (only qemu_mps2_an385 for Phase 1).
@@ -199,6 +224,7 @@ if (defined(boot_dynamic_seed) && boot_dynamic_seed) {
     script = "//build/scripts/gen_seed_blob_asm.py"
     deps = [
       "//apps/example/dynamic/hello:hello",
+      "//apps/shell:shell",
       "//librs:libc",
     ]
     outfile = "${target_gen_dir}/boot_seed_blobs.S"
@@ -207,6 +233,8 @@ if (defined(boot_dynamic_seed) && boot_dynamic_seed) {
       rebase_path(outfile),
       "--blob",
       "hello," + rebase_path("${root_out_dir}/bin/hello"),
+      "--blob",
+      "shell," + rebase_path("${root_out_dir}/bin/shell"),
       "--blob",
       "libc," + rebase_path("${root_out_dir}/lib/liblibrs.so"),
     ]

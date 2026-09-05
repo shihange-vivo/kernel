@@ -133,7 +133,7 @@ extern "C" fn init() {
     // first thread runs.
     #[cfg(boot_dynamic_seed)]
     {
-        crate::application::seed::init();
+        crate::application::seed::bootstrap();
     }
     time::timer::init();
     #[cfg(kernel_async)]
