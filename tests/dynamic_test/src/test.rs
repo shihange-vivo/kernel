@@ -1,13 +1,13 @@
 // NEWLINE-TIMEOUT: 10
-// ASSERT-SUCC: Dynamic application test started
-// ASSERT-SUCC: DSO_LOAD soname=libc.so.1
-// ASSERT-SUCC: hello dynamic app
-// ASSERT-SUCC: argv0=/apps/hello/app.elf
-// ASSERT-SUCC: auxv: AT_PHDR ok
-// ASSERT-SUCC: APP_LAUNCHED handle=.* path=/apps/hello/app.elf
-// ASSERT-SUCC: APP_INIT_COMPLETE handle=.*
-// ASSERT-SUCC: APP_REAP handle=.* private_images=1 imported_dsos=1
-// ASSERT-SUCC: DSO_REUSE soname=libc.so.1
+// CHECK-SUCC: Dynamic application test started
+// CHECK-SUCC: DSO_LOAD soname=libc.so.1
+// CHECK-SUCC: hello dynamic app
+// CHECK-SUCC: argv0=/apps/hello/app.elf
+// CHECK-SUCC: auxv: AT_PHDR ok
+// CHECK-SUCC: APP_LAUNCHED handle=.* path=/apps/hello/app.elf
+// CHECK-SUCC: APP_INIT_COMPLETE handle=.*
+// CHECK-SUCC: APP_REAP handle=.* private_images=1 imported_dsos=1
+// CHECK-SUCC: DSO_REUSE soname=libc.so.1
 // ASSERT-SUCC: Dynamic application test ended
 // ASSERT-FAIL: Backtrace in Panic.*
 // ASSERT-FAIL: ASSERTION FAILED.*

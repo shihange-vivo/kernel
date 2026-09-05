@@ -115,6 +115,11 @@ fn scope_visibility_vertical() {
     // group exits, the reaper runs the system fini on its worker thread and
     // unloads the instance (§8.5).
     let first = launch_and_wait(service, "/apps/scope_demo/app.elf");
+    // The ARM boot seed assembles the shell's domain first (slot 0) and the
+    // package corpus second. Boards whose seed carries no shell image (the
+    // C33 RV64 seed) hand the package slot 0; the reload invariants below
+    // do not depend on the absolute index.
+    #[cfg(target_arch = "arm")]
     assert_eq!(first.slot, 1, "shell holds slot 0, package takes slot 1");
 
     // Second launch: the unloaded slot reloads generation+1 (constructor runs
