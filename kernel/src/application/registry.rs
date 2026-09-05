@@ -75,6 +75,49 @@ pub enum AcquireOutcome {
     Pending(WaitHandle),
 }
 
+/// The outcome of a batch acquire over a whole declared system closure
+/// (C30, §7.3).
+pub enum AcquireBatchOutcome {
+    /// The entire closure was acquired atomically: `Vacant` slots became
+    /// `Loading` (with their permits) and `Ready` slots minted leases.
+    Acquired(PreparedSystemBatch),
+    /// Some slot is mid-construction; nothing changed and the caller must
+    /// wait on the ticket and retry the whole batch.
+    Pending(SystemBatchWait),
+}
+
+/// The atomically acquired system closure a resolver consumes edge-by-edge.
+pub struct PreparedSystemBatch {
+    /// First-load candidates: the SONAME paired with its publication permit.
+    pub loads: Vec<(DependencyName, LoadPermit)>,
+    /// Ready imports: the SONAME, its counted lease and a descriptor clone.
+    pub imports: Vec<(DependencyName, SystemDsoLease, PublishedImageDescriptor)>,
+}
+
+/// A batch waiter's ticket for an in-flight system closure (C30, §7.3).
+///
+/// The handle keys off the registry-wide resolution epoch, so a wake that
+/// resolves only *part* of the closure still causes a safe whole-batch
+/// re-check.
+pub struct SystemBatchWait {
+    observed: usize,
+    signal: Arc<AtomicUsize>,
+}
+
+impl SystemBatchWait {
+    /// Block until some slot of the closure resolved, then return so the
+    /// caller re-runs the whole batch acquisition.
+    pub fn wait(&self) {
+        loop {
+            let current = self.signal.load(Ordering::Acquire);
+            if current != self.observed {
+                break;
+            }
+            let _ = atomic_wait(&self.signal, current, Tick::MAX);
+        }
+    }
+}
+
 /// Per-`(domain, soname)` construction state (§13.2).
 ///
 /// `Quiescing` retains the descriptor and fini plan of the instance whose last
@@ -111,6 +154,11 @@ struct Slot {
 
 struct Inner {
     slots: Vec<Slot>,
+    /// Registry-wide resolution epoch: bumped whenever any slot resolves
+    /// (cancel, Ready publication or quiescence decision). Batch waiters key
+    /// off it instead of per-slot signals, so a batch covering several slots
+    /// re-checks the whole set atomically (C30, §7.3).
+    resolution: Arc<AtomicUsize>,
 }
 
 /// Shared registry handle. `Clone` yields another handle onto the same slot
@@ -131,7 +179,10 @@ impl SystemDsoRegistry {
     /// Create an empty registry.
     pub fn new() -> Self {
         Self {
-            inner: Arc::new(Mutex::new(Inner { slots: Vec::new() })),
+            inner: Arc::new(Mutex::new(Inner {
+                slots: Vec::new(),
+                resolution: Arc::new(AtomicUsize::new(0)),
+            })),
         }
     }
 
@@ -179,6 +230,82 @@ impl SystemDsoRegistry {
         }
     }
 
+    /// Atomically acquire the whole declared system closure (C30, §7.3).
+    ///
+    /// Every slot must be re-acquirable — `Vacant` or `Ready` — in which case
+    /// all `Vacant` slots mint a [`LoadPermit`] and all `Ready` slots mint a
+    /// [`SystemDsoLease`] plus a descriptor clone, under a single lock hold:
+    /// two concurrent sessions can never interleave two half-batches and form
+    /// an ABBA cycle. Any in-flight slot leaves the entire set untouched and
+    /// returns a [`SystemBatchWait`] ticket; the caller waits outside the lock
+    /// and retries the whole batch.
+    pub fn acquire_batch(
+        &self,
+        domain: LinkDomainId,
+        sonames: &[DependencyName],
+    ) -> AcquireBatchOutcome {
+        let mut inner = self.inner.lock();
+        // Deterministic order: SONAME byte order, de-duplicated (§7.3).
+        let mut ordered: Vec<DependencyName> = sonames.iter().cloned().collect();
+        ordered.sort();
+        ordered.dedup();
+        for soname in &ordered {
+            let index = ensure_slot(&mut inner.slots, domain, soname.clone());
+            match inner.slots[index].state {
+                InstanceState::Vacant | InstanceState::Ready { .. } => {}
+                InstanceState::Loading
+                | InstanceState::Relocated
+                | InstanceState::Quiescing { .. } => {
+                    return AcquireBatchOutcome::Pending(SystemBatchWait {
+                        observed: inner.resolution.load(Ordering::Acquire),
+                        signal: Arc::clone(&inner.resolution),
+                    });
+                }
+            }
+        }
+        let mut loads = Vec::new();
+        let mut imports = Vec::new();
+        for soname in ordered {
+            let index = ensure_slot(&mut inner.slots, domain, soname.clone());
+            let slot = &mut inner.slots[index];
+            match &mut slot.state {
+                InstanceState::Vacant => {
+                    slot.generation = slot.generation.wrapping_add(1);
+                    slot.state = InstanceState::Loading;
+                    loads.push((
+                        soname,
+                        LoadPermit {
+                            inner: Arc::clone(&self.inner),
+                            slot: index,
+                            generation: slot.generation,
+                            armed: true,
+                        },
+                    ));
+                }
+                InstanceState::Ready {
+                    leases,
+                    descriptor,
+                    ..
+                } => {
+                    *leases = leases.saturating_add(1);
+                    imports.push((
+                        soname,
+                        SystemDsoLease {
+                            inner: Arc::clone(&self.inner),
+                            slot: index,
+                            generation: slot.generation,
+                            domain: slot.domain,
+                            soname: slot.soname.clone(),
+                        },
+                        descriptor.clone(),
+                    ));
+                }
+                _ => unreachable!("batch pre-check passed"),
+            }
+        }
+        AcquireBatchOutcome::Acquired(PreparedSystemBatch { loads, imports })
+    }
+
     /// Advance a `Loading` slot to `Relocated` once the candidate image's
     /// relocation and seal stage completed (§13.3). All capacity/identity/
     /// generation checks happen in the link publisher's `prepare_batch` before
@@ -187,6 +314,7 @@ impl SystemDsoRegistry {
         let (inner, slot, generation) = permit.consume();
         {
             let mut guard = inner.lock();
+            let resolution = Arc::clone(&guard.resolution);
             let instance = guard.slots.get_mut(slot).ok_or_else(stale_error)?;
             if instance.generation != generation {
                 return Err(stale_error());
@@ -195,6 +323,9 @@ impl SystemDsoRegistry {
                 InstanceState::Loading => instance.state = InstanceState::Relocated,
                 _ => return Err(stale_error()),
             }
+            // The slot left an in-flight state for a resolvable one; wake
+            // per-slot and registry-wide waiters.
+            wake_waiters(&instance.waiter, &resolution);
         }
         Ok(RelocatedPermit {
             inner,
@@ -215,8 +346,9 @@ impl SystemDsoRegistry {
         fini_plan: FiniPlan,
     ) -> LoadResult<u32> {
         let (inner, slot, generation) = relocated.consume();
-        let signal = {
+        {
             let mut guard = inner.lock();
+            let resolution = Arc::clone(&guard.resolution);
             let instance = guard.slots.get_mut(slot).ok_or_else(stale_error)?;
             if instance.generation != generation {
                 return Err(stale_error());
@@ -228,12 +360,11 @@ impl SystemDsoRegistry {
                         descriptor,
                         fini_plan,
                     };
-                    Arc::clone(&instance.waiter)
+                    wake_waiters(&instance.waiter, &resolution);
                 }
                 _ => return Err(stale_error()),
             }
-        };
-        wake_waiters(&signal);
+        }
         Ok(generation)
     }
 
@@ -247,40 +378,33 @@ impl SystemDsoRegistry {
         soname: &DependencyName,
         keep_cached: bool,
     ) -> Option<u32> {
-        let resolved = {
-            let mut inner = self.inner.lock();
-            let index = inner
-                .slots
-                .iter()
-                .position(|s| s.domain == domain && &s.soname == soname)?;
-            let slot = &mut inner.slots[index];
-            let state = core::mem::replace(&mut slot.state, InstanceState::Vacant);
-            match state {
-                InstanceState::Quiescing { descriptor, fini_plan } => {
-                    if keep_cached {
-                        // KeepCached: stay Ready with zero leases so a later import
-                        // takes the fast path without a reload (§13.3).
-                        slot.state = InstanceState::Ready {
-                            leases: 0,
-                            descriptor,
-                            fini_plan,
-                        };
-                    }
-                    // Otherwise the pre-replace `Vacant` is already correct.
-                    Some((slot.generation, Arc::clone(&slot.waiter)))
+        let mut inner = self.inner.lock();
+        let resolution = Arc::clone(&inner.resolution);
+        let index = inner
+            .slots
+            .iter()
+            .position(|s| s.domain == domain && &s.soname == soname)?;
+        let slot = &mut inner.slots[index];
+        let state = core::mem::replace(&mut slot.state, InstanceState::Vacant);
+        match state {
+            InstanceState::Quiescing { descriptor, fini_plan } => {
+                if keep_cached {
+                    // KeepCached: stay Ready with zero leases so a later import
+                    // takes the fast path without a reload (§13.3).
+                    slot.state = InstanceState::Ready {
+                        leases: 0,
+                        descriptor,
+                        fini_plan,
+                    };
                 }
-                other => {
-                    slot.state = other;
-                    None
-                }
+                // Otherwise the pre-replace `Vacant` is already correct.
+                wake_waiters(&slot.waiter, &resolution);
+                Some(slot.generation)
             }
-        };
-        match resolved {
-            Some((generation, signal)) => {
-                wake_waiters(&signal);
-                Some(generation)
+            other => {
+                slot.state = other;
+                None
             }
-            None => None,
         }
     }
 
@@ -369,8 +493,9 @@ impl Drop for LoadPermit {
         if !self.armed {
             return;
         }
-        let signal = {
+        {
             let mut guard = self.inner.lock();
+            let resolution = Arc::clone(&guard.resolution);
             let Some(slot) = guard.slots.get_mut(self.slot) else {
                 return;
             };
@@ -378,11 +503,10 @@ impl Drop for LoadPermit {
                 return;
             }
             slot.state = InstanceState::Vacant;
-            Arc::clone(&slot.waiter)
-        };
-        // Cancelling back to `Vacant` makes the slot re-acquirable: wake any
-        // waiter blocked on this in-flight generation (§13.5).
-        wake_waiters(&signal);
+            // Cancelling back to `Vacant` makes the slot re-acquirable: wake
+            // any waiter blocked on this in-flight generation (§13.5).
+            wake_waiters(&slot.waiter, &resolution);
+        }
     }
 }
 
@@ -410,8 +534,9 @@ impl Drop for RelocatedPermit {
         if !self.armed {
             return;
         }
-        let signal = {
+        {
             let mut guard = self.inner.lock();
+            let resolution = Arc::clone(&guard.resolution);
             let Some(slot) = guard.slots.get_mut(self.slot) else {
                 return;
             };
@@ -421,9 +546,8 @@ impl Drop for RelocatedPermit {
                 return;
             }
             slot.state = InstanceState::Vacant;
-            Arc::clone(&slot.waiter)
-        };
-        wake_waiters(&signal);
+            wake_waiters(&slot.waiter, &resolution);
+        }
     }
 }
 
@@ -534,9 +658,13 @@ impl WaitHandle {
 /// The bump happens-before the wake so a waiter that has not yet slept observes
 /// the new value via `atomic_wait`'s re-check and returns immediately, while a
 /// sleeping waiter is woken and re-checks the same way.
-fn wake_waiters(signal: &AtomicUsize) {
+fn wake_waiters(signal: &AtomicUsize, resolution: &AtomicUsize) {
     signal.fetch_add(1, Ordering::Release);
     let _ = atomic_wake(signal, usize::MAX);
+    // The registry-wide epoch moves too so batch waiters re-check the whole
+    // set (§7.3).
+    resolution.fetch_add(1, Ordering::Release);
+    let _ = atomic_wake(resolution, usize::MAX);
 }
 
 fn ensure_slot(slots: &mut Vec<Slot>, domain: LinkDomainId, soname: DependencyName) -> usize {

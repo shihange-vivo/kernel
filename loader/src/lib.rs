@@ -45,12 +45,12 @@ pub use cache::{
 };
 pub use dynamic_linker::{
     ArtifactIdentity, ArtifactResolver, ArtifactRole, BuildId, BuildingSession, CommittedImage,
-    CommittingLinkProduct, DependencyName, DependencyRequest, DependencyResolution, DynamicLinker,
-    FileIdentity, FiniPlan, ImageId, ImageOwnership, ImportedImageDescriptor, InitPlan,
-    LifecycleEntry, LinkContext, LinkDomainId, LinkMapEntry, LinkProduct, LinkPublisher,
-    LinkSession, LoadMetrics, PreparedLinkManifest, ProgramHeaderRuntimeInfo,
-    PublishedImageDescriptor, PublishedRegion, PublishedSymbolTable, RelocatedSession,
-    ResolvedArtifact, ScopedSession, SealedSession,
+    CommittingLinkProduct, DependencyName, DependencyRequest, DependencyRequester,
+    DependencyResolution, DynamicLinker, FileIdentity, FiniPlan, ImageId, ImageOwnership,
+    ImportedImageDescriptor, InitPlan, LifecycleEntry, LinkContext, LinkDomainId, LinkMapEntry,
+    LinkProduct, LinkPublisher, LinkSession, LoadMetrics, PreparedLinkManifest,
+    ProgramHeaderRuntimeInfo, PublishedImageDescriptor, PublishedRegion, PublishedSymbolTable,
+    RelocatedSession, ResolvedArtifact, ScopedSession, SealedSession,
 };
 pub use error::{
     ErrorContext, HeaderField, LimitKind, LoadError, LoadErrorKind, LoadResult, LoadStage,

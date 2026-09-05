@@ -43,10 +43,7 @@ use blueos_loader::{
 use crate::{
     application::{
         adapters::{
-            resolver::{
-                identity_from_snapshot, ApplicationArtifactResolver, ResolverAuthorities,
-                SystemCandidatePermit,
-            },
+            resolver::{identity_from_snapshot, ApplicationArtifactResolver, ResolverAuthorities, SystemCandidatePermit},
             system_paths::SystemLibraryPaths,
             vfs_reader::VfsElfReader,
         },
@@ -122,9 +119,47 @@ impl ApplicationLoader {
         profile: LoadProfile,
         group: &ThreadGroup,
     ) -> LoadResult<LinkProduct<KernelLinkReceipt>> {
+        let resolver = ApplicationArtifactResolver::new(self.catalog, self.registry.clone());
+        self.link_with(root, profile, group, resolver)
+    }
+
+    /// Link a manifest-closed application package (C30, §7.2): the composite
+    /// resolver follows the package manifest's private edges and consumes the
+    /// atomically acquired system batch.
+    #[cfg(boot_dynamic_seed)]
+    pub fn link_package(
+        &self,
+        root: ResolvedArtifact<VfsElfReader>,
+        package: &'static crate::application::package::ApplicationPackageManifest,
+        profile: LoadProfile,
+        group: &ThreadGroup,
+    ) -> LoadResult<LinkProduct<KernelLinkReceipt>> {
+        let root_identity = root.identity().clone();
+        let resolver = crate::application::adapters::package_resolver::PackageArtifactResolver::new(
+            package,
+            self.catalog,
+            self.registry.clone(),
+            &root_identity,
+            self.domain,
+        )?;
+        self.link_with(root, profile, group, resolver)
+    }
+
+    /// The shared staged-link pipeline: begin, close the dependency closure
+    /// through `resolver`, freeze scopes, relocate, seal and publish, then
+    /// advance every first-loading system candidate to `Ready` (§12.1, §15.1).
+    fn link_with<Resolver>(
+        &self,
+        root: ResolvedArtifact<VfsElfReader>,
+        profile: LoadProfile,
+        group: &ThreadGroup,
+        mut resolver: Resolver,
+    ) -> LoadResult<LinkProduct<KernelLinkReceipt>>
+    where
+        Resolver: blueos_loader::ArtifactResolver<Reader = VfsElfReader> + ResolverFinish,
+    {
         let linker = DynamicLinker::new(ArmRelocator);
         let mut memory = self.memory.clone();
-        let mut resolver = ApplicationArtifactResolver::new(self.catalog, self.registry.clone());
         let mut cache = ArchitectureCodeCache::new(CacheRequirements::CURRENT_EXECUTION_CONTEXT);
         let mut publisher = KernelLinkPublisher::new(group.clone());
 
@@ -136,7 +171,7 @@ impl ApplicationLoader {
             &mut memory,
         )?;
         building.close_dependencies(&mut resolver)?;
-        let ResolverAuthorities { permits, leases } = resolver.finish_resolution();
+        let ResolverAuthorities { permits, leases } = resolver.finish();
         publisher.import_leases(leases);
 
         let product = building
@@ -177,6 +212,26 @@ impl ApplicationLoader {
                 .map_err(|_| loader_error())?;
         }
         Ok(())
+    }
+}
+
+/// The registry-authority hand-off both resolver flavors share (C30).
+trait ResolverFinish {
+    fn finish(&mut self) -> ResolverAuthorities;
+}
+
+impl ResolverFinish for ApplicationArtifactResolver {
+    fn finish(&mut self) -> ResolverAuthorities {
+        self.finish_resolution()
+    }
+}
+
+#[cfg(boot_dynamic_seed)]
+impl ResolverFinish
+    for crate::application::adapters::package_resolver::PackageArtifactResolver
+{
+    fn finish(&mut self) -> ResolverAuthorities {
+        self.finish_resolution()
     }
 }
 

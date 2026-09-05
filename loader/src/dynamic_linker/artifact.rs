@@ -123,7 +123,7 @@ impl ArtifactIdentity {
         self.build_id.as_ref()
     }
 
-    pub(crate) fn try_clone(&self) -> LoadResult<Self> {
+    pub fn try_clone(&self) -> LoadResult<Self> {
         Ok(Self {
             file: self.file.try_clone()?,
             generation: self.generation,
@@ -171,6 +171,20 @@ impl DependencyName {
         }
         Ok(Self {
             name: try_copy_bytes(&bytes[..name_len])?,
+        })
+    }
+
+    /// Copy an owned name without requiring a trailing NUL (manifest
+    /// catalogs store plain names); rejects empty or NUL-containing bytes.
+    pub fn from_bytes(bytes: &[u8]) -> LoadResult<Self> {
+        if bytes.is_empty() || bytes.iter().any(|byte| *byte == 0) {
+            return Err(LoadError::new(
+                LoadErrorKind::BadElf,
+                crate::error::ErrorContext::None,
+            ));
+        }
+        Ok(Self {
+            name: try_copy_bytes(bytes)?,
         })
     }
 

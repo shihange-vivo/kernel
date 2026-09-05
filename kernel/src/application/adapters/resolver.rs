@@ -52,10 +52,10 @@ use crate::{
 /// here until `finish_resolution`; the remaining fields de-duplicate a second
 /// `DT_NEEDED` of the same SONAME *within one link* so the resolver does not
 /// re-request (and block on) a generation it already owns.
-struct SystemCandidateClaim {
-    permit: LoadPermit,
-    soname: DependencyName,
-    snapshot: FileSnapshotId,
+pub(crate) struct SystemCandidateClaim {
+    pub(crate) permit: LoadPermit,
+    pub(crate) soname: DependencyName,
+    pub(crate) snapshot: FileSnapshotId,
 }
 
 /// One `SystemCandidate` this link must load and publish, paired with the

@@ -16,6 +16,8 @@
 //! VFS, memory and cache services (C23-b/C23-c).
 
 pub mod flat_memory;
+#[cfg(boot_dynamic_seed)]
+pub mod package_resolver;
 pub mod resolver;
 pub mod system_paths;
 pub mod vfs_reader;

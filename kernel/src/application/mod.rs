@@ -31,6 +31,8 @@ pub mod event_queue;
 pub mod group;
 pub mod loader;
 pub mod manager;
+#[cfg(boot_dynamic_seed)]
+pub mod package;
 pub mod publication;
 pub mod reaper;
 pub mod registry;

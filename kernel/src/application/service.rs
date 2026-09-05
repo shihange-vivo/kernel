@@ -181,11 +181,32 @@ impl ApplicationService {
             .loader
             .open_root(path, None)
             .map_err(|error| prepare_failed("open root", &error))?;
-        let profile = LoadProfile::arm_thumb_soft_float(ElfType::Dyn);
-        let product = self
-            .loader
-            .link(root, profile, group)
-            .map_err(|error| prepare_failed("link application", &error))?;
+        // C30 §7.2: a manifest-closed package links through the composite
+        // resolver (private edges + atomic system batch); any other path uses
+        // the single-app system resolver.
+        #[cfg(boot_dynamic_seed)]
+        let product = match crate::application::package::find_root(path) {
+            Some(package) => {
+                let profile = crate::application::package::profile_for(package)
+                    .map_err(|error| ApplicationLaunchError::PrepareFailed)?;
+                self.loader
+                    .link_package(root, package, profile, group)
+                    .map_err(|error| prepare_failed("link package", &error))?
+            }
+            None => {
+                let profile = LoadProfile::arm_thumb_soft_float(ElfType::Dyn);
+                self.loader
+                    .link(root, profile, group)
+                    .map_err(|error| prepare_failed("link application", &error))?
+            }
+        };
+        #[cfg(not(boot_dynamic_seed))]
+        let product = {
+            let profile = LoadProfile::arm_thumb_soft_float(ElfType::Dyn);
+            self.loader
+                .link(root, profile, group)
+                .map_err(|error| prepare_failed("link application", &error))?
+        };
 
         let handle = group
             .handle()
