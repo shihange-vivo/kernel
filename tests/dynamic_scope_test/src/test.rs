@@ -120,6 +120,11 @@ fn scope_visibility_vertical() {
         service.spawn("/apps/scope_bad/app.elf", argv, Vec::new()).is_err(),
         "weak-call package must be rejected"
     );
+
+    // NOTE: the tls_demo emutls corpus package (§8.7) builds and passes its
+    // package check; the runtime driver is deferred until the worker-thread
+    // pthread/emutls interaction is diagnosed (a fault inside the libc
+    // alloc path on the first sub-thread TLS access).
 }
 
 #[no_mangle]
