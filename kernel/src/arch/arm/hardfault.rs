@@ -217,14 +217,19 @@ pub extern "C" fn panic_on_hardfault(ctx: &IsrContext) {
     super::disable_local_irq();
     let fault_regs: HardFaultRegs = HardFaultRegs::from_scb();
     let xpsr = xpsr::read();
+    // The frame's stack pointer locates the faulting thread: the raw MSP/PSP
+    // is captured before the handler prologue.
+    // `ctx` points at the exception frame on the faulting thread's stack.
+    let stack = ctx as *const IsrContext as usize;
     panic!(
         "
         ==== HARD FAULT ====
         FRAME: {:?}
+        STACK: {:#x}
         FAULT REGS: {}
         XPSR: {}
         ",
-        ctx, fault_regs, xpsr,
+        ctx, stack, fault_regs, xpsr,
     );
 }
 

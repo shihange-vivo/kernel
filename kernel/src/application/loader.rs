@@ -330,6 +330,13 @@ fn log_lifecycle(product: &LinkProduct<KernelLinkReceipt>) {
             log::info!("LIFECYCLE_SYSTEM_FINI owner={}", entry.owner().get());
         }
     }
+    for edge in product.context().graph_edges() {
+        log::info!(
+            "LINK_EDGE requester={} provider={}",
+            edge.requester().get(),
+            edge.provider().get()
+        );
+    }
     for entry in product.link_map() {
         log::info!(
             "LINK_MAP owner={} soname={} bias={:#x}",

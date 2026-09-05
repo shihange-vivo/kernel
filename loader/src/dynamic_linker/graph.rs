@@ -74,7 +74,7 @@ impl DependencyNode {
 
 /// A directed dependency edge: `requester` needs the `needed_index`-th
 /// `DT_NEEDED` of its dynamic table, satisfied by `provider`.
-pub(crate) struct DependencyEdge {
+pub struct DependencyEdge {
     requester: ImageId,
     provider: ImageId,
     needed_index: u16,
@@ -82,17 +82,17 @@ pub(crate) struct DependencyEdge {
 
 impl DependencyEdge {
     #[inline]
-    pub(crate) const fn requester(&self) -> ImageId {
+    pub const fn requester(&self) -> ImageId {
         self.requester
     }
 
     #[inline]
-    pub(crate) const fn provider(&self) -> ImageId {
+    pub const fn provider(&self) -> ImageId {
         self.provider
     }
 
     #[inline]
-    pub(crate) const fn needed_index(&self) -> u16 {
+    pub const fn needed_index(&self) -> u16 {
         self.needed_index
     }
 }
@@ -450,11 +450,11 @@ impl DiscoveryItem {
         }
     }
 
-    pub(crate) const fn requester(&self) -> ImageId {
+    pub const fn requester(&self) -> ImageId {
         self.requester
     }
 
-    pub(crate) const fn needed_index(&self) -> u16 {
+    pub const fn needed_index(&self) -> u16 {
         self.needed_index
     }
 }

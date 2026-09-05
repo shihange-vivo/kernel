@@ -422,6 +422,13 @@ impl LinkContext {
         &self.scopes
     }
 
+    /// The recorded dependency edges (requester → provider), for the C31
+    /// lifecycle oracle to assert the closure shape (§17.1).
+    #[inline]
+    pub fn graph_edges(&self) -> &[crate::dynamic_linker::graph::DependencyEdge] {
+        self.graph.edges()
+    }
+
     #[inline]
     pub fn images(&self) -> &[CommittedImage] {
         &self.images

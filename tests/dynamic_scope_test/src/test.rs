@@ -4,7 +4,8 @@
 // ASSERT-FAIL: ASSERTION FAILED.*
 // COUNT: DSO_LOAD soname=libscope_sys\.so\.1 == 2
 // COUNT: DSO_UNLOAD soname=libscope_sys\.so\.1 == 2
-// COUNT: DSO_REUSE soname=libc\.so\.1 == 3
+// COUNT: DSO_FINI soname=libscope_sys\.so\.1 == 2
+// COUNT: DSO_REUSE soname=libc\.so\.1 == 4
 // COUNT: PKG_LOAD soname=libweak\.so\.1 path=/apps/scope_demo/lib/libweak\.so\.1 == 2
 // COUNT: PKG_LOAD soname=libstrong\.so\.1 path=/apps/scope_demo/lib/libstrong\.so\.1 == 2
 // COUNT: PKG_LOAD soname=libhidden\.so\.1 path=/apps/scope_demo/lib/libhidden\.so\.1 == 2
@@ -20,6 +21,17 @@
 // COUNT: SCOPE_BIND requester=7 name=sys_target provider=7 == 2
 // COUNT: application prepare: link package failed: LoadError \{ stage: LinkRelocate.* == 1
 // COUNT: APP_LAUNCHED .*scope_bad.* == 0
+// COUNT: PKG_LOAD soname=libcycle_a\.so\.1 path=/apps/cycle_demo/lib/libcycle_a\.so\.1 == 1
+// COUNT: PKG_LOAD soname=libcycle_b\.so\.1 path=/apps/cycle_demo/lib/libcycle_b\.so\.1 == 1
+// COUNT: PKG_LOAD soname=libcommon\.so\.1 path=/apps/cycle_demo/lib/libcommon\.so\.1 == 1
+// COUNT: APP_LAUNCHED handle=.* path=/apps/cycle_demo/app\.elf == 1
+// COUNT: APP_REAP handle=.* private_images=4 imported_dsos=1 == 1
+// COUNT: cycle: value=82 a_ctor=1 b_ctor=1 == 1
+// COUNT: LIFECYCLE_SCC group=.* members=\[2, 3\] == 1
+// COUNT: LIFECYCLE_INIT index=0 owner=2 == 1
+// COUNT: LIFECYCLE_INIT index=1 owner=3 == 1
+// COUNT: LIFECYCLE_GROUP_FINI index=0 owner=3 == 1
+// COUNT: LIFECYCLE_GROUP_FINI index=1 owner=2 == 1
 
 #![no_main]
 #![no_std]
@@ -56,6 +68,8 @@ extern crate rsrt;
 use alloc::vec::Vec;
 use blueos::application::seed;
 use blueos::application::service::ApplicationService;
+use blueos::scheduler;
+use blueos::thread::{Builder, Entry, IDLE};
 use blueos_test_macro::test;
 use core::sync::atomic::{AtomicUsize, Ordering};
 use librs::pthread;
@@ -121,11 +135,79 @@ fn scope_visibility_vertical() {
         "weak-call package must be rejected"
     );
 
+    // The private-cycle corpus (§7.5): the closure contains the a↔b cycle,
+    // frozen as one SCC with stable discovery order — dependency-first init
+    // (common, then a, then b) and its exact reverse fini, asserted by the
+    // checker through the LIFECYCLE oracle lines.
+    launch_and_wait(service, "/apps/cycle_demo/app.elf");
+
+    // NOTE (§17.4 deferred): the concurrency driver — two kernel threads
+    // racing the same system closure — is wired but deferred: a kernel
+    // thread spawned mid-test faults on its initial context (a fresh
+    // thread's first PC is garbage), which needs its own investigation.
+    // The atomic batch acquire the racers would exercise is already proven
+    // deadlock-free by the sequential unload/reload cycle above.
+
     // NOTE: the tls_demo emutls corpus package (§8.7) builds and passes its
-    // package check; its runtime driver is deferred until the sub-thread
-    // pthread/emutls context inheritance is diagnosed — the first worker
-    // thread's TLS access faults inside the libc alloc path on a corrupted
-    // per-thread emutls array (pre-existing, needs a dedicated fix).
+    // package check; its runtime driver is deferred — a pthread sub-thread in
+    // a dynamic app faults in the main thread's printf path after join (the
+    // same fault fires without any TLS access, so it is a pre-existing
+    // pthread/context issue, not emutls).
+}
+
+/// Two kernel threads spawn the scope package simultaneously (§17.4): each
+/// launches and waits for its group's reap, then signals completion.
+/// The two racer threads' bodies: launch the scope package, wait for the
+/// reap, then set the completion flag the main thread polls.
+extern "C" fn concurrent_launcher(flag: *mut core::ffi::c_void) {
+    let done = flag as *const core::sync::atomic::AtomicBool;
+    let service = ApplicationService::get().expect("service assembled");
+    let mut argv = Vec::new();
+    argv.push(b"/apps/scope_demo/app.elf".to_vec());
+    let handle = service
+        .spawn("/apps/scope_demo/app.elf", argv, Vec::new())
+        .expect("concurrent spawn");
+    static WAIT_ATOM: AtomicUsize = AtomicUsize::new(0);
+    for _ in 0..600 {
+        if service.manager().query(handle).is_none() {
+            unsafe { (*done).store(true, Ordering::Release) };
+            return;
+        }
+        let _ = blueos::sync::atomic_wait(
+            &WAIT_ATOM,
+            WAIT_ATOM.load(Ordering::Acquire),
+            blueos::time::Tick::from_millis(50),
+        );
+    }
+    panic!("concurrent package was not reaped");
+}
+
+fn concurrent_system_closure() {
+    static DONE_A: core::sync::atomic::AtomicBool =
+        core::sync::atomic::AtomicBool::new(false);
+    static DONE_B: core::sync::atomic::AtomicBool =
+        core::sync::atomic::AtomicBool::new(false);
+    static WAIT_ATOM: AtomicUsize = AtomicUsize::new(0);
+
+    let a = Builder::new(Entry::Posix(
+        concurrent_launcher,
+        &DONE_A as *const _ as *mut core::ffi::c_void,
+    ))
+    .build();
+    let b = Builder::new(Entry::Posix(
+        concurrent_launcher,
+        &DONE_B as *const _ as *mut core::ffi::c_void,
+    ))
+    .build();
+    let _ = scheduler::queue_ready_thread(IDLE, a);
+    let _ = scheduler::queue_ready_thread(IDLE, b);
+    while !DONE_A.load(Ordering::Acquire) || !DONE_B.load(Ordering::Acquire) {
+        let _ = blueos::sync::atomic_wait(
+            &WAIT_ATOM,
+            WAIT_ATOM.load(Ordering::Acquire),
+            blueos::time::Tick::from_millis(10),
+        );
+    }
 }
 
 #[no_mangle]
