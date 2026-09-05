@@ -85,6 +85,21 @@ impl KernelLinkReceipt {
     /// exactly once (§16.4): the private image leases (the root), the
     /// first-loading system DSO leases, and the counted imported DSO leases.
     #[inline]
+    /// Take the first-loading system candidates' unique allocation leases
+    /// (C31-c, §8.4): the loader moves them into the registry at batch
+    /// publication, so the receipt only retains private allocations and
+    /// imported leases from then on.
+    pub fn take_system_allocations(&mut self) -> Vec<AllocationLease> {
+        core::mem::take(&mut self.system_allocations)
+    }
+
+    /// Attach the first group's system leases, minted when the initialization
+    /// batch completes (C31-c, §8.4): the first-loading group holds ordinary
+    /// counted leases like any importer, released at group exit.
+    pub fn attach_system_leases(&mut self, leases: Vec<SystemDsoLease>) {
+        self.system_leases.extend(leases);
+    }
+
     pub fn into_parts(
         self,
     ) -> (

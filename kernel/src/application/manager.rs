@@ -38,7 +38,10 @@ use alloc::sync::Arc;
 use alloc::vec::Vec;
 use spin::Mutex;
 
-use crate::application::group::{ThreadGroup, ThreadGroupBackend};
+use crate::application::{
+    group::{ThreadGroup, ThreadGroupBackend},
+    registry::SystemDsoRegistry,
+};
 
 /// How an application executes (§14.1).
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -159,13 +162,17 @@ struct Inner {
 pub struct ApplicationManager {
     inner: Arc<Mutex<Inner>>,
     thread_groups: ThreadGroupBackend,
+    /// The system DSO registry, minted into every thread group so an early
+    /// exit can fail its pending initialization batch (C31-c, §8.3).
+    registry: SystemDsoRegistry,
 }
 
 impl ApplicationManager {
-    pub fn new() -> Self {
+    pub fn new(registry: SystemDsoRegistry) -> Self {
         Self {
             inner: Arc::new(Mutex::new(Inner { slots: Vec::new() })),
             thread_groups: ThreadGroupBackend::new(),
+            registry,
         }
     }
 
@@ -195,7 +202,7 @@ impl ApplicationManager {
                 request.model,
             ));
         }
-        let group = self.thread_groups.create_group();
+        let group = self.thread_groups.create_group(&self.registry);
         let prepare_group = group.clone();
         let (slot, generation) = {
             let mut inner = self.inner.lock();
@@ -387,7 +394,7 @@ impl ApplicationManager {
 
 impl Default for ApplicationManager {
     fn default() -> Self {
-        Self::new()
+        Self::new(SystemDsoRegistry::new())
     }
 }
 
@@ -396,6 +403,7 @@ impl Clone for ApplicationManager {
         Self {
             inner: Arc::clone(&self.inner),
             thread_groups: ThreadGroupBackend::new(),
+            registry: self.registry.clone(),
         }
     }
 }
@@ -462,7 +470,7 @@ mod tests {
 
     #[test]
     fn process_request_is_unsupported() {
-        let manager = ApplicationManager::new();
+        let manager = ApplicationManager::new(SystemDsoRegistry::new());
         let req = OwnedLaunchRequest::new(ExecutionModel::Process, b"app".to_vec());
         let err = manager.launch(req, |_| Ok(())).unwrap_err();
         assert!(matches!(
@@ -475,7 +483,7 @@ mod tests {
 
     #[test]
     fn relaunch_after_release_bumps_the_generation() {
-        let manager = ApplicationManager::new();
+        let manager = ApplicationManager::new(SystemDsoRegistry::new());
         let first = manager.launch(request(b"app"), |_| Ok(())).unwrap();
         // A prepared launch stays Loading until the init plan completed (S10).
         assert_eq!(manager.query(first).unwrap().state, ApplicationState::Loading);
@@ -500,7 +508,7 @@ mod tests {
 
     #[test]
     fn init_completion_requires_the_loading_state() {
-        let manager = ApplicationManager::new();
+        let manager = ApplicationManager::new(SystemDsoRegistry::new());
         let handle = manager.launch(request(b"app"), |_| Ok(())).unwrap();
         manager.complete_init(handle).unwrap();
         // A second init completion on a Running application is an illegal
@@ -513,7 +521,7 @@ mod tests {
 
     #[test]
     fn stale_and_forged_handles_are_rejected() {
-        let manager = ApplicationManager::new();
+        let manager = ApplicationManager::new(SystemDsoRegistry::new());
         let handle = manager.launch(request(b"app"), |_| Ok(())).unwrap();
         assert!(manager.query(handle).is_some());
 
@@ -535,7 +543,7 @@ mod tests {
 
     #[test]
     fn failed_prepare_leaves_a_queryable_failed_slot() {
-        let manager = ApplicationManager::new();
+        let manager = ApplicationManager::new(SystemDsoRegistry::new());
         let err = manager
             .launch(request(b"app"), |_| Err(ApplicationLaunchError::PrepareFailed))
             .unwrap_err();
@@ -547,7 +555,7 @@ mod tests {
 
     #[test]
     fn releasing_an_already_released_slot_is_rejected() {
-        let manager = ApplicationManager::new();
+        let manager = ApplicationManager::new(SystemDsoRegistry::new());
         let handle = manager.launch(request(b"app"), |_| Ok(())).unwrap();
         manager.complete_init(handle).unwrap();
         manager.begin_exit(handle).unwrap();
@@ -561,7 +569,7 @@ mod tests {
 
     #[test]
     fn release_requires_a_terminal_state() {
-        let manager = ApplicationManager::new();
+        let manager = ApplicationManager::new(SystemDsoRegistry::new());
         let handle = manager.launch(request(b"app"), |_| Ok(())).unwrap();
         // A live application cannot be released out from under its group.
         assert!(matches!(

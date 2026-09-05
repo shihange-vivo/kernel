@@ -51,8 +51,8 @@ use alloc::vec::Vec;
 use core::sync::atomic::{AtomicUsize, Ordering};
 
 use blueos_loader::{
-    DependencyName, ErrorContext, FiniPlan, LinkDomainId, LoadError, LoadErrorKind, LoadResult,
-    PublishedImageDescriptor,
+    AllocationLease, DependencyName, ErrorContext, FiniPlan, LinkDomainId, LoadError,
+    LoadErrorKind, LoadResult, PublishedImageDescriptor,
 };
 use spin::Mutex;
 
@@ -94,6 +94,67 @@ pub struct PreparedSystemBatch {
     pub imports: Vec<(DependencyName, SystemDsoLease, PublishedImageDescriptor)>,
 }
 
+/// The registry-owned backing of one new system candidate (C31-c, §8.4).
+///
+/// The first-loading application moves these into the registry at batch
+/// publication: the instance — not the application receipt — owns the unique
+/// allocation, the descriptor and the fini plan from then on.
+pub struct SystemCandidateBacking {
+    pub descriptor: PublishedImageDescriptor,
+    pub fini_plan: FiniPlan,
+    pub allocation: AllocationLease,
+    /// System-to-system dependency leases the instance retains while Ready
+    /// (populated with SCC edges in C31-d; empty for now).
+    pub dependencies: Vec<SystemDsoLease>,
+}
+
+/// The publication authority for a batch of `Initializing` slots (C31-c,
+/// §8.3), minted by [`SystemDsoRegistry::publish_relocated_batch`].
+///
+/// It must be advanced with [`SystemDsoRegistry::finish_initialization_batch`]
+/// once the application reports `ApplicationInitComplete`, or failed through
+/// [`SystemDsoRegistry::fail_initialization_batch`] when the application dies
+/// first. Dropping it armed fails the batch: no descriptor is ever published
+/// and the backings move to `Failed` for the C31-d worker.
+pub struct SystemInitBatch {
+    inner: Arc<Mutex<Inner>>,
+    slots: Vec<usize>,
+    generations: Vec<u32>,
+    armed: bool,
+}
+
+impl SystemInitBatch {
+    fn consume(mut self) -> (Arc<Mutex<Inner>>, Vec<usize>, Vec<u32>) {
+        self.armed = false;
+        (
+            Arc::clone(&self.inner),
+            core::mem::take(&mut self.slots),
+            core::mem::take(&mut self.generations),
+        )
+    }
+}
+
+impl Drop for SystemInitBatch {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        // The application never completed its init: fail the batch through
+        // the registry so no half-initialized descriptor is published.
+        let registry = SystemDsoRegistry {
+            inner: Arc::clone(&self.inner),
+        };
+        let slots = core::mem::take(&mut self.slots);
+        let generations = core::mem::take(&mut self.generations);
+        registry.fail_initialization_batch(SystemInitBatch {
+            inner: Arc::clone(&registry.inner),
+            slots,
+            generations,
+            armed: true,
+        });
+    }
+}
+
 /// A batch waiter's ticket for an in-flight system closure (C30, §7.3).
 ///
 /// The handle keys off the registry-wide resolution epoch, so a wake that
@@ -130,14 +191,41 @@ enum InstanceState {
     Vacant,
     Loading,
     Relocated,
+    /// The batch publication was accepted: the backing, descriptor and fini
+    /// plan are registry-owned while the application's constructors run. No
+    /// waiter may observe a descriptor here — they stay `Pending` until the
+    /// application reports init completion (C31-c, §8.3).
+    Initializing {
+        descriptor: PublishedImageDescriptor,
+        fini_plan: FiniPlan,
+        allocation: AllocationLease,
+        dependencies: Vec<SystemDsoLease>,
+    },
     Ready {
         leases: usize,
         descriptor: PublishedImageDescriptor,
         fini_plan: FiniPlan,
+        /// The instance owns its backing (§8.4): the unique allocation lease
+        /// and its system-to-system dependency leases live with the Ready
+        /// state, released only by the C31-d quiescence worker.
+        allocation: AllocationLease,
+        dependencies: Vec<SystemDsoLease>,
     },
     Quiescing {
         descriptor: PublishedImageDescriptor,
         fini_plan: FiniPlan,
+        allocation: AllocationLease,
+        dependencies: Vec<SystemDsoLease>,
+    },
+    /// Constructor aborted (thread fault or exit before init completion): no
+    /// half-initialized descriptor may be published. The backing is retained
+    /// here until the registry worker releases it (C31-d), while the slot
+    /// behaves like `Vacant` for a generation+1 retry.
+    Failed {
+        descriptor: PublishedImageDescriptor,
+        fini_plan: FiniPlan,
+        allocation: AllocationLease,
+        dependencies: Vec<SystemDsoLease>,
     },
 }
 
@@ -159,6 +247,9 @@ struct Inner {
     /// off it instead of per-slot signals, so a batch covering several slots
     /// re-checks the whole set atomically (C30, §7.3).
     resolution: Arc<AtomicUsize>,
+    /// Backings of failed constructor batches, retained until the C31-d
+    /// registry worker has quiescence evidence and releases them.
+    failed_backings: Vec<AllocationLease>,
 }
 
 /// Shared registry handle. `Clone` yields another handle onto the same slot
@@ -182,6 +273,7 @@ impl SystemDsoRegistry {
             inner: Arc::new(Mutex::new(Inner {
                 slots: Vec::new(),
                 resolution: Arc::new(AtomicUsize::new(0)),
+                failed_backings: Vec::new(),
             })),
         }
     }
@@ -198,6 +290,24 @@ impl SystemDsoRegistry {
     ) -> AcquireOutcome {
         let mut inner = self.inner.lock();
         let index = ensure_slot(&mut inner.slots, domain, soname.clone());
+        // A failed constructor batch never publishes a descriptor: the slot
+        // re-opens for a generation+1 retry and the failed backing is
+        // retained for the C31-d worker (§8.3).
+        if matches!(inner.slots[index].state, InstanceState::Failed { .. }) {
+            let failed = core::mem::replace(&mut inner.slots[index].state, InstanceState::Vacant);
+            if let InstanceState::Failed { allocation, .. } = failed {
+                inner.failed_backings.push(allocation);
+            }
+            let slot = &mut inner.slots[index];
+            slot.generation = slot.generation.wrapping_add(1);
+            slot.state = InstanceState::Loading;
+            return AcquireOutcome::Permit(LoadPermit {
+                inner: Arc::clone(&self.inner),
+                slot: index,
+                generation: slot.generation,
+                armed: true,
+            });
+        }
         let slot = &mut inner.slots[index];
         match &mut slot.state {
             InstanceState::Vacant => {
@@ -222,11 +332,14 @@ impl SystemDsoRegistry {
             }
             InstanceState::Loading
             | InstanceState::Relocated
+            | InstanceState::Initializing { .. }
             | InstanceState::Quiescing { .. } => AcquireOutcome::Pending(WaitHandle {
                 generation: slot.generation,
                 observed: slot.waiter.load(Ordering::Acquire),
                 signal: Arc::clone(&slot.waiter),
             }),
+            // Hoisted before the match.
+            InstanceState::Failed { .. } => unreachable!("Failed hoisted before the match"),
         }
     }
 
@@ -253,8 +366,10 @@ impl SystemDsoRegistry {
             let index = ensure_slot(&mut inner.slots, domain, soname.clone());
             match inner.slots[index].state {
                 InstanceState::Vacant | InstanceState::Ready { .. } => {}
+                InstanceState::Failed { .. } => {}
                 InstanceState::Loading
                 | InstanceState::Relocated
+                | InstanceState::Initializing { .. }
                 | InstanceState::Quiescing { .. } => {
                     return AcquireBatchOutcome::Pending(SystemBatchWait {
                         observed: inner.resolution.load(Ordering::Acquire),
@@ -267,6 +382,15 @@ impl SystemDsoRegistry {
         let mut imports = Vec::new();
         for soname in ordered {
             let index = ensure_slot(&mut inner.slots, domain, soname.clone());
+            if matches!(inner.slots[index].state, InstanceState::Failed { .. }) {
+                // Retryable like `Vacant`: retain the failed backing for the
+                // C31-d worker and mint the next generation.
+                let failed =
+                    core::mem::replace(&mut inner.slots[index].state, InstanceState::Vacant);
+                if let InstanceState::Failed { allocation, .. } = failed {
+                    inner.failed_backings.push(allocation);
+                }
+            }
             let slot = &mut inner.slots[index];
             match &mut slot.state {
                 InstanceState::Vacant => {
@@ -335,37 +459,150 @@ impl SystemDsoRegistry {
         })
     }
 
-    /// Publish a fully relocated and sealed image as the Ready instance for its
-    /// generation (§13.3). `descriptor`/`fini_plan` are the values the link
-    /// publisher's receipt carries (C26); the registry retains them so a later
-    /// link can import this instance and the reaper can run its destructors.
-    pub fn mark_ready(
+    /// Publish a whole batch of relocated system candidates in one lock hold
+    /// (C31-c, §8.3): each slot moves `Relocated → Initializing` and the
+    /// registry becomes the owner of its backing allocation, descriptor and
+    /// fini plan. Waiters stay `Pending` — nothing here publishes a
+    /// descriptor. The returned [`SystemInitBatch`] must be advanced with
+    /// [`SystemDsoRegistry::finish_initialization_batch`] once the
+    /// application reports `ApplicationInitComplete`, or failed through
+    /// [`SystemDsoRegistry::fail_initialization_batch`] when the application
+    /// dies first.
+    pub fn publish_relocated_batch(
         &self,
-        relocated: RelocatedPermit,
-        descriptor: PublishedImageDescriptor,
-        fini_plan: FiniPlan,
-    ) -> LoadResult<u32> {
-        let (inner, slot, generation) = relocated.consume();
-        {
-            let mut guard = inner.lock();
-            let resolution = Arc::clone(&guard.resolution);
-            let instance = guard.slots.get_mut(slot).ok_or_else(stale_error)?;
-            if instance.generation != generation {
+        permits: Vec<RelocatedPermit>,
+        backings: Vec<SystemCandidateBacking>,
+    ) -> LoadResult<SystemInitBatch> {
+        if permits.len() != backings.len() {
+            return Err(stale_error());
+        }
+        let mut slots = Vec::new();
+        let mut generations = Vec::new();
+        slots.try_reserve(permits.len()).map_err(|_| registry_oom())?;
+        generations.try_reserve(permits.len()).map_err(|_| registry_oom())?;
+        for (permit, backing) in permits.into_iter().zip(backings.into_iter()) {
+            let (inner_arc, slot, generation) = permit.consume();
+            {
+                let mut guard = inner_arc.lock();
+                let instance = guard.slots.get_mut(slot).ok_or_else(stale_error)?;
+                if instance.generation != generation {
+                    return Err(stale_error());
+                }
+                match instance.state {
+                    InstanceState::Relocated => {
+                        instance.state = InstanceState::Initializing {
+                            descriptor: backing.descriptor,
+                            fini_plan: backing.fini_plan,
+                            allocation: backing.allocation,
+                            dependencies: backing.dependencies,
+                        };
+                    }
+                    _ => return Err(stale_error()),
+                }
+            }
+            slots.push(slot);
+            generations.push(generation);
+        }
+        Ok(SystemInitBatch {
+            inner: Arc::clone(&self.inner),
+            slots,
+            generations,
+            armed: true,
+        })
+    }
+
+    /// Complete a published initialization batch: every slot moves
+    /// `Initializing → Ready` with one counted lease minted for the
+    /// first-loading application group (§8.4 — the first group holds an
+    /// ordinary lease like any importer). Called by the
+    /// `ApplicationInitComplete` syscall path before the manager marks the
+    /// application `Running`; all tokens were validated at publish time, so
+    /// this path only moves state.
+    pub fn finish_initialization_batch(
+        &self,
+        batch: SystemInitBatch,
+    ) -> LoadResult<Vec<SystemDsoLease>> {
+        let (inner, slots, generations) = batch.consume();
+        let mut guard = inner.lock();
+        let resolution = Arc::clone(&guard.resolution);
+        let mut leases = Vec::new();
+        leases
+            .try_reserve(slots.len())
+            .map_err(|_| registry_oom())?;
+        for (slot, generation) in slots.iter().zip(generations.iter()) {
+            let instance = guard.slots.get_mut(*slot).ok_or_else(stale_error)?;
+            if instance.generation != *generation {
+                // A stale generation here is a kernel consistency error: the
+                // batch was minted for this exact generation (§8.3).
                 return Err(stale_error());
             }
-            match instance.state {
-                InstanceState::Relocated => {
+            match core::mem::replace(&mut instance.state, InstanceState::Vacant) {
+                InstanceState::Initializing {
+                    descriptor,
+                    fini_plan,
+                    allocation,
+                    dependencies,
+                } => {
                     instance.state = InstanceState::Ready {
-                        leases: 0,
+                        leases: 1,
                         descriptor,
                         fini_plan,
+                        allocation,
+                        dependencies,
                     };
-                    wake_waiters(&instance.waiter, &resolution);
+                    leases.push(SystemDsoLease {
+                        inner: Arc::clone(&inner),
+                        slot: *slot,
+                        generation: *generation,
+                        domain: instance.domain,
+                        soname: instance.soname.clone(),
+                    });
                 }
                 _ => return Err(stale_error()),
             }
         }
-        Ok(generation)
+        for slot in &slots {
+            wake_waiters(&guard.slots[*slot].waiter, &resolution);
+        }
+        drop(guard);
+        Ok(leases)
+    }
+
+    /// Fail a published initialization batch: the application died before its
+    /// init completed, so no descriptor may be published. Each slot returns to
+    /// `Vacant` for a generation+1 retry and its backing is retained for the
+    /// C31-d worker; waiters wake and re-acquire (§8.3, §8.6).
+    pub fn fail_initialization_batch(&self, batch: SystemInitBatch) {
+        let (inner, slots, generations) = batch.consume();
+        let mut guard = inner.lock();
+        let resolution = Arc::clone(&guard.resolution);
+        for (slot, generation) in slots.iter().zip(generations.iter()) {
+            let Some(instance) = guard.slots.get_mut(*slot) else {
+                continue;
+            };
+            if instance.generation != *generation {
+                continue;
+            }
+            match core::mem::replace(&mut instance.state, InstanceState::Vacant) {
+                InstanceState::Initializing {
+                    descriptor,
+                    fini_plan,
+                    allocation,
+                    dependencies,
+                } => {
+                    instance.state = InstanceState::Failed {
+                        descriptor,
+                        fini_plan,
+                        allocation,
+                        dependencies,
+                    };
+                }
+                _ => {
+                    instance.state = InstanceState::Vacant;
+                }
+            }
+            wake_waiters(&instance.waiter, &resolution);
+        }
     }
 
     /// Resolve a `Quiescing` slot once the reaper has evidence it is safe to
@@ -387,7 +624,12 @@ impl SystemDsoRegistry {
         let slot = &mut inner.slots[index];
         let state = core::mem::replace(&mut slot.state, InstanceState::Vacant);
         match state {
-            InstanceState::Quiescing { descriptor, fini_plan } => {
+            InstanceState::Quiescing {
+                descriptor,
+                fini_plan,
+                allocation,
+                dependencies,
+            } => {
                 if keep_cached {
                     // KeepCached: stay Ready with zero leases so a later import
                     // takes the fast path without a reload (§13.3).
@@ -395,7 +637,15 @@ impl SystemDsoRegistry {
                         leases: 0,
                         descriptor,
                         fini_plan,
+                        allocation,
+                        dependencies,
                     };
+                } else {
+                    // The unique backing and dependency leases drop here; the
+                    // C31-d worker performs the actual release outside the
+                    // registry lock.
+                    drop(allocation);
+                    drop(dependencies);
                 }
                 // Otherwise the pre-replace `Vacant` is already correct.
                 wake_waiters(&slot.waiter, &resolution);
@@ -599,12 +849,16 @@ impl Drop for SystemDsoLease {
             if let InstanceState::Ready {
                 descriptor,
                 fini_plan,
-                ..
+                allocation,
+                dependencies,
+                leases: _,
             } = state
             {
                 slot.state = InstanceState::Quiescing {
                     descriptor,
                     fini_plan,
+                    allocation,
+                    dependencies,
                 };
             }
         }
@@ -658,6 +912,10 @@ impl WaitHandle {
 /// The bump happens-before the wake so a waiter that has not yet slept observes
 /// the new value via `atomic_wait`'s re-check and returns immediately, while a
 /// sleeping waiter is woken and re-checks the same way.
+fn registry_oom() -> LoadError {
+    LoadError::new(LoadErrorKind::OutOfMemory, ErrorContext::None)
+}
+
 fn wake_waiters(signal: &AtomicUsize, resolution: &AtomicUsize) {
     signal.fetch_add(1, Ordering::Release);
     let _ = atomic_wake(signal, usize::MAX);

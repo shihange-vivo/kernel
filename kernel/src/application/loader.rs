@@ -35,9 +35,9 @@
 use alloc::vec::Vec;
 
 use blueos_loader::{
-    ArchitectureCodeCache, ArmRelocator, CacheRequirements, DynamicLinker, ImageOwnership,
-    LinkDomainId, LinkProduct, LoadError, LoadErrorKind, LoadProfile, LoadResult,
-    ResolvedArtifact, SessionLimits,
+    AllocationLease, ArchitectureCodeCache, ArmRelocator, CacheRequirements, DependencyName,
+    DynamicLinker, ImageOwnership, LinkDomainId, LinkProduct, LoadError, LoadErrorKind,
+    LoadProfile, LoadResult, ResolvedArtifact, SessionLimits,
 };
 
 use crate::{
@@ -49,7 +49,9 @@ use crate::{
         },
         group::ThreadGroup,
         publication::{KernelLinkPublisher, KernelLinkReceipt},
-        registry::SystemDsoRegistry,
+        registry::{
+            SystemCandidateBacking, SystemDsoRegistry, SystemInitBatch,
+        },
     },
     vfs::open_path,
 };
@@ -81,6 +83,12 @@ impl ApplicationLoader {
     }
 
     /// The shared-flat memory service the loader links into (§15).
+    /// The system DSO registry, for the init-completion path to advance the
+    /// pending initialization batch (C31-c, §8.3).
+    pub fn registry(&self) -> &SystemDsoRegistry {
+        &self.registry
+    }
+
     pub fn memory(&self) -> &crate::application::adapters::flat_memory::FlatImageMemory {
         &self.memory
     }
@@ -174,27 +182,72 @@ impl ApplicationLoader {
         let ResolverAuthorities { permits, leases } = resolver.finish();
         publisher.import_leases(leases);
 
-        let product = building
+        let mut product = building
             .freeze_scopes()?
             .relocate()?
             .seal(&mut cache)?
             .publish(&mut publisher)?;
 
-        self.hand_off(permits, &product)?;
+        // C31-c (§8.3): publish the whole system batch as Initializing and
+        // hand the token to the group; ApplicationInitComplete advances it
+        // to Ready (or the group's early exit fails it).
+        let batch = self.hand_off(permits, &mut product)?;
+        group
+            .install_pending_system_batch(batch)
+            .map_err(|_| loader_error())?;
         log_bindings(&product);
         log_lifecycle(&product);
 
         Ok(product)
     }
 
-    /// Advance each first-loading system candidate through the registry to
-    /// `Ready`, matching its permit to the committed image by SONAME (§13.3).
+    /// Advance every first-loading system candidate to `Initializing` in one
+    /// batch and move the receipt's system backings into the registry
+    /// (C31-c, §8.3/§8.4). Returns the batch token the group holds until the
+    /// application reports init completion.
     fn hand_off(
         &self,
         permits: Vec<SystemCandidatePermit>,
-        product: &LinkProduct<KernelLinkReceipt>,
-    ) -> LoadResult<()> {
+        product: &mut LinkProduct<KernelLinkReceipt>,
+    ) -> LoadResult<SystemInitBatch> {
+        // The receipt's raw system allocations are ordered by image id
+        // (commit_batch partitions the link map in id order); pair each with
+        // its candidate's SONAME for the permit match below.
+        let allocations = product.publication_mut().take_system_allocations();
+        let mut allocations_by_soname: Vec<(DependencyName, AllocationLease)> = product
+            .context()
+            .images()
+            .iter()
+            .filter(|image| image.descriptor().ownership() == ImageOwnership::SystemCandidate)
+            .map(|image| {
+                image
+                    .descriptor()
+                    .soname()
+                    .cloned()
+                    .ok_or_else(loader_error)
+            })
+            .collect::<LoadResult<Vec<_>>>()?
+            .into_iter()
+            .zip(allocations)
+            .collect();
+        if permits.len() != allocations_by_soname.len() {
+            return Err(loader_error());
+        }
+
+        let mut relocated = Vec::new();
+        relocated
+            .try_reserve(permits.len())
+            .map_err(|_| loader_error())?;
+        let mut backings = Vec::new();
+        backings
+            .try_reserve(permits.len())
+            .map_err(|_| loader_error())?;
         for candidate in permits {
+            let allocation_index = allocations_by_soname
+                .iter()
+                .position(|(soname, _)| soname == &candidate.soname)
+                .ok_or_else(loader_error)?;
+            let (_, allocation) = allocations_by_soname.swap_remove(allocation_index);
             let image = product
                 .context()
                 .images()
@@ -204,24 +257,27 @@ impl ApplicationLoader {
                         && image.descriptor().soname() == Some(&candidate.soname)
                 })
                 .ok_or_else(loader_error)?;
-            let relocated = self
-                .registry
-                .publish_relocated(candidate.permit)
-                .map_err(|_| loader_error())?;
+            relocated.push(self.registry.publish_relocated(candidate.permit)?);
             // A system candidate with no destructors has no plan entry; the
             // registry stores an empty plan for it.
-            let fini = product
+            let fini_plan = product
                 .lifecycle_plans()
                 .system_fini()
                 .iter()
                 .find(|plan| plan.owner() == image.owner())
                 .map(|plan| plan.plan().clone())
                 .unwrap_or_default();
-            self.registry
-                .mark_ready(relocated, image.descriptor().clone(), fini)
-                .map_err(|_| loader_error())?;
+            backings.push(SystemCandidateBacking {
+                descriptor: image.descriptor().clone(),
+                fini_plan,
+                allocation,
+                // System-to-system dependency leases land with the C31-d SCC
+                // edges; the first group holds the link's import leases.
+                dependencies: alloc::vec![],
+            });
         }
-        Ok(())
+        self.registry
+            .publish_relocated_batch(relocated, backings)
     }
 }
 

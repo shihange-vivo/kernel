@@ -540,6 +540,14 @@ impl<Receipt> LinkProduct<Receipt> {
         &self.link_map
     }
 
+    /// Mutable access to the publisher receipt, for the host to move parts
+    /// out before installation (C31-c: the system backings move into the
+    /// registry at batch publication).
+    #[inline]
+    pub fn publication_mut(&mut self) -> &mut Receipt {
+        &mut self.publication
+    }
+
     #[inline]
     /// The C31-a relocation-binding oracle (§17.1): the recorded scope
     /// decision per relocation — requester, symbol name and winning provider.

@@ -78,8 +78,8 @@ impl ApplicationService {
             let memory = FlatImageMemory::new();
             let registry = SystemDsoRegistry::new();
             let loader = ApplicationLoader::new(catalog, registry.clone(), memory.clone(), domain);
-            let reaper = ApplicationReaper::new(registry, memory);
-            let manager = ApplicationManager::new();
+            let reaper = ApplicationReaper::new(registry.clone(), memory);
+            let manager = ApplicationManager::new(registry);
             // The deferred reaper thread owns clones of the reaper and the
             // manager and releases drained groups outside every manager lock
             // (§16.4).
@@ -105,6 +105,28 @@ impl ApplicationService {
     /// The deferred reaper (C27, §16.4).
     pub fn reaper(&self) -> &ApplicationReaper {
         &self.reaper
+    }
+
+    /// Accept the application's init completion (C31-c, §8.3): first advance
+    /// the pending system batch `Initializing → Ready` and mint the first
+    /// group's leases, then move the manager's public state to `Running`.
+    /// Only the validated `ApplicationInitComplete` syscall path calls this.
+    pub fn complete_init(
+        &self,
+        group: &ThreadGroup,
+        handle: ApplicationHandle,
+    ) -> Result<(), ApplicationLaunchError> {
+        if let Some(batch) = group.take_pending_system_batch() {
+            let leases = self
+                .loader
+                .registry()
+                .finish_initialization_batch(batch)
+                .map_err(|_| ApplicationLaunchError::PrepareFailed)?;
+            group
+                .attach_system_leases(leases)
+                .map_err(|_| ApplicationLaunchError::PrepareFailed)?;
+        }
+        self.manager.complete_init(handle)
     }
 
     /// Launch a dynamic application: link it against the system catalog,

@@ -37,6 +37,7 @@ use crate::{
         event_queue::{ApplicationEvent, ApplicationEventQueue},
         manager::ApplicationHandle,
         publication::KernelLinkReceipt,
+        registry::{SystemDsoLease, SystemDsoRegistry, SystemInitBatch},
         start_storage::ApplicationStartStorage,
     },
     thread::{Thread, ThreadNode},
@@ -100,6 +101,9 @@ pub enum ThreadGroupError {
 }
 
 struct GroupInner {
+    /// The system DSO registry handle, so a re-upgraded membership can reach
+    /// it and an early exit can fail the pending batch (C31-c, §8.3).
+    registry: SystemDsoRegistry,
     state: GroupState,
     members: Vec<ThreadNode>,
     /// The application handle the manager minted for this group (§14.3). Set
@@ -117,6 +121,10 @@ struct GroupInner {
     /// [`blueos_header::application::BlueOsApplicationStartInfo`] stays valid
     /// until the last thread exits.
     start_storage: Option<ApplicationStartStorage>,
+    /// The pending system initialization batch (C31-c, §8.3): installed with
+    /// the link product, taken by the `ApplicationInitComplete` path to
+    /// advance the system candidates to Ready, or failed on early exit.
+    pending_system_batch: Option<SystemInitBatch>,
     /// The fini-plan disposition, set only once draining begins (§16.4).
     fini: ExitFini,
     /// The bounded, capacity-guaranteed exit-event queue the scheduler's
@@ -134,12 +142,16 @@ struct GroupInner {
 /// membership set.
 pub struct ThreadGroup {
     inner: Arc<Mutex<GroupInner>>,
+    /// The system DSO registry, for the early-exit path to fail a pending
+    /// initialization batch (C31-c, §8.3).
+    registry: SystemDsoRegistry,
 }
 
 impl Clone for ThreadGroup {
     fn clone(&self) -> Self {
         Self {
             inner: Arc::clone(&self.inner),
+            registry: self.registry.clone(),
         }
     }
 }
@@ -178,7 +190,10 @@ impl ThreadGroupMembership {
     /// Re-acquire the group if it is still live. Returns `None` once the last
     /// strong reference has dropped and the group has been reclaimed.
     pub fn upgrade(&self) -> Option<ThreadGroup> {
-        self.inner.upgrade().map(|inner| ThreadGroup { inner })
+        self.inner.upgrade().map(|inner| {
+            let registry = inner.lock().registry.clone();
+            ThreadGroup { inner, registry }
+        })
     }
 }
 
@@ -189,18 +204,20 @@ impl core::fmt::Debug for ThreadGroupMembership {
 }
 
 impl ThreadGroup {
-    fn with_state(state: GroupState) -> Self {
+    fn with_state(state: GroupState, registry: SystemDsoRegistry) -> Self {
         let inner = Arc::new(Mutex::new(GroupInner {
+            registry: registry.clone(),
             state,
             members: Vec::new(),
             handle: None,
             product: None,
             start_storage: None,
+            pending_system_batch: None,
             fini: ExitFini::Pending,
             events: ApplicationEventQueue::default(),
             members_epoch: Arc::new(AtomicUsize::new(0)),
         }));
-        Self { inner }
+        Self { inner, registry }
     }
 
     /// The group's current state.
@@ -375,20 +392,71 @@ impl ThreadGroup {
         inner.fini != ExitFini::Pending
     }
 
+    /// Install the pending system initialization batch with the link product
+    /// (C31-c, §8.3). The group holds it until the application reports
+    /// `ApplicationInitComplete`; an early exit fails it instead.
+    pub fn install_pending_system_batch(
+        &self,
+        batch: SystemInitBatch,
+    ) -> Result<(), ThreadGroupError> {
+        let mut inner = self.inner.lock();
+        // The batch installs during the prepare closure, right after the link
+        // publishes — the group is still `New` (the product install follows).
+        if inner.state != GroupState::New && inner.state != GroupState::Linked {
+            return Err(ThreadGroupError::NotLinked);
+        }
+        if inner.pending_system_batch.is_some() {
+            return Err(ThreadGroupError::AlreadyLinked);
+        }
+        inner.pending_system_batch = Some(batch);
+        Ok(())
+    }
+
+    /// Take the pending system initialization batch, for the
+    /// `ApplicationInitComplete` path to advance to Ready (C31-c, §8.3).
+    pub fn take_pending_system_batch(&self) -> Option<SystemInitBatch> {
+        let mut inner = self.inner.lock();
+        inner.pending_system_batch.take()
+    }
+
+    /// Attach the first group's system leases to its receipt (C31-c, §8.4):
+    /// the first-loading group holds ordinary counted leases, released at
+    /// group exit like any importer's.
+    pub fn attach_system_leases(
+        &self,
+        leases: Vec<SystemDsoLease>,
+    ) -> Result<(), ThreadGroupError> {
+        let mut inner = self.inner.lock();
+        let Some(product) = inner.product.as_mut() else {
+            return Err(ThreadGroupError::NotLinked);
+        };
+        product.publication_mut().attach_system_leases(leases);
+        Ok(())
+    }
+
     /// Begin the two-phase exit: atomically forbid new threads and move the
     /// group from `Linked` to `Draining` (§16.2). Only the exit coordinator for
     /// this group may call it; a duplicate or out-of-order call is rejected.
+    /// An early exit — the application never reported init completion — fails
+    /// the pending system batch so no half-initialized descriptor is
+    /// published (C31-c, §8.3).
     pub fn begin_exit(&self) -> Result<(), ThreadGroupError> {
-        let mut inner = self.inner.lock();
-        match inner.state {
-            GroupState::Linked => {
-                inner.state = GroupState::Draining;
-                Ok(())
+        let batch = {
+            let mut inner = self.inner.lock();
+            match inner.state {
+                GroupState::Linked => {
+                    inner.state = GroupState::Draining;
+                    inner.pending_system_batch.take()
+                }
+                GroupState::Draining => return Err(ThreadGroupError::AlreadyDraining),
+                GroupState::New => return Err(ThreadGroupError::NotLinked),
+                GroupState::Reaped => return Err(ThreadGroupError::AlreadyReaped),
             }
-            GroupState::Draining => Err(ThreadGroupError::AlreadyDraining),
-            GroupState::New => Err(ThreadGroupError::NotLinked),
-            GroupState::Reaped => Err(ThreadGroupError::AlreadyReaped),
+        };
+        if let Some(batch) = batch {
+            self.registry.fail_initialization_batch(batch);
         }
+        Ok(())
     }
 
     /// Record that the normal-path destructor plan completed (§16.4). Must be
@@ -481,8 +549,8 @@ impl ThreadGroupBackend {
     }
 
     /// Mint a fresh group with no running threads (§14.2 step 3).
-    pub fn create_group(&self) -> ThreadGroup {
-        ThreadGroup::with_state(GroupState::New)
+    pub fn create_group(&self, registry: &SystemDsoRegistry) -> ThreadGroup {
+        ThreadGroup::with_state(GroupState::New, registry.clone())
     }
 }
 
@@ -503,7 +571,8 @@ mod tests {
     #[test]
     fn a_fresh_group_has_no_members() {
         let backend = ThreadGroupBackend::new();
-        let group = backend.create_group();
+        let registry = SystemDsoRegistry::new();
+        let group = backend.create_group(&registry);
         assert_eq!(group.state(), GroupState::New);
         assert!(group.is_empty());
     }
@@ -511,7 +580,8 @@ mod tests {
     #[test]
     fn membership_is_counted_and_deduplicated() {
         let backend = ThreadGroupBackend::new();
-        let group = backend.create_group();
+        let registry = SystemDsoRegistry::new();
+        let group = backend.create_group(&registry);
 
         let thread = dummy_thread();
         let id = Thread::id(&thread);

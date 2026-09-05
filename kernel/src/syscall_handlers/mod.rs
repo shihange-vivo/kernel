@@ -1020,7 +1020,7 @@ mod application_syscalls {
         let Some(service) = crate::application::service::ApplicationService::get() else {
             return -(libc::ENOSYS as c_long);
         };
-        match service.manager().complete_init(handle) {
+        match service.complete_init(&group, handle) {
             Ok(()) => {
                 // C29 oracle (§18.5): init completion marks the public
                 // Loading → Running transition.

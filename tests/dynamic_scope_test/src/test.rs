@@ -10,7 +10,7 @@
 // COUNT: PKG_LOAD soname=libprotected\.so\.1 path=/apps/scope_demo/lib/libprotected\.so\.1 == 1
 // COUNT: PKG_LOAD soname=libweakdata\.so\.1 path=/apps/scope_demo/lib/libweakdata\.so\.1 == 1
 // COUNT: APP_LAUNCHED handle=.*:1 path=/apps/scope_demo/app\.elf == 1
-// COUNT: APP_REAP handle=.*:1 private_images=6 imported_dsos=1 == 1
+// COUNT: APP_REAP handle=.*:1 private_images=6 imported_dsos=2 == 1
 // COUNT: scope: value=111 fn=1110 hidden=555 hidden_report=999 protected=333 self=444 sys=777 sys_target=42 weakdata=0 == 1
 // COUNT: SCOPE_BIND requester=.* name=missing_data provider=none == 1
 // COUNT: SCOPE_BIND requester=7 name=sys_target provider=7 == 1
