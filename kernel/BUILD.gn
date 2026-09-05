@@ -226,12 +226,18 @@ if (defined(boot_dynamic_seed) && boot_dynamic_seed) {
     deps = [
       "//apps/example/dynamic/hello:hello",
       "//apps/example/dynamic/multi_dso:multi_manifest",
+      "//apps/example/dynamic/scope_bad:scope_bad_manifest",
+      "//apps/example/dynamic/scope_demo:scope_demo_manifest",
+      "//apps/example/dynamic/scope_demo:scope_sys",
       "//apps/shell:shell",
       "//librs:libc",
+      "//librs:libc_freeze",
     ]
     outfile = "${target_gen_dir}/boot_seed_blobs.S"
-    # The package template emits the layout JSON next to the manifest.
+    # The package template emits each layout JSON next to its manifest.
     _multi_layout = "${root_gen_dir}/apps/example/dynamic/multi_dso/multi_layout.json"
+    _scope_layout = "${root_gen_dir}/apps/example/dynamic/scope_demo/scope_demo_layout.json"
+    _scope_bad_layout = "${root_gen_dir}/apps/example/dynamic/scope_bad/scope_bad_layout.json"
     args = [
       "--out",
       rebase_path(outfile),
@@ -240,9 +246,15 @@ if (defined(boot_dynamic_seed) && boot_dynamic_seed) {
       "--blob",
       "shell," + rebase_path("${root_out_dir}/bin/shell"),
       "--blob",
-      "libc," + rebase_path("${root_out_dir}/lib/liblibrs.so"),
+      "libc," + rebase_path("${root_out_dir}/lib/liblibrs.frozen.so"),
+      "--blob",
+      "scope_sys," + rebase_path("${root_out_dir}/lib/libscope_sys.so"),
       "--layout",
       rebase_path(_multi_layout),
+      "--layout",
+      rebase_path(_scope_layout),
+      "--layout",
+      rebase_path(_scope_bad_layout),
     ]
     outputs = [ outfile ]
   }
@@ -257,12 +269,22 @@ if (defined(boot_dynamic_seed) && boot_dynamic_seed) {
   # generated manifest into a standalone rlib the kernel resolver consumes.
   action("gen_app_package_catalog") {
     script = "//build/scripts/gen_app_package_catalog.py"
-    deps = [ "//apps/example/dynamic/multi_dso:multi_manifest" ]
+    deps = [
+      "//apps/example/dynamic/multi_dso:multi_manifest",
+      "//apps/example/dynamic/scope_bad:scope_bad_manifest",
+      "//apps/example/dynamic/scope_demo:scope_demo_manifest",
+    ]
     _multi_manifest = "${root_gen_dir}/apps/example/dynamic/multi_dso/multi_manifest.json"
+    _scope_manifest = "${root_gen_dir}/apps/example/dynamic/scope_demo/scope_demo_manifest.json"
+    _scope_bad_manifest = "${root_gen_dir}/apps/example/dynamic/scope_bad/scope_bad_manifest.json"
     outfile = "${target_gen_dir}/app_package_catalog.rs"
     args = [
       "--manifest",
       rebase_path(_multi_manifest),
+      "--manifest",
+      rebase_path(_scope_manifest),
+      "--manifest",
+      rebase_path(_scope_bad_manifest),
       "--out",
       rebase_path(outfile),
     ]
