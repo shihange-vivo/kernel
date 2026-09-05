@@ -51,6 +51,7 @@ pub use publish::{
     PreparedLinkManifest,
 };
 pub(crate) use scope::{ResolvedSymbol, ScopeImage, ScopeSet, SymbolRegionKind, SymbolScope};
+pub use scope::RelocationBinding;
 pub use session::{
     BuildingSession, DynamicLinker, LinkSession, LoadMetrics, RelocatedSession, ScopedSession,
     SealedSession,

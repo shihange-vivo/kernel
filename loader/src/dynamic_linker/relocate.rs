@@ -190,6 +190,13 @@ impl SessionRelocation {
     pub(crate) const fn source(&self) -> &RelocationSource {
         &self.source
     }
+
+    /// The decoded relocation record (symbol index and image-relative
+    /// target offset) this operation was preflighted from.
+    #[inline]
+    pub(crate) const fn record(&self) -> &RelocationRecord {
+        &self.record
+    }
 }
 
 /// Per-image inputs to the session relocation engine, borrowed from the

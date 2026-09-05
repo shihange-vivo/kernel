@@ -337,6 +337,77 @@ impl ScopeSet {
     }
 }
 
+/// One recorded relocation binding: which image referenced which symbol and
+/// which owner's definition won in the frozen scopes (§17.1 oracle).
+///
+/// The frozen scope decision is captured per relocation, not re-derived after
+/// publication: `provider` names the image whose definition the lookup
+/// returned (`None` for a relative relocation or an undefined weak bound to
+/// zero), `offset` is the relocation's image-relative target, and `name` is
+/// the referenced symbol's byte name (empty when the relocation names no
+/// symbol). Tests compare normalized image ids, symbol names and owners —
+/// never raw addresses.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RelocationBinding {
+    requester: ImageId,
+    name: Vec<u8>,
+    provider: Option<ImageId>,
+    kind: crate::relocation::RelocationKind,
+    offset: TargetAddress,
+}
+
+impl RelocationBinding {
+    #[inline]
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn new(
+        requester: ImageId,
+        name: Vec<u8>,
+        provider: Option<ImageId>,
+        kind: crate::relocation::RelocationKind,
+        offset: TargetAddress,
+    ) -> Self {
+        Self {
+            requester,
+            name,
+            provider,
+            kind,
+            offset,
+        }
+    }
+
+    /// The image whose relocation this binding records.
+    #[inline]
+    pub const fn requester(&self) -> ImageId {
+        self.requester
+    }
+
+    /// The referenced symbol's byte name; empty for a symbol-less relocation
+    /// (`R_ARM_RELATIVE`).
+    #[inline]
+    pub fn name(&self) -> &[u8] {
+        &self.name
+    }
+
+    /// The provider image the frozen scopes resolved to, or `None` for a
+    /// relative relocation or an undefined weak bound to zero.
+    #[inline]
+    pub const fn provider(&self) -> Option<ImageId> {
+        self.provider
+    }
+
+    /// The relocation kind this binding was produced for.
+    #[inline]
+    pub const fn kind(&self) -> crate::relocation::RelocationKind {
+        self.kind
+    }
+
+    /// The relocation's image-relative target offset.
+    #[inline]
+    pub const fn offset(&self) -> TargetAddress {
+        self.offset
+    }
+}
+
 /// Indices of an image's protected, defined, exportable symbols.
 fn collect_protected(table: &SymbolTable) -> LoadResult<Vec<u32>> {
     let mut protected = Vec::new();

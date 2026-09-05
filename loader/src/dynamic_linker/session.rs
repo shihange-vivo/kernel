@@ -34,7 +34,8 @@ use crate::{
             self, CommittedImage, CommittingLinkProduct, LinkContext, LinkMapImage, LinkProduct,
             LinkPublisher, PreparedLinkManifest,
         },
-        relocate::{self, ProviderRegion, RelocationImage, RelocationPolicy},
+        relocate::{self, ProviderRegion, RelocationImage, RelocationPolicy, RelocationSource},
+        scope::RelocationBinding,
         ArtifactIdentity, ArtifactResolver, ArtifactRole, DependencyName, DependencyRequest,
         DependencyRequester,
         DependencyResolution, ImageId, ImageOwnership, LinkDomainId, PublishedImageDescriptor,
@@ -124,6 +125,23 @@ impl LoadMetrics {
     #[inline]
     pub(crate) fn record_hash_probes(&mut self, count: u64) {
         self.hash_probes = self.hash_probes.saturating_add(count);
+    }
+
+    /// Charge the C31-a relocation-binding snapshot (name copies plus the
+    /// fixed per-binding overhead) against the runtime metadata budget.
+    #[inline]
+    pub(crate) fn record_relocation_bindings(
+        &mut self,
+        bytes: u64,
+        limits: &SessionLimits,
+    ) -> LoadResult<()> {
+        let total = self
+            .runtime_metadata_bytes
+            .checked_add(bytes)
+            .ok_or_else(session_overflow)?;
+        limits.check_total_runtime_metadata_bytes(total)?;
+        self.runtime_metadata_bytes = total;
+        Ok(())
     }
 
     #[inline]
@@ -294,6 +312,8 @@ pub struct RelocatedState {
     images: Vec<SessionImage<RelocatedImageState>>,
     imported: Vec<ImportedImage>,
     scopes: ScopeSet,
+    /// C31-a oracle: the recorded scope decision per relocation (§17.1).
+    bindings: Vec<RelocationBinding>,
 }
 
 /// Per-image state after cache synchronization and memory protection (S8).
@@ -335,6 +355,8 @@ pub struct SealedSessionState {
     images: Vec<SessionImage<SealedImageState>>,
     imported: Vec<ImportedImage>,
     scopes: ScopeSet,
+    /// C31-a oracle: the recorded scope decision per relocation (§17.1).
+    bindings: Vec<RelocationBinding>,
 }
 
 /// The rollback authority for a live session: it owns the memory backend it
@@ -903,7 +925,7 @@ impl<'a, M: ImageMemory + ?Sized, A: ArchRelocator> ScopedSession<'a, M, A> {
         }
 
         let policy = RelocationPolicy::for_profile(&self.profile);
-        relocate::run(
+        let operations = relocate::run(
             &self.arch,
             &symbols,
             &relocation_images,
@@ -917,6 +939,16 @@ impl<'a, M: ImageMemory + ?Sized, A: ArchRelocator> ScopedSession<'a, M, A> {
             &mut self.rollback.log,
         )
         .map_err(|error| error.at_stage(LoadStage::LinkRelocate))?;
+
+        // C31-a oracle (§17.1): record every relocation's scope decision —
+        // requester, symbol name and winning provider — into the published
+        // snapshot before any state is rewrapped.
+        let bindings = record_bindings(
+            &operations,
+            &symbols,
+            &self.limits,
+            &mut self.metrics,
+        )?;
 
         drop(relocation_images);
         drop(symbols);
@@ -945,6 +977,7 @@ impl<'a, M: ImageMemory + ?Sized, A: ArchRelocator> ScopedSession<'a, M, A> {
                 images: relocated_images,
                 imported,
                 scopes,
+                bindings,
             },
         })
     }
@@ -1097,6 +1130,7 @@ impl<'a, M: ImageProtectionMemory + ?Sized, A: ArchRelocator> RelocatedSession<'
             images,
             imported,
             scopes,
+            bindings,
         } = self.state;
         let mut images = images.into_iter();
         let mut sealed_states = sealed_images.into_iter();
@@ -1124,6 +1158,7 @@ impl<'a, M: ImageProtectionMemory + ?Sized, A: ArchRelocator> RelocatedSession<'
                 images: output,
                 imported,
                 scopes,
+                bindings,
             },
         })
     }
@@ -1244,6 +1279,7 @@ impl<M: ImageMemory + ?Sized, A: ArchRelocator> SealedSession<'_, M, A> {
             images,
             imported,
             scopes,
+            bindings,
         } = state;
 
         let mut slots: Vec<Option<CommittedImage>> = Vec::new();
@@ -1302,7 +1338,14 @@ impl<M: ImageMemory + ?Sized, A: ArchRelocator> SealedSession<'_, M, A> {
         let receipt = unsafe { publisher.commit_batch(prepared, product) };
 
         Ok(LinkProduct::new(
-            context, entry, init_plan, fini_plan, link_map, metrics, receipt,
+            context,
+            entry,
+            init_plan,
+            fini_plan,
+            link_map,
+            metrics,
+            bindings,
+            receipt,
         ))
     }
 }
@@ -1447,6 +1490,63 @@ fn enqueue_dependencies(
             .map_err(|error| error.at_stage(stage))?;
     }
     Ok(())
+}
+
+
+/// C31-a oracle (§17.1): snapshot every relocation's scope decision — the
+/// requester, the referenced symbol name and the winning provider — into the
+/// published bindings. Symbol-less (`R_ARM_RELATIVE`) relocations record an
+/// empty name and no provider; an undefined weak records its name with no
+/// provider (it bound to zero). The name copies are charged against the
+/// runtime metadata budget.
+fn record_bindings(
+    operations: &[relocate::SessionRelocation],
+    symbols: &[&SymbolTable],
+    limits: &SessionLimits,
+    metrics: &mut LoadMetrics,
+) -> LoadResult<Vec<RelocationBinding>> {
+    /// The byte name of `index` in `owner`'s symbol table, empty when absent.
+    fn symbol_name<'t>(symbols: &[&'t SymbolTable], owner: ImageId, index: u32) -> &'t [u8] {
+        let Some(table) = symbols.get(owner.get() as usize) else {
+            return &[];
+        };
+        let Some(entry) = table.entry(index) else {
+            return &[];
+        };
+        table.name(entry)
+    }
+
+    let mut bindings = Vec::new();
+    bindings
+        .try_reserve_exact(operations.len())
+        .map_err(|_| link_relocation_oom())?;
+    for operation in operations {
+        let record = operation.record();
+        let (name, provider) = match operation.source() {
+            RelocationSource::Relative => (alloc::vec![], None),
+            RelocationSource::UndefinedWeak => (
+                symbol_name(symbols, operation.owner(), record.symbol_index()).to_vec(),
+                None,
+            ),
+            RelocationSource::Symbol(resolved) => (
+                symbol_name(symbols, operation.owner(), record.symbol_index()).to_vec(),
+                Some(resolved.owner()),
+            ),
+        };
+        // Fixed overhead per binding plus the copied name bytes.
+        let bytes = 24u64
+            .checked_add(name.len() as u64)
+            .ok_or_else(session_overflow)?;
+        metrics.record_relocation_bindings(bytes, limits)?;
+        bindings.push(RelocationBinding::new(
+            operation.owner(),
+            name,
+            provider,
+            operation.kind(),
+            record.offset(),
+        ));
+    }
+    Ok(bindings)
 }
 
 fn publish_oom() -> LoadError {

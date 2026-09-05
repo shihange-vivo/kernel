@@ -50,7 +50,7 @@ pub use dynamic_linker::{
     ImportedImageDescriptor, InitPlan, LifecycleEntry, LinkContext, LinkDomainId, LinkMapEntry,
     LinkProduct, LinkPublisher, LinkSession, LoadMetrics, PreparedLinkManifest,
     ProgramHeaderRuntimeInfo, PublishedImageDescriptor, PublishedRegion, PublishedSymbolTable,
-    RelocatedSession, ResolvedArtifact, ScopedSession, SealedSession,
+    RelocatedSession, RelocationBinding, ResolvedArtifact, ScopedSession, SealedSession,
 };
 pub use error::{
     ErrorContext, HeaderField, LimitKind, LoadError, LoadErrorKind, LoadResult, LoadStage,

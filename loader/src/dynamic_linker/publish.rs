@@ -29,8 +29,9 @@ use alloc::vec::Vec;
 use crate::{
     address::{TargetAddress, TargetRange},
     dynamic_linker::{
-        graph::DependencyGraph, ArtifactIdentity, DependencyName, FiniPlan, ImageId,
-        ImageOwnership, InitPlan, LoadMetrics, PublishedImageDescriptor, PublishedRegion, ScopeSet,
+        graph::DependencyGraph, scope::RelocationBinding, ArtifactIdentity, DependencyName,
+        FiniPlan, ImageId, ImageOwnership, InitPlan, LoadMetrics, PublishedImageDescriptor,
+        PublishedRegion, ScopeSet,
     },
     error::{ErrorContext, LoadError, LoadErrorKind, LoadResult, LoadStage},
     image::{LoadedRegion, SealedState},
@@ -489,6 +490,8 @@ pub struct LinkProduct<Receipt> {
     fini_plan: FiniPlan,
     link_map: Vec<LinkMapEntry>,
     metrics: LoadMetrics,
+    /// C31-a oracle (§17.1): the recorded scope decision per relocation.
+    bindings: Vec<crate::dynamic_linker::scope::RelocationBinding>,
     publication: Receipt,
 }
 
@@ -502,6 +505,7 @@ impl<Receipt> LinkProduct<Receipt> {
         fini_plan: FiniPlan,
         link_map: Vec<LinkMapEntry>,
         metrics: LoadMetrics,
+        bindings: Vec<crate::dynamic_linker::scope::RelocationBinding>,
         publication: Receipt,
     ) -> Self {
         Self {
@@ -511,6 +515,7 @@ impl<Receipt> LinkProduct<Receipt> {
             fini_plan,
             link_map,
             metrics,
+            bindings,
             publication,
         }
     }
@@ -542,6 +547,13 @@ impl<Receipt> LinkProduct<Receipt> {
     }
 
     #[inline]
+    /// The C31-a relocation-binding oracle (§17.1): the recorded scope
+    /// decision per relocation — requester, symbol name and winning provider.
+    #[inline]
+    pub fn relocation_bindings(&self) -> &[RelocationBinding] {
+        &self.bindings
+    }
+
     pub fn metrics(&self) -> LoadMetrics {
         self.metrics
     }

@@ -181,6 +181,7 @@ impl ApplicationLoader {
             .publish(&mut publisher)?;
 
         self.hand_off(permits, &product)?;
+        log_bindings(&product);
 
         Ok(product)
     }
@@ -237,4 +238,26 @@ impl ResolverFinish
 
 fn loader_error() -> LoadError {
     LoadError::new(LoadErrorKind::Backend, blueos_loader::ErrorContext::None)
+}
+
+/// C31-a scope oracle (§17.1): surface each relocation's frozen scope decision
+/// — requester image id, symbol name and winning provider id — for the QEMU
+/// checker to assert normalized binding triples.
+fn log_bindings(product: &LinkProduct<KernelLinkReceipt>) {
+    for binding in product.relocation_bindings() {
+        let name = core::str::from_utf8(binding.name()).unwrap_or("<non-utf8>");
+        match binding.provider() {
+            Some(provider) => log::info!(
+                "SCOPE_BIND requester={} name={} provider={}",
+                binding.requester().get(),
+                name,
+                provider.get()
+            ),
+            None => log::info!(
+                "SCOPE_BIND requester={} name={} provider=none",
+                binding.requester().get(),
+                name
+            ),
+        }
+    }
 }
