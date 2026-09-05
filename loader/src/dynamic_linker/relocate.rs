@@ -40,9 +40,6 @@ use crate::{
 };
 
 /// The set of relocation kinds a profile's engine understands.
-///
-/// The `ARM32` set is the four NOW relocations of §11.2; every other profile
-/// is fail-closed (an empty set) until its engine lands.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct RelocationTypeSet(u8);
 
@@ -65,8 +62,12 @@ impl RelocationTypeSet {
         Self(0)
     }
 
-    const fn arm_now() -> Self {
+    const fn full_now() -> Self {
         Self(Self::RELATIVE | Self::ABSOLUTE | Self::GLOBAL_DATA | Self::JUMP_SLOT)
+    }
+
+    const fn riscv_now() -> Self {
+        Self(Self::RELATIVE | Self::ABSOLUTE | Self::JUMP_SLOT)
     }
 
     #[inline]
@@ -89,11 +90,13 @@ pub(crate) struct RelocationPolicy {
 }
 
 impl RelocationPolicy {
-    /// The policy for a profile. Only ARM32 has a NOW engine so far; every
-    /// other machine is fail-closed.
+    /// The policy for a named machine profile. Raw relocation numbers are
+    /// still classified by that machine's relocator, so enabling a semantic
+    /// kind here never admits another architecture's encoding.
     pub(crate) const fn for_profile(profile: &LoadProfile) -> Self {
         match profile.machine() {
-            ElfMachine::Arm => Self::arm_now(),
+            ElfMachine::Arm | ElfMachine::Aarch64 => Self::full_now(),
+            ElfMachine::Riscv => Self::riscv_now(),
             _ => Self::fail_closed(),
         }
     }
@@ -108,9 +111,9 @@ impl RelocationPolicy {
         }
     }
 
-    const fn arm_now() -> Self {
+    const fn full_now() -> Self {
         Self {
-            allowed_types: RelocationTypeSet::arm_now(),
+            allowed_types: RelocationTypeSet::full_now(),
             // Undefined weak data binds to 0; undefined weak control flow does
             // not (§9.2 rules 7–8, default-reject).
             allow_undefined_weak_data: true,
@@ -118,6 +121,43 @@ impl RelocationPolicy {
             require_control_flow_target_x: true,
             require_target_owner_writable: true,
         }
+    }
+
+    const fn riscv_now() -> Self {
+        Self {
+            allowed_types: RelocationTypeSet::riscv_now(),
+            allow_undefined_weak_data: true,
+            allow_undefined_weak_control_flow: false,
+            require_control_flow_target_x: true,
+            require_target_owner_writable: true,
+        }
+    }
+}
+
+#[cfg(test)]
+mod policy_tests {
+    use crate::{identity::ElfType, relocation::RelocationKind};
+
+    use super::RelocationPolicy;
+
+    #[test]
+    fn machine_profiles_enable_only_their_semantic_now_set() {
+        let arm = RelocationPolicy::for_profile(&crate::LoadProfile::arm_thumb_soft_float(
+            ElfType::Dyn,
+        ));
+        let aarch64 = RelocationPolicy::for_profile(&crate::LoadProfile::aarch64(ElfType::Dyn));
+        let riscv = RelocationPolicy::for_profile(&crate::LoadProfile::riscv64(ElfType::Dyn));
+
+        for policy in [arm, aarch64] {
+            assert!(policy.allowed_types.contains(RelocationKind::Relative));
+            assert!(policy.allowed_types.contains(RelocationKind::Absolute));
+            assert!(policy.allowed_types.contains(RelocationKind::GlobalData));
+            assert!(policy.allowed_types.contains(RelocationKind::JumpSlot));
+        }
+        assert!(riscv.allowed_types.contains(RelocationKind::Relative));
+        assert!(riscv.allowed_types.contains(RelocationKind::Absolute));
+        assert!(!riscv.allowed_types.contains(RelocationKind::GlobalData));
+        assert!(riscv.allowed_types.contains(RelocationKind::JumpSlot));
     }
 }
 

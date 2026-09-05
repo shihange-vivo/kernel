@@ -245,9 +245,14 @@ impl CodeCache for ArchitectureCodeCache {
             core::arch::asm!("fence.i", options(nostack));
         }
 
-        #[cfg(target_arch = "arm")]
+        #[cfg(all(target_arch = "arm", armv7m))]
         unsafe {
             core::arch::asm!("dsb", "isb", options(nostack, preserves_flags));
+        }
+
+        #[cfg(all(target_arch = "arm", not(armv7m)))]
+        for range in prepared.executable_ranges() {
+            unsafe { synchronize_arm_v8m(*range)? };
         }
 
         #[cfg(target_arch = "aarch64")]
@@ -287,11 +292,15 @@ fn architecture_cache_capability() -> LoadResult<(ExecutionScope, CacheMaintenan
         CacheMaintenance::BarrierOnly,
     ));
 
-    // Cache-enabled Cortex-M (v8-M and later) requires a D-clean/I-invalidate
-    // sequence we do not implement yet; failing closed here prevents the
-    // cache-less MPS2 barrier path from being silently reused (§12.4).
+    // Phase 2 cache-enabled Cortex-M publication performs a D-cache clean to
+    // PoU followed by an I-cache invalidate to PoU for every executable byte.
+    // This remains current-core scope; an SMP Cortex-M product must provide a
+    // rendezvous adapter before advertising AllExecutionContexts.
     #[cfg(all(target_arch = "arm", not(armv7m)))]
-    return Err(cache_capability_error());
+    return Ok((
+        ExecutionScope::CurrentExecutionContext,
+        CacheMaintenance::CleanAndInvalidate,
+    ));
 
     #[cfg(target_arch = "aarch64")]
     return Ok((
@@ -307,6 +316,57 @@ fn architecture_cache_capability() -> LoadResult<(ExecutionScope, CacheMaintenan
 
     #[allow(unreachable_code)]
     Err(cache_capability_error())
+}
+
+/// Publish freshly written code on cache-enabled Cortex-M implementations.
+///
+/// ARMv8-M Mainline exposes cache maintenance through the System Control
+/// Block. `DCCMVAU` cleans a data-cache line to the point of unification and
+/// `ICIMVAU` invalidates the corresponding instruction-cache line. Cortex-M55
+/// (the Phase 2 hard-float baseline) has 32-byte I/D cache lines. Cacheless
+/// implementations define these maintenance writes as harmless; the barriers
+/// still establish the required instruction synchronization boundary.
+///
+/// # Safety
+///
+/// The caller runs in privileged kernel context on ARMv8-M and supplies ranges
+/// already validated by the loader. The two MMIO addresses are architectural
+/// SCB registers, not application-controlled pointers.
+#[cfg(all(target_arch = "arm", not(armv7m)))]
+unsafe fn synchronize_arm_v8m(runtime_range: TargetRange) -> LoadResult<()> {
+    const CACHE_LINE_BYTES: u64 = 32;
+    const SCB_ICIMVAU: *mut u32 = 0xE000_EF58 as *mut u32;
+    const SCB_DCCMVAU: *mut u32 = 0xE000_EF64 as *mut u32;
+
+    let end = runtime_range.end()?.get();
+    let mut address = runtime_range
+        .start()
+        .align_down(CACHE_LINE_BYTES)?
+        .get();
+
+    core::arch::asm!("dsb", options(nostack, preserves_flags));
+    while address < end {
+        let mva = u32::try_from(address).map_err(|_| cache_error(runtime_range))?;
+        core::ptr::write_volatile(SCB_DCCMVAU, mva);
+        address = address
+            .checked_add(CACHE_LINE_BYTES)
+            .ok_or_else(|| cache_error(runtime_range))?;
+    }
+    core::arch::asm!("dsb", options(nostack, preserves_flags));
+
+    address = runtime_range
+        .start()
+        .align_down(CACHE_LINE_BYTES)?
+        .get();
+    while address < end {
+        let mva = u32::try_from(address).map_err(|_| cache_error(runtime_range))?;
+        core::ptr::write_volatile(SCB_ICIMVAU, mva);
+        address = address
+            .checked_add(CACHE_LINE_BYTES)
+            .ok_or_else(|| cache_error(runtime_range))?;
+    }
+    core::arch::asm!("dsb", "isb", options(nostack, preserves_flags));
+    Ok(())
 }
 
 #[cfg(target_arch = "aarch64")]
