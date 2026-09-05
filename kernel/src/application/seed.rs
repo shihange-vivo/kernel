@@ -29,13 +29,21 @@ use blueos_loader::LinkDomainId;
 use crate::application::adapters::system_paths::{SystemLibraryEntry, SystemLibraryPaths};
 use crate::application::service::ApplicationService;
 
-/// The fixed Phase 1 system library catalog (§12.2): `DT_NEEDED libc.so.1`
-/// resolves to this VFS path, whose bytes come from the embedded artifact.
-static SYSTEM_LIBRARIES: &[SystemLibraryEntry] = &[SystemLibraryEntry {
-    soname: b"libc.so.1",
-    path: "/system/lib/libc.so.1",
-    build_id: None,
-}];
+/// The fixed system library catalog (§12.2): each `DT_NEEDED` resolves to
+/// this VFS path, whose bytes come from the embedded artifact. C31-a adds the
+/// second system DSO for the scope corpus's non-interpose case (§17.2).
+static SYSTEM_LIBRARIES: &[SystemLibraryEntry] = &[
+    SystemLibraryEntry {
+        soname: b"libc.so.1",
+        path: "/system/lib/libc.so.1",
+        build_id: None,
+    },
+    SystemLibraryEntry {
+        soname: b"libscope_sys.so.1",
+        path: "/system/lib/libscope_sys.so.1",
+        build_id: None,
+    },
+];
 static CATALOG: SystemLibraryPaths = SystemLibraryPaths::new(SYSTEM_LIBRARIES);
 
 /// The embedded system image (C29 §18.1). The build emits one start/end
@@ -47,6 +55,8 @@ extern "C" {
     static __bk_seed_shell_end: u8;
     static __bk_seed_libc_start: u8;
     static __bk_seed_libc_end: u8;
+    static __bk_seed_scope_sys_start: u8;
+    static __bk_seed_scope_sys_end: u8;
 }
 
 /// The bytes of one embedded artifact.
@@ -126,6 +136,9 @@ pub fn init() -> &'static ApplicationService {
     });
     seed_file("/system/lib/libc.so.1", unsafe {
         blob(&__bk_seed_libc_start, &__bk_seed_libc_end)
+    });
+    seed_file("/system/lib/libscope_sys.so.1", unsafe {
+        blob(&__bk_seed_scope_sys_start, &__bk_seed_scope_sys_end)
     });
     // C30 §6.1: the built-in application packages (root + private DSOs) are
     // seeded from their manifest-listed paths.
