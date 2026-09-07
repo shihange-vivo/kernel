@@ -20,12 +20,21 @@
 //! Chip select is controlled by the display bus so a single-line header and
 //! quad payload remain part of one logical transaction.
 
+use core::sync::atomic::{compiler_fence, Ordering};
+
 use crate::spi::{SpiBitOrder, SpiConfig, SpiPhase, SpiPolarity};
 use blueos_hal::{Configuration, PlatPeri};
 
 const FIFO_SIZE: usize = 64;
 const SPI_CMD_TIMEOUT: usize = 100_000;
 const EMPTY_WRITE_PAD: u8 = 0;
+
+const GDMA_BASE: usize = 0x6008_0000;
+const GDMA_DESCRIPTOR_BYTES: usize = 4092;
+const GDMA_DESCRIPTOR_COUNT: usize = 8;
+const GDMA_MAX_TRANSFER_BYTES: usize = GDMA_DESCRIPTOR_BYTES * GDMA_DESCRIPTOR_COUNT;
+const HP_RAM_START: usize = 0x4080_0000;
+const HP_RAM_END: usize = 0x4088_0000;
 
 const REG_CMD: usize = 0x00;
 const REG_ADDR: usize = 0x04;
@@ -41,6 +50,16 @@ const REG_DMA_INT_CLR: usize = 0x38;
 const REG_W0: usize = 0x98;
 const REG_SLAVE: usize = 0xe0;
 const REG_CLK_GATE: usize = 0xe8;
+
+const GDMA_MISC_CONF: usize = 0x64;
+const GDMA_OUT_INT_RAW_CH0: usize = 0x30;
+const GDMA_OUT_INT_CLR_CH0: usize = 0x3c;
+const GDMA_OUT_CONF0_CH0: usize = 0xd0;
+const GDMA_OUT_CONF1_CH0: usize = 0xd4;
+const GDMA_OUTFIFO_STATUS_CH0: usize = 0xd8;
+const GDMA_OUT_LINK_CH0: usize = 0xe0;
+const GDMA_OUT_PRI_CH0: usize = 0xfc;
+const GDMA_OUT_PERI_SEL_CH0: usize = 0x100;
 
 const CMD_UPDATE: u32 = 1 << 23;
 const CMD_USR: u32 = 1 << 24;
@@ -80,18 +99,54 @@ const DMA_RX_ENA: u32 = 1 << 27;
 const DMA_TX_ENA: u32 = 1 << 28;
 const RX_AFIFO_RST: u32 = 1 << 29;
 const BUF_AFIFO_RST: u32 = 1 << 30;
+const DMA_AFIFO_RST: u32 = 1 << 31;
 const DMA_TRANS_DONE: u32 = 1 << 12;
+
+const GDMA_AHB_RESET: u32 = 1 << 0;
+const GDMA_CLOCK_ENABLE: u32 = 1 << 3;
+const GDMA_OUT_RESET: u32 = 1 << 0;
+const GDMA_OUT_AUTO_WRITEBACK: u32 = 1 << 2;
+const GDMA_OUT_DESCRIPTOR_BURST: u32 = 1 << 4;
+const GDMA_OUT_DATA_BURST: u32 = 1 << 5;
+const GDMA_OUT_CHECK_OWNER: u32 = 1 << 12;
+const GDMA_OUTFIFO_EMPTY: u32 = 1 << 1;
+const GDMA_OUTLINK_ADDRESS_MASK: u32 = 0x000f_ffff;
+const GDMA_OUTLINK_STOP: u32 = 1 << 20;
+const GDMA_OUTLINK_START: u32 = 1 << 21;
+const GDMA_OUT_DESCRIPTOR_ERROR: u32 = 1 << 2;
+const GDMA_OUT_TOTAL_EOF: u32 = 1 << 3;
+const GDMA_OUT_ALL_INTERRUPTS: u32 = 0x3f;
+const GDMA_PERIPHERAL_SPI2: u32 = 0;
 
 const SLAVE_MODE: u32 = 1 << 26;
 const SLAVE_SOFT_RESET: u32 = 1 << 27;
 
 const PCR_SPI2_CONF: usize = 0xc0;
 const PCR_SPI2_CLKM_CONF: usize = 0xc4;
+const PCR_GDMA_CONF: usize = 0xbc;
 const PCR_SPI2_CLK_EN: u32 = 1 << 0;
 const PCR_SPI2_RST_EN: u32 = 1 << 1;
+const PCR_GDMA_CLK_EN: u32 = 1 << 0;
+const PCR_GDMA_RST_EN: u32 = 1 << 1;
 const PCR_SPI2_CLKM_SEL_MASK: u32 = 0b11 << 20;
 const PCR_SPI2_CLKM_SEL_80M: u32 = 1 << 20;
 const PCR_SPI2_CLKM_EN: u32 = 1 << 22;
+
+#[derive(Clone, Copy)]
+#[repr(C)]
+struct DmaDescriptor {
+    flags: u32,
+    buffer: u32,
+    next: u32,
+}
+
+impl DmaDescriptor {
+    const EMPTY: Self = Self {
+        flags: 0,
+        buffer: 0,
+        next: 0,
+    };
+}
 
 #[inline]
 unsafe fn read32(addr: usize) -> u32 {
@@ -150,6 +205,76 @@ impl<const SPI_BASE: usize, const PCR_BASE: usize, const SOURCE_HZ: u32>
     fn modify_reg(offset: usize, clear: u32, set: u32) {
         let value = Self::read_reg(offset);
         Self::write_reg(offset, (value & !clear) | set);
+    }
+
+    #[inline]
+    fn read_gdma_reg(offset: usize) -> u32 {
+        unsafe { read32(GDMA_BASE + offset) }
+    }
+
+    #[inline]
+    fn write_gdma_reg(offset: usize, value: u32) {
+        unsafe { write32(GDMA_BASE + offset, value) };
+    }
+
+    #[inline]
+    fn modify_gdma_reg(offset: usize, clear: u32, set: u32) {
+        let value = Self::read_gdma_reg(offset);
+        Self::write_gdma_reg(offset, (value & !clear) | set);
+    }
+
+    fn init_gdma() {
+        unsafe {
+            let conf_addr = PCR_BASE + PCR_GDMA_CONF;
+            let conf = read32(conf_addr) | PCR_GDMA_CLK_EN;
+            write32(conf_addr, conf | PCR_GDMA_RST_EN);
+            write32(conf_addr, conf & !PCR_GDMA_RST_EN);
+        }
+
+        Self::modify_gdma_reg(GDMA_MISC_CONF, 0, GDMA_AHB_RESET);
+        Self::modify_gdma_reg(GDMA_MISC_CONF, GDMA_AHB_RESET, GDMA_CLOCK_ENABLE);
+    }
+
+    fn is_dma_addressable(data: &[u8]) -> bool {
+        let start = data.as_ptr() as usize;
+        start >= HP_RAM_START
+            && start
+                .checked_add(data.len())
+                .is_some_and(|end| end <= HP_RAM_END)
+    }
+
+    fn prepare_tx_descriptors(
+        descriptors: &mut [DmaDescriptor; GDMA_DESCRIPTOR_COUNT],
+        data: &[u8],
+    ) -> usize {
+        debug_assert!(!data.is_empty());
+        debug_assert!(data.len() <= GDMA_MAX_TRANSFER_BYTES);
+
+        let descriptor_count = data.len().div_ceil(GDMA_DESCRIPTOR_BYTES);
+        let descriptor_address = descriptors.as_ptr() as usize;
+        let mut data_offset = 0;
+        for index in 0..descriptor_count {
+            let byte_count = core::cmp::min(
+                GDMA_DESCRIPTOR_BYTES,
+                data.len().saturating_sub(data_offset),
+            );
+            let is_last = index + 1 == descriptor_count;
+            descriptors[index] = DmaDescriptor {
+                flags: byte_count as u32
+                    | ((byte_count as u32) << 12)
+                    | if is_last { 1 << 30 } else { 0 }
+                    | 1 << 31,
+                buffer: unsafe { data.as_ptr().add(data_offset) } as usize as u32,
+                next: if is_last {
+                    0
+                } else {
+                    (descriptor_address + core::mem::size_of::<DmaDescriptor>() * (index + 1))
+                        as u32
+                },
+            };
+            data_offset += byte_count;
+        }
+        descriptor_count
     }
 
     fn write_fifo(data: &[u8]) {
@@ -235,10 +360,123 @@ impl<const SPI_BASE: usize, const PCR_BASE: usize, const SOURCE_HZ: u32>
         );
     }
 
+    fn reset_spi_dma_fifo() {
+        let mask = RX_AFIFO_RST | BUF_AFIFO_RST | DMA_AFIFO_RST;
+        Self::modify_reg(REG_DMA_CONF, 0, mask);
+        Self::modify_reg(REG_DMA_CONF, mask, 0);
+    }
+
+    fn stop_tx_dma() {
+        Self::modify_gdma_reg(GDMA_OUT_LINK_CH0, 0, GDMA_OUTLINK_STOP);
+        Self::modify_reg(REG_DMA_CONF, DMA_TX_ENA, 0);
+        Self::write_gdma_reg(GDMA_OUT_INT_CLR_CH0, GDMA_OUT_ALL_INTERRUPTS);
+    }
+
+    fn start_tx_dma(data: &[u8]) -> blueos_hal::err::Result<()> {
+        let mut descriptors = [DmaDescriptor::EMPTY; GDMA_DESCRIPTOR_COUNT];
+        let descriptor_count = Self::prepare_tx_descriptors(&mut descriptors, data);
+        debug_assert!(descriptor_count > 0);
+
+        Self::write_gdma_reg(GDMA_OUT_INT_CLR_CH0, GDMA_OUT_ALL_INTERRUPTS);
+        Self::modify_gdma_reg(GDMA_OUT_CONF0_CH0, 0, GDMA_OUT_RESET);
+        Self::modify_gdma_reg(
+            GDMA_OUT_CONF0_CH0,
+            GDMA_OUT_RESET | GDMA_OUT_AUTO_WRITEBACK | GDMA_OUT_DATA_BURST,
+            GDMA_OUT_DESCRIPTOR_BURST,
+        );
+        Self::modify_gdma_reg(GDMA_OUT_CONF1_CH0, GDMA_OUT_CHECK_OWNER, 0);
+        Self::write_gdma_reg(GDMA_OUT_PRI_CH0, 0);
+        Self::write_gdma_reg(GDMA_OUT_PERI_SEL_CH0, GDMA_PERIPHERAL_SPI2);
+
+        compiler_fence(Ordering::SeqCst);
+        Self::write_gdma_reg(
+            GDMA_OUT_LINK_CH0,
+            (descriptors.as_ptr() as usize as u32) & GDMA_OUTLINK_ADDRESS_MASK,
+        );
+        Self::modify_reg(REG_DMA_CONF, 0, DMA_TX_ENA);
+        Self::modify_gdma_reg(GDMA_OUT_LINK_CH0, 0, GDMA_OUTLINK_START);
+
+        let mut dma_ready = false;
+        for _ in 0..SPI_CMD_TIMEOUT {
+            let interrupts = Self::read_gdma_reg(GDMA_OUT_INT_RAW_CH0);
+            if interrupts & GDMA_OUT_DESCRIPTOR_ERROR != 0 {
+                Self::stop_tx_dma();
+                return Err(blueos_hal::err::HalError::Fail);
+            }
+            if Self::read_gdma_reg(GDMA_OUTFIFO_STATUS_CH0) & GDMA_OUTFIFO_EMPTY == 0
+                || interrupts != 0
+            {
+                dma_ready = true;
+                break;
+            }
+            core::hint::spin_loop();
+        }
+        if !dma_ready {
+            Self::stop_tx_dma();
+            return Err(blueos_hal::err::HalError::Timeout);
+        }
+
+        Self::reset_spi_dma_fifo();
+        let result = Self::start_transfer();
+        let mut dma_finished = result.is_err();
+        if result.is_ok() {
+            for _ in 0..SPI_CMD_TIMEOUT {
+                let interrupts = Self::read_gdma_reg(GDMA_OUT_INT_RAW_CH0);
+                if interrupts & GDMA_OUT_DESCRIPTOR_ERROR != 0 {
+                    Self::stop_tx_dma();
+                    return Err(blueos_hal::err::HalError::Fail);
+                }
+                if interrupts & GDMA_OUT_TOTAL_EOF != 0 {
+                    dma_finished = true;
+                    break;
+                }
+                core::hint::spin_loop();
+            }
+        }
+        compiler_fence(Ordering::SeqCst);
+        Self::stop_tx_dma();
+        result?;
+        if dma_finished {
+            Ok(())
+        } else {
+            Err(blueos_hal::err::HalError::Timeout)
+        }
+    }
+
+    fn write_dma_chunks(
+        data: &[u8],
+        quad: bool,
+        header: Option<&[u8; 4]>,
+    ) -> blueos_hal::err::Result<()> {
+        let mut first = true;
+        for chunk in data.chunks(GDMA_MAX_TRANSFER_BYTES) {
+            Self::configure_data_mode(quad);
+            if first {
+                if let Some(header) = header {
+                    let address = u32::from_be_bytes([header[1], header[2], header[3], 0]);
+                    Self::modify_reg(REG_USER, 0, USER_USR_COMMAND | USER_USR_ADDR);
+                    Self::write_reg(REG_USER2, (7u32 << 28) | u32::from(header[0]));
+                    Self::modify_reg(REG_USER1, 0b1_1111 << 27, 23u32 << 27);
+                    Self::write_reg(REG_ADDR, address);
+                }
+                first = false;
+            }
+
+            Self::write_reg(REG_MS_DLEN, chunk.len() as u32 * 8 - 1);
+            Self::start_tx_dma(chunk)?;
+        }
+        Ok(())
+    }
+
     fn write_chunks(data: &[u8], quad: bool) -> blueos_hal::err::Result<()> {
         if data.is_empty() {
             return Ok(());
         }
+        if data.len() > FIFO_SIZE && Self::is_dma_addressable(data) {
+            return Self::write_dma_chunks(data, quad, None);
+        }
+
+        Self::modify_reg(REG_DMA_CONF, DMA_TX_ENA, 0);
         Self::configure_data_mode(quad);
         for chunk in data.chunks(FIFO_SIZE) {
             Self::reset_fifo(true, false);
@@ -318,6 +556,9 @@ impl<const SPI_BASE: usize, const PCR_BASE: usize, const SOURCE_HZ: u32>
         if data.is_empty() {
             return Self::write_chunks(header, false);
         }
+        if data.len() > FIFO_SIZE && Self::is_dma_addressable(data) {
+            return Self::write_dma_chunks(data, true, Some(header));
+        }
 
         // Encode the flash-shaped header as a one-line 8-bit command plus a
         // one-line 24-bit address, followed by quad write data.
@@ -384,6 +625,7 @@ impl<const SPI_BASE: usize, const PCR_BASE: usize, const SOURCE_HZ: u32> Configu
 
     fn configure(&self, config: &SpiConfig) -> blueos_hal::err::Result<()> {
         self.enable();
+        Self::init_gdma();
 
         Self::modify_reg(REG_SLAVE, SLAVE_MODE, SLAVE_SOFT_RESET);
         Self::modify_reg(REG_SLAVE, SLAVE_SOFT_RESET | SLAVE_MODE, 0);
@@ -451,6 +693,29 @@ impl<const SPI_BASE: usize, const PCR_BASE: usize, const SOURCE_HZ: u32> blueos_
 mod tests {
     use super::*;
     use blueos_test_macro::test;
+
+    type TestSpi = Esp32c6Spi2<0, 0, 80_000_000>;
+
+    #[test]
+    fn tx_descriptors_cover_multiple_chunks() {
+        let data = [0u8; GDMA_DESCRIPTOR_BYTES + 1];
+        let mut descriptors = [DmaDescriptor::EMPTY; GDMA_DESCRIPTOR_COUNT];
+
+        let count = TestSpi::prepare_tx_descriptors(&mut descriptors, &data);
+
+        assert_eq!(count, 2);
+        assert_eq!(descriptors[0].flags & 0xfff, GDMA_DESCRIPTOR_BYTES as u32);
+        assert_eq!(
+            (descriptors[0].flags >> 12) & 0xfff,
+            GDMA_DESCRIPTOR_BYTES as u32
+        );
+        assert_eq!(descriptors[0].flags >> 30, 0b10);
+        assert_ne!(descriptors[0].next, 0);
+        assert_eq!(descriptors[1].flags & 0xfff, 1);
+        assert_eq!((descriptors[1].flags >> 12) & 0xfff, 1);
+        assert_eq!(descriptors[1].flags >> 30, 0b11);
+        assert_eq!(descriptors[1].next, 0);
+    }
 
     #[test]
     fn wait_until_clear_times_out() {
