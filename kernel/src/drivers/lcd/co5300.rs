@@ -314,6 +314,33 @@ where
 
         let panel_width = u32::from(self.width);
         let panel_height = u32::from(self.height);
+
+        // The controller accepts rectangles with even origins and dimensions. Forward an
+        // already aligned, unclipped multi-row buffer directly so a batched framebuffer write
+        // becomes one QSPI transaction instead of being split into two-row transfers.
+        if area.col_end < panel_width
+            && area.row_end < panel_height
+            && area.col_start & 1 == 0
+            && area.row_start & 1 == 0
+            && source_width & 1 == 0
+            && source_height & 1 == 0
+        {
+            let panel_area = Area::new(
+                area.col_start as u16,
+                area.row_start as u16,
+                source_width as u16,
+                source_height as u16,
+            );
+            block_on_sync(self.display.write_pixels(
+                panel_area,
+                FrameControl::new_standalone(),
+                color,
+            ))
+            .map_err(|_| super::LcdError::Bus)?;
+            self.cached_even_row = None;
+            return Ok(());
+        }
+
         if area.col_start >= panel_width || area.row_start >= panel_height {
             return Ok(());
         }

@@ -129,13 +129,38 @@ impl<T: Lcd> FramebufferOps for LcdFramebuffer<T> {
         let mut pixel_index = u32::try_from(offset / u64::from(LCD_BYTES_PER_PIXEL))
             .map_err(|_| embedded_io::ErrorKind::InvalidInput)?;
         let mut written = 0;
+        let line_bytes = self.line_length() as usize;
         let mut display = &mut self.display;
 
         while written < buf.len() {
             let row = pixel_index / self.width;
             let col = pixel_index % self.width;
-            let row_pixels =
-                (self.width - col).min((buf.len() - written) as u32 / LCD_BYTES_PER_PIXEL);
+            let remaining_bytes = buf.len() - written;
+
+            // Preserve complete consecutive scanlines as one draw operation. Besides reducing
+            // syscall-side overhead, this lets controllers such as CO5300 transmit a larger
+            // aligned rectangle instead of opening one bus transaction for every row.
+            if col == 0 && remaining_bytes >= line_bytes {
+                let available_rows = (self.height - row) as usize;
+                let row_count = (remaining_bytes / line_bytes).min(available_rows);
+                let draw_bytes = row_count * line_bytes;
+                display
+                    .draw_area(
+                        DrawArea {
+                            row_start: row,
+                            row_end: row + row_count as u32 - 1,
+                            col_start: 0,
+                            col_end: self.width - 1,
+                        },
+                        &buf[written..written + draw_bytes],
+                    )
+                    .map_err(lcd_error_to_io_error)?;
+                pixel_index += row_count as u32 * self.width;
+                written += draw_bytes;
+                continue;
+            }
+
+            let row_pixels = (self.width - col).min(remaining_bytes as u32 / LCD_BYTES_PER_PIXEL);
             let row_bytes = row_pixels as usize * LCD_BYTES_PER_PIXEL as usize;
             display
                 .draw_area(
