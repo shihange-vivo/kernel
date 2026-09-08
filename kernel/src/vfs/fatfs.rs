@@ -85,28 +85,10 @@ impl FatFileSystem {
             return Err(code::EAGAIN);
         }
 
-        let mut storage = FatStorage::new(device_name)?;
-        let format_opts = fatfs::FormatVolumeOptions::new()
-            .bytes_per_sector(storage.sector_size)
-            .total_sectors(storage.sector_num.try_into().unwrap())
-            .bytes_per_cluster(BLOCK_SIZE);
-        let internal_fs = Box::new({
-            match fatfs::FileSystem::new(storage.clone(), fatfs::FsOptions::new()) {
-                Ok(fs) => fs,
-                Err(_) => {
-                    warn!(
-                        "[FatFileSystem] Failed to construct internal fs, format it and try again."
-                    );
-                    fatfs::format_volume(&mut storage, format_opts)
-                        .expect("[FatFileSystem] Format volume fail.");
-                    storage
-                        .flush()
-                        .expect("[FatFileSystem] Flush after format fail.");
-                    fatfs::FileSystem::new(storage, fatfs::FsOptions::new())
-                        .expect("[FatFileSystem] Failed to construct internal fs again")
-                }
-            }
-        });
+        let storage = FatStorage::new(device_name)?;
+        let internal_fs = Box::new(
+            fatfs::FileSystem::new(storage, fatfs::FsOptions::new()).map_err(Error::from)?,
+        );
         let wrapper = Box::new(InternalFsWrapper {
             fs: Box::leak(internal_fs),
             lock: Arc::new(Mutex::new(())),
@@ -912,6 +894,7 @@ impl<T> InternalFsLock<T> {
 #[derive(Clone)]
 pub(crate) struct FatStorage {
     device: Arc<dyn Device>,
+    base_offset: u64,
     position: u64,              // index of bytes
     pub(crate) total_size: u64, // total size in bytes
     pub(crate) sector_size: u16,
@@ -928,10 +911,32 @@ impl FatStorage {
             .get_block_device(device_name)
             .ok_or(code::ENODEV)?;
         let sector_size = block_device.sector_size().unwrap();
-        let sector_num = block_device.capacity().unwrap();
-        let total_size = sector_num * (sector_size as u64);
+        let device_sector_num = block_device.capacity().unwrap();
+        let mut first_sector = [0u8; 512];
+        let first_sector_len = block_device
+            .read(0, &mut first_sector, false)
+            .map_err(Error::from)?;
+        let (first_sector_no, sector_num) = if first_sector_len == first_sector.len() {
+            detect_fat_volume(&first_sector, sector_size, device_sector_num)
+                .unwrap_or((0, device_sector_num))
+        } else {
+            (0, device_sector_num)
+        };
+        let base_offset = first_sector_no
+            .checked_mul(sector_size as u64)
+            .ok_or(code::EOVERFLOW)?;
+        let total_size = sector_num
+            .checked_mul(sector_size as u64)
+            .ok_or(code::EOVERFLOW)?;
+        if first_sector_no != 0 {
+            info!(
+                "[FatFileSystem] using FAT partition at sector {}, length {} sectors",
+                first_sector_no, sector_num
+            );
+        }
         let storage = Self {
             device: block_device,
+            base_offset,
             position: 0,
             total_size,
             sector_size,
@@ -943,7 +948,16 @@ impl FatStorage {
 
 impl Read for FatStorage {
     fn read(&mut self, buf: &mut [u8]) -> Result<usize, Self::Error> {
-        let read_size = match self.device.read(self.position, buf, false) {
+        let remaining = self.total_size.saturating_sub(self.position);
+        let read_len = core::cmp::min(buf.len() as u64, remaining) as usize;
+        if read_len == 0 {
+            return Ok(0);
+        }
+        let read_size = match self.device.read(
+            self.base_offset + self.position,
+            &mut buf[..read_len],
+            false,
+        ) {
             Ok(read_size) => read_size,
             Err(error) => {
                 return Err(error.into());
@@ -956,12 +970,21 @@ impl Read for FatStorage {
 
 impl Write for FatStorage {
     fn write(&mut self, buf: &[u8]) -> Result<usize, Self::Error> {
-        let write_size = match self.device.write(self.position, buf, false) {
-            Ok(write_size) => write_size,
-            Err(error) => {
-                return Err(error.into());
-            }
-        };
+        let remaining = self.total_size.saturating_sub(self.position);
+        let write_len = core::cmp::min(buf.len() as u64, remaining) as usize;
+        if write_len == 0 {
+            return Ok(0);
+        }
+        let write_size =
+            match self
+                .device
+                .write(self.base_offset + self.position, &buf[..write_len], false)
+            {
+                Ok(write_size) => write_size,
+                Err(error) => {
+                    return Err(error.into());
+                }
+            };
         self.position += write_size as u64;
         Ok(write_size)
     }
@@ -978,23 +1001,131 @@ impl Seek for FatStorage {
     fn seek(&mut self, pos: SeekFrom) -> Result<u64, Self::Error> {
         let new_pos = match pos {
             SeekFrom::Start(offset) => offset,
-            SeekFrom::End(offset) => {
-                let end = self.total_size;
-                end.saturating_add(offset as u64)
-            }
-            SeekFrom::Current(offset) => {
-                if offset >= 0 {
-                    self.position.saturating_add(offset.unsigned_abs())
-                } else {
-                    self.position.saturating_sub(offset.unsigned_abs())
-                }
-            }
+            SeekFrom::End(offset) => self
+                .total_size
+                .checked_add_signed(offset)
+                .ok_or(FatStorageError::from(ErrorKind::InvalidInput))?,
+            SeekFrom::Current(offset) => self
+                .position
+                .checked_add_signed(offset)
+                .ok_or(FatStorageError::from(ErrorKind::InvalidInput))?,
         };
         if new_pos > self.total_size {
             return Err(ErrorKind::InvalidInput.into());
         }
         self.position = new_pos;
         Ok(self.position)
+    }
+}
+
+const MBR_PARTITION_TABLE_OFFSET: usize = 446;
+const MBR_PARTITION_ENTRY_SIZE: usize = 16;
+
+fn detect_fat_volume(
+    first_sector: &[u8; 512],
+    sector_size: u16,
+    device_sector_num: u64,
+) -> Option<(u64, u64)> {
+    if first_sector[510..512] != [0x55, 0xaa] {
+        return None;
+    }
+
+    let bytes_per_sector = u16::from_le_bytes([first_sector[11], first_sector[12]]);
+    let sectors_per_cluster = first_sector[13];
+    let reserved_sectors = u16::from_le_bytes([first_sector[14], first_sector[15]]);
+    let fat_count = first_sector[16];
+    if matches!(first_sector[0], 0xe9 | 0xeb)
+        && bytes_per_sector == sector_size
+        && sectors_per_cluster.is_power_of_two()
+        && reserved_sectors != 0
+        && matches!(fat_count, 1 | 2)
+    {
+        return Some((0, device_sector_num));
+    }
+
+    for index in 0..4 {
+        let offset = MBR_PARTITION_TABLE_OFFSET + index * MBR_PARTITION_ENTRY_SIZE;
+        let partition_type = first_sector[offset + 4];
+        if !is_fat_partition_type(partition_type) {
+            continue;
+        }
+        let first_sector_no = u32::from_le_bytes([
+            first_sector[offset + 8],
+            first_sector[offset + 9],
+            first_sector[offset + 10],
+            first_sector[offset + 11],
+        ]) as u64;
+        let sector_num = u32::from_le_bytes([
+            first_sector[offset + 12],
+            first_sector[offset + 13],
+            first_sector[offset + 14],
+            first_sector[offset + 15],
+        ]) as u64;
+        if first_sector_no != 0
+            && sector_num != 0
+            && first_sector_no
+                .checked_add(sector_num)
+                .is_some_and(|end| end <= device_sector_num)
+        {
+            return Some((first_sector_no, sector_num));
+        }
+    }
+    None
+}
+
+fn is_fat_partition_type(partition_type: u8) -> bool {
+    matches!(
+        partition_type,
+        0x01 | 0x04 | 0x06 | 0x0b | 0x0c | 0x0e | 0x11 | 0x14 | 0x16 | 0x1b | 0x1c | 0x1e
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use blueos_test_macro::test;
+
+    #[test]
+    fn detects_unpartitioned_fat_volume() {
+        let mut sector = [0u8; 512];
+        sector[0] = 0xeb;
+        sector[11..13].copy_from_slice(&512u16.to_le_bytes());
+        sector[13] = 8;
+        sector[14..16].copy_from_slice(&32u16.to_le_bytes());
+        sector[16] = 2;
+        sector[510..512].copy_from_slice(&[0x55, 0xaa]);
+
+        assert_eq!(
+            detect_fat_volume(&sector, 512, 1_000_000),
+            Some((0, 1_000_000))
+        );
+    }
+
+    #[test]
+    fn detects_first_mbr_fat_partition() {
+        let mut sector = [0u8; 512];
+        let entry = MBR_PARTITION_TABLE_OFFSET;
+        sector[entry + 4] = 0x0c;
+        sector[entry + 8..entry + 12].copy_from_slice(&2048u32.to_le_bytes());
+        sector[entry + 12..entry + 16].copy_from_slice(&500_000u32.to_le_bytes());
+        sector[510..512].copy_from_slice(&[0x55, 0xaa]);
+
+        assert_eq!(
+            detect_fat_volume(&sector, 512, 1_000_000),
+            Some((2048, 500_000))
+        );
+    }
+
+    #[test]
+    fn rejects_partition_outside_device() {
+        let mut sector = [0u8; 512];
+        let entry = MBR_PARTITION_TABLE_OFFSET;
+        sector[entry + 4] = 0x0b;
+        sector[entry + 8..entry + 12].copy_from_slice(&900_000u32.to_le_bytes());
+        sector[entry + 12..entry + 16].copy_from_slice(&200_000u32.to_le_bytes());
+        sector[510..512].copy_from_slice(&[0x55, 0xaa]);
+
+        assert_eq!(detect_fat_volume(&sector, 512, 1_000_000), None);
     }
 }
 

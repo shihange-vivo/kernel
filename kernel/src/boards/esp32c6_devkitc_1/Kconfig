@@ -31,7 +31,7 @@ config SD_CARD
     select ENABLE_BLOCK
     select SPI_CORE
     help
-      Enable the Waveshare ESP32-C6-Touch-LCD-1.54 microSD slot. The slot
+      Enable the Waveshare ESP32-C6-Touch-AMOLED-2.16 microSD slot. The slot
       uses SPI2 with a dedicated chip-select on GPIO6.
 
 config SD_CARD_SCLK_GPIO

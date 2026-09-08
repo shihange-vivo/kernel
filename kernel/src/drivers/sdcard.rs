@@ -31,7 +31,8 @@ use crate::{
 const SECTOR_SIZE: usize = 512;
 const R1_RETRIES: usize = 8;
 const INIT_RETRIES: usize = 4_000;
-const TOKEN_RETRIES: usize = 100_000;
+const INIT_TOKEN_RETRIES: usize = 10_000;
+const DATA_TOKEN_RETRIES: usize = 100_000;
 const BUSY_RETRIES: usize = 1_000_000;
 
 const CMD0: u8 = 0;
@@ -140,12 +141,12 @@ where
     Err(SdCardError::Timeout)
 }
 
-fn wait_token<T, G>(bus: &mut BlockSpi<T, G>, token: u8) -> Result<(), SdCardError>
+fn wait_token<T, G>(bus: &mut BlockSpi<T, G>, token: u8, retries: usize) -> Result<(), SdCardError>
 where
     T: blueos_hal::spi::Spi<blueos_driver::spi::SpiConfig, ()>,
     G: blueos_hal::gpio::OutputPin,
 {
-    for _ in 0..TOKEN_RETRIES {
+    for _ in 0..retries {
         let value = read_byte(bus)?;
         if value == token {
             return Ok(());
@@ -181,8 +182,42 @@ where
     }
 
     fn command(&mut self, command: u8, argument: u32, crc: u8) -> Result<u8, SdCardError> {
-        self.spi
-            .with_cs(|bus| send_command(bus, command, argument, crc))
+        self.with_card_selected(|bus| send_command(bus, command, argument, crc))
+    }
+
+    /// Run one SD SPI transaction and provide the mandatory trailing clock
+    /// after releasing chip select. Without that extra byte some cards keep
+    /// their command state active, so the next command receives a stale or
+    /// malformed R1 response.
+    fn with_card_selected<R>(
+        &mut self,
+        f: impl FnOnce(&mut BlockSpi<T, G>) -> Result<R, SdCardError>,
+    ) -> Result<R, SdCardError> {
+        let result = self.spi.with_cs(f);
+        let trailing_clock = self.spi.clock_idle(&[0xff]).map_err(SdCardError::Spi);
+        match result {
+            Ok(value) => trailing_clock.map(|()| value),
+            Err(error) => {
+                let _ = trailing_clock;
+                Err(error)
+            }
+        }
+    }
+
+    fn with_card_selected_config<R>(
+        &mut self,
+        config: &blueos_driver::spi::SpiConfig,
+        f: impl FnOnce(&mut BlockSpi<T, G>) -> Result<R, SdCardError>,
+    ) -> Result<R, SdCardError> {
+        let result = self.spi.with_cs_config(config, f);
+        let trailing_clock = self.spi.clock_idle(&[0xff]).map_err(SdCardError::Spi);
+        match result {
+            Ok(value) => trailing_clock.map(|()| value),
+            Err(error) => {
+                let _ = trailing_clock;
+                Err(error)
+            }
+        }
     }
 
     fn block_address(&self, block_id: usize, index: usize) -> Result<u32, SdCardError> {
@@ -213,7 +248,7 @@ where
             return Err(SdCardError::Response(response));
         }
 
-        let cmd8 = self.spi.with_cs(|bus| {
+        let cmd8 = self.with_card_selected(|bus| {
             let response = send_command(bus, CMD8, 0x1aa, 0x87)?;
             if response == 0x01 {
                 let mut r7 = [0u8; 4];
@@ -250,7 +285,7 @@ where
             return Err(SdCardError::Timeout);
         }
 
-        let ocr = self.spi.with_cs(|bus| {
+        let ocr = self.with_card_selected(|bus| {
             let response = send_command(bus, CMD58, 0, 0x01)?;
             if response != 0 {
                 return Err(SdCardError::Response(response));
@@ -261,12 +296,12 @@ where
         })?;
         self.high_capacity = ocr & (1 << 30) != 0;
 
-        let csd = self.spi.with_cs(|bus| {
+        let csd = self.with_card_selected(|bus| {
             let response = send_command(bus, CMD9, 0, 0x01)?;
             if response != 0 {
                 return Err(SdCardError::Response(response));
             }
-            wait_token(bus, DATA_START_TOKEN)?;
+            wait_token(bus, DATA_START_TOKEN, INIT_TOKEN_RETRIES)?;
             let mut data = [0u8; 16];
             transfer_ff(bus, &mut data)?;
             let mut crc = [0u8; 2];
@@ -300,18 +335,20 @@ where
         }
         for (index, chunk) in buf.chunks_mut(SECTOR_SIZE).enumerate() {
             let address = self.block_address(block_id, index)?;
-            self.spi
-                .with_cs_config(&blueos_driver::spi::SpiConfig::sd_card_default(), |bus| {
+            self.with_card_selected_config(
+                &blueos_driver::spi::SpiConfig::sd_card_default(),
+                |bus| {
                     let response = send_command(bus, CMD17, address, 0x01)?;
                     if response != 0 {
                         return Err(SdCardError::Response(response));
                     }
-                    wait_token(bus, DATA_START_TOKEN)?;
+                    wait_token(bus, DATA_START_TOKEN, DATA_TOKEN_RETRIES)?;
                     transfer_ff(bus, chunk)?;
                     let mut crc = [0u8; 2];
                     transfer_ff(bus, &mut crc)?;
                     Ok(())
-                })?;
+                },
+            )?;
         }
         Ok(())
     }
@@ -329,8 +366,9 @@ where
         }
         for (index, chunk) in buf.chunks(SECTOR_SIZE).enumerate() {
             let address = self.block_address(block_id, index)?;
-            self.spi
-                .with_cs_config(&blueos_driver::spi::SpiConfig::sd_card_default(), |bus| {
+            self.with_card_selected_config(
+                &blueos_driver::spi::SpiConfig::sd_card_default(),
+                |bus| {
                     let response = send_command(bus, CMD24, address, 0x01)?;
                     if response != 0 {
                         return Err(SdCardError::Response(response));
@@ -348,7 +386,8 @@ where
                         }
                     }
                     Err(SdCardError::Timeout)
-                })?;
+                },
+            )?;
         }
         Ok(())
     }
