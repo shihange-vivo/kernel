@@ -141,7 +141,8 @@ extern "C" fn init() {
     }
     // C29 §18.2: seed the embedded dynamic system image and assemble the
     // application stack (VFS/flat memory/registry/manager/reaper) before the
-    // first thread runs.
+    // first thread runs. The dedicated kernel image starts the interactive
+    // shell from its static entry; test images do not inherit that workload.
     #[cfg(boot_dynamic_seed)]
     {
         crate::application::seed::bootstrap();

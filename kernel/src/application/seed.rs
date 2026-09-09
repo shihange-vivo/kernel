@@ -26,8 +26,10 @@ use alloc::vec::Vec;
 
 use blueos_loader::LinkDomainId;
 
-use crate::application::adapters::system_paths::{SystemLibraryEntry, SystemLibraryPaths};
-use crate::application::service::ApplicationService;
+use crate::application::{
+    adapters::system_paths::{SystemLibraryEntry, SystemLibraryPaths},
+    service::ApplicationService,
+};
 
 /// The fixed system library catalog (§12.2): each `DT_NEEDED` resolves to
 /// this VFS path, whose bytes come from the embedded artifact. C31-a adds the
@@ -163,16 +165,28 @@ pub fn init() -> &'static ApplicationService {
     ApplicationService::init(&CATALOG, LinkDomainId::new(1))
 }
 
-/// Boot bootstrap (§18.2): seed the system image, assemble the application
-/// stack and launch the dynamic shell. A launch failure is logged, not
-/// fatal — the kernel keeps running with the service assembled.
+/// Boot bootstrap (§18.2): seed the system image and assemble the application
+/// stack before scheduling starts.
+///
+/// Starting the interactive shell is deliberately separate. Most QEMU test
+/// images contain their own static test application; queueing a shell in every
+/// such image changes the scheduler under test and can leave an interactive
+/// console reader alive for the whole run. The dedicated `kernel_image` calls
+/// [`launch_bootstrap_shell`] from its static entry once scheduling has begun.
 pub fn bootstrap() -> &'static ApplicationService {
+    init()
+}
+
+/// Launch the dynamic bootstrap shell from the dedicated boot image.
+///
+/// A launch failure is logged but is not fatal: the application service stays
+/// available for diagnostics or a later explicit spawn.
+pub fn launch_bootstrap_shell() {
     let service = init();
     let argv = alloc::vec![b"/apps/shell/app.elf".to_vec()];
     if let Err(error) = service.spawn("/apps/shell/app.elf", argv, Vec::new()) {
         log::error!("boot: bootstrap shell launch failed: {:?}", error);
     }
-    service
 }
 
 /// The fixed catalog for callers that build their own service view (the

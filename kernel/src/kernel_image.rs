@@ -12,12 +12,11 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Bootable kernel image without static applications (C29, §18.2).
+//! Dedicated bootable kernel image for the dynamic shell (C29, §18.2).
 //!
-//! The boot seed path assembles the application stack and launches the
-//! dynamic bootstrap shell before the scheduler starts, so this image only
-//! carries the kernel and the rsrt runtime. `main` is a stub: the scheduler
-//! takes over in `boot::init` and this thread is never resumed.
+//! The boot seed path assembles the application stack before the scheduler
+//! starts. This image's static entry then launches the dynamic bootstrap shell,
+//! keeping that interactive application out of unrelated test images.
 
 #![no_main]
 #![no_std]
@@ -35,5 +34,5 @@ static KERNEL_ANCHOR: extern "C" fn() -> usize = blueos::arch::current_sp;
 
 #[no_mangle]
 pub extern "C" fn main() {
-    // The dynamic bootstrap shell owns the console from here on.
+    blueos::application::seed::launch_bootstrap_shell();
 }

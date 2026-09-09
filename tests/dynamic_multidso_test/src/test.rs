@@ -3,7 +3,7 @@
 // ASSERT-FAIL: Backtrace in Panic.*
 // ASSERT-FAIL: ASSERTION FAILED.*
 // COUNT: DSO_LOAD soname=libc\.so\.1 == 1
-// COUNT: DSO_REUSE soname=libc\.so\.1 == 2
+// COUNT: DSO_REUSE soname=libc\.so\.1 == 1
 // COUNT: PKG_LOAD soname=libfoo\.so\.1 path=/apps/multi/lib/libfoo\.so\.1 == 2
 // COUNT: PKG_LOAD soname=libbar\.so\.1 path=/apps/multi/lib/libbar\.so\.1 == 2
 // COUNT: PKG_LOAD soname=libcommon\.so\.1 path=/apps/multi/lib/libcommon\.so\.1 == 2
@@ -53,8 +53,7 @@ extern crate alloc;
 extern crate rsrt;
 
 use alloc::vec::Vec;
-use blueos::application::seed;
-use blueos::application::service::ApplicationService;
+use blueos::application::{seed, service::ApplicationService};
 use blueos_test_macro::test;
 use core::sync::atomic::{AtomicUsize, Ordering};
 use librs::pthread;

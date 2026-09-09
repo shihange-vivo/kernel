@@ -33,8 +33,7 @@ extern crate alloc;
 extern crate rsrt;
 
 use alloc::vec::Vec;
-use blueos::application::seed;
-use blueos::application::service::ApplicationService;
+use blueos::application::{seed, service::ApplicationService};
 use blueos_test_macro::test;
 use core::sync::atomic::{AtomicUsize, Ordering};
 use librs::pthread;
@@ -43,7 +42,10 @@ use semihosting::println;
 /// Launch the hello app and wait (bounded) for the deferred reaper to recycle
 /// its slot, then assert the public state is gone. Returns the handle whose
 /// generation the relaunch assertion compares against.
-fn launch_and_wait(service: &ApplicationService, argc1: bool) -> blueos::application::manager::ApplicationHandle {
+fn launch_and_wait(
+    service: &ApplicationService,
+    argc1: bool,
+) -> blueos::application::manager::ApplicationHandle {
     let mut argv = Vec::new();
     argv.push(b"/apps/hello/app.elf".to_vec());
     if argc1 {

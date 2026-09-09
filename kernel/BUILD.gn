@@ -192,10 +192,9 @@ run_clippy("blueos_clippy") {
   deps = [ ":blueos" ]
 }
 
-# C29 §18.2: the bootable kernel image without static applications. The boot
-# seed path assembles the application stack and launches the dynamic
-# bootstrap shell, so the image only needs the kernel, the rsrt runtime and a
-# stub `main` that retires after the scheduler takes over.
+# C29 §18.2: the bootable kernel image whose sole static application launches
+# the dynamic bootstrap shell. Keeping this launch in the dedicated image
+# prevents unrelated QEMU test binaries from also running an interactive shell.
 build_rust("kernel_image") {
   crate_type = "bin"
   edition = "2021"
