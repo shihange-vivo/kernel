@@ -14,12 +14,9 @@
 
 use alloc::vec::Vec;
 use goblin::{
-    elf::{
-        dynamic::DT_SONAME,
-        program_header::{
-            PF_R, PF_W, PF_X, PT_ARM_EXIDX, PT_DYNAMIC, PT_GNU_EH_FRAME, PT_GNU_RELRO,
-            PT_GNU_STACK, PT_INTERP, PT_LOAD, PT_NOTE, PT_PHDR, PT_TLS,
-        },
+    elf::program_header::{
+        PF_R, PF_W, PF_X, PT_ARM_EXIDX, PT_DYNAMIC, PT_GNU_EH_FRAME, PT_GNU_RELRO, PT_GNU_STACK,
+        PT_INTERP, PT_LOAD, PT_NOTE, PT_PHDR, PT_TLS,
     },
     elf64,
 };
@@ -35,12 +32,25 @@ use crate::{
     image::{
         features::validate_dynamic_features,
         inspect::{InspectedImage, StackKind},
-        map::dynamic_error,
         DynamicFeatureSummary,
     },
     reader::ElfReader,
     MemoryPermissions,
 };
+
+/// A dependency shared object without a `PT_DYNAMIC` has nowhere to keep its
+/// dynamic symbols or relocations: malformed ELF, reported without implying a
+/// `DT_SONAME` requirement (§5.3).
+fn missing_dynamic_error() -> LoadError {
+    LoadError::new(
+        LoadErrorKind::BadElf,
+        ErrorContext::ProgramHeader {
+            index: 0,
+            field: ProgramHeaderField::Type,
+            value: u64::from(PT_DYNAMIC),
+        },
+    )
+}
 
 pub(crate) struct AdmittedImage<R: ElfReader> {
     reader: R,
@@ -80,7 +90,8 @@ impl<R: ElfReader> AdmittedImage<R> {
     }
 
     /// Mark this artifact as a shared object rather than the executable root.
-    /// A shared object may have `e_entry == 0` and must provide a SONAME.
+    /// A shared object may have `e_entry == 0` and may omit `DT_SONAME`; it
+    /// still requires a `PT_DYNAMIC` (checked during `inspect`).
     #[inline]
     pub(crate) const fn with_role(mut self, role: ArtifactRole) -> Self {
         self.role = role;
@@ -337,19 +348,23 @@ impl<R: ElfReader> AdmittedImage<R> {
         // S1 stage 2: the dynamic feature summary must be decided here, before
         // any allocation or write. A `PT_DYNAMIC` that requests an unsupported
         // feature is rejected while the write count is still zero.
+        //
+        // A dependency shared object must still carry a `PT_DYNAMIC` — its
+        // symbols and relocations live there — but a missing table is a plain
+        // malformed-ELF condition, not a SONAME one (§5.3): the root and static
+        // PIEs legitimately have none.
         let summary = match dynamic.as_ref() {
             Some(dynamic) => validate_dynamic_features(
                 &self.reader,
                 dynamic,
                 self.policy,
-                self.role,
                 self.header.class(),
                 self.header.endian(),
                 self.request.limits(),
             )
             .map_err(|error| error.at_stage(LoadStage::Inspect))?,
             None if self.role == ArtifactRole::SharedObject => {
-                return Err(dynamic_error(DT_SONAME, 0).at_stage(LoadStage::Inspect));
+                return Err(missing_dynamic_error().at_stage(LoadStage::Inspect));
             }
             None => DynamicFeatureSummary::empty(),
         };

@@ -20,7 +20,6 @@ use goblin::elf::dynamic::{
 };
 
 use crate::{
-    dynamic_linker::ArtifactRole,
     elf::DynamicSegmentInfo,
     error::{LoadError, LoadErrorKind, LoadResult},
     identity::{ElfClass, ElfData, LoadLimits, LoadPolicy},
@@ -83,7 +82,6 @@ pub(crate) fn validate_dynamic_features<R: ElfReader>(
     reader: &R,
     dynamic: &DynamicSegmentInfo,
     policy: LoadPolicy,
-    role: ArtifactRole,
     class: ElfClass,
     endian: ElfData,
     limits: &LoadLimits,
@@ -165,12 +163,10 @@ pub(crate) fn validate_dynamic_features<R: ElfReader>(
         return Err(dynamic_error(DT_NULL, file_range.len()));
     }
 
-    // A shared object must advertise a bounded, NUL-terminated SONAME; only the
-    // root may omit it. The offset itself is bounds-checked against `DT_STRSZ`
-    // later, in S4.
-    if role == ArtifactRole::SharedObject && soname.is_none() {
-        return Err(dynamic_error(DT_SONAME, 0));
-    }
+    // A shared object may omit `DT_SONAME` (§5.1): when present the offset is
+    // bounds-checked against `DT_STRSZ` later, in S4. Distinguishing two
+    // SONAME-less files is the resolver's job — by identity and path — not
+    // this stage's.
     if has_plt_relocations && policy.requires_now_for_plt() && !bind_now {
         return Err(unsupported_dynamic(DT_JMPREL, 0));
     }

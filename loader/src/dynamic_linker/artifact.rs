@@ -85,8 +85,9 @@ pub enum ArtifactRole {
     /// The link root: must carry a canonical entry fully inside an executable
     /// region and is published as the application entry.
     ExecutableRoot,
-    /// A dependent shared object: may have `e_entry == 0` and must provide a
-    /// bounded, NUL-terminated `DT_SONAME`.
+    /// A dependent shared object: may have `e_entry == 0` and may omit
+    /// `DT_SONAME` (two SONAME-less files are distinguished by identity and
+    /// path at the resolver layer, §5.2).
     SharedObject,
 }
 

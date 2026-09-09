@@ -32,6 +32,98 @@ fn fixture_builder_emits_a_parseable_elf64_header() {
     assert!(elf.little_endian);
 }
 
+/// §5.1 SONAME relaxation: a shared object without `DT_SONAME` is a normal
+/// dependency; a root or static PIE without one always was. The remaining
+/// hard requirement is `PT_DYNAMIC` for a shared object.
+mod soname_relaxation {
+    use std::vec::Vec;
+
+    use goblin::elf::header::{EM_RISCV, ET_DYN};
+
+    use crate::{
+        dynamic_linker::ArtifactRole,
+        error::{LoadErrorKind, ProgramHeaderField},
+        identity::{ElfType, LoadLimits, LoadProfile, LoadRequest},
+        image::ImageLoader,
+        reader::SliceElfReader,
+        tests::fixture::ElfFixtureBuilder,
+    };
+
+    fn dyn_request() -> LoadRequest {
+        LoadRequest::new(LoadProfile::riscv64(ElfType::Dyn), LoadLimits::DEFAULT)
+    }
+
+    /// One PT_LOAD (r-x, entry inside) plus a PT_DYNAMIC with a single
+    /// DT_NULL entry: a valid shared object that declares no SONAME and no
+    /// dependencies. The load segment must cover the dynamic table's file
+    /// range (the builder appends the PT_DYNAMIC after the PT_LOAD header).
+    fn no_soname_dso_bytes() -> Vec<u8> {
+        ElfFixtureBuilder::elf64(EM_RISCV, ET_DYN)
+            .with_load_segment(0x1000, 0x200, 0x200, 0x4)
+            .with_dynamic_segment(0x1000)
+            .build()
+    }
+
+    #[test]
+    fn shared_object_without_soname_passes_inspect() {
+        let bytes = no_soname_dso_bytes();
+        let result = ImageLoader::new(SliceElfReader::new(&bytes), dyn_request())
+            .admit()
+            .expect("admit")
+            .with_role(ArtifactRole::SharedObject)
+            .inspect();
+        assert!(
+            result.is_ok(),
+            "a SharedObject without DT_SONAME must pass inspect: {:?}",
+            result.err()
+        );
+    }
+
+    #[test]
+    fn root_without_dynamic_table_passes_inspect() {
+        // A static PIE root: one PT_LOAD, no PT_DYNAMIC, no SONAME, no
+        // DT_NEEDED — inspect must accept it (§5.1).
+        let bytes = ElfFixtureBuilder::elf64(EM_RISCV, ET_DYN)
+            .with_load_segment(0x1000, 0x100, 0x100, 0x4)
+            .with_entry(0x1000)
+            .build();
+        let result = ImageLoader::new(SliceElfReader::new(&bytes), dyn_request())
+            .admit()
+            .expect("admit")
+            .inspect();
+        assert!(
+            result.is_ok(),
+            "a root without PT_DYNAMIC must pass inspect: {:?}",
+            result.err()
+        );
+    }
+
+    #[test]
+    fn shared_object_without_dynamic_table_is_bad_elf() {
+        // PT_DYNAMIC is still required for a shared object — its symbols and
+        // relocations live there — but the error is a plain program-header
+        // BadElf, not SONAME-flavored (§5.3).
+        let bytes = ElfFixtureBuilder::elf64(EM_RISCV, ET_DYN)
+            .with_load_segment(0x1000, 0x100, 0x100, 0x4)
+            .build();
+        let error = match ImageLoader::new(SliceElfReader::new(&bytes), dyn_request())
+            .admit()
+            .expect("admit")
+            .with_role(ArtifactRole::SharedObject)
+            .inspect()
+        {
+            Ok(_) => panic!("a SharedObject without PT_DYNAMIC must be rejected"),
+            Err(error) => error,
+        };
+        assert!(matches!(error.kind(), LoadErrorKind::BadElf));
+        assert!(matches!(
+            error.context(),
+            crate::error::ErrorContext::ProgramHeader { .. }
+        ));
+        let _ = ProgramHeaderField::Type;
+    }
+}
+
 #[test]
 fn fixture_builder_emits_a_parseable_elf32_header() {
     let bytes = ElfFixtureBuilder::elf32(EM_ARM, ET_DYN).build();

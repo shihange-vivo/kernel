@@ -159,6 +159,79 @@ impl ElfFixtureBuilder {
         self
     }
 
+    /// Append a `PT_DYNAMIC` whose content is a single `DT_NULL` entry: a
+    /// well-formed dynamic table with no `DT_NEEDED`, no `DT_SONAME` and no
+    /// other tags — the minimal valid table for a dependency scan.
+    ///
+    /// The segment's `p_vaddr`/`p_offset`/`p_filesz` mirror the convention of
+    /// [`Self::with_load_segment`]: the file range is placed right after the
+    /// program headers so it stays inside the file.
+    pub fn with_dynamic_segment(self, vaddr: u64) -> Self {
+        if self.is64 {
+            self.with_dynamic_segment_64(vaddr)
+        } else {
+            self.with_dynamic_segment_32(vaddr)
+        }
+    }
+
+    fn with_dynamic_segment_64(mut self, vaddr: u64) -> Self {
+        let entry_size = elf64::dynamic::SIZEOF_DYN;
+        let ph_offset = elf64::header::SIZEOF_EHDR
+            + self.ph_count as usize * elf64::program_header::SIZEOF_PHDR;
+        let ph_end = ph_offset + elf64::program_header::SIZEOF_PHDR;
+        if self.bytes.len() < ph_end {
+            self.bytes.resize(ph_end, 0);
+        }
+
+        let dyn_offset = ph_end;
+        let dyn_len = entry_size; // one DT_NULL terminator
+        if self.bytes.len() < dyn_offset + dyn_len {
+            self.bytes.resize(dyn_offset + dyn_len, 0);
+        }
+
+        write_u32(&mut self.bytes, ph_offset, 2); // p_type = PT_DYNAMIC
+        write_u32(&mut self.bytes, ph_offset + 4, 0x4); // p_flags = PF_R
+        write_u64(&mut self.bytes, ph_offset + 8, dyn_offset as u64); // p_offset
+        write_u64(&mut self.bytes, ph_offset + 16, vaddr); // p_vaddr
+        write_u64(&mut self.bytes, ph_offset + 24, vaddr); // p_paddr
+        write_u64(&mut self.bytes, ph_offset + 32, dyn_len as u64); // p_filesz
+        write_u64(&mut self.bytes, ph_offset + 40, dyn_len as u64); // p_memsz
+        write_u64(&mut self.bytes, ph_offset + 48, 0x4); // p_align
+
+        self.ph_count += 1;
+        write_u16(&mut self.bytes, 56, self.ph_count);
+        self
+    }
+
+    fn with_dynamic_segment_32(mut self, vaddr: u64) -> Self {
+        let entry_size = elf32::dynamic::SIZEOF_DYN;
+        let ph_offset = elf32::header::SIZEOF_EHDR
+            + self.ph_count as usize * elf32::program_header::SIZEOF_PHDR;
+        let ph_end = ph_offset + elf32::program_header::SIZEOF_PHDR;
+        if self.bytes.len() < ph_end {
+            self.bytes.resize(ph_end, 0);
+        }
+
+        let dyn_offset = ph_end;
+        let dyn_len = entry_size; // one DT_NULL terminator
+        if self.bytes.len() < dyn_offset + dyn_len {
+            self.bytes.resize(dyn_offset + dyn_len, 0);
+        }
+
+        write_u32(&mut self.bytes, ph_offset, 2); // p_type = PT_DYNAMIC
+        write_u32(&mut self.bytes, ph_offset + 4, 0x4); // p_flags = PF_R
+        write_u32(&mut self.bytes, ph_offset + 8, dyn_offset as u32); // p_offset
+        write_u32(&mut self.bytes, ph_offset + 12, vaddr as u32); // p_vaddr
+        write_u32(&mut self.bytes, ph_offset + 16, vaddr as u32); // p_paddr
+        write_u32(&mut self.bytes, ph_offset + 20, dyn_len as u32); // p_filesz
+        write_u32(&mut self.bytes, ph_offset + 24, dyn_len as u32); // p_memsz
+        write_u32(&mut self.bytes, ph_offset + 28, 0x4); // p_align
+
+        self.ph_count += 1;
+        write_u16(&mut self.bytes, 44, self.ph_count);
+        self
+    }
+
     pub fn build(self) -> Vec<u8> {
         self.bytes
     }
