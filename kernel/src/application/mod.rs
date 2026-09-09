@@ -65,6 +65,8 @@ pub mod publication;
 pub mod reaper;
 pub mod registry;
 #[cfg(boot_dynamic_seed)]
+pub mod runtime;
+#[cfg(boot_dynamic_seed)]
 pub mod seed;
 pub mod service;
 pub mod start_storage;

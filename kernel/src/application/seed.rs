@@ -12,48 +12,13 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Boot-time system image seeding and application-stack assembly (C29, §18.1/18.2).
+//! Boot-time system image seeding (C29, §18.1/18.2).
 //!
 //! The dynamic system image — the hello PIE and `libc.so.1` — is embedded in
 //! the kernel binary by the build (`.bk_seed`, see `gen_seed_blob_asm.py`) and
-//! copied into the root tmpfs here, under the fixed Phase 1 paths. The
-//! [`ApplicationService`] is then assembled over the fixed system library
-//! catalog. Boot calls this once, after the VFS and the scheduler are up;
-//! the service singleton makes it idempotent, and re-seeding the same paths
-//! is tolerated so the dynamic test can exercise the same entry point.
-
-use alloc::vec::Vec;
-
-use blueos_loader::LinkDomainId;
-
-use crate::application::{
-    adapters::system_paths::{SystemLibraryEntry, SystemLibraryPaths},
-    service::ApplicationService,
-};
-
-/// The fixed system library catalog (§12.2): each `DT_NEEDED` resolves to
-/// this VFS path, whose bytes come from the embedded artifact. C31-a adds the
-/// second system DSO for the scope corpus's non-interpose case (§17.2).
-static SYSTEM_LIBRARIES: &[SystemLibraryEntry] = &[
-    SystemLibraryEntry {
-        soname: b"libc.so.1",
-        path: "/system/lib/libc.so.1",
-        build_id: None,
-        // The shared libc has unmodeled escapes (kernel callbacks, global
-        // function pointers): never unload it (§8.5).
-        keep_cached: true,
-    },
-    SystemLibraryEntry {
-        soname: b"libscope_sys.so.1",
-        path: "/system/lib/libscope_sys.so.1",
-        build_id: None,
-        // The scope corpus's test system DSO has no escapes: the C31-d
-        // reaper runs its fini and unloads it on quiescence, and the next
-        // launch reloads generation+1.
-        keep_cached: false,
-    },
-];
-static CATALOG: SystemLibraryPaths = SystemLibraryPaths::new(SYSTEM_LIBRARIES);
+//! copied into the root tmpfs here, under fixed paths. This module only
+//! installs bytes into the VFS; [`super::runtime`] separately assembles the
+//! loader-facing application service over those paths.
 
 /// The embedded system image (C29 §18.1). The build emits one start/end
 /// symbol pair per artifact around an `.incbin` of its bytes.
@@ -130,12 +95,12 @@ fn seed_file(path: &str, bytes: &[u8]) {
     }
 }
 
-/// Seed the embedded system image and assemble the application stack.
+/// Install the embedded system image into the root tmpfs.
 ///
-/// Boot calls this once after the VFS and scheduler are initialized; the
-/// service is a `Once` singleton, so later calls (the dynamic test) reuse the
-/// assembled stack. Returns the service for immediate use at boot.
-pub fn init() -> &'static ApplicationService {
+/// Boot calls this after the VFS is initialized and before initializing the
+/// dynamic application runtime. Reinstalling replaces the files at the same
+/// paths, but normal boot invokes this interface exactly once.
+pub fn install() {
     // SAFETY: the `.bk_seed` blobs are emitted by the build for this board.
     seed_file("/apps/hello/app.elf", unsafe {
         blob(&__bk_seed_hello_start, &__bk_seed_hello_end)
@@ -162,35 +127,4 @@ pub fn init() -> &'static ApplicationService {
             }
         }
     }
-    ApplicationService::init(&CATALOG, LinkDomainId::new(1))
-}
-
-/// Boot bootstrap (§18.2): seed the system image and assemble the application
-/// stack before scheduling starts.
-///
-/// Starting the interactive shell is deliberately separate. Most QEMU test
-/// images contain their own static test application; queueing a shell in every
-/// such image changes the scheduler under test and can leave an interactive
-/// console reader alive for the whole run. The dedicated `kernel_image` calls
-/// [`launch_bootstrap_shell`] from its static entry once scheduling has begun.
-pub fn bootstrap() -> &'static ApplicationService {
-    init()
-}
-
-/// Launch the dynamic bootstrap shell from the dedicated boot image.
-///
-/// A launch failure is logged but is not fatal: the application service stays
-/// available for diagnostics or a later explicit spawn.
-pub fn launch_bootstrap_shell() {
-    let service = init();
-    let argv = alloc::vec![b"/apps/shell/app.elf".to_vec()];
-    if let Err(error) = service.spawn("/apps/shell/app.elf", argv, Vec::new()) {
-        log::error!("boot: bootstrap shell launch failed: {:?}", error);
-    }
-}
-
-/// The fixed catalog for callers that build their own service view (the
-/// dynamic test's assertions).
-pub fn catalog() -> &'static SystemLibraryPaths {
-    &CATALOG
 }

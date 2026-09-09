@@ -76,7 +76,7 @@ extern crate rsrt;
 
 use alloc::vec::Vec;
 use blueos::{
-    application::{seed, service::ApplicationService},
+    application::{runtime, service::ApplicationService},
     scheduler,
     thread::{Builder, Entry, Stack, IDLE},
 };
@@ -115,9 +115,10 @@ fn launch_and_wait(
 
 #[test]
 fn scope_visibility_vertical() {
-    // The boot seed path embedded the corpus artifacts and assembled the
-    // service (§18.2); the test runs the same entry point.
-    let service = seed::init();
+    // Boot installed the embedded corpus artifacts and initialized the runtime
+    // (§18.2); this idempotent call retrieves the same service without
+    // reseeding the VFS.
+    let service = runtime::init();
 
     // The scope corpus package: all bindings are asserted by the checker
     // through the app's printed values and the SCOPE_BIND oracle lines.

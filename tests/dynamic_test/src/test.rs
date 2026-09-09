@@ -33,7 +33,7 @@ extern crate alloc;
 extern crate rsrt;
 
 use alloc::vec::Vec;
-use blueos::application::{seed, service::ApplicationService};
+use blueos::application::{runtime, service::ApplicationService};
 use blueos_test_macro::test;
 use core::sync::atomic::{AtomicUsize, Ordering};
 use librs::pthread;
@@ -73,9 +73,10 @@ fn launch_and_wait(
 
 #[test]
 fn dynamic_app_vertical() {
-    // The boot seed path embedded the artifacts and assembled the service
-    // (§18.2); the test runs the same entry point.
-    let service = seed::init();
+    // Boot installed the embedded artifacts and initialized the runtime
+    // (§18.2); this idempotent call retrieves the same service without
+    // reseeding the VFS.
+    let service = runtime::init();
 
     // First launch: this link is the first loading generation for libc.so.1
     // (DSO_LOAD), the app runs its main through the shared libc, exits and is

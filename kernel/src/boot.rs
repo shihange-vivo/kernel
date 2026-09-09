@@ -128,24 +128,14 @@ extern "C" fn init() {
 
     scheduler::init();
     logger::logger_init();
-    // C32: hard-float boards must grant CP10/CP11 access before any
-    // hard-float application runs; soft-float boards leave the FPU off.
-    #[cfg(has_fpu)]
-    {
-        const SCB_CPACR: *mut u32 = 0xE000_ED88 as *mut u32;
-        const CP10_CP11_FULL_ACCESS: u32 = 0b11 << 20 | 0b11 << 22;
-        unsafe {
-            let cpacr = SCB_CPACR.read_volatile();
-            SCB_CPACR.write_volatile(cpacr | CP10_CP11_FULL_ACCESS);
-        }
-    }
-    // C29 §18.2: seed the embedded dynamic system image and assemble the
-    // application stack (VFS/flat memory/registry/manager/reaper) before the
-    // first thread runs. The dedicated kernel image starts the interactive
-    // shell from its static entry; test images do not inherit that workload.
+    // C29 §18.2: first install the embedded dynamic system image into the VFS,
+    // then initialize the loader-facing application runtime before the first
+    // thread runs. The dedicated kernel image starts the interactive shell
+    // from its static entry; test images do not inherit that workload.
     #[cfg(boot_dynamic_seed)]
     {
-        crate::application::seed::bootstrap();
+        crate::application::seed::install();
+        crate::application::runtime::init();
     }
     time::timer::init();
     #[cfg(kernel_async)]
