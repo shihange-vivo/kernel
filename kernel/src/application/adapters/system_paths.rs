@@ -12,15 +12,18 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Fixed system library catalog (C23-b, §12.2).
+//! Fixed system library catalog (C23-b, §12.2; namespace plan §6).
 //!
-//! Phase 1 resolves system dependencies only through an exact byte-name
-//! lookup against a board/product-provided mapping — never the current
-//! directory, `LD_LIBRARY_PATH`, `RPATH`/`RUNPATH`, or an application
-//! package `lib/` directory. Each entry pairs a `DT_SONAME` with its absolute
-//! path and, where policy requires it, an expected build-id.
+//! The catalog is the board/product-provided mapping between the names plain
+//! `DT_NEEDED` requests search for and the on-device DSO paths. Since the
+//! namespace replacement (§5/§6 of the plan) a DSO may omit `DT_SONAME`, so
+//! the entry's name and path are independent keys: `resolve_name` serves
+//! plain-name lookups, `resolve_path` decides whether a path-resolved
+//! dependency is a shared system DSO (the normalized catalog path is the
+//! registry key). `resolve` keeps the legacy SONAME-keyed spelling for
+//! current callers until step 4 re-keys the registry.
 
-/// One fixed mapping from a system `DT_SONAME` to its on-device path.
+/// One fixed mapping from a system lookup name to its on-device path.
 #[derive(Clone, Copy, Debug)]
 pub struct SystemLibraryEntry {
     /// The `DT_SONAME` byte name, e.g. `b"libc.so.1"`, without a NUL.
@@ -54,12 +57,24 @@ impl SystemLibraryPaths {
         Self { entries }
     }
 
+    /// Look up a plain dependency name (a `DT_NEEDED` string without path
+    /// separators) by exact, case-sensitive comparison (§4.3 step 2).
+    pub fn resolve_name(&self, name: &[u8]) -> Option<&'static SystemLibraryEntry> {
+        self.entries.iter().find(|entry| entry.soname == name)
+    }
+
+    /// Look up an entry by its normalized absolute device path (§4.1 rule 2):
+    /// a path-resolved dependency whose path equals a catalog entry's path is
+    /// a shared system DSO, whatever `DT_SONAME` it carries. The returned
+    /// entry's path doubles as the registry key (§6).
+    pub fn resolve_path(&self, path: &str) -> Option<&'static SystemLibraryEntry> {
+        self.entries.iter().find(|entry| entry.path == path)
+    }
+
     /// Look up a `DT_NEEDED`/`DT_SONAME` byte name by exact, case-sensitive
     /// comparison. Returns `None` when the name is not in the catalog, which
     /// the resolver treats as an unresolved system dependency (§12.2).
     pub fn resolve(&self, soname: &[u8]) -> Option<&'static SystemLibraryEntry> {
-        self.entries
-            .iter()
-            .find(|entry| entry.soname == soname)
+        self.resolve_name(soname)
     }
 }

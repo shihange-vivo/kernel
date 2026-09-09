@@ -39,10 +39,7 @@ use blueos_loader::{ElfType, ImageProtectionMemory, LinkDomainId, LoadProfile};
 
 use crate::{
     application::{
-        adapters::{
-            flat_memory::FlatImageMemory,
-            system_paths::SystemLibraryPaths,
-        },
+        adapters::{flat_memory::FlatImageMemory, system_paths::SystemLibraryPaths},
         group::{ThreadGroup, ThreadGroupMembership},
         loader::ApplicationLoader,
         manager::{
@@ -62,6 +59,7 @@ pub struct ApplicationService {
     manager: ApplicationManager,
     loader: ApplicationLoader,
     reaper: ApplicationReaper,
+    system_domain: LinkDomainId,
 }
 
 static APPLICATION_SERVICE: Once<ApplicationService> = Once::new();
@@ -88,6 +86,7 @@ impl ApplicationService {
                 manager,
                 loader,
                 reaper,
+                system_domain: domain,
             }
         })
     }
@@ -199,15 +198,31 @@ impl ApplicationService {
             })
             .collect();
 
+        // Namespace-replacement plan §3.2: capture the working directory once
+        // at launch start and resolve the (possibly relative) input against
+        // that snapshot, so a mid-load `chdir()` cannot change what the rest
+        // of this launch means. Everything downstream uses the normalized
+        // absolute `root_path`.
+        let launch_pwd = crate::vfs::get_working_dir().get_full_path();
+        let namespace = crate::application::namespace::ApplicationNamespace::from_launch_path(
+            path,
+            &launch_pwd,
+            crate::application::board_dynamic_profile(),
+            self.system_domain,
+        )
+        .ok_or(ApplicationLaunchError::PrepareFailed)?;
+        let root_path = namespace.root_path();
+
         let root = self
             .loader
-            .open_root(path, None)
+            .open_root(root_path, None)
             .map_err(|error| prepare_failed("open root", &error))?;
         // C30 §7.2: a manifest-closed package links through the composite
         // resolver (private edges + atomic system batch); any other path uses
-        // the single-app system resolver.
+        // the single-app system resolver. The manifest catalog keys packages
+        // by their absolute root path, so look up the resolved `root_path`.
         #[cfg(boot_dynamic_seed)]
-        let product = match crate::application::package::find_root(path) {
+        let product = match crate::application::package::find_root(root_path) {
             Some(package) => {
                 let profile = crate::application::package::profile_for(package)
                     .map_err(|error| ApplicationLaunchError::PrepareFailed)?;
@@ -219,7 +234,7 @@ impl ApplicationService {
                 // §9.1: the board policy picks the dynamic profile; a
                 // manifest-closed package records it, a bare application
                 // uses the board's default.
-                let profile = crate::application::board_dynamic_profile();
+                let profile = namespace.profile();
                 self.loader
                     .link(root, profile, group)
                     .map_err(|error| prepare_failed("link application", &error))?
@@ -227,7 +242,7 @@ impl ApplicationService {
         };
         #[cfg(not(boot_dynamic_seed))]
         let product = {
-            let profile = crate::application::board_dynamic_profile();
+            let profile = namespace.profile();
             self.loader
                 .link(root, profile, group)
                 .map_err(|error| prepare_failed("link application", &error))?
@@ -236,14 +251,10 @@ impl ApplicationService {
         let handle = group
             .handle()
             .ok_or(ApplicationLaunchError::PrepareFailed)?;
-        let granule = self
-            .loader
-            .memory()
-            .protection_capabilities()
-            .granule();
+        let granule = self.loader.memory().protection_capabilities().granule();
         let storage = ApplicationStartStorage::build(
             handle,
-            path.as_bytes(),
+            root_path.as_bytes(),
             &argv_views,
             &envp_views,
             &product,
@@ -259,8 +270,9 @@ impl ApplicationService {
             .install_link_product(product, storage)
             .map_err(|_| ApplicationLaunchError::PrepareFailed)?;
 
-        let stack = thread::Stack::from_size(blueos_kconfig::CONFIG_MAIN_THREAD_STACK_SIZE as usize)
-            .ok_or(ApplicationLaunchError::PrepareFailed)?;
+        let stack =
+            thread::Stack::from_size(blueos_kconfig::CONFIG_MAIN_THREAD_STACK_SIZE as usize)
+                .ok_or(ApplicationLaunchError::PrepareFailed)?;
         let main = Builder::new(Entry::Raw(entry, start_info as *mut core::ffi::c_void))
             .set_stack(stack)
             .set_membership(ThreadGroupMembership::downgrade(group))

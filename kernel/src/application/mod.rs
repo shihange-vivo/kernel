@@ -59,6 +59,7 @@ pub mod event_queue;
 pub mod group;
 pub mod loader;
 pub mod manager;
+pub mod namespace;
 #[cfg(boot_dynamic_seed)]
 pub mod package;
 pub mod publication;
