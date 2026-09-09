@@ -58,9 +58,23 @@ mod tests {
         let t = scheduler::current_thread();
         semihosting::println!("cmsis_rv2 unittest started");
 
+        // The CMSIS validation suite assumes its conventional
+        // named interrupt symbols are installed in the vector table.
+        // BlueOS uses a runtime vector table instead, so wire the validation
+        // handlers explicitly before TS_Init enables the two test IRQs.
+        let irq_a = arch::irq::IrqNumber::new(2);
+        let irq_b = arch::irq::IrqNumber::new(3);
+        arch::irq::disable_irq(irq_a);
+        arch::irq::disable_irq(irq_b);
+        unsafe {
+            arch::irq::register_raw_isr(irq_a, crate::uart::uart1rx_handler);
+            arch::irq::register_raw_isr(irq_b, crate::uart::uart1tx_handler);
+        }
+
         unsafe { cmsis_rv2() };
         semihosting::println!("cmsis_rv2 unittest finished");
     }
+
     // wrapper functions for cmsis_rv2, avoid rc count problem
     #[no_mangle]
     pub unsafe extern "C" fn report_before_rv2() {
