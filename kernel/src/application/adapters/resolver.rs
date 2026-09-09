@@ -179,8 +179,8 @@ impl ArtifactResolver for ApplicationArtifactResolver {
                     )));
                 }
                 AcquireOutcome::Lease(lease) => {
-                    // We hold the lease, so the instance cannot have dropped to
-                    // `Quiescing`; `descriptor` is guaranteed Some.
+                    // We hold the counted lease, so the instance must remain
+                    // Ready and its descriptor is guaranteed.
                     let descriptor = self
                         .registry
                         .descriptor(domain, needed)
@@ -191,9 +191,9 @@ impl ArtifactResolver for ApplicationArtifactResolver {
                         "DSO_REUSE soname={}",
                         core::str::from_utf8(needed.as_bytes()).unwrap_or("<non-utf8>")
                     );
-                    return Ok(DependencyResolution::Import(
-                        ImportedImageDescriptor::new(descriptor),
-                    ));
+                    return Ok(DependencyResolution::Import(ImportedImageDescriptor::new(
+                        descriptor,
+                    )));
                 }
                 // A concurrent link is mid-construction for this generation:
                 // block (outside any loader-memory or manager lock) until it

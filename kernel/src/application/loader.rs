@@ -52,15 +52,16 @@ use blueos_loader::Riscv64Relocator as PlatformRelocator;
 use crate::{
     application::{
         adapters::{
-            resolver::{identity_from_snapshot, ApplicationArtifactResolver, ResolverAuthorities, SystemCandidatePermit},
+            resolver::{
+                identity_from_snapshot, ApplicationArtifactResolver, ResolverAuthorities,
+                SystemCandidatePermit,
+            },
             system_paths::SystemLibraryPaths,
             vfs_reader::VfsElfReader,
         },
         group::ThreadGroup,
         publication::{KernelLinkPublisher, KernelLinkReceipt},
-        registry::{
-            SystemCandidateBacking, SystemDsoRegistry, SystemInitBatch,
-        },
+        registry::{SystemCandidateBacking, SystemDsoRegistry, SystemInitBatch},
     },
     vfs::open_path,
 };
@@ -152,13 +153,14 @@ impl ApplicationLoader {
         group: &ThreadGroup,
     ) -> LoadResult<LinkProduct<KernelLinkReceipt>> {
         let root_identity = root.identity().clone();
-        let resolver = crate::application::adapters::package_resolver::PackageArtifactResolver::new(
-            package,
-            self.catalog,
-            self.registry.clone(),
-            &root_identity,
-            self.domain,
-        )?;
+        let resolver =
+            crate::application::adapters::package_resolver::PackageArtifactResolver::new(
+                package,
+                self.catalog,
+                self.registry.clone(),
+                &root_identity,
+                self.domain,
+            )?;
         self.link_with(root, profile, group, resolver)
     }
 
@@ -280,17 +282,92 @@ impl ApplicationLoader {
                 .find(|plan| plan.owner() == image.owner())
                 .map(|plan| plan.plan().clone())
                 .unwrap_or_default();
+
+            let scc = product
+                .lifecycle_plans()
+                .sccs()
+                .iter()
+                .find(|members| members.contains(&image.owner()))
+                .ok_or_else(loader_error)?;
+            let mut scc_members = Vec::new();
+            scc_members
+                .try_reserve(scc.len())
+                .map_err(|_| loader_error())?;
+            for member in scc {
+                let member_image = product
+                    .context()
+                    .images()
+                    .iter()
+                    .find(|candidate| candidate.owner() == *member)
+                    .ok_or_else(loader_error)?;
+                if matches!(
+                    member_image.descriptor().ownership(),
+                    ImageOwnership::SystemCandidate | ImageOwnership::ExternalReady
+                ) {
+                    scc_members.push(
+                        member_image
+                            .descriptor()
+                            .soname()
+                            .cloned()
+                            .ok_or_else(loader_error)?,
+                    );
+                }
+            }
+            if scc_members.is_empty() {
+                return Err(loader_error());
+            }
+            scc_members.sort();
+            scc_members.dedup();
+
+            // Retain one lease for every direct outgoing edge to another
+            // system SCC. Edges inside this SCC are structural: turning them
+            // into ordinary leases would create a self-sustaining cycle.
+            let mut dependency_names = Vec::new();
+            for edge in product.context().graph_edges() {
+                if edge.requester() != image.owner() || scc.contains(&edge.provider()) {
+                    continue;
+                }
+                let provider = product
+                    .context()
+                    .images()
+                    .iter()
+                    .find(|candidate| candidate.owner() == edge.provider())
+                    .ok_or_else(loader_error)?;
+                if matches!(
+                    provider.descriptor().ownership(),
+                    ImageOwnership::SystemCandidate | ImageOwnership::ExternalReady
+                ) {
+                    dependency_names.push(
+                        provider
+                            .descriptor()
+                            .soname()
+                            .cloned()
+                            .ok_or_else(loader_error)?,
+                    );
+                }
+            }
+            dependency_names.sort();
+            dependency_names.dedup();
+            let mut dependencies = Vec::new();
+            dependencies
+                .try_reserve(dependency_names.len())
+                .map_err(|_| loader_error())?;
+            let keep_cached = self
+                .catalog
+                .resolve(candidate.soname.as_bytes())
+                .ok_or_else(loader_error)?
+                .keep_cached;
             backings.push(SystemCandidateBacking {
                 descriptor: image.descriptor().clone(),
                 fini_plan,
                 allocation,
-                // System-to-system dependency leases land with the C31-d SCC
-                // edges; the first group holds the link's import leases.
-                dependencies: alloc::vec![],
+                dependency_names,
+                dependencies,
+                scc_members,
+                keep_cached,
             });
         }
-        self.registry
-            .publish_relocated_batch(relocated, backings)
+        self.registry.publish_relocated_batch(relocated, backings)
     }
 }
 
@@ -306,9 +383,7 @@ impl ResolverFinish for ApplicationArtifactResolver {
 }
 
 #[cfg(boot_dynamic_seed)]
-impl ResolverFinish
-    for crate::application::adapters::package_resolver::PackageArtifactResolver
-{
+impl ResolverFinish for crate::application::adapters::package_resolver::PackageArtifactResolver {
     fn finish(&mut self) -> ResolverAuthorities {
         self.finish_resolution()
     }
@@ -365,7 +440,10 @@ fn log_lifecycle(product: &LinkProduct<KernelLinkReceipt>) {
         log::info!(
             "LIFECYCLE_SCC group={} members={:?}",
             group,
-            members.iter().map(|id| id.get()).collect::<alloc::vec::Vec<_>>()
+            members
+                .iter()
+                .map(|id| id.get())
+                .collect::<alloc::vec::Vec<_>>()
         );
     }
 }

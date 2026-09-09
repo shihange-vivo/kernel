@@ -22,22 +22,16 @@
 //! counted imported DSO leases, and resolves each resulting registry quiescence
 //! (§16.4).
 //!
-//! Phase 1 is *conservatively resident* (§13.3): a system DSO that was first
-//! loaded by some application, or that another application imported, is never
-//! unloaded here. The first-loading raw allocation lease and the `Ready`
-//! descriptor it backs stay mapped so a later import can reuse the exact same
-//! instance without a reload; proving quiescence and unloading (generation + 1)
-//! is deferred to the C29 fixture. This reaper therefore never releases a
-//! system allocation lease, only the counted imported references, whose
-//! `Drop` moves a zero-lease slot to `Quiescing` and is resolved back to a
-//! cached `Ready` by [`SystemDsoRegistry::resolve_quiescence`](super::registry::SystemDsoRegistry::resolve_quiescence).
+//! System instances retain cross-SCC dependency leases. After dropping an
+//! application's leases, the reaper resolves zero-user SCCs to a fixed point:
+//! cache-pinned groups stay Ready, while unloadable groups remain hidden in
+//! `Unloading` through fini and backing release. Dropping one group's outgoing
+//! leases can make another group quiescent, hence the bounded retry loop.
 
-use alloc::boxed::Box;
-use alloc::sync::Arc;
-use alloc::vec::Vec;
+use alloc::{boxed::Box, sync::Arc, vec::Vec};
 use core::sync::atomic::{AtomicUsize, Ordering};
 
-use blueos_loader::{ImageMemory, LinkProduct};
+use blueos_loader::{DependencyName, ImageMemory, LinkDomainId, LinkProduct};
 
 use crate::{
     application::{
@@ -114,8 +108,7 @@ impl ApplicationReaper {
     /// every registry/manager lock).
     pub fn spawn(&self, manager: ApplicationManager) {
         let reaper = self.clone();
-        let thread = Builder::new(Entry::Closure(Box::new(move || reaper.run(manager))))
-            .build();
+        let thread = Builder::new(Entry::Closure(Box::new(move || reaper.run(manager)))).build();
         let queued = crate::scheduler::queue_ready_thread(thread::IDLE, thread);
         debug_assert!(queued.is_ok(), "reaper thread must queue");
     }
@@ -258,50 +251,81 @@ impl ApplicationReaper {
         drop(_system);
 
         let imported_dsos = system_leases.len();
+        let mut quiescence: Vec<(LinkDomainId, DependencyName, bool)> = Vec::new();
         for lease in system_leases {
             let domain = lease.domain();
-            // Record the address before the lease drops: `Drop` may move the
-            // slot to `Quiescing`, which retains the SONAME, but the reaper must
-            // resolve using the values it held, not a stale reference.
             let soname = lease.soname().clone();
             let keep_cached = self
                 .catalog
                 .resolve(soname.as_bytes())
                 .map(|entry| entry.keep_cached)
                 .unwrap_or(true);
+            quiescence.push((domain, soname, keep_cached));
             drop(lease);
-            // The catalog's quiescence policy decides the slot's future: stay
-            // cached for later imports, or run the system fini on this worker
-            // thread (outside every registry lock) and release the backing so
-            // generation+1 reloads (§8.5).
-            match self.registry.resolve_quiescence(domain, &soname, keep_cached) {
-                Some(QuiescenceResolution::KeptCached) => {}
-                Some(QuiescenceResolution::Unloaded {
-                    allocation,
-                    fini_plan,
-                }) => {
-                    for entry in fini_plan.iter() {
-                        // SAFETY: the fini targets were validated against the
-                        // owner's executable region at plan build time, and the
-                        // allocation is still mapped — it is released only
-                        // after every destructor completed (§8.5).
-                        unsafe {
-                            let function: extern "C" fn() =
-                                core::mem::transmute(entry.function().get() as usize);
-                            function();
-                        }
+        }
+
+        loop {
+            let mut made_progress = false;
+            let mut request = 0;
+            while request < quiescence.len() {
+                let resolution = {
+                    let (domain, soname, keep_cached) = &quiescence[request];
+                    self.registry
+                        .resolve_quiescence(*domain, soname, *keep_cached)
+                };
+                match resolution {
+                    Some(QuiescenceResolution::KeptCached) => {
+                        quiescence.swap_remove(request);
+                        made_progress = true;
                     }
-                    log::info!(
-                        "DSO_FINI soname={}",
-                        core::str::from_utf8(soname.as_bytes()).unwrap_or("<non-utf8>")
-                    );
-                    memory.release_committed(allocation);
-                    log::info!(
-                        "DSO_UNLOAD soname={}",
-                        core::str::from_utf8(soname.as_bytes()).unwrap_or("<non-utf8>")
-                    );
+                    Some(QuiescenceResolution::Unloaded(mut batch)) => {
+                        let backings = batch.take_backings();
+                        let mut unloaded_names = Vec::new();
+                        for backing in backings {
+                            let crate::application::registry::SystemUnloadBacking {
+                                soname,
+                                allocation,
+                                fini_plan,
+                                dependencies,
+                            } = backing;
+                            for entry in fini_plan.iter() {
+                                // SAFETY: the fini targets were validated against the
+                                // owner's executable region at plan build time, and the
+                                // allocation is still mapped — it is released only
+                                // after every destructor completed (§8.5).
+                                unsafe {
+                                    let function: extern "C" fn() =
+                                        core::mem::transmute(entry.function().get() as usize);
+                                    function();
+                                }
+                            }
+                            log::info!(
+                                "DSO_FINI soname={}",
+                                core::str::from_utf8(soname.as_bytes()).unwrap_or("<non-utf8>")
+                            );
+                            memory.release_committed(allocation);
+                            log::info!(
+                                "DSO_UNLOAD soname={}",
+                                core::str::from_utf8(soname.as_bytes()).unwrap_or("<non-utf8>")
+                            );
+                            // Provider SCCs stay live until this member's fini
+                            // and backing release are complete.
+                            drop(dependencies);
+                            unloaded_names.push(soname);
+                        }
+                        let finished = self.registry.finish_unload(batch);
+                        debug_assert!(finished.is_ok());
+                        if finished.is_err() {
+                            log::error!("system DSO unload completion rejected");
+                        }
+                        quiescence.retain(|(_, soname, _)| !unloaded_names.contains(soname));
+                        made_progress = true;
+                    }
+                    None => request += 1,
                 }
-                None => {}
+            }
+            if quiescence.is_empty() || !made_progress {
+                break;
             }
         }
 

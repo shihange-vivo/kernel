@@ -49,19 +49,20 @@ pub fn find_private_image(
 }
 
 /// The declared dependency edge for `soname` from `requester`, if any.
-pub fn find_edge(
-    entry: &PackageImageEntry,
-    soname: &[u8],
-) -> Option<&'static DeclaredDependency> {
+pub fn find_edge(entry: &PackageImageEntry, soname: &[u8]) -> Option<&'static DeclaredDependency> {
     entry.needed.iter().find(|edge| edge.soname == soname)
 }
+
+/// The generated package names a target profile this kernel does not support.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct UnsupportedPackageProfile;
 
 /// Map a package's target profile id to its loader profile (§9.1: the board
 /// policy picks the profile; the package records it in the manifest). Unknown
 /// ids fail closed rather than deriving ABI policy from an untrusted ELF.
 pub fn profile_for(
     package: &ApplicationPackageManifest,
-) -> Result<blueos_loader::LoadProfile, ()> {
+) -> Result<blueos_loader::LoadProfile, UnsupportedPackageProfile> {
     match package.profile {
         "thumbv7m-vivo-blueos-newlibeabi" => Ok(blueos_loader::LoadProfile::arm_thumb_soft_float(
             blueos_loader::ElfType::Dyn,
@@ -78,6 +79,6 @@ pub fn profile_for(
         "riscv32-vivo-blueos-imac" | "riscv32-vivo-blueos-imc" => Ok(
             blueos_loader::LoadProfile::riscv32(blueos_loader::ElfType::Dyn),
         ),
-        _ => Err(()),
+        _ => Err(UnsupportedPackageProfile),
     }
 }

@@ -32,8 +32,10 @@
 //! * [`SystemDsoLease`] — one counted reference to a Ready instance. Acquiring
 //!   it on the Ready fast path only increments a counter; it never re-maps,
 //!   re-relocates or re-runs init (§13.3, §12.5). Its `Drop` only decrements
-//!   the counter and, when the last lease goes, moves the slot to `Quiescing`:
-//!   it never executes application code and never releases the image (§13.3).
+//!   the counter. A reaper explicitly resolves a zero-user instance through
+//!   [`SystemDsoRegistry::resolve_quiescence`]; an ordinary failed-link drop
+//!   safely leaves a reusable zero-user `Ready` instance instead of stranding
+//!   it in an in-flight state with no worker (§13.3).
 //! * [`WaitHandle`] — a waiter's ticket for an in-flight generation. A resolver
 //!   that loses the race blocks on it outside any loader/manager lock; the
 //!   slot's resolution signal wakes it so it can re-acquire (§13.3, §13.5).
@@ -78,12 +80,37 @@ pub enum AcquireOutcome {
 pub enum QuiescenceResolution {
     /// The zero-lease instance stays `Ready` for a later import.
     KeptCached,
-    /// The instance unloaded: the worker must run the fini plan (outside the
-    /// registry lock) and then release the unique backing.
-    Unloaded {
-        allocation: AllocationLease,
-        fini_plan: FiniPlan,
-    },
+    /// A whole system SCC entered `Unloading`. The worker must run every fini
+    /// plan and release every backing before completing the batch.
+    Unloaded(SystemUnloadBatch),
+}
+
+/// One member handed to the quiescence worker for destruction.
+pub struct SystemUnloadBacking {
+    pub soname: DependencyName,
+    pub allocation: AllocationLease,
+    pub fini_plan: FiniPlan,
+    /// Outgoing SCC dependency leases. They remain live through this member's
+    /// fini and drop only after its backing has been released.
+    pub dependencies: Vec<SystemDsoLease>,
+}
+
+/// Completion token for an atomically quiesced system SCC.
+///
+/// Its slots remain `Unloading`, so no new link can observe a partially
+/// destroyed group. The worker takes the backings, performs fini/release in
+/// ordinary thread context, then calls [`SystemDsoRegistry::finish_unload`].
+pub struct SystemUnloadBatch {
+    inner: Arc<Mutex<Inner>>,
+    slots: Vec<usize>,
+    generations: Vec<u32>,
+    backings: Vec<SystemUnloadBacking>,
+}
+
+impl SystemUnloadBatch {
+    pub fn take_backings(&mut self) -> Vec<SystemUnloadBacking> {
+        core::mem::take(&mut self.backings)
+    }
 }
 
 /// The outcome of a batch acquire over a whole declared system closure
@@ -114,9 +141,17 @@ pub struct SystemCandidateBacking {
     pub descriptor: PublishedImageDescriptor,
     pub fini_plan: FiniPlan,
     pub allocation: AllocationLease,
-    /// System-to-system dependency leases the instance retains while Ready
-    /// (populated with SCC edges in C31-d; empty for now).
+    /// Outgoing dependencies to other system SCCs. They become counted leases
+    /// atomically when the whole initialization batch becomes Ready.
+    pub dependency_names: Vec<DependencyName>,
+    /// Empty storage pre-reserved for `dependency_names`, so the Ready
+    /// transition and lease minting do not allocate under the registry lock.
     pub dependencies: Vec<SystemDsoLease>,
+    /// Every SONAME in this candidate's system SCC. Internal SCC edges are
+    /// structural and do not mint self-sustaining leases.
+    pub scc_members: Vec<DependencyName>,
+    /// Cached/unloadable policy captured from the immutable system catalog.
+    pub keep_cached: bool,
 }
 
 /// The publication authority for a batch of `Initializing` slots (C31-c,
@@ -192,9 +227,8 @@ impl SystemBatchWait {
 
 /// Per-`(domain, soname)` construction state (§13.2).
 ///
-/// `Quiescing` retains the descriptor and fini plan of the instance whose last
-/// lease dropped, so `resolve_quiescence` can either keep it cached (back to a
-/// zero-lease `Ready`) or unload it (back to `Vacant`). `Initializing`
+/// `Unloading` hides every member of an SCC while its worker runs fini and
+/// releases backing memory. `Initializing`
 /// (constructors running) and `Failed` (constructor aborted, no safe rollback)
 /// are introduced together with the constructor lifecycle in C27; C24 delivers
 /// the permit/lease core and stops at `Relocated`/`Ready`.
@@ -210,7 +244,10 @@ enum InstanceState {
         descriptor: PublishedImageDescriptor,
         fini_plan: FiniPlan,
         allocation: AllocationLease,
+        dependency_names: Vec<DependencyName>,
         dependencies: Vec<SystemDsoLease>,
+        scc_members: Vec<DependencyName>,
+        keep_cached: bool,
     },
     Ready {
         leases: usize,
@@ -221,13 +258,12 @@ enum InstanceState {
         /// state, released only by the C31-d quiescence worker.
         allocation: AllocationLease,
         dependencies: Vec<SystemDsoLease>,
+        scc_members: Vec<DependencyName>,
+        keep_cached: bool,
     },
-    Quiescing {
-        descriptor: PublishedImageDescriptor,
-        fini_plan: FiniPlan,
-        allocation: AllocationLease,
-        dependencies: Vec<SystemDsoLease>,
-    },
+    /// An SCC's backings have moved to a [`SystemUnloadBatch`]. The state is
+    /// not re-acquirable until the worker calls `finish_unload`.
+    Unloading,
     /// Constructor aborted (thread fault or exit before init completion): no
     /// half-initialized descriptor may be published. The backing is retained
     /// here until the registry worker releases it (C31-d), while the slot
@@ -236,7 +272,10 @@ enum InstanceState {
         descriptor: PublishedImageDescriptor,
         fini_plan: FiniPlan,
         allocation: AllocationLease,
+        dependency_names: Vec<DependencyName>,
         dependencies: Vec<SystemDsoLease>,
+        scc_members: Vec<DependencyName>,
+        keep_cached: bool,
     },
 }
 
@@ -246,7 +285,7 @@ struct Slot {
     generation: u32,
     state: InstanceState,
     /// Resolution signal: bumped (and its waiters woken) whenever the slot
-    /// leaves an in-flight or quiescing state for a re-acquirable one (`Vacant`
+    /// leaves an in-flight state for a re-acquirable one (`Vacant`
     /// or `Ready`). Waiters key off this atom's stable heap address.
     waiter: Arc<AtomicUsize>,
 }
@@ -344,7 +383,7 @@ impl SystemDsoRegistry {
             InstanceState::Loading
             | InstanceState::Relocated
             | InstanceState::Initializing { .. }
-            | InstanceState::Quiescing { .. } => AcquireOutcome::Pending(WaitHandle {
+            | InstanceState::Unloading => AcquireOutcome::Pending(WaitHandle {
                 generation: slot.generation,
                 observed: slot.waiter.load(Ordering::Acquire),
                 signal: Arc::clone(&slot.waiter),
@@ -381,7 +420,7 @@ impl SystemDsoRegistry {
                 InstanceState::Loading
                 | InstanceState::Relocated
                 | InstanceState::Initializing { .. }
-                | InstanceState::Quiescing { .. } => {
+                | InstanceState::Unloading => {
                     return AcquireBatchOutcome::Pending(SystemBatchWait {
                         observed: inner.resolution.load(Ordering::Acquire),
                         signal: Arc::clone(&inner.resolution),
@@ -507,7 +546,10 @@ impl SystemDsoRegistry {
                             descriptor: backing.descriptor,
                             fini_plan: backing.fini_plan,
                             allocation: backing.allocation,
+                            dependency_names: backing.dependency_names,
                             dependencies: backing.dependencies,
+                            scc_members: backing.scc_members,
+                            keep_cached: backing.keep_cached,
                         };
                     }
                     _ => return Err(stale_error()),
@@ -542,19 +584,66 @@ impl SystemDsoRegistry {
         leases
             .try_reserve(slots.len())
             .map_err(|_| registry_oom())?;
+
+        // Validate the complete transition and every outgoing dependency
+        // before mutating a slot. A provider may be an already-Ready import or
+        // another member of this initialization batch.
         for (slot, generation) in slots.iter().zip(generations.iter()) {
-            let instance = guard.slots.get_mut(*slot).ok_or_else(stale_error)?;
+            let instance = guard.slots.get(*slot).ok_or_else(stale_error)?;
             if instance.generation != *generation {
-                // A stale generation here is a kernel consistency error: the
-                // batch was minted for this exact generation (§8.3).
                 return Err(stale_error());
             }
+            let InstanceState::Initializing {
+                dependency_names,
+                dependencies,
+                ..
+            } = &instance.state
+            else {
+                return Err(stale_error());
+            };
+            if dependencies.capacity() < dependency_names.len() {
+                return Err(registry_oom());
+            }
+            for dependency in dependency_names {
+                let provider = guard
+                    .slots
+                    .iter()
+                    .find(|provider| {
+                        provider.domain == instance.domain && &provider.soname == dependency
+                    })
+                    .ok_or_else(stale_error)?;
+                match &provider.state {
+                    InstanceState::Ready { .. } => {}
+                    InstanceState::Initializing { .. } => {
+                        let provider_index = guard
+                            .slots
+                            .iter()
+                            .position(|candidate| core::ptr::eq(candidate, provider))
+                            .ok_or_else(stale_error)?;
+                        if !slots.contains(&provider_index) {
+                            return Err(stale_error());
+                        }
+                    }
+                    _ => return Err(stale_error()),
+                }
+            }
+        }
+
+        let mut pending_dependencies = Vec::new();
+        pending_dependencies
+            .try_reserve(slots.len())
+            .map_err(|_| registry_oom())?;
+        for (slot, generation) in slots.iter().zip(generations.iter()) {
+            let instance = guard.slots.get_mut(*slot).ok_or_else(stale_error)?;
             match core::mem::replace(&mut instance.state, InstanceState::Vacant) {
                 InstanceState::Initializing {
                     descriptor,
                     fini_plan,
                     allocation,
+                    dependency_names,
                     dependencies,
+                    scc_members,
+                    keep_cached,
                 } => {
                     instance.state = InstanceState::Ready {
                         leases: 1,
@@ -562,7 +651,10 @@ impl SystemDsoRegistry {
                         fini_plan,
                         allocation,
                         dependencies,
+                        scc_members,
+                        keep_cached,
                     };
+                    pending_dependencies.push((*slot, dependency_names));
                     leases.push(SystemDsoLease {
                         inner: Arc::clone(&inner),
                         slot: *slot,
@@ -572,6 +664,42 @@ impl SystemDsoRegistry {
                     });
                 }
                 _ => return Err(stale_error()),
+            }
+        }
+
+        // All candidates are now Ready under the same lock hold. Mint one
+        // retained lease for each outgoing cross-SCC edge and attach it to the
+        // source instance. Internal SCC edges were removed by the loader.
+        for (source_slot, dependency_names) in pending_dependencies {
+            for soname in dependency_names {
+                let provider_slot = guard
+                    .slots
+                    .iter()
+                    .position(|provider| {
+                        provider.domain == guard.slots[source_slot].domain
+                            && provider.soname == soname
+                    })
+                    .ok_or_else(stale_error)?;
+                let (domain, generation) = {
+                    let provider = &mut guard.slots[provider_slot];
+                    let InstanceState::Ready { leases, .. } = &mut provider.state else {
+                        return Err(stale_error());
+                    };
+                    *leases = leases.saturating_add(1);
+                    (provider.domain, provider.generation)
+                };
+                let dependency = SystemDsoLease {
+                    inner: Arc::clone(&inner),
+                    slot: provider_slot,
+                    generation,
+                    domain,
+                    soname,
+                };
+                let InstanceState::Ready { dependencies, .. } = &mut guard.slots[source_slot].state
+                else {
+                    return Err(stale_error());
+                };
+                dependencies.push(dependency);
             }
         }
         for slot in &slots {
@@ -601,13 +729,19 @@ impl SystemDsoRegistry {
                     descriptor,
                     fini_plan,
                     allocation,
+                    dependency_names,
                     dependencies,
+                    scc_members,
+                    keep_cached,
                 } => {
                     instance.state = InstanceState::Failed {
                         descriptor,
                         fini_plan,
                         allocation,
+                        dependency_names,
                         dependencies,
+                        scc_members,
+                        keep_cached,
                     };
                 }
                 _ => {
@@ -618,11 +752,13 @@ impl SystemDsoRegistry {
         }
     }
 
-    /// Resolve a `Quiescing` slot once the reaper has evidence it is safe to
-    /// either keep cached (no unload) or unload and allow `generation + 1` to
-    /// reload (§13.3, C31-d §8.5). `Unloaded` hands the worker the unique
-    /// backing and the fini plan it must run *outside* the registry lock —
-    /// the allocation must stay mapped until the fini completed.
+    /// Resolve the zero-user SCC containing `soname` once the reaper has
+    /// quiescence evidence (§13.3, C31-d §8.5).
+    ///
+    /// Every member must be Ready with zero counted leases. If any member is
+    /// cache-pinned, the whole SCC stays Ready. Otherwise all members move to
+    /// `Unloading` in one lock hold and their backings are handed to the
+    /// worker; no concurrent acquire can observe a half-destroyed SCC.
     pub fn resolve_quiescence(
         &self,
         domain: LinkDomainId,
@@ -630,47 +766,112 @@ impl SystemDsoRegistry {
         keep_cached: bool,
     ) -> Option<QuiescenceResolution> {
         let mut inner = self.inner.lock();
-        let resolution = Arc::clone(&inner.resolution);
         let index = inner
             .slots
             .iter()
             .position(|s| s.domain == domain && &s.soname == soname)?;
-        let slot = &mut inner.slots[index];
-        let state = core::mem::replace(&mut slot.state, InstanceState::Vacant);
-        match state {
-            InstanceState::Quiescing {
-                descriptor,
+        let InstanceState::Ready {
+            leases: 0,
+            scc_members,
+            keep_cached: stored_keep_cached,
+            ..
+        } = &inner.slots[index].state
+        else {
+            return None;
+        };
+
+        let mut members = Vec::new();
+        members.try_reserve(scc_members.len()).ok()?;
+        for member in scc_members {
+            let member_index = inner
+                .slots
+                .iter()
+                .position(|slot| slot.domain == domain && &slot.soname == member)?;
+            if !members.contains(&member_index) {
+                members.push(member_index);
+            }
+        }
+        if members.is_empty() {
+            members.push(index);
+        }
+
+        let mut group_keep_cached = keep_cached || *stored_keep_cached;
+        for member in &members {
+            let InstanceState::Ready {
+                leases: 0,
+                keep_cached,
+                ..
+            } = &inner.slots[*member].state
+            else {
+                return None;
+            };
+            group_keep_cached |= *keep_cached;
+        }
+        if group_keep_cached {
+            return Some(QuiescenceResolution::KeptCached);
+        }
+
+        let mut backings = Vec::new();
+        let mut slots = Vec::new();
+        let mut generations = Vec::new();
+        backings.try_reserve(members.len()).ok()?;
+        slots.try_reserve(members.len()).ok()?;
+        generations.try_reserve(members.len()).ok()?;
+        for member in members {
+            let slot = &mut inner.slots[member];
+            let state = core::mem::replace(&mut slot.state, InstanceState::Unloading);
+            let InstanceState::Ready {
+                leases: 0,
+                descriptor: _,
                 fini_plan,
                 allocation,
                 dependencies,
-            } => {
-                wake_waiters(&slot.waiter, &resolution);
-                if keep_cached {
-                    // KeepCached: stay Ready with zero leases so a later import
-                    // takes the fast path without a reload (§13.3).
-                    slot.state = InstanceState::Ready {
-                        leases: 0,
-                        descriptor,
-                        fini_plan,
-                        allocation,
-                        dependencies,
-                    };
-                    return Some(QuiescenceResolution::KeptCached);
-                }
-                // Unload: the instance's dependency leases drop, and the
-                // unique backing moves to the worker for fini + release
-                // (§8.5). The pre-replace `Vacant` is already correct.
-                drop(dependencies);
-                Some(QuiescenceResolution::Unloaded {
-                    allocation,
-                    fini_plan,
-                })
-            }
-            other => {
-                slot.state = other;
-                None
+                scc_members: _,
+                keep_cached: _,
+            } = state
+            else {
+                unreachable!("SCC quiescence was validated before transition")
+            };
+            slots.push(member);
+            generations.push(slot.generation);
+            backings.push(SystemUnloadBacking {
+                soname: slot.soname.clone(),
+                allocation,
+                fini_plan,
+                dependencies,
+            });
+        }
+        drop(inner);
+        Some(QuiescenceResolution::Unloaded(SystemUnloadBatch {
+            inner: Arc::clone(&self.inner),
+            slots,
+            generations,
+            backings,
+        }))
+    }
+
+    /// Publish completion of a system SCC's fini/release work. Only now do its
+    /// slots become `Vacant` and wake waiters for generation+1.
+    pub fn finish_unload(&self, mut batch: SystemUnloadBatch) -> LoadResult<()> {
+        if !Arc::ptr_eq(&self.inner, &batch.inner) || !batch.backings.is_empty() {
+            return Err(stale_error());
+        }
+        let mut inner = batch.inner.lock();
+        let resolution = Arc::clone(&inner.resolution);
+        for (slot, generation) in batch.slots.iter().zip(batch.generations.iter()) {
+            let instance = inner.slots.get(*slot).ok_or_else(stale_error)?;
+            if instance.generation != *generation
+                || !matches!(instance.state, InstanceState::Unloading)
+            {
+                return Err(stale_error());
             }
         }
+        for slot in core::mem::take(&mut batch.slots) {
+            let instance = &mut inner.slots[slot];
+            instance.state = InstanceState::Vacant;
+            wake_waiters(&instance.waiter, &resolution);
+        }
+        Ok(())
     }
 
     /// Drain the failed constructor batches' retained backings (C31-c, §8.6):
@@ -824,11 +1025,13 @@ impl Drop for RelocatedPermit {
 
 /// One counted reference to a Ready system DSO (§13.3).
 ///
-/// `Drop` only decrements the instance's lease count and, when the last lease
-/// goes, moves the slot to `Quiescing` (retaining the descriptor and fini plan
-/// for the reaper's decision). It never runs application code and never
-/// releases the mapped image: unloading is the reaper's decision, made with
-/// quiescence evidence (§13.3, C27).
+/// `Drop` only decrements the instance's lease count. A zero-user instance
+/// remains `Ready` and reusable until an application reaper explicitly asks
+/// the registry to resolve quiescence. This matters for pre-publication link
+/// failures: they have no installed group receipt/reaper, so the last imported
+/// lease must not leave the provider permanently stuck in an in-flight state.
+/// Unloading remains a reaper decision made with quiescence evidence
+/// (§13.3, C27).
 pub struct SystemDsoLease {
     inner: Arc<Mutex<Inner>>,
     slot: usize,
@@ -865,24 +1068,6 @@ impl Drop for SystemDsoLease {
             return;
         };
         *leases = leases.saturating_sub(1);
-        if *leases == 0 {
-            let state = core::mem::replace(&mut slot.state, InstanceState::Vacant);
-            if let InstanceState::Ready {
-                descriptor,
-                fini_plan,
-                allocation,
-                dependencies,
-                leases: _,
-            } = state
-            {
-                slot.state = InstanceState::Quiescing {
-                    descriptor,
-                    fini_plan,
-                    allocation,
-                    dependencies,
-                };
-            }
-        }
     }
 }
 
