@@ -2,23 +2,23 @@
 // ASSERT-SUCC: Dynamic scope test ended
 // ASSERT-FAIL: Backtrace in Panic.*
 // ASSERT-FAIL: ASSERTION FAILED.*
-// COUNT: DSO_LOAD soname=libscope_sys\.so\.1 == 2
-// COUNT: DSO_UNLOAD soname=libscope_sys\.so\.1 == 2
-// COUNT: DSO_FINI soname=libscope_sys\.so\.1 == 2
-// COUNT: DSO_REUSE soname=libc\.so\.1 == 4
-// COUNT: PKG_LOAD soname=libweak\.so\.1 path=/apps/scope_demo/lib/libweak\.so\.1 == 2
-// COUNT: PKG_LOAD soname=libstrong\.so\.1 path=/apps/scope_demo/lib/libstrong\.so\.1 == 2
-// COUNT: PKG_LOAD soname=libhidden\.so\.1 path=/apps/scope_demo/lib/libhidden\.so\.1 == 2
-// COUNT: PKG_LOAD soname=libprotected\.so\.1 path=/apps/scope_demo/lib/libprotected\.so\.1 == 2
-// COUNT: PKG_LOAD soname=libweakdata\.so\.1 path=/apps/scope_demo/lib/libweakdata\.so\.1 == 2
-// COUNT: APP_LAUNCHED handle=.*:1 path=/apps/scope_demo/app\.elf == 1
-// COUNT: APP_REAP handle=.*:1 private_images=6 imported_dsos=2 == 1
-// COUNT: APP_LAUNCHED handle=.*:2 path=/apps/scope_demo/app\.elf == 1
-// COUNT: APP_REAP handle=.*:2 private_images=6 imported_dsos=2 == 1
-// COUNT: scope: value=111 fn=1110 hidden=555 hidden_report=999 protected=333 self=444 sys=777 sys_target=42 sys_ctor=1 weakdata=0 == 2
-// COUNT: DSO_FINI soname=libscope_sys\.so\.1 == 2
-// COUNT: SCOPE_BIND requester=.* name=missing_data provider=none == 2
-// COUNT: SCOPE_BIND requester=7 name=sys_target provider=7 == 2
+// COUNT: DSO_LOAD soname=libscope_sys\.so\.1 == 3
+// COUNT: DSO_REUSE soname=libscope_sys\.so\.1 == 1
+// COUNT: DSO_UNLOAD soname=libscope_sys\.so\.1 == 3
+// COUNT: DSO_FINI soname=libscope_sys\.so\.1 == 3
+// COUNT: DSO_REUSE soname=libc\.so\.1 == 6
+// COUNT: PKG_LOAD soname=libweak\.so\.1 path=/apps/scope_demo/lib/libweak\.so\.1 == 4
+// COUNT: PKG_LOAD soname=libstrong\.so\.1 path=/apps/scope_demo/lib/libstrong\.so\.1 == 4
+// COUNT: PKG_LOAD soname=libhidden\.so\.1 path=/apps/scope_demo/lib/libhidden\.so\.1 == 4
+// COUNT: PKG_LOAD soname=libprotected\.so\.1 path=/apps/scope_demo/lib/libprotected\.so\.1 == 4
+// COUNT: PKG_LOAD soname=libweakdata\.so\.1 path=/apps/scope_demo/lib/libweakdata\.so\.1 == 4
+// COUNT: APP_LAUNCHED handle=.* path=/apps/scope_demo/app\.elf == 4
+// COUNT: APP_REAP handle=.* private_images=6 imported_dsos=2 == 4
+// COUNT: scope: value=111 fn=1110 hidden=555 hidden_report=999 protected=333 self=444 sys=777 sys_target=42 sys_ctor=1 weakdata=0 == 4
+// COUNT: SCOPE_BIND requester=.* name=missing_data provider=none == 4
+// COUNT: SCOPE_BIND requester=7 name=sys_target provider=7 == 3
+// COUNT: SCOPE_BIND requester=7 name=strlen provider=1 == 3
+// COUNT: LINK_EDGE requester=7 provider=1 == 3
 // COUNT: application prepare: link package failed: LoadError \{ stage: LinkRelocate.* == 1
 // COUNT: APP_LAUNCHED .*scope_bad.* == 0
 // COUNT: PKG_LOAD soname=libcycle_a\.so\.1 path=/apps/cycle_demo/lib/libcycle_a\.so\.1 == 1
@@ -32,6 +32,11 @@
 // COUNT: LIFECYCLE_INIT index=1 owner=3 == 1
 // COUNT: LIFECYCLE_GROUP_FINI index=0 owner=3 == 1
 // COUNT: LIFECYCLE_GROUP_FINI index=1 owner=2 == 1
+// COUNT: PKG_LOAD soname=libfoo\.so\.1 path=/apps/tls_demo/lib/libfoo\.so\.1 == 1
+// COUNT: PKG_LOAD soname=libbar\.so\.1 path=/apps/tls_demo/lib/libbar\.so\.1 == 1
+// COUNT: APP_LAUNCHED handle=.* path=/apps/tls_demo/app\.elf == 1
+// COUNT: APP_REAP handle=.* private_images=3 imported_dsos=1 == 1
+// COUNT: tls: a_foo=7 a_bar=7 b_foo=13 b_bar=13 repeat=1 == 1
 
 #![no_main]
 #![no_std]
@@ -57,6 +62,10 @@
 //!   even though the root defines a same-named symbol;
 //! * undefined weak data — `missing_data` binds to zero
 //!   (SCOPE_BIND provider=none; the app prints weakdata=0).
+//! * atomic concurrent acquisition — two linker workers race the same system
+//!   closure and share one `libscope_sys` instance;
+//! * emutls — the TLS corpus repeatedly creates and joins pthreads and proves
+//!   per-image control identity plus per-thread value isolation.
 //!
 //! The negative package (`scope_bad`) carries an undefined weak *function*
 //! call: the relocation policy must reject the link and the app must never
@@ -66,10 +75,11 @@ extern crate alloc;
 extern crate rsrt;
 
 use alloc::vec::Vec;
-use blueos::application::seed;
-use blueos::application::service::ApplicationService;
-use blueos::scheduler;
-use blueos::thread::{Builder, Entry, IDLE};
+use blueos::{
+    application::{seed, service::ApplicationService},
+    scheduler,
+    thread::{Builder, Entry, Stack, IDLE},
+};
 use blueos_test_macro::test;
 use core::sync::atomic::{AtomicUsize, Ordering};
 use librs::pthread;
@@ -115,12 +125,7 @@ fn scope_visibility_vertical() {
     // group exits, the reaper runs the system fini on its worker thread and
     // unloads the instance (§8.5).
     let first = launch_and_wait(service, "/apps/scope_demo/app.elf");
-    // The ARM boot seed assembles the shell's domain first (slot 0) and the
-    // package corpus second. Boards whose seed carries no shell image (the
-    // C33 RV64 seed) hand the package slot 0; the reload invariants below
-    // do not depend on the absolute index.
-    #[cfg(target_arch = "arm")]
-    assert_eq!(first.slot, 1, "shell holds slot 0, package takes slot 1");
+    assert_eq!(first.slot, 0, "the first test package takes slot 0");
 
     // Second launch: the unloaded slot reloads generation+1 (constructor runs
     // again); the checker asserts the init/fini/unload oracle lines.
@@ -136,7 +141,9 @@ fn scope_visibility_vertical() {
     let mut argv = Vec::new();
     argv.push(b"/apps/scope_bad/app.elf".to_vec());
     assert!(
-        service.spawn("/apps/scope_bad/app.elf", argv, Vec::new()).is_err(),
+        service
+            .spawn("/apps/scope_bad/app.elf", argv, Vec::new())
+            .is_err(),
         "weak-call package must be rejected"
     );
 
@@ -146,18 +153,15 @@ fn scope_visibility_vertical() {
     // checker through the LIFECYCLE oracle lines.
     launch_and_wait(service, "/apps/cycle_demo/app.elf");
 
-    // NOTE (§17.4 deferred): the concurrency driver — two kernel threads
-    // racing the same system closure — is wired but deferred: a kernel
-    // thread spawned mid-test faults on its initial context (a fresh
-    // thread's first PC is garbage), which needs its own investigation.
-    // The atomic batch acquire the racers would exercise is already proven
-    // deadlock-free by the sequential unload/reload cycle above.
+    // Two kernel threads now race the same system closure. Besides proving
+    // that batch acquisition has no partial-wait deadlock, this exercises a
+    // shared Ready instance and the last-user unload path concurrently.
+    concurrent_system_closure();
 
-    // NOTE: the tls_demo emutls corpus package (§8.7) builds and passes its
-    // package check; its runtime driver is deferred — a pthread sub-thread in
-    // a dynamic app faults in the main thread's printf path after join (the
-    // same fault fires without any TLS access, so it is a pre-existing
-    // pthread/context issue, not emutls).
+    // The emutls corpus creates and joins several pthreads. Each worker must
+    // receive an independent instance for the same-named TLS controls in the
+    // two private DSOs; the app prints the observed values for the checker.
+    launch_and_wait(service, "/apps/tls_demo/app.elf");
 }
 
 /// Two kernel threads spawn the scope package simultaneously (§17.4): each
@@ -188,21 +192,22 @@ extern "C" fn concurrent_launcher(flag: *mut core::ffi::c_void) {
 }
 
 fn concurrent_system_closure() {
-    static DONE_A: core::sync::atomic::AtomicBool =
-        core::sync::atomic::AtomicBool::new(false);
-    static DONE_B: core::sync::atomic::AtomicBool =
-        core::sync::atomic::AtomicBool::new(false);
+    const LINKER_WORKER_STACK_SIZE: usize = 64 << 10;
+    static DONE_A: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+    static DONE_B: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
     static WAIT_ATOM: AtomicUsize = AtomicUsize::new(0);
 
     let a = Builder::new(Entry::Posix(
         concurrent_launcher,
         &DONE_A as *const _ as *mut core::ffi::c_void,
     ))
+    .set_stack(Stack::from_size(LINKER_WORKER_STACK_SIZE).expect("linker worker stack"))
     .build();
     let b = Builder::new(Entry::Posix(
         concurrent_launcher,
         &DONE_B as *const _ as *mut core::ffi::c_void,
     ))
+    .set_stack(Stack::from_size(LINKER_WORKER_STACK_SIZE).expect("linker worker stack"))
     .build();
     let _ = scheduler::queue_ready_thread(IDLE, a);
     let _ = scheduler::queue_ready_thread(IDLE, b);
