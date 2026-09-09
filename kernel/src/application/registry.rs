@@ -46,8 +46,7 @@
 //! manager clones it into whichever thread performs a link or a reap, and every
 //! slow VFS/link/init step runs *outside* the short registry lock (§14.2).
 
-use alloc::sync::Arc;
-use alloc::vec::Vec;
+use alloc::{sync::Arc, vec::Vec};
 use core::sync::atomic::{AtomicUsize, Ordering};
 
 use blueos_loader::{
@@ -371,7 +370,7 @@ impl SystemDsoRegistry {
     ) -> AcquireBatchOutcome {
         let mut inner = self.inner.lock();
         // Deterministic order: SONAME byte order, de-duplicated (§7.3).
-        let mut ordered: Vec<DependencyName> = sonames.iter().cloned().collect();
+        let mut ordered: Vec<DependencyName> = sonames.to_vec();
         ordered.sort();
         ordered.dedup();
         for soname in &ordered {
@@ -419,9 +418,7 @@ impl SystemDsoRegistry {
                     ));
                 }
                 InstanceState::Ready {
-                    leases,
-                    descriptor,
-                    ..
+                    leases, descriptor, ..
                 } => {
                     *leases = leases.saturating_add(1);
                     imports.push((
@@ -490,8 +487,12 @@ impl SystemDsoRegistry {
         }
         let mut slots = Vec::new();
         let mut generations = Vec::new();
-        slots.try_reserve(permits.len()).map_err(|_| registry_oom())?;
-        generations.try_reserve(permits.len()).map_err(|_| registry_oom())?;
+        slots
+            .try_reserve(permits.len())
+            .map_err(|_| registry_oom())?;
+        generations
+            .try_reserve(permits.len())
+            .map_err(|_| registry_oom())?;
         for (permit, backing) in permits.into_iter().zip(backings.into_iter()) {
             let (inner_arc, slot, generation) = permit.consume();
             {
@@ -811,8 +812,7 @@ impl Drop for RelocatedPermit {
             let Some(slot) = guard.slots.get_mut(self.slot) else {
                 return;
             };
-            if slot.generation != self.generation
-                || !matches!(slot.state, InstanceState::Relocated)
+            if slot.generation != self.generation || !matches!(slot.state, InstanceState::Relocated)
             {
                 return;
             }
@@ -1001,8 +1001,7 @@ mod tests {
         let domain = LinkDomainId::new(7);
         let soname = name(b"libc.so.1\0");
 
-        let AcquireOutcome::Permit(permit) =
-            registry.acquire_or_begin_load(domain, soname.clone())
+        let AcquireOutcome::Permit(permit) = registry.acquire_or_begin_load(domain, soname.clone())
         else {
             panic!("expected permit");
         };
@@ -1021,8 +1020,7 @@ mod tests {
         let domain = LinkDomainId::new(7);
         let soname = name(b"libc.so.1\0");
 
-        let AcquireOutcome::Permit(permit) =
-            registry.acquire_or_begin_load(domain, soname.clone())
+        let AcquireOutcome::Permit(permit) = registry.acquire_or_begin_load(domain, soname.clone())
         else {
             panic!("expected permit");
         };
@@ -1063,8 +1061,7 @@ mod tests {
         let domain = LinkDomainId::new(7);
         let soname = name(b"libc.so.1\0");
 
-        let AcquireOutcome::Permit(permit) =
-            registry.acquire_or_begin_load(domain, soname.clone())
+        let AcquireOutcome::Permit(permit) = registry.acquire_or_begin_load(domain, soname.clone())
         else {
             panic!("expected permit");
         };
