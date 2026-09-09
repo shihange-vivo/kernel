@@ -119,6 +119,12 @@ pub mod thread {
         pub spawn_hook: Option<extern "C" fn(tid: usize, spawn_args: *mut SpawnArgs)>,
         pub stack_start: *mut u8,
         pub stack_size: usize,
+        /// Complete allocation containing the usable stack and any metadata.
+        /// A non-zero value transfers ownership to the kernel when the
+        /// allocation fields are valid. Zero keeps the legacy
+        /// caller-owned/raw-stack behavior.
+        pub stack_allocation_size: usize,
+        pub stack_allocation_align: usize,
         pub entry: extern "C" fn(*mut core::ffi::c_void),
         pub arg: *mut core::ffi::c_void,
         pub cleanup: Option<extern "C" fn(*mut core::ffi::c_void)>,

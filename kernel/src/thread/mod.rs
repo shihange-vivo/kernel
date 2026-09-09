@@ -82,17 +82,23 @@ pub enum ThreadKind {
 }
 
 #[derive(Debug)]
-pub struct Stack(Storage);
+pub struct Stack {
+    storage: Storage,
+    /// `true` for an allocation transferred through `CreateThread`. Such an
+    /// allocation came from `AllocMem`, whose matching release operation is
+    /// the kernel allocator's unknown-layout `free`.
+    free_transferred_allocation: bool,
+}
 
 impl Stack {
     #[inline]
     pub fn top(&self) -> *mut u8 {
-        unsafe { self.0.base().add(self.size()) }
+        unsafe { self.storage.base().add(self.size()) }
     }
 
     #[inline]
     pub fn base(&self) -> *mut u8 {
-        self.0.base()
+        self.storage.base()
     }
 
     #[inline]
@@ -106,11 +112,17 @@ impl Stack {
         if storage.base().is_null() {
             return None;
         }
-        Some(Self(storage))
+        Some(Self {
+            storage,
+            free_transferred_allocation: false,
+        })
     }
 
     pub const fn new() -> Self {
-        Self(Storage::new())
+        Self {
+            storage: Storage::new(),
+            free_transferred_allocation: false,
+        }
     }
 
     #[inline]
@@ -125,11 +137,61 @@ impl Stack {
         if base as usize % ALIGN != 0 {
             return None;
         }
-        Some(Self(unsafe { Storage::from_raw(base, size) }))
+        Some(Self {
+            storage: unsafe { Storage::from_raw(base, size) },
+            free_transferred_allocation: false,
+        })
+    }
+
+    /// Take ownership of a userspace allocation while using only its prefix
+    /// as the thread stack.
+    ///
+    /// The scheduler drops the allocation only after the retired thread has
+    /// switched away from this stack. This avoids running a userspace cleanup
+    /// callback (and potentially issuing a nested syscall) in the context
+    /// switch handler.
+    ///
+    /// # Safety
+    ///
+    /// `base` must identify an exclusively owned allocation returned by the
+    /// `AllocMem` syscall with exactly `allocation_size` and
+    /// `allocation_align`. On success that ownership transfers to the kernel;
+    /// the caller must neither access nor free it again.
+    #[inline]
+    pub unsafe fn from_allocated(
+        base: *mut u8,
+        stack_size: usize,
+        allocation_size: usize,
+        allocation_align: usize,
+    ) -> Option<Self> {
+        const ALIGN: usize = core::mem::align_of::<Context>();
+        if stack_size < ALIGN
+            || stack_size > allocation_size
+            || base.is_null()
+            || base as usize % ALIGN != 0
+        {
+            return None;
+        }
+        let layout = Layout::from_size_align(allocation_size, allocation_align).ok()?;
+        if base as usize % layout.align() != 0 {
+            return None;
+        }
+        Some(Self {
+            storage: unsafe { Storage::from_raw(base, stack_size) },
+            free_transferred_allocation: true,
+        })
     }
 
     pub fn size(&self) -> usize {
-        self.0.size()
+        self.storage.size()
+    }
+}
+
+impl Drop for Stack {
+    fn drop(&mut self) {
+        if self.free_transferred_allocation {
+            crate::allocator::free(self.storage.base());
+        }
     }
 }
 

@@ -393,7 +393,22 @@ create_thread(spawn_args_ptr: *const SpawnArgs) -> c_long {
         return -1;
     }
     let spawn_args = unsafe {&*spawn_args_ptr};
-    let Some(stack) = Stack::from_raw(spawn_args.stack_start, spawn_args.stack_size) else {
+    let stack = if spawn_args.stack_allocation_size == 0 {
+        Stack::from_raw(spawn_args.stack_start, spawn_args.stack_size)
+    } else {
+        // SAFETY: ownership of this allocation is transferred by the syscall
+        // ABI. Validation in `from_allocated` rejects inconsistent bounds or
+        // alignment; on success the caller must not free it again.
+        unsafe {
+            Stack::from_allocated(
+                spawn_args.stack_start,
+                spawn_args.stack_size,
+                spawn_args.stack_allocation_size,
+                spawn_args.stack_allocation_align,
+            )
+        }
+    };
+    let Some(stack) = stack else {
         return -1;
     };
     let t = Builder::new(Entry::Posix(spawn_args.entry, spawn_args.arg))
