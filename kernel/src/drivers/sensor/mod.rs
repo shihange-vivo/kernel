@@ -16,3 +16,5 @@
 
 #[cfg(bme280)]
 pub mod bme280;
+#[cfg(battery)]
+pub mod battery;

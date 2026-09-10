@@ -25,6 +25,18 @@ config SOC_ESP32C6
     select HAS_MIE
     select I2C_CORE
 
+config BATTERY
+    bool "Enable AXP2101 battery driver"
+    default y
+    select I2C_CORE
+    select USE_EMBEDDED_HAL_V1
+    help
+      Enable the AXP2101 PMIC battery reader. The Waveshare
+      ESP32-C6-Touch-AMOLED-2.16 board has an AXP2101 PMIC at I2C
+      address 0x34 that provides battery voltage, state-of-charge,
+      and charging status through its internal fuel gauge and ADC.
+      The driver exposes the result as /dev/battery.
+
 config SD_CARD
     bool "Enable SD card over SPI"
     default n
