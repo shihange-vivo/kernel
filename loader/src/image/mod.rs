@@ -22,6 +22,7 @@ mod inspect;
 mod map;
 mod plan;
 mod relocate;
+pub mod scan;
 mod seal;
 
 pub(crate) use decode::{
@@ -31,6 +32,7 @@ pub(crate) use features::DynamicFeatureSummary;
 pub(crate) use image_loader::{read_u16, read_u32, read_u64, ImageLoader};
 pub(crate) use inspect::StackKind;
 pub(crate) use map::LoadedRegion;
+pub use scan::{scan_artifact, ScannedArtifact};
 pub use seal::{
     AppliedProtectionSet, PreparedProtectionPlan, ProtectionBatch, ProtectionCapabilities,
     ProtectionLevel, ProtectionRecord, SealPlan, SealRange, SealedState,

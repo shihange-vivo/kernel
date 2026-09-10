@@ -108,6 +108,21 @@ impl<R: ElfReader> InspectedImage<R> {
         self.phdr_geometry
     }
 
+    /// The file-scanning view of an inspected image (§7.2): the dynamic
+    /// segment (if any), the S1 feature summary and the load segments, for
+    /// the read-only dependency scanner to resolve dynstr offsets against the
+    /// file instead of a mapped copy.
+    #[inline]
+    pub(crate) fn scan_parts(
+        &self,
+    ) -> (
+        Option<&DynamicSegmentInfo>,
+        &DynamicFeatureSummary,
+        &[LoadSegmentInfo],
+    ) {
+        (self.dynamic.as_ref(), &self.summary, &self.load_segments)
+    }
+
     pub fn plan(mut self) -> LoadResult<PlannedImage<R>> {
         let mut r = 0;
         for segment in self.load_segments.iter() {

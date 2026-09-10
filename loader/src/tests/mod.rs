@@ -124,6 +124,187 @@ mod soname_relaxation {
     }
 }
 
+/// §7.2 read-only dependency scan: the scanner must see the same SONAME and
+/// `DT_NEEDED` set the real pipeline would decode, without any allocation.
+mod dependency_scan {
+    use goblin::elf::{
+        dynamic::{DT_NEEDED, DT_SONAME, DT_STRSZ, DT_STRTAB},
+        header::{EM_RISCV, ET_DYN},
+    };
+
+    use crate::{
+        dynamic_linker::ArtifactRole,
+        identity::{ElfType, LoadLimits, LoadProfile},
+        image::scan::scan_artifact,
+        reader::SliceElfReader,
+        tests::fixture::ElfFixtureBuilder,
+    };
+
+    fn profile() -> LoadProfile {
+        LoadProfile::riscv64(ElfType::Dyn)
+    }
+
+    /// A dynamic-area convention shared by these fixtures: one PT_LOAD (r-x,
+    /// vaddr 0x1000) whose 0x100-byte file range starts right after the ELF
+    /// header, so the dynamic table and dynstr — appended after the program
+    /// headers — land inside it with `vaddr = 0x1000 + (file - 0x40)`.
+    fn scanned_dso(entries: &[(u64, u64)], dynstr: &[u8]) -> std::vec::Vec<u8> {
+        // File layout: ehdr (0x40) | PT_LOAD phdr | PT_DYNAMIC phdr | dynamic
+        // table | dynstr. The single PT_LOAD maps file offset 0x40 (its own
+        // phdr) to vaddr 0x1000 with 0x100 bytes, so vaddr = 0x1000 + (x -
+        // 0x40) for every covered file offset x, and the dynamic table and
+        // dynstr — appended after the phdrs — land inside that range.
+        const EHDR: u64 = 0x40;
+        const PHDR: u64 = 0x38;
+        const LOAD_BASE: u64 = 0x1000;
+        let dyn_file = EHDR + 2 * PHDR;
+        // strtab/strsz entries + the caller's entries + the DT_NULL terminator
+        let table_len = (2 + entries.len() + 1) as u64 * 16;
+        let strtab_file = dyn_file + table_len;
+        let to_vaddr = |file: u64| LOAD_BASE + file - EHDR;
+
+        let mut all_entries: std::vec::Vec<(u32, u64)> = std::vec![
+            (DT_STRTAB as u32, to_vaddr(strtab_file)),
+            (DT_STRSZ as u32, dynstr.len() as u64),
+        ];
+        all_entries.extend(entries.iter().map(|&(tag, value)| (tag as u32, value)));
+        let bytes = ElfFixtureBuilder::elf64(EM_RISCV, ET_DYN)
+            .with_load_segment(LOAD_BASE, 0x100, 0x100, 0x4)
+            .with_dynamic_entries(to_vaddr(dyn_file), &all_entries)
+            .with_dynstr(strtab_file as usize, dynstr)
+            .build();
+        debug_assert!(strtab_file as usize + dynstr.len() <= bytes.len());
+        bytes
+    }
+
+    #[test]
+    fn scan_reads_soname_and_needed_in_order() {
+        // dynstr: "libc.so.1\0libfoo.so.1\0self.so\0" — offsets 0, 10, 22
+        let dynstr: &[u8] = b"libc.so.1\0libfoo.so.1\0self.so\0";
+        let bytes = scanned_dso(&[(DT_NEEDED, 0), (DT_NEEDED, 10), (DT_SONAME, 22)], dynstr);
+        let scanned = scan_artifact(
+            &SliceElfReader::new(&bytes),
+            profile(),
+            ArtifactRole::SharedObject,
+            LoadLimits::DEFAULT,
+        )
+        .expect("scan");
+        assert_eq!(
+            scanned.declared_soname.as_ref().unwrap().as_bytes(),
+            b"self.so"
+        );
+        assert_eq!(scanned.needed.len(), 2);
+        assert_eq!(scanned.needed[0].as_bytes(), b"libc.so.1");
+        assert_eq!(scanned.needed[1].as_bytes(), b"libfoo.so.1");
+    }
+
+    #[test]
+    fn scan_accepts_dso_without_soname() {
+        let dynstr: &[u8] = b"libc.so.1\0";
+        let bytes = scanned_dso(&[(DT_NEEDED, 0)], dynstr);
+        let scanned = scan_artifact(
+            &SliceElfReader::new(&bytes),
+            profile(),
+            ArtifactRole::SharedObject,
+            LoadLimits::DEFAULT,
+        )
+        .expect("scan");
+        assert!(scanned.declared_soname.is_none());
+        assert_eq!(scanned.needed.len(), 1);
+        assert_eq!(scanned.needed[0].as_bytes(), b"libc.so.1");
+    }
+
+    #[test]
+    fn scan_returns_empty_for_root_without_dynamic() {
+        // A static PIE root: one PT_LOAD, no PT_DYNAMIC.
+        let bytes = ElfFixtureBuilder::elf64(EM_RISCV, ET_DYN)
+            .with_load_segment(0x1000, 0x100, 0x100, 0x4)
+            .with_entry(0x1000)
+            .build();
+        let scanned = scan_artifact(
+            &SliceElfReader::new(&bytes),
+            profile(),
+            ArtifactRole::ExecutableRoot,
+            LoadLimits::DEFAULT,
+        )
+        .expect("scan");
+        assert!(scanned.declared_soname.is_none());
+        assert!(scanned.needed.is_empty());
+    }
+
+    #[test]
+    fn scan_rejects_dso_without_dynamic() {
+        let bytes = ElfFixtureBuilder::elf64(EM_RISCV, ET_DYN)
+            .with_load_segment(0x1000, 0x100, 0x100, 0x4)
+            .build();
+        let result = scan_artifact(
+            &SliceElfReader::new(&bytes),
+            profile(),
+            ArtifactRole::SharedObject,
+            LoadLimits::DEFAULT,
+        );
+        assert!(
+            result.is_err(),
+            "a SharedObject without PT_DYNAMIC must fail the scan"
+        );
+    }
+
+    #[test]
+    fn scan_fails_on_unterminated_dependency_name() {
+        // dynstr with no NUL after the offset: the shared NUL-scan must
+        // reject it (BadElf, §7.3 length rules).
+        let dynstr: &[u8] = b"libc.so.1"; // no terminator
+        let bytes = scanned_dso(&[(DT_NEEDED, 0)], dynstr);
+        let result = scan_artifact(
+            &SliceElfReader::new(&bytes),
+            profile(),
+            ArtifactRole::SharedObject,
+            LoadLimits::DEFAULT,
+        );
+        assert!(
+            result.is_err(),
+            "an unterminated DT_NEEDED string must fail"
+        );
+    }
+
+    #[test]
+    fn scan_fails_on_needed_offset_past_dynstr() {
+        // DT_NEEDED offset 0xff points past the end of the 10-byte dynstr.
+        let dynstr: &[u8] = b"libc.so.1\0";
+        let bytes = scanned_dso(&[(DT_NEEDED, 0xff)], dynstr);
+        let result = scan_artifact(
+            &SliceElfReader::new(&bytes),
+            profile(),
+            ArtifactRole::SharedObject,
+            LoadLimits::DEFAULT,
+        );
+        assert!(
+            result.is_err(),
+            "an out-of-range DT_NEEDED offset must fail"
+        );
+    }
+
+    #[test]
+    fn scan_fails_when_needed_has_no_strtab() {
+        // A dynamic table with DT_NEEDED but no DT_STRTAB/DT_STRSZ pair: the
+        // same BadElf the S4 decode reports for the unpaired tags.
+        const EHDR: u64 = 0x40;
+        const PHDR: u64 = 0x38;
+        let dyn_vaddr = 0x1000 + EHDR + PHDR - EHDR; // after the two phdrs
+        let bytes = ElfFixtureBuilder::elf64(EM_RISCV, ET_DYN)
+            .with_load_segment(0x1000, 0x100, 0x100, 0x4)
+            .with_dynamic_entries(dyn_vaddr, &[(DT_NEEDED as u32, 0)])
+            .build();
+        let result = scan_artifact(
+            &SliceElfReader::new(&bytes),
+            profile(),
+            ArtifactRole::SharedObject,
+            LoadLimits::DEFAULT,
+        );
+        assert!(result.is_err(), "DT_NEEDED without DT_STRTAB must fail");
+    }
+}
+
 #[test]
 fn fixture_builder_emits_a_parseable_elf32_header() {
     let bytes = ElfFixtureBuilder::elf32(EM_ARM, ET_DYN).build();

@@ -595,20 +595,12 @@ impl<R: ElfReader, M: ImageMemory> MappedImage<R, M> {
         dynstr: &[u8],
         tag: u64,
     ) -> LoadResult<DependencyName> {
-        let max_len = self.request.limits().max_dependency_name_len();
-        let start = usize::try_from(offset).map_err(|_| dynamic_error(tag, offset))?;
-        let tail = dynstr
-            .get(start..)
-            .ok_or_else(|| dynamic_error(tag, offset))?;
-        let scan = core::cmp::min(max_len as usize + 1, tail.len());
-        let nul = tail[..scan]
-            .iter()
-            .position(|&byte| byte == 0)
-            .ok_or_else(|| dynamic_error(tag, offset))?;
-        if nul == 0 {
-            return Err(dynamic_error(tag, offset));
-        }
-        DependencyName::from_terminated(&tail[..nul + 1]).map_err(|_| dynamic_error(tag, offset))
+        decode_dependency_name_at(
+            offset,
+            dynstr,
+            tag,
+            self.request.limits().max_dependency_name_len(),
+        )
     }
 
     /// S4 stage 4: save the lifecycle targets and array ranges without fixing
@@ -929,6 +921,32 @@ pub(crate) fn dynamic_error(tag: u64, value: u64) -> LoadError {
         LoadErrorKind::BadElf,
         ErrorContext::DynamicTag { tag, value },
     )
+}
+
+/// Decode one `DT_NEEDED`/`DT_SONAME` string-table offset into an owned
+/// [`DependencyName`], bounded by `max_len` (§7.3).
+///
+/// Shared by the S4 map stage and the read-only dependency scanner so both
+/// always resolve offsets with the same NUL-scan and length rules.
+pub(crate) fn decode_dependency_name_at(
+    offset: u64,
+    dynstr: &[u8],
+    tag: u64,
+    max_len: u32,
+) -> LoadResult<DependencyName> {
+    let start = usize::try_from(offset).map_err(|_| dynamic_error(tag, offset))?;
+    let tail = dynstr
+        .get(start..)
+        .ok_or_else(|| dynamic_error(tag, offset))?;
+    let scan = core::cmp::min(max_len as usize + 1, tail.len());
+    let nul = tail[..scan]
+        .iter()
+        .position(|&byte| byte == 0)
+        .ok_or_else(|| dynamic_error(tag, offset))?;
+    if nul == 0 {
+        return Err(dynamic_error(tag, offset));
+    }
+    DependencyName::from_terminated(&tail[..nul + 1]).map_err(|_| dynamic_error(tag, offset))
 }
 
 pub(crate) fn unsupported_dynamic(tag: u64, value: u64) -> LoadError {

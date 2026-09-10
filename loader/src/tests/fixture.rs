@@ -167,11 +167,94 @@ impl ElfFixtureBuilder {
     /// [`Self::with_load_segment`]: the file range is placed right after the
     /// program headers so it stays inside the file.
     pub fn with_dynamic_segment(self, vaddr: u64) -> Self {
+        self.with_dynamic_entries(vaddr, &[])
+    }
+
+    /// Append a `PT_DYNAMIC` carrying `(tag, value)` entries (in order,
+    /// duplicates preserved) followed by the `DT_NULL` terminator. The file
+    /// range sits right after the program headers, as in
+    /// [`Self::with_dynamic_segment`]; pair it with [`Self::with_dynstr`] to
+    /// provide the string table the `DT_STRTAB`/`DT_STRSZ` tags point at.
+    pub fn with_dynamic_entries(self, vaddr: u64, entries: &[(u32, u64)]) -> Self {
         if self.is64 {
-            self.with_dynamic_segment_64(vaddr)
+            self.with_dynamic_entries_64(vaddr, entries)
         } else {
-            self.with_dynamic_segment_32(vaddr)
+            self.with_dynamic_entries_32(vaddr, entries)
         }
+    }
+
+    fn with_dynamic_entries_64(mut self, vaddr: u64, entries: &[(u32, u64)]) -> Self {
+        let entry_size = elf64::dynamic::SIZEOF_DYN;
+        let ph_offset = elf64::header::SIZEOF_EHDR
+            + self.ph_count as usize * elf64::program_header::SIZEOF_PHDR;
+        let ph_end = ph_offset + elf64::program_header::SIZEOF_PHDR;
+        if self.bytes.len() < ph_end {
+            self.bytes.resize(ph_end, 0);
+        }
+
+        // dynamic entries + DT_NULL terminator
+        let entry_count = entries.len() + 1;
+        let dyn_len = entry_count * entry_size;
+        let dyn_offset = ph_end;
+        if self.bytes.len() < dyn_offset + dyn_len {
+            self.bytes.resize(dyn_offset + dyn_len, 0);
+        }
+        for (index, &(tag, value)) in entries.iter().enumerate() {
+            let at = dyn_offset + index * entry_size;
+            write_u64(&mut self.bytes, at, u64::from(tag)); // d_tag
+            write_u64(&mut self.bytes, at + 8, value); // d_val
+        }
+        // trailing DT_NULL stays zero
+
+        write_u32(&mut self.bytes, ph_offset, 2); // p_type = PT_DYNAMIC
+        write_u32(&mut self.bytes, ph_offset + 4, 0x4); // p_flags = PF_R
+        write_u64(&mut self.bytes, ph_offset + 8, dyn_offset as u64); // p_offset
+        write_u64(&mut self.bytes, ph_offset + 16, vaddr); // p_vaddr
+        write_u64(&mut self.bytes, ph_offset + 24, vaddr); // p_paddr
+        write_u64(&mut self.bytes, ph_offset + 32, dyn_len as u64); // p_filesz
+        write_u64(&mut self.bytes, ph_offset + 40, dyn_len as u64); // p_memsz
+        write_u64(&mut self.bytes, ph_offset + 48, 0x4); // p_align
+
+        self.ph_count += 1;
+        write_u16(&mut self.bytes, 56, self.ph_count);
+        self
+    }
+
+    fn with_dynamic_entries_32(mut self, vaddr: u64, entries: &[(u32, u64)]) -> Self {
+        let entry_size = elf32::dynamic::SIZEOF_DYN;
+        let ph_offset = elf32::header::SIZEOF_EHDR
+            + self.ph_count as usize * elf32::program_header::SIZEOF_PHDR;
+        let ph_end = ph_offset + elf32::program_header::SIZEOF_PHDR;
+        if self.bytes.len() < ph_end {
+            self.bytes.resize(ph_end, 0);
+        }
+
+        // dynamic entries + DT_NULL terminator
+        let entry_count = entries.len() + 1;
+        let dyn_len = entry_count * entry_size;
+        let dyn_offset = ph_end;
+        if self.bytes.len() < dyn_offset + dyn_len {
+            self.bytes.resize(dyn_offset + dyn_len, 0);
+        }
+        for (index, &(tag, value)) in entries.iter().enumerate() {
+            let at = dyn_offset + index * entry_size;
+            write_u32(&mut self.bytes, at, tag); // d_tag
+            write_u32(&mut self.bytes, at + 4, value as u32); // d_val
+        }
+        // trailing DT_NULL stays zero
+
+        write_u32(&mut self.bytes, ph_offset, 2); // p_type = PT_DYNAMIC
+        write_u32(&mut self.bytes, ph_offset + 4, 0x4); // p_flags = PF_R
+        write_u32(&mut self.bytes, ph_offset + 8, dyn_offset as u32); // p_offset
+        write_u32(&mut self.bytes, ph_offset + 12, vaddr as u32); // p_vaddr
+        write_u32(&mut self.bytes, ph_offset + 16, vaddr as u32); // p_paddr
+        write_u32(&mut self.bytes, ph_offset + 20, dyn_len as u32); // p_filesz
+        write_u32(&mut self.bytes, ph_offset + 24, dyn_len as u32); // p_memsz
+        write_u32(&mut self.bytes, ph_offset + 28, 0x4); // p_align
+
+        self.ph_count += 1;
+        write_u16(&mut self.bytes, 44, self.ph_count);
+        self
     }
 
     fn with_dynamic_segment_64(mut self, vaddr: u64) -> Self {
@@ -229,6 +312,19 @@ impl ElfFixtureBuilder {
 
         self.ph_count += 1;
         write_u16(&mut self.bytes, 44, self.ph_count);
+        self
+    }
+
+    /// Append a `dynstr` byte blob at file offset `offset` (the fixtures keep
+    /// `p_vaddr == file_offset` for the dynamic area, so a `DT_STRTAB` value
+    /// equal to `offset` resolves inside the segment). The blob typically
+    /// holds NUL-separated names; `DT_NEEDED`/`DT_SONAME` values are offsets
+    /// into it.
+    pub fn with_dynstr(mut self, offset: usize, bytes: &[u8]) -> Self {
+        if self.bytes.len() < offset + bytes.len() {
+            self.bytes.resize(offset + bytes.len(), 0);
+        }
+        self.bytes[offset..offset + bytes.len()].copy_from_slice(bytes);
         self
     }
 

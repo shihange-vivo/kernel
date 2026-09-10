@@ -46,12 +46,12 @@ pub use cache::{
 pub use dynamic_linker::{
     ArtifactIdentity, ArtifactResolver, ArtifactRole, BuildId, BuildingSession, CommittedImage,
     CommittingLinkProduct, DependencyName, DependencyRequest, DependencyRequester,
-    DependencyResolution, DynamicLinker, FileIdentity, FiniPlan, ImageId, ImageOwnership,
-    ImageFiniPlan, ImportedImageDescriptor, InitPlan, LifecycleEntry, LifecyclePlans,
-    LinkContext, LinkDomainId, LinkMapEntry, LinkProduct, LinkPublisher, LinkSession, LoadMetrics,
-    PreparedLinkManifest,
-    ProgramHeaderRuntimeInfo, PublishedImageDescriptor, PublishedRegion, PublishedSymbolTable,
-    RelocatedSession, RelocationBinding, ResolvedArtifact, ScopedSession, SealedSession,
+    DependencyResolution, DynamicLinker, FileIdentity, FiniPlan, ImageFiniPlan, ImageId,
+    ImageOwnership, ImportedImageDescriptor, InitPlan, LifecycleEntry, LifecyclePlans, LinkContext,
+    LinkDomainId, LinkMapEntry, LinkProduct, LinkPublisher, LinkSession, LoadMetrics,
+    PreparedLinkManifest, ProgramHeaderRuntimeInfo, PublishedImageDescriptor, PublishedRegion,
+    PublishedSymbolTable, RelocatedSession, RelocationBinding, ResolvedArtifact, ScopedSession,
+    SealedSession,
 };
 pub use error::{
     ErrorContext, HeaderField, LimitKind, LoadError, LoadErrorKind, LoadResult, LoadStage,
@@ -62,8 +62,9 @@ pub use identity::{
     LoadRequest, SessionLimits,
 };
 pub use image::{
-    AppliedProtectionSet, PreparedProtectionPlan, ProtectionBatch, ProtectionCapabilities,
-    ProtectionLevel, ProtectionRecord, SealPlan, SealRange, SealedState,
+    scan_artifact, AppliedProtectionSet, PreparedProtectionPlan, ProtectionBatch,
+    ProtectionCapabilities, ProtectionLevel, ProtectionRecord, ScannedArtifact, SealPlan,
+    SealRange, SealedState,
 };
 pub use memory::{
     AllocationId, AllocationLease, AllocationOffset, AllocationOwnership, AllocationRequest,

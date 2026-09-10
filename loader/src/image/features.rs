@@ -16,7 +16,7 @@ use alloc::vec::Vec;
 use goblin::elf::dynamic::{
     DF_1_NOW, DF_BIND_NOW, DT_BIND_NOW, DT_FINI, DT_FINI_ARRAY, DT_FINI_ARRAYSZ, DT_FLAGS,
     DT_FLAGS_1, DT_INIT, DT_INIT_ARRAY, DT_INIT_ARRAYSZ, DT_JMPREL, DT_NEEDED, DT_NULL, DT_PLTREL,
-    DT_PLTRELSZ, DT_PREINIT_ARRAY, DT_PREINIT_ARRAYSZ, DT_SONAME,
+    DT_PLTRELSZ, DT_PREINIT_ARRAY, DT_PREINIT_ARRAYSZ, DT_SONAME, DT_STRSZ, DT_STRTAB,
 };
 
 use crate::{
@@ -33,10 +33,14 @@ use crate::{
 /// It records raw `DT_NEEDED`/`DT_SONAME` string-table offsets rather than
 /// resolving them: full dynstr decoding is deferred to S4, but the presence of
 /// every phase-gated feature is decided here so an unsupported image never
-/// reaches allocation.
+/// reaches allocation. The `DT_STRTAB`/`DT_STRSZ` pair is recorded too: the
+/// read-only dependency scanner (§7.2) resolves the offsets from the file with
+/// the same summary instead of re-decoding the whole table.
 pub(crate) struct DynamicFeatureSummary {
     needed: Vec<u64>,
     soname: Option<u64>,
+    strtab: Option<u64>,
+    strsz: Option<u64>,
     has_plt_relocations: bool,
     has_lifecycle: bool,
 }
@@ -46,6 +50,8 @@ impl DynamicFeatureSummary {
         Self {
             needed: Vec::new(),
             soname: None,
+            strtab: None,
+            strsz: None,
             has_plt_relocations: false,
             has_lifecycle: false,
         }
@@ -59,6 +65,18 @@ impl DynamicFeatureSummary {
     #[inline]
     pub(crate) const fn soname(&self) -> Option<u64> {
         self.soname
+    }
+
+    /// The `DT_STRTAB` vaddr, when the table declares one.
+    #[inline]
+    pub(crate) const fn strtab(&self) -> Option<u64> {
+        self.strtab
+    }
+
+    /// The `DT_STRSZ` byte length, when the table declares one.
+    #[inline]
+    pub(crate) const fn strsz(&self) -> Option<u64> {
+        self.strsz
     }
 
     #[inline]
@@ -106,6 +124,8 @@ pub(crate) fn validate_dynamic_features<R: ElfReader>(
             LoadError::new(LoadErrorKind::OutOfMemory, crate::error::ErrorContext::None)
         })?;
     let mut soname = None;
+    let mut strtab = None;
+    let mut strsz = None;
     let mut has_plt_relocations = false;
     let mut bind_now = false;
     let mut has_lifecycle = false;
@@ -150,6 +170,16 @@ pub(crate) fn validate_dynamic_features<R: ElfReader>(
                     return Err(dynamic_error(DT_SONAME, value));
                 }
             }
+            DT_STRTAB => {
+                if strtab.replace(value).is_some() {
+                    return Err(dynamic_error(DT_STRTAB, value));
+                }
+            }
+            DT_STRSZ => {
+                if strsz.replace(value).is_some() {
+                    return Err(dynamic_error(DT_STRSZ, value));
+                }
+            }
             DT_PLTRELSZ | DT_PLTREL | DT_JMPREL => has_plt_relocations = true,
             DT_BIND_NOW => bind_now = true,
             DT_FLAGS if value & DF_BIND_NOW != 0 => bind_now = true,
@@ -174,6 +204,8 @@ pub(crate) fn validate_dynamic_features<R: ElfReader>(
     Ok(DynamicFeatureSummary {
         needed,
         soname,
+        strtab,
+        strsz,
         has_plt_relocations,
         has_lifecycle,
     })
