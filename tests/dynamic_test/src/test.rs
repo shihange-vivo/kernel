@@ -1,13 +1,14 @@
 // NEWLINE-TIMEOUT: 10
 // CHECK-SUCC: Dynamic application test started
-// CHECK-SUCC: DSO_LOAD soname=libc.so.1
+// CHECK-SUCC: DSO_LOAD path=/system/lib/libc.so.1
 // CHECK-SUCC: hello dynamic app
 // CHECK-SUCC: argv0=/apps/hello/app.elf
+// CHECK-SUCC: argv0=app.elf
 // CHECK-SUCC: auxv: AT_PHDR ok
 // CHECK-SUCC: APP_LAUNCHED handle=.* path=/apps/hello/app.elf
 // CHECK-SUCC: APP_INIT_COMPLETE handle=.*
 // CHECK-SUCC: APP_REAP handle=.* private_images=1 imported_dsos=1
-// CHECK-SUCC: DSO_REUSE soname=libc.so.1
+// CHECK-SUCC: DSO_REUSE path=/system/lib/libc.so.1
 // ASSERT-SUCC: Dynamic application test ended
 // ASSERT-FAIL: Backtrace in Panic.*
 // ASSERT-FAIL: ASSERTION FAILED.*
@@ -44,15 +45,16 @@ use semihosting::println;
 /// generation the relaunch assertion compares against.
 fn launch_and_wait(
     service: &ApplicationService,
+    path: &str,
     argc1: bool,
 ) -> blueos::application::manager::ApplicationHandle {
     let mut argv = Vec::new();
-    argv.push(b"/apps/hello/app.elf".to_vec());
+    argv.push(path.as_bytes().to_vec());
     if argc1 {
         argv.push(b"arg1".to_vec());
     }
     let handle = service
-        .spawn("/apps/hello/app.elf", argv, Vec::new())
+        .spawn(path, argv, Vec::new())
         .expect("spawn dynamic app");
 
     // Bounded poll: the reaper scans every REAPER_POLL_MILLIS and the app
@@ -81,11 +83,17 @@ fn dynamic_app_vertical() {
     // First launch: this link is the first loading generation for libc.so.1
     // (DSO_LOAD), the app runs its main through the shared libc, exits and is
     // reaped with its private image and its one imported libc lease.
-    let first = launch_and_wait(service, true);
+    let first = launch_and_wait(service, "/apps/hello/app.elf", true);
 
     // Second launch: the Ready libc instance is imported (DSO_REUSE), not
-    // remapped; the slot is recycled with a bumped generation (§14.3).
-    let second = launch_and_wait(service, false);
+    // remapped. Change cwd and use a relative launch path to exercise the
+    // service's one-time pwd snapshot; its log still reports the normalized
+    // absolute identity. The slot is recycled with a bumped generation.
+    assert_eq!(
+        blueos::vfs::syscalls::chdir(b"/apps/hello\0".as_ptr().cast()),
+        0
+    );
+    let second = launch_and_wait(service, "app.elf", false);
     assert_eq!(first.slot, second.slot, "slot must be recycled");
     assert_ne!(
         first.generation, second.generation,

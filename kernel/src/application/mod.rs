@@ -16,19 +16,16 @@
 //! neutral contracts (`ElfReader`, `ArtifactResolver`, `ImageMemory`, …) to
 //! the kernel's VFS, memory and cache services.
 //!
-//! Phase 1 is delivered slice-by-slice. C23-b lands the read-only
-//! [`adapters::vfs_reader::VfsElfReader`] and the fixed
-//! [`adapters::system_paths::SystemLibraryPaths`] catalog; C23-c adds the
-//! [`adapters::flat_memory::FlatImageMemory`] shared-flat backend. C24 adds the
-//! [`registry::SystemDsoRegistry`] permit/lease/generation state machine that
-//! turns a relocated system image into a shareable Ready instance and hands
-//! back either a load permit or an import lease (§13). The
-//! [`ArtifactResolver`] adaptation and the manager/group orchestration follow
-//! in C24/C25.
+//! A launch freezes an [`namespace::ApplicationNamespace`], then
+//! [`planner::NamespaceLoadPlanner`] scans the actual VFS ELF closure and
+//! resolves each dependency to a concrete path. The resolver atomically
+//! acquires that plan's system-library keys before the linker maps anything;
+//! private images stay group-owned while system images are published through
+//! [`registry::SystemDsoRegistry`]. Manager/group/start-storage/reaper modules
+//! own the remaining execution and lifecycle state.
 
 /// The board policy's dynamic-application profile (§9.1): the single place
-/// where the board ABI decides which loader profile a bare (non-package)
-/// application links with.
+/// where the board ABI decides which loader profile an application links with.
 #[cfg(target_board = "qemu_mps2_an385")]
 pub fn board_dynamic_profile() -> blueos_loader::LoadProfile {
     blueos_loader::LoadProfile::arm_thumb_soft_float(blueos_loader::ElfType::Dyn)
@@ -60,8 +57,7 @@ pub mod group;
 pub mod loader;
 pub mod manager;
 pub mod namespace;
-#[cfg(boot_dynamic_seed)]
-pub mod package;
+pub mod planner;
 pub mod publication;
 pub mod reaper;
 pub mod registry;

@@ -12,206 +12,263 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! `ArtifactResolver` adapter over the system catalog and the DSO registry
-//! (C24, §12.2).
+//! Runtime namespace resolver.
 //!
-//! [`ApplicationArtifactResolver`] turns a `DT_NEEDED` byte name into either a
-//! fresh [`DependencyResolution::Load`] (a `SystemCandidate` the session must
-//! load and later publish) or a [`DependencyResolution::Import`] (a Ready
-//! instance already relocated and sealed by an earlier link). It never searches
-//! the current directory, `LD_LIBRARY_PATH`, `RPATH`/`RUNPATH` or an
-//! application-package `lib/` directory: a system dependency resolves only
-//! through an exact byte-name hit in the fixed [`SystemLibraryPaths`] catalog.
-//!
-//! The resolver owns the registry authority it acquires: each minted
-//! [`LoadPermit`] and [`SystemDsoLease`] is retained for the duration of the
-//! staged link and handed over by [`ApplicationArtifactResolver::finish_resolution`]
-//! so the kernel link publisher can advance it (C26). If the resolver is
-//! dropped before that hand-off — the link failed — the retained permits and
-//! leases drop too, cancelling the load or releasing the import (§13.5).
+//! The launch planner has already resolved every `DT_NEEDED` string to an
+//! exact VFS path and acquired the complete system closure atomically. This
+//! adapter therefore performs no search and takes no new system permit while
+//! the linker owns mapped memory: it only replays planned requester/edge
+//! bindings, reopens the frozen snapshots, and consumes the prepared permits
+//! or leases.
 
 use alloc::vec::Vec;
 
 use blueos_loader::{
     ArtifactIdentity, ArtifactResolver, BuildId, DependencyName, DependencyRequest,
     DependencyResolution, ErrorContext, FileIdentity, ImageOwnership, ImportedImageDescriptor,
-    LoadError, LoadErrorKind, LoadResult, ResolvedArtifact,
+    LinkDomainId, LoadError, LoadErrorKind, LoadResult, ResolvedArtifact,
 };
 
 use crate::{
     application::{
-        adapters::{system_paths::SystemLibraryPaths, vfs_reader::VfsElfReader},
-        registry::{AcquireOutcome, LoadPermit, SystemDsoLease, SystemDsoRegistry},
+        planner::{NamespaceLoadPlan, PlannedImage},
+        registry::{
+            AcquireBatchOutcome, LoadPermit, PreparedSystemBatch, SystemDsoLease, SystemDsoRegistry,
+        },
     },
     vfs::{open_path, FileSnapshotId},
 };
 
-/// A `SystemCandidate` claimed for this link but not yet published.
-///
-/// The `permit` is the sole publication authority for its generation and stays
-/// here until `finish_resolution`; the remaining fields de-duplicate a second
-/// `DT_NEEDED` of the same SONAME *within one link* so the resolver does not
-/// re-request (and block on) a generation it already owns.
-pub(crate) struct SystemCandidateClaim {
-    pub(crate) permit: LoadPermit,
-    pub(crate) soname: DependencyName,
-    pub(crate) snapshot: FileSnapshotId,
+use super::vfs_reader::VfsElfReader;
+
+struct SystemCandidateClaim {
+    key: DependencyName,
+    identity: ArtifactIdentity,
+    snapshot: FileSnapshotId,
+    permit: LoadPermit,
 }
 
-/// One `SystemCandidate` this link must load and publish, paired with the
-/// `DT_NEEDED` SONAME its permit was minted for. The `ApplicationLoader` uses
-/// the SONAME to match the permit to the candidate's published descriptor and
-/// per-image fini plan when it advances the registry to `Ready` (§13.3).
+struct SystemImportClaim {
+    key: DependencyName,
+    descriptor: blueos_loader::PublishedImageDescriptor,
+}
+
+/// One first-load system image and its unique registry publication authority.
 pub struct SystemCandidatePermit {
-    pub soname: DependencyName,
+    pub key: DependencyName,
+    pub identity: ArtifactIdentity,
     pub permit: LoadPermit,
 }
 
-/// The registry authorities a staged link accumulated (C26 hands them to the
-/// kernel link publisher's receipt).
+/// Registry authority accumulated while replaying a namespace plan.
 pub struct ResolverAuthorities {
-    /// Publication permits for every `SystemCandidate` this link must load,
-    /// each paired with its SONAME so the publisher can advance the registry.
     pub permits: Vec<SystemCandidatePermit>,
-    /// Counted references to every Ready instance this link imported.
     pub leases: Vec<SystemDsoLease>,
+    /// Identity-to-canonical-key mapping for every system image in the plan.
+    /// Publication uses this instead of optional ELF SONAME metadata.
+    pub system_images: Vec<(ArtifactIdentity, DependencyName)>,
 }
 
-/// Resolves system dependencies against the fixed catalog and the registry.
-pub struct ApplicationArtifactResolver {
-    catalog: &'static SystemLibraryPaths,
-    registry: SystemDsoRegistry,
+/// Resolve a fully planned application namespace into linker artifacts.
+pub struct NamespaceArtifactResolver {
+    plan: NamespaceLoadPlan,
+    batch_loads: Vec<(DependencyName, LoadPermit)>,
+    batch_imports: Vec<(
+        DependencyName,
+        SystemDsoLease,
+        blueos_loader::PublishedImageDescriptor,
+    )>,
     candidates: Vec<SystemCandidateClaim>,
     leases: Vec<SystemDsoLease>,
+    imports: Vec<SystemImportClaim>,
+    opened_private: Vec<ArtifactIdentity>,
 }
 
-impl ApplicationArtifactResolver {
-    /// Build a resolver over a fixed catalog and a shared registry.
-    pub fn new(catalog: &'static SystemLibraryPaths, registry: SystemDsoRegistry) -> Self {
-        Self {
-            catalog,
-            registry,
+impl NamespaceArtifactResolver {
+    /// Atomically acquire the plan's whole system closure. Waiting and retrying
+    /// happens here, before the dynamic linker allocates an image.
+    pub fn new(
+        plan: NamespaceLoadPlan,
+        registry: SystemDsoRegistry,
+        domain: LinkDomainId,
+    ) -> LoadResult<Self> {
+        let PreparedSystemBatch { loads, imports } = loop {
+            match registry.acquire_batch(domain, plan.system_keys()) {
+                AcquireBatchOutcome::Acquired(batch) => break batch,
+                AcquireBatchOutcome::Pending(wait) => wait.wait(),
+            }
+        };
+        Ok(Self {
+            plan,
+            batch_loads: loads,
+            batch_imports: imports,
             candidates: Vec::new(),
             leases: Vec::new(),
-        }
+            imports: Vec::new(),
+            opened_private: Vec::new(),
+        })
     }
 
-    /// Hand over the permits and leases acquired across `resolve` calls, leaving
-    /// the resolver empty. The caller (the kernel link publisher) owns them from
-    /// here on and must advance or drop them (§12.1, §13.3).
+    /// Reopen the planned root and verify that it is still the same snapshot.
+    pub fn root_artifact(&self) -> LoadResult<ResolvedArtifact<VfsElfReader>> {
+        self.open_planned(
+            &self.plan.images()[self.plan.root()],
+            ImageOwnership::SessionPrivate,
+        )
+    }
+
+    /// Hand all registry authority to the publisher after dependency closure.
     pub fn finish_resolution(&mut self) -> ResolverAuthorities {
         let permits = core::mem::take(&mut self.candidates)
             .into_iter()
             .map(|claim| SystemCandidatePermit {
-                soname: claim.soname,
+                key: claim.key,
+                identity: claim.identity,
                 permit: claim.permit,
             })
             .collect();
-        let leases = core::mem::take(&mut self.leases);
-        ResolverAuthorities { permits, leases }
+        let mut leases = core::mem::take(&mut self.leases);
+        leases.extend(
+            core::mem::take(&mut self.batch_imports)
+                .into_iter()
+                .map(|(_, lease, _)| lease),
+        );
+        let system_images = self
+            .plan
+            .images()
+            .iter()
+            .filter_map(|image| {
+                image
+                    .system_key()
+                    .map(|key| (image.identity().clone(), key.clone()))
+            })
+            .collect();
+        ResolverAuthorities {
+            permits,
+            leases,
+            system_images,
+        }
     }
 
-    /// Open `entry`'s path, freeze its snapshot and derive the artifact identity
-    /// from that same snapshot (§12.2: identity, reader and build-id come from
-    /// one snapshot). The reader's generation re-check still guards against a
-    /// mid-load write.
-    fn open_candidate(
+    fn open_planned(
         &self,
-        entry: &'static crate::application::adapters::system_paths::SystemLibraryEntry,
-    ) -> LoadResult<(VfsElfReader, FileSnapshotId)> {
-        let file = open_path(entry.path, libc::O_RDONLY, 0).map_err(|_| backend_error())?;
+        image: &PlannedImage,
+        ownership: ImageOwnership,
+    ) -> LoadResult<ResolvedArtifact<VfsElfReader>> {
+        let file = open_path(image.path(), libc::O_RDONLY, 0).map_err(|_| backend_error())?;
         let reader = VfsElfReader::new(file);
         let snapshot = reader.snapshot_id();
-        Ok((reader, snapshot))
+        if snapshot != image.snapshot() {
+            return Err(source_changed());
+        }
+        let identity = image.identity().clone();
+        Ok(ResolvedArtifact::new(identity, ownership, reader))
+    }
+
+    fn planned_provider_index(&self, request: &DependencyRequest<'_>) -> LoadResult<usize> {
+        let requester = self
+            .plan
+            .images()
+            .iter()
+            .position(|image| image.identity() == request.requester().identity())
+            .ok_or_else(backend_error)?;
+        self.plan
+            .edges()
+            .iter()
+            .find(|edge| edge.requester() == requester && edge.request() == request.needed())
+            .map(|edge| edge.provider())
+            .ok_or_else(|| unresolved(request.needed()))
+    }
+
+    fn resolve_system(
+        &mut self,
+        provider_index: usize,
+    ) -> LoadResult<DependencyResolution<VfsElfReader>> {
+        let provider = &self.plan.images()[provider_index];
+        let key = provider.system_key().ok_or_else(backend_error)?.clone();
+
+        if let Some(claim) = self.candidates.iter().find(|claim| claim.key == key) {
+            if claim.identity != *provider.identity() || claim.snapshot != provider.snapshot() {
+                return Err(source_changed());
+            }
+            return self
+                .open_planned(provider, ImageOwnership::SystemCandidate)
+                .map(DependencyResolution::Load);
+        }
+
+        if let Some((_, permit)) = take_by_key(&mut self.batch_loads, &key, |item| &item.0) {
+            let artifact = self.open_planned(provider, ImageOwnership::SystemCandidate)?;
+            self.candidates.push(SystemCandidateClaim {
+                key: key.clone(),
+                identity: provider.identity().clone(),
+                snapshot: provider.snapshot(),
+                permit,
+            });
+            log::info!("DSO_LOAD path={}", provider.path());
+            return Ok(DependencyResolution::Load(artifact));
+        }
+
+        if let Some((_, lease, descriptor)) =
+            take_by_key(&mut self.batch_imports, &key, |item| &item.0)
+        {
+            if descriptor.identity() != provider.identity() {
+                return Err(source_changed());
+            }
+            self.leases.push(lease);
+            self.imports.push(SystemImportClaim {
+                key: key.clone(),
+                descriptor: descriptor.clone(),
+            });
+            log::info!("DSO_REUSE path={}", provider.path());
+            return Ok(DependencyResolution::Import(ImportedImageDescriptor::new(
+                descriptor,
+            )));
+        }
+
+        if let Some(claim) = self.imports.iter().find(|claim| claim.key == key) {
+            return Ok(DependencyResolution::Import(ImportedImageDescriptor::new(
+                claim.descriptor.clone(),
+            )));
+        }
+        Err(backend_error())
     }
 }
 
-impl ArtifactResolver for ApplicationArtifactResolver {
+impl ArtifactResolver for NamespaceArtifactResolver {
     type Reader = VfsElfReader;
 
     fn resolve(
         &mut self,
         request: &DependencyRequest<'_>,
     ) -> LoadResult<DependencyResolution<Self::Reader>> {
-        let needed = request.needed();
-        let domain = request.domain();
-        let entry = self
-            .catalog
-            .resolve(needed.as_bytes())
-            .ok_or_else(|| unresolved(needed))?;
-
-        // Same-SONAME de-duplication within this link: a second `DT_NEEDED` of
-        // an already-claimed SystemCandidate must not re-request (and block on)
-        // the generation we still hold. Re-open the same trusted path, re-derive
-        // the identity from the fresh snapshot, and let the loader's own
-        // identity de-duplication record only the extra edge.
-        if let Some(claim) = self.candidates.iter().find(|c| c.soname == *needed) {
-            let (reader, snapshot) = self.open_candidate(entry)?;
-            if snapshot != claim.snapshot {
-                return Err(source_changed());
+        let provider_index = self.planned_provider_index(request)?;
+        if self.plan.images()[provider_index].system() {
+            self.resolve_system(provider_index)
+        } else {
+            let provider = &self.plan.images()[provider_index];
+            if !self.opened_private.contains(provider.identity()) {
+                log::info!("NS_LOAD path={}", provider.path());
+                self.opened_private.push(provider.identity().clone());
             }
-            return Ok(DependencyResolution::Load(ResolvedArtifact::new(
-                identity_from_snapshot(snapshot, entry.build_id),
-                ImageOwnership::SystemCandidate,
-                reader,
-            )));
-        }
-
-        loop {
-            match self.registry.acquire_or_begin_load(domain, needed.clone()) {
-                AcquireOutcome::Permit(permit) => {
-                    let (reader, snapshot) = self.open_candidate(entry)?;
-                    self.candidates.push(SystemCandidateClaim {
-                        permit,
-                        soname: needed.clone(),
-                        snapshot,
-                    });
-                    // C29 oracle: this link is the first loading generation
-                    // for the SONAME (§18.5).
-                    log::info!(
-                        "DSO_LOAD soname={}",
-                        core::str::from_utf8(needed.as_bytes()).unwrap_or("<non-utf8>")
-                    );
-                    return Ok(DependencyResolution::Load(ResolvedArtifact::new(
-                        identity_from_snapshot(snapshot, entry.build_id),
-                        ImageOwnership::SystemCandidate,
-                        reader,
-                    )));
-                }
-                AcquireOutcome::Lease(lease) => {
-                    // We hold the counted lease, so the instance must remain
-                    // Ready and its descriptor is guaranteed.
-                    let descriptor = self
-                        .registry
-                        .descriptor(domain, needed)
-                        .ok_or_else(backend_error)?;
-                    self.leases.push(lease);
-                    // C29 oracle: the mapped Ready instance is reused (§18.5).
-                    log::info!(
-                        "DSO_REUSE soname={}",
-                        core::str::from_utf8(needed.as_bytes()).unwrap_or("<non-utf8>")
-                    );
-                    return Ok(DependencyResolution::Import(ImportedImageDescriptor::new(
-                        descriptor,
-                    )));
-                }
-                // A concurrent link is mid-construction for this generation:
-                // block (outside any loader-memory or manager lock) until it
-                // resolves, then re-acquire (§13.3).
-                AcquireOutcome::Pending(handle) => handle.wait(),
-            }
+            self.open_planned(provider, ImageOwnership::SessionPrivate)
+                .map(DependencyResolution::Load)
         }
     }
 }
 
-/// Encode a frozen snapshot into the loader's opaque [`FileIdentity`] so two
-/// identities compare equal only for the same `(fs_instance, inode, content
-/// generation, len)`. The snapshot's content generation doubles as the
-/// [`ArtifactIdentity`] generation: a reload of the same path after a write
-/// yields a fresh identity rather than aliasing the old one.
+fn take_by_key<T>(
+    items: &mut Vec<T>,
+    key: &DependencyName,
+    key_of: impl Fn(&T) -> &DependencyName,
+) -> Option<T> {
+    let position = items.iter().position(|item| key_of(item) == key)?;
+    Some(items.swap_remove(position))
+}
+
+/// Encode a frozen snapshot into the loader's opaque file identity.
 pub(crate) fn identity_from_snapshot(
     snapshot: FileSnapshotId,
-    build_id: Option<&'static [u8]>,
+    build_id: Option<&[u8]>,
 ) -> ArtifactIdentity {
     let mut bytes = [0u8; 32];
     bytes[0..8].copy_from_slice(&snapshot.fs_instance.to_le_bytes());
@@ -234,7 +291,11 @@ fn source_changed() -> LoadError {
 }
 
 fn unresolved(needed: &DependencyName) -> LoadError {
-    // C30 §7.1: the session attaches the real requester image id when the
-    // resolver leaves the context empty; the resolver no longer fakes `0`.
-    LoadError::new(LoadErrorKind::Backend, ErrorContext::None)
+    LoadError::new(
+        LoadErrorKind::Backend,
+        ErrorContext::Dependency {
+            requester: 0,
+            needed: needed.as_bytes().into(),
+        },
+    )
 }

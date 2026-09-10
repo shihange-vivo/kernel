@@ -33,7 +33,7 @@ use crate::application::{
 /// non-interpose case (§17.2).
 static SYSTEM_LIBRARIES: &[SystemLibraryEntry] = &[
     SystemLibraryEntry {
-        soname: b"libc.so.1",
+        lookup_name: b"libc.so.1",
         path: "/system/lib/libc.so.1",
         build_id: None,
         // The shared libc has unmodeled escapes (kernel callbacks, global
@@ -41,7 +41,10 @@ static SYSTEM_LIBRARIES: &[SystemLibraryEntry] = &[
         keep_cached: true,
     },
     SystemLibraryEntry {
-        soname: b"libscope_sys.so.1",
+        // This fixture deliberately has no DT_SONAME. Linking records its
+        // build filename while the catalog path remains the stable registry
+        // key, proving that lookup metadata and ELF metadata are independent.
+        lookup_name: b"libscope_sys.so",
         path: "/system/lib/libscope_sys.so.1",
         build_id: None,
         // The scope corpus's test system DSO has no escapes: the C31-d

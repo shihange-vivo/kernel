@@ -15,7 +15,7 @@
 //! System DSO registry: permit, lease and generation state machine (C24, §13).
 //!
 //! One [`SystemDsoRegistry`] tracks every mapped system DSO instance per
-//! `(LinkDomainId, SONAME)`. It answers the single question a resolver needs:
+//! `(LinkDomainId, canonical system path)`. It answers the single question a resolver needs:
 //! for a requested system dependency, is there already a Ready instance to
 //! *import*, or must some link *load* it as a candidate?
 //!
@@ -36,9 +36,9 @@
 //!   [`SystemDsoRegistry::resolve_quiescence`]; an ordinary failed-link drop
 //!   safely leaves a reusable zero-user `Ready` instance instead of stranding
 //!   it in an in-flight state with no worker (§13.3).
-//! * [`WaitHandle`] — a waiter's ticket for an in-flight generation. A resolver
-//!   that loses the race blocks on it outside any loader/manager lock; the
-//!   slot's resolution signal wakes it so it can re-acquire (§13.3, §13.5).
+//! * [`SystemBatchWait`] — a waiter's ticket for an in-flight closure. A
+//!   planner-acquired batch never partially mutates the registry, so concurrent
+//!   sessions cannot form an ABBA wait cycle.
 //!
 //! The registry keeps no [`AllocationLease`](blueos_loader::AllocationLease)
 //! and owns no raw memory: the unique allocation lease for the mapped image
@@ -62,20 +62,6 @@ use crate::{
     time::Tick,
 };
 
-/// The outcome of asking the registry for a system dependency (§13.3).
-///
-/// `Permit` means the caller won the vacant slot and must load the image;
-/// `Lease` means a Ready instance already exists and was borrowed;
-/// `Pending(handle)` means some other link is mid-construction at the handle's
-/// generation, and the caller must block on the handle for that generation to
-/// resolve and then re-acquire. A caller never treats `Pending` as "the image
-/// is loaded".
-pub enum AcquireOutcome {
-    Permit(LoadPermit),
-    Lease(SystemDsoLease),
-    Pending(WaitHandle),
-}
-
 /// The outcome of resolving a quiescent slot (C31-d, §8.5).
 pub enum QuiescenceResolution {
     /// The zero-lease instance stays `Ready` for a later import.
@@ -87,7 +73,7 @@ pub enum QuiescenceResolution {
 
 /// One member handed to the quiescence worker for destruction.
 pub struct SystemUnloadBacking {
-    pub soname: DependencyName,
+    pub key: DependencyName,
     pub allocation: AllocationLease,
     pub fini_plan: FiniPlan,
     /// Outgoing SCC dependency leases. They remain live through this member's
@@ -126,9 +112,9 @@ pub enum AcquireBatchOutcome {
 
 /// The atomically acquired system closure a resolver consumes edge-by-edge.
 pub struct PreparedSystemBatch {
-    /// First-load candidates: the SONAME paired with its publication permit.
+    /// First-load candidates: the canonical path key and publication permit.
     pub loads: Vec<(DependencyName, LoadPermit)>,
-    /// Ready imports: the SONAME, its counted lease and a descriptor clone.
+    /// Ready imports: the canonical path key, lease and descriptor clone.
     pub imports: Vec<(DependencyName, SystemDsoLease, PublishedImageDescriptor)>,
 }
 
@@ -143,11 +129,11 @@ pub struct SystemCandidateBacking {
     pub allocation: AllocationLease,
     /// Outgoing dependencies to other system SCCs. They become counted leases
     /// atomically when the whole initialization batch becomes Ready.
-    pub dependency_names: Vec<DependencyName>,
-    /// Empty storage pre-reserved for `dependency_names`, so the Ready
+    pub dependency_keys: Vec<DependencyName>,
+    /// Empty storage pre-reserved for `dependency_keys`, so the Ready
     /// transition and lease minting do not allocate under the registry lock.
     pub dependencies: Vec<SystemDsoLease>,
-    /// Every SONAME in this candidate's system SCC. Internal SCC edges are
+    /// Every canonical path key in this candidate's system SCC. Internal edges are
     /// structural and do not mint self-sustaining leases.
     pub scc_members: Vec<DependencyName>,
     /// Cached/unloadable policy captured from the immutable system catalog.
@@ -225,7 +211,7 @@ impl SystemBatchWait {
     }
 }
 
-/// Per-`(domain, soname)` construction state (§13.2).
+/// Per-`(domain, canonical path)` construction state (§13.2).
 ///
 /// `Unloading` hides every member of an SCC while its worker runs fini and
 /// releases backing memory. `Initializing`
@@ -244,7 +230,7 @@ enum InstanceState {
         descriptor: PublishedImageDescriptor,
         fini_plan: FiniPlan,
         allocation: AllocationLease,
-        dependency_names: Vec<DependencyName>,
+        dependency_keys: Vec<DependencyName>,
         dependencies: Vec<SystemDsoLease>,
         scc_members: Vec<DependencyName>,
         keep_cached: bool,
@@ -272,7 +258,7 @@ enum InstanceState {
         descriptor: PublishedImageDescriptor,
         fini_plan: FiniPlan,
         allocation: AllocationLease,
-        dependency_names: Vec<DependencyName>,
+        dependency_keys: Vec<DependencyName>,
         dependencies: Vec<SystemDsoLease>,
         scc_members: Vec<DependencyName>,
         keep_cached: bool,
@@ -281,13 +267,9 @@ enum InstanceState {
 
 struct Slot {
     domain: LinkDomainId,
-    soname: DependencyName,
+    key: DependencyName,
     generation: u32,
     state: InstanceState,
-    /// Resolution signal: bumped (and its waiters woken) whenever the slot
-    /// leaves an in-flight state for a re-acquirable one (`Vacant`
-    /// or `Ready`). Waiters key off this atom's stable heap address.
-    waiter: Arc<AtomicUsize>,
 }
 
 struct Inner {
@@ -328,71 +310,6 @@ impl SystemDsoRegistry {
         }
     }
 
-    /// Request `soname` in `domain` (§13.3).
-    ///
-    /// Vacant → `Permit` (the sole publication authority for a fresh
-    /// generation); `Ready` → `Lease` (counter incremented, no re-map);
-    /// otherwise → `Pending(current_generation)`.
-    pub fn acquire_or_begin_load(
-        &self,
-        domain: LinkDomainId,
-        soname: DependencyName,
-    ) -> AcquireOutcome {
-        let mut inner = self.inner.lock();
-        let index = ensure_slot(&mut inner.slots, domain, soname.clone());
-        // A failed constructor batch never publishes a descriptor: the slot
-        // re-opens for a generation+1 retry and the failed backing is
-        // retained for the C31-d worker (§8.3).
-        if matches!(inner.slots[index].state, InstanceState::Failed { .. }) {
-            let failed = core::mem::replace(&mut inner.slots[index].state, InstanceState::Vacant);
-            if let InstanceState::Failed { allocation, .. } = failed {
-                inner.failed_backings.push(allocation);
-            }
-            let slot = &mut inner.slots[index];
-            slot.generation = slot.generation.wrapping_add(1);
-            slot.state = InstanceState::Loading;
-            return AcquireOutcome::Permit(LoadPermit {
-                inner: Arc::clone(&self.inner),
-                slot: index,
-                generation: slot.generation,
-                armed: true,
-            });
-        }
-        let slot = &mut inner.slots[index];
-        match &mut slot.state {
-            InstanceState::Vacant => {
-                slot.generation = slot.generation.wrapping_add(1);
-                slot.state = InstanceState::Loading;
-                AcquireOutcome::Permit(LoadPermit {
-                    inner: Arc::clone(&self.inner),
-                    slot: index,
-                    generation: slot.generation,
-                    armed: true,
-                })
-            }
-            InstanceState::Ready { leases, .. } => {
-                *leases = leases.saturating_add(1);
-                AcquireOutcome::Lease(SystemDsoLease {
-                    inner: Arc::clone(&self.inner),
-                    slot: index,
-                    generation: slot.generation,
-                    domain: slot.domain,
-                    soname: slot.soname.clone(),
-                })
-            }
-            InstanceState::Loading
-            | InstanceState::Relocated
-            | InstanceState::Initializing { .. }
-            | InstanceState::Unloading => AcquireOutcome::Pending(WaitHandle {
-                generation: slot.generation,
-                observed: slot.waiter.load(Ordering::Acquire),
-                signal: Arc::clone(&slot.waiter),
-            }),
-            // Hoisted before the match.
-            InstanceState::Failed { .. } => unreachable!("Failed hoisted before the match"),
-        }
-    }
-
     /// Atomically acquire the whole declared system closure (C30, §7.3).
     ///
     /// Every slot must be re-acquirable — `Vacant` or `Ready` — in which case
@@ -405,15 +322,15 @@ impl SystemDsoRegistry {
     pub fn acquire_batch(
         &self,
         domain: LinkDomainId,
-        sonames: &[DependencyName],
+        keys: &[DependencyName],
     ) -> AcquireBatchOutcome {
         let mut inner = self.inner.lock();
-        // Deterministic order: SONAME byte order, de-duplicated (§7.3).
-        let mut ordered: Vec<DependencyName> = sonames.to_vec();
+        // Deterministic canonical-path byte order, de-duplicated (§7.3).
+        let mut ordered: Vec<DependencyName> = keys.to_vec();
         ordered.sort();
         ordered.dedup();
-        for soname in &ordered {
-            let index = ensure_slot(&mut inner.slots, domain, soname.clone());
+        for key in &ordered {
+            let index = ensure_slot(&mut inner.slots, domain, key.clone());
             match inner.slots[index].state {
                 InstanceState::Vacant | InstanceState::Ready { .. } => {}
                 InstanceState::Failed { .. } => {}
@@ -430,8 +347,8 @@ impl SystemDsoRegistry {
         }
         let mut loads = Vec::new();
         let mut imports = Vec::new();
-        for soname in ordered {
-            let index = ensure_slot(&mut inner.slots, domain, soname.clone());
+        for key in ordered {
+            let index = ensure_slot(&mut inner.slots, domain, key.clone());
             if matches!(inner.slots[index].state, InstanceState::Failed { .. }) {
                 // Retryable like `Vacant`: retain the failed backing for the
                 // C31-d worker and mint the next generation.
@@ -447,7 +364,7 @@ impl SystemDsoRegistry {
                     slot.generation = slot.generation.wrapping_add(1);
                     slot.state = InstanceState::Loading;
                     loads.push((
-                        soname,
+                        key,
                         LoadPermit {
                             inner: Arc::clone(&self.inner),
                             slot: index,
@@ -461,13 +378,13 @@ impl SystemDsoRegistry {
                 } => {
                     *leases = leases.saturating_add(1);
                     imports.push((
-                        soname,
+                        key,
                         SystemDsoLease {
                             inner: Arc::clone(&self.inner),
                             slot: index,
                             generation: slot.generation,
                             domain: slot.domain,
-                            soname: slot.soname.clone(),
+                            key: slot.key.clone(),
                         },
                         descriptor.clone(),
                     ));
@@ -486,7 +403,6 @@ impl SystemDsoRegistry {
         let (inner, slot, generation) = permit.consume();
         {
             let mut guard = inner.lock();
-            let resolution = Arc::clone(&guard.resolution);
             let instance = guard.slots.get_mut(slot).ok_or_else(stale_error)?;
             if instance.generation != generation {
                 return Err(stale_error());
@@ -495,9 +411,6 @@ impl SystemDsoRegistry {
                 InstanceState::Loading => instance.state = InstanceState::Relocated,
                 _ => return Err(stale_error()),
             }
-            // The slot left an in-flight state for a resolvable one; wake
-            // per-slot and registry-wide waiters.
-            wake_waiters(&instance.waiter, &resolution);
         }
         Ok(RelocatedPermit {
             inner,
@@ -546,7 +459,7 @@ impl SystemDsoRegistry {
                             descriptor: backing.descriptor,
                             fini_plan: backing.fini_plan,
                             allocation: backing.allocation,
-                            dependency_names: backing.dependency_names,
+                            dependency_keys: backing.dependency_keys,
                             dependencies: backing.dependencies,
                             scc_members: backing.scc_members,
                             keep_cached: backing.keep_cached,
@@ -594,22 +507,22 @@ impl SystemDsoRegistry {
                 return Err(stale_error());
             }
             let InstanceState::Initializing {
-                dependency_names,
+                dependency_keys,
                 dependencies,
                 ..
             } = &instance.state
             else {
                 return Err(stale_error());
             };
-            if dependencies.capacity() < dependency_names.len() {
+            if dependencies.capacity() < dependency_keys.len() {
                 return Err(registry_oom());
             }
-            for dependency in dependency_names {
+            for dependency in dependency_keys {
                 let provider = guard
                     .slots
                     .iter()
                     .find(|provider| {
-                        provider.domain == instance.domain && &provider.soname == dependency
+                        provider.domain == instance.domain && &provider.key == dependency
                     })
                     .ok_or_else(stale_error)?;
                 match &provider.state {
@@ -640,7 +553,7 @@ impl SystemDsoRegistry {
                     descriptor,
                     fini_plan,
                     allocation,
-                    dependency_names,
+                    dependency_keys,
                     dependencies,
                     scc_members,
                     keep_cached,
@@ -654,13 +567,13 @@ impl SystemDsoRegistry {
                         scc_members,
                         keep_cached,
                     };
-                    pending_dependencies.push((*slot, dependency_names));
+                    pending_dependencies.push((*slot, dependency_keys));
                     leases.push(SystemDsoLease {
                         inner: Arc::clone(&inner),
                         slot: *slot,
                         generation: *generation,
                         domain: instance.domain,
-                        soname: instance.soname.clone(),
+                        key: instance.key.clone(),
                     });
                 }
                 _ => return Err(stale_error()),
@@ -670,14 +583,13 @@ impl SystemDsoRegistry {
         // All candidates are now Ready under the same lock hold. Mint one
         // retained lease for each outgoing cross-SCC edge and attach it to the
         // source instance. Internal SCC edges were removed by the loader.
-        for (source_slot, dependency_names) in pending_dependencies {
-            for soname in dependency_names {
+        for (source_slot, dependency_keys) in pending_dependencies {
+            for key in dependency_keys {
                 let provider_slot = guard
                     .slots
                     .iter()
                     .position(|provider| {
-                        provider.domain == guard.slots[source_slot].domain
-                            && provider.soname == soname
+                        provider.domain == guard.slots[source_slot].domain && provider.key == key
                     })
                     .ok_or_else(stale_error)?;
                 let (domain, generation) = {
@@ -693,7 +605,7 @@ impl SystemDsoRegistry {
                     slot: provider_slot,
                     generation,
                     domain,
-                    soname,
+                    key,
                 };
                 let InstanceState::Ready { dependencies, .. } = &mut guard.slots[source_slot].state
                 else {
@@ -703,7 +615,7 @@ impl SystemDsoRegistry {
             }
         }
         for slot in &slots {
-            wake_waiters(&guard.slots[*slot].waiter, &resolution);
+            wake_waiters(&resolution);
         }
         drop(guard);
         Ok(leases)
@@ -729,7 +641,7 @@ impl SystemDsoRegistry {
                     descriptor,
                     fini_plan,
                     allocation,
-                    dependency_names,
+                    dependency_keys,
                     dependencies,
                     scc_members,
                     keep_cached,
@@ -738,7 +650,7 @@ impl SystemDsoRegistry {
                         descriptor,
                         fini_plan,
                         allocation,
-                        dependency_names,
+                        dependency_keys,
                         dependencies,
                         scc_members,
                         keep_cached,
@@ -748,11 +660,11 @@ impl SystemDsoRegistry {
                     instance.state = InstanceState::Vacant;
                 }
             }
-            wake_waiters(&instance.waiter, &resolution);
+            wake_waiters(&resolution);
         }
     }
 
-    /// Resolve the zero-user SCC containing `soname` once the reaper has
+    /// Resolve the zero-user SCC containing `key` once the reaper has
     /// quiescence evidence (§13.3, C31-d §8.5).
     ///
     /// Every member must be Ready with zero counted leases. If any member is
@@ -762,14 +674,14 @@ impl SystemDsoRegistry {
     pub fn resolve_quiescence(
         &self,
         domain: LinkDomainId,
-        soname: &DependencyName,
+        key: &DependencyName,
         keep_cached: bool,
     ) -> Option<QuiescenceResolution> {
         let mut inner = self.inner.lock();
         let index = inner
             .slots
             .iter()
-            .position(|s| s.domain == domain && &s.soname == soname)?;
+            .position(|slot| slot.domain == domain && &slot.key == key)?;
         let InstanceState::Ready {
             leases: 0,
             scc_members,
@@ -786,7 +698,7 @@ impl SystemDsoRegistry {
             let member_index = inner
                 .slots
                 .iter()
-                .position(|slot| slot.domain == domain && &slot.soname == member)?;
+                .position(|slot| slot.domain == domain && &slot.key == member)?;
             if !members.contains(&member_index) {
                 members.push(member_index);
             }
@@ -835,7 +747,7 @@ impl SystemDsoRegistry {
             slots.push(member);
             generations.push(slot.generation);
             backings.push(SystemUnloadBacking {
-                soname: slot.soname.clone(),
+                key: slot.key.clone(),
                 allocation,
                 fini_plan,
                 dependencies,
@@ -869,7 +781,7 @@ impl SystemDsoRegistry {
         for slot in core::mem::take(&mut batch.slots) {
             let instance = &mut inner.slots[slot];
             instance.state = InstanceState::Vacant;
-            wake_waiters(&instance.waiter, &resolution);
+            wake_waiters(&resolution);
         }
         Ok(())
     }
@@ -881,23 +793,23 @@ impl SystemDsoRegistry {
         core::mem::take(&mut inner.failed_backings)
     }
 
-    /// The current generation of `soname` in `domain`, if any.
-    pub fn generation(&self, domain: LinkDomainId, soname: &DependencyName) -> Option<u32> {
+    /// The current generation of `key` in `domain`, if any.
+    pub fn generation(&self, domain: LinkDomainId, key: &DependencyName) -> Option<u32> {
         let inner = self.inner.lock();
         inner
             .slots
             .iter()
-            .find(|s| s.domain == domain && &s.soname == soname)
+            .find(|slot| slot.domain == domain && &slot.key == key)
             .map(|s| s.generation)
     }
 
     /// The number of live leases on a Ready instance (0 if not Ready).
-    pub fn lease_count(&self, domain: LinkDomainId, soname: &DependencyName) -> Option<usize> {
+    pub fn lease_count(&self, domain: LinkDomainId, key: &DependencyName) -> Option<usize> {
         let inner = self.inner.lock();
         inner
             .slots
             .iter()
-            .find(|s| s.domain == domain && &s.soname == soname)
+            .find(|slot| slot.domain == domain && &slot.key == key)
             .map(|s| match &s.state {
                 InstanceState::Ready { leases, .. } => *leases,
                 _ => 0,
@@ -909,13 +821,13 @@ impl SystemDsoRegistry {
     pub fn descriptor(
         &self,
         domain: LinkDomainId,
-        soname: &DependencyName,
+        key: &DependencyName,
     ) -> Option<PublishedImageDescriptor> {
         let inner = self.inner.lock();
         let slot = inner
             .slots
             .iter()
-            .find(|s| s.domain == domain && &s.soname == soname)?;
+            .find(|slot| slot.domain == domain && &slot.key == key)?;
         match &slot.state {
             InstanceState::Ready { descriptor, .. } => Some(descriptor.clone()),
             _ => None,
@@ -923,12 +835,12 @@ impl SystemDsoRegistry {
     }
 
     /// A clone of the retained fini plan for a Ready instance, for the reaper.
-    pub fn fini_plan(&self, domain: LinkDomainId, soname: &DependencyName) -> Option<FiniPlan> {
+    pub fn fini_plan(&self, domain: LinkDomainId, key: &DependencyName) -> Option<FiniPlan> {
         let inner = self.inner.lock();
         let slot = inner
             .slots
             .iter()
-            .find(|s| s.domain == domain && &s.soname == soname)?;
+            .find(|slot| slot.domain == domain && &slot.key == key)?;
         match &slot.state {
             InstanceState::Ready { fini_plan, .. } => Some(fini_plan.clone()),
             _ => None,
@@ -976,9 +888,8 @@ impl Drop for LoadPermit {
                 return;
             }
             slot.state = InstanceState::Vacant;
-            // Cancelling back to `Vacant` makes the slot re-acquirable: wake
-            // any waiter blocked on this in-flight generation (§13.5).
-            wake_waiters(&slot.waiter, &resolution);
+            // Cancelling back to `Vacant` makes the slot re-acquirable.
+            wake_waiters(&resolution);
         }
     }
 }
@@ -1018,7 +929,7 @@ impl Drop for RelocatedPermit {
                 return;
             }
             slot.state = InstanceState::Vacant;
-            wake_waiters(&slot.waiter, &resolution);
+            wake_waiters(&resolution);
         }
     }
 }
@@ -1037,7 +948,7 @@ pub struct SystemDsoLease {
     slot: usize,
     generation: u32,
     domain: LinkDomainId,
-    soname: DependencyName,
+    key: DependencyName,
 }
 
 impl SystemDsoLease {
@@ -1048,10 +959,10 @@ impl SystemDsoLease {
         self.domain
     }
 
-    /// The SONAME this lease was minted for (§16.4).
+    /// The canonical system catalog path key this lease was minted for.
     #[inline]
-    pub fn soname(&self) -> &DependencyName {
-        &self.soname
+    pub fn key(&self) -> &DependencyName {
+        &self.key
     }
 }
 
@@ -1071,79 +982,28 @@ impl Drop for SystemDsoLease {
     }
 }
 
-/// A waiter blocked on an in-flight generation (§13.3).
-///
-/// A resolver that receives [`AcquireOutcome::Pending`] holds this handle and
-/// calls [`WaitHandle::wait`] *outside* any loader-memory or manager lock. The
-/// handle records both the generation it observed and the resolution-signal
-/// epoch current at mint time, so a wake that resolves a *different* generation
-/// is still safe: after unblocking, the resolver simply re-requests and observes
-/// the current state rather than trusting a stale result.
-pub struct WaitHandle {
-    generation: u32,
-    /// Signal epoch captured while the generation was still in flight. `wait`
-    /// blocks until the signal moves past this value.
-    observed: usize,
-    signal: Arc<AtomicUsize>,
-}
-
-impl WaitHandle {
-    /// The generation that was mid-construction when this handle was minted.
-    #[inline]
-    pub const fn generation(&self) -> u32 {
-        self.generation
-    }
-
-    /// Block until the in-flight generation resolves (the slot becomes `Vacant`
-    /// or `Ready`), then return so the caller can re-acquire.
-    ///
-    /// The waiter sleeps while the resolution signal is unchanged and returns
-    /// once a [`wake_waiters`] bump moves it past the observed epoch. A spurious
-    /// or stale wake only causes a harmless re-check: `atomic_wait` re-validates
-    /// under the wait-queue lock, so a bump racing this check is observed as
-    /// `EAGAIN` and re-looped rather than lost.
-    pub fn wait(&self) {
-        loop {
-            let current = self.signal.load(Ordering::Acquire);
-            if current != self.observed {
-                break;
-            }
-            let _ = atomic_wait(&self.signal, current, Tick::MAX);
-        }
-    }
-}
-
-/// Bump a slot's resolution signal and wake every waiter blocked on it (§13.5).
-///
-/// The bump happens-before the wake so a waiter that has not yet slept observes
-/// the new value via `atomic_wait`'s re-check and returns immediately, while a
-/// sleeping waiter is woken and re-checks the same way.
 fn registry_oom() -> LoadError {
     LoadError::new(LoadErrorKind::OutOfMemory, ErrorContext::None)
 }
 
-fn wake_waiters(signal: &AtomicUsize, resolution: &AtomicUsize) {
-    signal.fetch_add(1, Ordering::Release);
-    let _ = atomic_wake(signal, usize::MAX);
-    // The registry-wide epoch moves too so batch waiters re-check the whole
-    // set (§7.3).
+/// Bump the registry-wide resolution epoch and wake every batch waiter.
+fn wake_waiters(resolution: &AtomicUsize) {
     resolution.fetch_add(1, Ordering::Release);
     let _ = atomic_wake(resolution, usize::MAX);
 }
 
-fn ensure_slot(slots: &mut Vec<Slot>, domain: LinkDomainId, soname: DependencyName) -> usize {
+fn ensure_slot(slots: &mut Vec<Slot>, domain: LinkDomainId, key: DependencyName) -> usize {
     if let Some(index) = slots
         .iter()
-        .position(|s| s.domain == domain && s.soname == soname)
+        .position(|slot| slot.domain == domain && slot.key == key)
     {
         return index;
     }
     slots.push(Slot {
         domain,
-        soname,
+        key,
         generation: 0,
         state: InstanceState::Vacant,
-        waiter: Arc::new(AtomicUsize::new(0)),
     });
     slots.len() - 1
 }
@@ -1157,111 +1017,76 @@ mod tests {
     use super::*;
     use blueos_test_macro::test;
 
-    fn name(bytes: &[u8]) -> DependencyName {
-        DependencyName::from_terminated(bytes).expect("valid soname")
+    fn key(path: &[u8]) -> DependencyName {
+        DependencyName::from_bytes(path).expect("valid system path")
     }
 
     #[test]
-    fn vacant_slot_grants_a_single_permit_then_pends() {
+    fn vacant_batch_grants_one_permit_per_key() {
         let registry = SystemDsoRegistry::new();
         let domain = LinkDomainId::new(7);
-        let soname = name(b"libc.so.1\0");
-
-        let first = registry.acquire_or_begin_load(domain, soname.clone());
-        assert!(matches!(first, AcquireOutcome::Permit(_)));
-        // A second request while Loading must not mint a second permit.
-        let AcquireOutcome::Pending(handle) =
-            registry.acquire_or_begin_load(domain, soname.clone())
+        let libc = key(b"/system/lib/libc.so.1");
+        let other = key(b"/system/lib/libother.so.1");
+        let AcquireBatchOutcome::Acquired(batch) =
+            registry.acquire_batch(domain, &[other.clone(), libc.clone(), libc.clone()])
         else {
-            panic!("expected pending");
+            panic!("expected acquired batch");
         };
-        assert_eq!(handle.generation(), 1);
-        // The permit is the sole publication authority for generation 1.
-        assert_eq!(registry.generation(domain, &soname), Some(1));
+        assert_eq!(batch.loads.len(), 2);
+        assert!(batch.imports.is_empty());
+        assert_eq!(registry.generation(domain, &libc), Some(1));
+        assert_eq!(registry.generation(domain, &other), Some(1));
     }
 
     #[test]
-    fn dropping_an_armed_permit_returns_to_vacant() {
+    fn in_flight_slot_pends_the_whole_batch_without_partial_acquire() {
         let registry = SystemDsoRegistry::new();
         let domain = LinkDomainId::new(7);
-        let soname = name(b"libc.so.1\0");
-
-        let AcquireOutcome::Permit(permit) = registry.acquire_or_begin_load(domain, soname.clone())
+        let libc = key(b"/system/lib/libc.so.1");
+        let other = key(b"/system/lib/libother.so.1");
+        let AcquireBatchOutcome::Acquired(mut first) =
+            registry.acquire_batch(domain, core::slice::from_ref(&libc))
         else {
-            panic!("expected permit");
+            panic!("expected first batch");
         };
+        let permit = first.loads.pop().expect("libc permit").1;
+        let AcquireBatchOutcome::Pending(wait) =
+            registry.acquire_batch(domain, &[libc.clone(), other.clone()])
+        else {
+            panic!("expected pending batch");
+        };
+        assert_eq!(registry.generation(domain, &other), None);
         drop(permit);
-        // Cancelled: the next request wins a fresh (bumped) generation.
-        assert!(matches!(
-            registry.acquire_or_begin_load(domain, soname.clone()),
-            AcquireOutcome::Permit(_)
-        ));
-        assert_eq!(registry.generation(domain, &soname), Some(2));
+        wait.wait();
+        let AcquireBatchOutcome::Acquired(second) =
+            registry.acquire_batch(domain, &[libc.clone(), other.clone()])
+        else {
+            panic!("expected retry batch");
+        };
+        assert_eq!(second.loads.len(), 2);
+        assert_eq!(registry.generation(domain, &libc), Some(2));
+        assert_eq!(registry.generation(domain, &other), Some(1));
     }
 
     #[test]
-    fn dropping_an_armed_relocated_permit_cancels_too() {
+    fn dropping_a_relocated_permit_reopens_the_path_key() {
         let registry = SystemDsoRegistry::new();
         let domain = LinkDomainId::new(7);
-        let soname = name(b"libc.so.1\0");
-
-        let AcquireOutcome::Permit(permit) = registry.acquire_or_begin_load(domain, soname.clone())
+        let libc = key(b"/system/lib/libc.so.1");
+        let AcquireBatchOutcome::Acquired(mut batch) =
+            registry.acquire_batch(domain, core::slice::from_ref(&libc))
         else {
-            panic!("expected permit");
+            panic!("expected batch");
         };
+        let permit = batch.loads.pop().expect("permit").1;
         let relocated = registry.publish_relocated(permit).expect("relocate");
         drop(relocated);
-        // Nothing ran: a later request wins a fresh generation.
-        assert!(matches!(
-            registry.acquire_or_begin_load(domain, soname.clone()),
-            AcquireOutcome::Permit(_)
-        ));
-        assert_eq!(registry.generation(domain, &soname), Some(2));
-    }
-
-    #[test]
-    fn pending_tracks_the_inflight_generation() {
-        let registry = SystemDsoRegistry::new();
-        let domain = LinkDomainId::new(7);
-        let soname = name(b"libc.so.1\0");
-
-        // Hold the permit so the slot stays Loading across the second request.
-        let _permit = registry.acquire_or_begin_load(domain, soname.clone());
-        let AcquireOutcome::Pending(handle) =
-            registry.acquire_or_begin_load(domain, soname.clone())
+        let AcquireBatchOutcome::Acquired(retry) =
+            registry.acquire_batch(domain, core::slice::from_ref(&libc))
         else {
-            panic!("expected pending");
+            panic!("expected retry batch");
         };
-        assert_eq!(handle.generation(), 1);
-    }
-
-    // §13.5: a permit owner that drops before publication must wake the waiter
-    // blocked on that generation. Single-threaded here, so we resolve first and
-    // then observe `wait` return immediately (the signal has already advanced
-    // past the epoch the handle observed); the sleeping path is covered by the
-    // multi-threaded QEMU integration fixtures.
-    #[test]
-    fn dropping_a_permit_wakes_a_waiting_resolver() {
-        let registry = SystemDsoRegistry::new();
-        let domain = LinkDomainId::new(7);
-        let soname = name(b"libc.so.1\0");
-
-        let AcquireOutcome::Permit(permit) = registry.acquire_or_begin_load(domain, soname.clone())
-        else {
-            panic!("expected permit");
-        };
-        let AcquireOutcome::Pending(handle) =
-            registry.acquire_or_begin_load(domain, soname.clone())
-        else {
-            panic!("expected pending");
-        };
-        drop(permit);
-        // Must not deadlock: the permit's cancellation bumped the signal.
-        handle.wait();
-        // The waiter can now re-acquire on the fresh generation.
-        assert!(matches!(
-            registry.acquire_or_begin_load(domain, soname.clone()),
-            AcquireOutcome::Permit(_)
-        ));
+        assert_eq!(retry.loads.len(), 1);
+        assert_eq!(registry.generation(domain, &libc), Some(2));
     }
 }

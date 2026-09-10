@@ -17,17 +17,18 @@
 //! The catalog is the board/product-provided mapping between the names plain
 //! `DT_NEEDED` requests search for and the on-device DSO paths. Since the
 //! namespace replacement (§5/§6 of the plan) a DSO may omit `DT_SONAME`, so
-//! the entry's name and path are independent keys: `resolve_name` serves
+//! the entry's lookup name and path are independent: `resolve_name` serves
 //! plain-name lookups, `resolve_path` decides whether a path-resolved
 //! dependency is a shared system DSO (the normalized catalog path is the
-//! registry key). `resolve` keeps the legacy SONAME-keyed spelling for
-//! current callers until step 4 re-keys the registry.
+//! registry key). Neither operation depends on the ELF carrying `DT_SONAME`.
+
+use blueos_loader::{DependencyName, LoadResult};
 
 /// One fixed mapping from a system lookup name to its on-device path.
 #[derive(Clone, Copy, Debug)]
 pub struct SystemLibraryEntry {
-    /// The `DT_SONAME` byte name, e.g. `b"libc.so.1"`, without a NUL.
-    pub soname: &'static [u8],
+    /// The plain lookup name, e.g. `b"libc.so.1"`, without a NUL.
+    pub lookup_name: &'static [u8],
     /// Absolute device path of the DSO, e.g. `"/system/lib/libc.so.1"`.
     pub path: &'static str,
     /// Expected build-id bytes when policy requires one; `None` accepts any
@@ -40,6 +41,14 @@ pub struct SystemLibraryEntry {
     /// it. Only set `false` for DSOs with no kernel callbacks or escaped
     /// function pointers.
     pub keep_cached: bool,
+}
+
+impl SystemLibraryEntry {
+    /// The canonical registry key. System instances are keyed by catalog path,
+    /// not by optional ELF `DT_SONAME` metadata.
+    pub fn key(&self) -> LoadResult<DependencyName> {
+        DependencyName::from_bytes(self.path.as_bytes())
+    }
 }
 
 /// A fixed, board/product-configured system library catalog.
@@ -60,7 +69,7 @@ impl SystemLibraryPaths {
     /// Look up a plain dependency name (a `DT_NEEDED` string without path
     /// separators) by exact, case-sensitive comparison (§4.3 step 2).
     pub fn resolve_name(&self, name: &[u8]) -> Option<&'static SystemLibraryEntry> {
-        self.entries.iter().find(|entry| entry.soname == name)
+        self.entries.iter().find(|entry| entry.lookup_name == name)
     }
 
     /// Look up an entry by its normalized absolute device path (§4.1 rule 2):
@@ -71,10 +80,8 @@ impl SystemLibraryPaths {
         self.entries.iter().find(|entry| entry.path == path)
     }
 
-    /// Look up a `DT_NEEDED`/`DT_SONAME` byte name by exact, case-sensitive
-    /// comparison. Returns `None` when the name is not in the catalog, which
-    /// the resolver treats as an unresolved system dependency (§12.2).
-    pub fn resolve(&self, soname: &[u8]) -> Option<&'static SystemLibraryEntry> {
-        self.resolve_name(soname)
+    /// Look up an entry from its canonical registry key.
+    pub fn resolve_key(&self, key: &DependencyName) -> Option<&'static SystemLibraryEntry> {
+        self.resolve_path(core::str::from_utf8(key.as_bytes()).ok()?)
     }
 }

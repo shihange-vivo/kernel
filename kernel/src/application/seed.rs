@@ -114,17 +114,12 @@ pub fn install() {
     seed_file("/system/lib/libscope_sys.so.1", unsafe {
         blob(&__bk_seed_scope_sys_start, &__bk_seed_scope_sys_end)
     });
-    // C30 §6.1: the built-in application packages (root + private DSOs) are
-    // seeded from their manifest-listed paths.
-    for package in crate::application::package::packages() {
-        for entry in core::iter::once(&package.root).chain(package.private_images.iter().copied()) {
-            // SAFETY: the catalog's blob pairs bound the same linker-emitted
-            // artifact bytes the build embedded for this board.
-            if let Some(bytes) = unsafe { crate::application::package::image_blob(entry.path) } {
-                seed_file(entry.path, bytes);
-            } else {
-                log::error!("boot seed: package blob missing for {}", entry.path);
-            }
-        }
+    // Bundle layouts are installation data only: they say which embedded
+    // artifact is copied to which VFS path. Runtime dependency discovery does
+    // not consume this catalog.
+    for entry in boot_seed_catalog::FILES {
+        // SAFETY: the generated function bounds the matching linker-emitted
+        // `.bk_seed` blob pair.
+        seed_file(entry.path, unsafe { entry.bytes() });
     }
 }

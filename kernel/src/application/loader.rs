@@ -20,8 +20,8 @@
 //! → freeze_scopes → relocate → seal → publish` sequence (§12.1), hands the
 //! resolver's accumulated registry authority to the kernel link publisher, and
 //! — once `publish` returns the committed [`LinkProduct`] — advances every
-//! first-loading system candidate through the registry to `Ready` by SONAME
-//! match (§13.3).
+//! first-loading system candidate through the registry to `Ready` by its
+//! canonical catalog path (§13.3).
 //!
 //! The loader is a cloneable handle: it keeps the fixed catalog, the shared
 //! registry and the shared-flat memory service, and mints a fresh linker,
@@ -35,9 +35,9 @@
 use alloc::vec::Vec;
 
 use blueos_loader::{
-    AllocationLease, ArchitectureCodeCache, CacheRequirements, DependencyName, DynamicLinker,
-    ImageOwnership, LinkDomainId, LinkProduct, LoadError, LoadErrorKind, LoadProfile, LoadResult,
-    ResolvedArtifact, SessionLimits,
+    AllocationLease, ArchitectureCodeCache, ArtifactIdentity, CacheRequirements, DependencyName,
+    DynamicLinker, ImageOwnership, LinkDomainId, LinkProduct, LoadError, LoadErrorKind,
+    LoadProfile, LoadResult, SessionLimits,
 };
 
 #[cfg(target_arch = "aarch64")]
@@ -49,21 +49,15 @@ use blueos_loader::Riscv32Relocator as PlatformRelocator;
 #[cfg(target_arch = "riscv64")]
 use blueos_loader::Riscv64Relocator as PlatformRelocator;
 
-use crate::{
-    application::{
-        adapters::{
-            resolver::{
-                identity_from_snapshot, ApplicationArtifactResolver, ResolverAuthorities,
-                SystemCandidatePermit,
-            },
-            system_paths::SystemLibraryPaths,
-            vfs_reader::VfsElfReader,
-        },
-        group::ThreadGroup,
-        publication::{KernelLinkPublisher, KernelLinkReceipt},
-        registry::{SystemCandidateBacking, SystemDsoRegistry, SystemInitBatch},
+use crate::application::{
+    adapters::{
+        resolver::{NamespaceArtifactResolver, ResolverAuthorities, SystemCandidatePermit},
+        system_paths::SystemLibraryPaths,
     },
-    vfs::open_path,
+    group::ThreadGroup,
+    planner::NamespaceLoadPlan,
+    publication::{KernelLinkPublisher, KernelLinkReceipt},
+    registry::{SystemCandidateBacking, SystemDsoRegistry, SystemInitBatch},
 };
 
 /// A cloneable handle that links a dynamic application against the shared-flat
@@ -99,32 +93,15 @@ impl ApplicationLoader {
         &self.registry
     }
 
+    pub fn catalog(&self) -> &'static SystemLibraryPaths {
+        self.catalog
+    }
+
     pub fn memory(&self) -> &crate::application::adapters::flat_memory::FlatImageMemory {
         &self.memory
     }
 
-    /// Open `path`, freeze its snapshot and derive the session-private root
-    /// artifact identity from that same snapshot (§12.2). The root is always
-    /// [`ImageOwnership::SessionPrivate`]; system candidates are produced only
-    /// by the resolver during dependency closure.
-    pub fn open_root(
-        &self,
-        path: &str,
-        build_id: Option<&'static [u8]>,
-    ) -> LoadResult<ResolvedArtifact<VfsElfReader>> {
-        let file = open_path(path, libc::O_RDONLY, 0).map_err(|_| loader_error())?;
-        let reader = VfsElfReader::new(file);
-        let snapshot = reader.snapshot_id();
-        let identity = identity_from_snapshot(snapshot, build_id);
-        Ok(ResolvedArtifact::new(
-            identity,
-            ImageOwnership::SessionPrivate,
-            reader,
-        ))
-    }
-
-    /// Run a complete staged link of `root` under `profile` into `group`, then
-    /// advance every first-loading system candidate to `Ready` (§12.1, §15.1).
+    /// Link a pre-scanned namespace plan under `profile` into `group`.
     ///
     /// The returned [`LinkProduct`] is fully committed and carries the receipt
     /// that owns every raw allocation lease; the caller installs it into the
@@ -133,54 +110,13 @@ impl ApplicationLoader {
     /// permits/leases drop, cancelling the load (§13.5).
     pub fn link(
         &self,
-        root: ResolvedArtifact<VfsElfReader>,
+        plan: NamespaceLoadPlan,
         profile: LoadProfile,
         group: &ThreadGroup,
     ) -> LoadResult<LinkProduct<KernelLinkReceipt>> {
-        let resolver = ApplicationArtifactResolver::new(self.catalog, self.registry.clone());
-        self.link_with(root, profile, group, resolver)
-    }
-
-    /// Link a manifest-closed application package (C30, §7.2): the composite
-    /// resolver follows the package manifest's private edges and consumes the
-    /// atomically acquired system batch.
-    #[cfg(boot_dynamic_seed)]
-    pub fn link_package(
-        &self,
-        root: ResolvedArtifact<VfsElfReader>,
-        package: &'static crate::application::package::ApplicationPackageManifest,
-        profile: LoadProfile,
-        group: &ThreadGroup,
-    ) -> LoadResult<LinkProduct<KernelLinkReceipt>> {
-        let root_identity = root.identity().clone();
-        let resolver =
-            crate::application::adapters::package_resolver::PackageArtifactResolver::new(
-                package,
-                self.catalog,
-                self.registry.clone(),
-                &root_identity,
-                self.domain,
-            )?;
-        self.link_with(root, profile, group, resolver)
-    }
-
-    /// The shared staged-link pipeline: begin, close the dependency closure
-    /// through `resolver`, freeze scopes, relocate, seal and publish, then
-    /// advance every first-loading system candidate to `Ready` (§12.1, §15.1).
-    fn link_with<Resolver>(
-        &self,
-        root: ResolvedArtifact<VfsElfReader>,
-        profile: LoadProfile,
-        group: &ThreadGroup,
-        mut resolver: Resolver,
-    ) -> LoadResult<LinkProduct<KernelLinkReceipt>>
-    where
-        Resolver: blueos_loader::ArtifactResolver<Reader = VfsElfReader> + ResolverFinish,
-    {
-        // The package-selected LoadProfile and the relocator must describe the
-        // same machine/class. DynamicLinker::begin enforces that pairing, so a
-        // foreign package fails before mapping even if its manifest was
-        // accidentally included in this board image.
+        let mut resolver =
+            NamespaceArtifactResolver::new(plan, self.registry.clone(), self.domain)?;
+        let root = resolver.root_artifact()?;
         let linker = DynamicLinker::new(PlatformRelocator);
         let mut memory = self.memory.clone();
         let mut cache = ArchitectureCodeCache::new(CacheRequirements::CURRENT_EXECUTION_CONTEXT);
@@ -194,7 +130,11 @@ impl ApplicationLoader {
             &mut memory,
         )?;
         building.close_dependencies(&mut resolver)?;
-        let ResolverAuthorities { permits, leases } = resolver.finish();
+        let ResolverAuthorities {
+            permits,
+            leases,
+            system_images,
+        } = resolver.finish_resolution();
         publisher.import_leases(leases);
 
         let mut product = building
@@ -206,7 +146,7 @@ impl ApplicationLoader {
         // C31-c (§8.3): publish the whole system batch as Initializing and
         // hand the token to the group; ApplicationInitComplete advances it
         // to Ready (or the group's early exit fails it).
-        let batch = self.hand_off(permits, &mut product)?;
+        let batch = self.hand_off(permits, &system_images, &mut product)?;
         group
             .install_pending_system_batch(batch)
             .map_err(|_| loader_error())?;
@@ -223,29 +163,23 @@ impl ApplicationLoader {
     fn hand_off(
         &self,
         permits: Vec<SystemCandidatePermit>,
+        system_images: &[(ArtifactIdentity, DependencyName)],
         product: &mut LinkProduct<KernelLinkReceipt>,
     ) -> LoadResult<SystemInitBatch> {
         // The receipt's raw system allocations are ordered by image id
         // (commit_batch partitions the link map in id order); pair each with
-        // its candidate's SONAME for the permit match below.
+        // its candidate identity for the permit match below. A DSO need not
+        // carry `DT_SONAME`, so publication must not use it as identity.
         let allocations = product.publication_mut().take_system_allocations();
-        let mut allocations_by_soname: Vec<(DependencyName, AllocationLease)> = product
+        let mut allocations_by_identity: Vec<(ArtifactIdentity, AllocationLease)> = product
             .context()
             .images()
             .iter()
             .filter(|image| image.descriptor().ownership() == ImageOwnership::SystemCandidate)
-            .map(|image| {
-                image
-                    .descriptor()
-                    .soname()
-                    .cloned()
-                    .ok_or_else(loader_error)
-            })
-            .collect::<LoadResult<Vec<_>>>()?
-            .into_iter()
+            .map(|image| image.descriptor().identity().clone())
             .zip(allocations)
             .collect();
-        if permits.len() != allocations_by_soname.len() {
+        if permits.len() != allocations_by_identity.len() {
             return Err(loader_error());
         }
 
@@ -258,18 +192,18 @@ impl ApplicationLoader {
             .try_reserve(permits.len())
             .map_err(|_| loader_error())?;
         for candidate in permits {
-            let allocation_index = allocations_by_soname
+            let allocation_index = allocations_by_identity
                 .iter()
-                .position(|(soname, _)| soname == &candidate.soname)
+                .position(|(identity, _)| identity == &candidate.identity)
                 .ok_or_else(loader_error)?;
-            let (_, allocation) = allocations_by_soname.swap_remove(allocation_index);
+            let (_, allocation) = allocations_by_identity.swap_remove(allocation_index);
             let image = product
                 .context()
                 .images()
                 .iter()
                 .find(|image| {
                     image.descriptor().ownership() == ImageOwnership::SystemCandidate
-                        && image.descriptor().soname() == Some(&candidate.soname)
+                        && image.descriptor().identity() == &candidate.identity
                 })
                 .ok_or_else(loader_error)?;
             relocated.push(self.registry.publish_relocated(candidate.permit)?);
@@ -304,13 +238,10 @@ impl ApplicationLoader {
                     member_image.descriptor().ownership(),
                     ImageOwnership::SystemCandidate | ImageOwnership::ExternalReady
                 ) {
-                    scc_members.push(
-                        member_image
-                            .descriptor()
-                            .soname()
-                            .cloned()
-                            .ok_or_else(loader_error)?,
-                    );
+                    scc_members.push(system_key_for_identity(
+                        system_images,
+                        member_image.descriptor().identity(),
+                    )?);
                 }
             }
             if scc_members.is_empty() {
@@ -322,7 +253,7 @@ impl ApplicationLoader {
             // Retain one lease for every direct outgoing edge to another
             // system SCC. Edges inside this SCC are structural: turning them
             // into ordinary leases would create a self-sustaining cycle.
-            let mut dependency_names = Vec::new();
+            let mut dependency_keys = Vec::new();
             for edge in product.context().graph_edges() {
                 if edge.requester() != image.owner() || scc.contains(&edge.provider()) {
                     continue;
@@ -337,31 +268,28 @@ impl ApplicationLoader {
                     provider.descriptor().ownership(),
                     ImageOwnership::SystemCandidate | ImageOwnership::ExternalReady
                 ) {
-                    dependency_names.push(
-                        provider
-                            .descriptor()
-                            .soname()
-                            .cloned()
-                            .ok_or_else(loader_error)?,
-                    );
+                    dependency_keys.push(system_key_for_identity(
+                        system_images,
+                        provider.descriptor().identity(),
+                    )?);
                 }
             }
-            dependency_names.sort();
-            dependency_names.dedup();
+            dependency_keys.sort();
+            dependency_keys.dedup();
             let mut dependencies = Vec::new();
             dependencies
-                .try_reserve(dependency_names.len())
+                .try_reserve(dependency_keys.len())
                 .map_err(|_| loader_error())?;
             let keep_cached = self
                 .catalog
-                .resolve(candidate.soname.as_bytes())
+                .resolve_key(&candidate.key)
                 .ok_or_else(loader_error)?
                 .keep_cached;
             backings.push(SystemCandidateBacking {
                 descriptor: image.descriptor().clone(),
                 fini_plan,
                 allocation,
-                dependency_names,
+                dependency_keys,
                 dependencies,
                 scc_members,
                 keep_cached,
@@ -371,22 +299,15 @@ impl ApplicationLoader {
     }
 }
 
-/// The registry-authority hand-off both resolver flavors share (C30).
-trait ResolverFinish {
-    fn finish(&mut self) -> ResolverAuthorities;
-}
-
-impl ResolverFinish for ApplicationArtifactResolver {
-    fn finish(&mut self) -> ResolverAuthorities {
-        self.finish_resolution()
-    }
-}
-
-#[cfg(boot_dynamic_seed)]
-impl ResolverFinish for crate::application::adapters::package_resolver::PackageArtifactResolver {
-    fn finish(&mut self) -> ResolverAuthorities {
-        self.finish_resolution()
-    }
+fn system_key_for_identity(
+    system_images: &[(ArtifactIdentity, DependencyName)],
+    identity: &ArtifactIdentity,
+) -> LoadResult<DependencyName> {
+    system_images
+        .iter()
+        .find(|(candidate, _)| candidate == identity)
+        .map(|(_, key)| key.clone())
+        .ok_or_else(loader_error)
 }
 
 fn loader_error() -> LoadError {

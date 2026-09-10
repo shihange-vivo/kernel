@@ -46,6 +46,8 @@ use crate::{
             ApplicationHandle, ApplicationLaunchError, ApplicationManager, ExecutionModel,
             OwnedLaunchRequest,
         },
+        namespace::ApplicationNamespace,
+        planner::NamespaceLoadPlanner,
         reaper::ApplicationReaper,
         registry::SystemDsoRegistry,
         start_storage::ApplicationStartStorage,
@@ -141,10 +143,18 @@ impl ApplicationService {
         argv: Vec<Vec<u8>>,
         envp: Vec<Vec<u8>>,
     ) -> Result<ApplicationHandle, ApplicationLaunchError> {
-        let identity = path.as_bytes().to_vec();
+        let launch_pwd = crate::vfs::get_working_dir().get_full_path();
+        let namespace = ApplicationNamespace::from_launch_path(
+            path,
+            &launch_pwd,
+            crate::application::board_dynamic_profile(),
+            self.system_domain,
+        )
+        .ok_or(ApplicationLaunchError::PrepareFailed)?;
+        let identity = namespace.root_path().as_bytes().to_vec();
         let result = self.manager.launch(
             OwnedLaunchRequest::new(ExecutionModel::ThreadGroup, identity.clone()),
-            |group| self.prepare(group, path, &argv, &envp),
+            |group| self.prepare(group, &namespace, &argv, &envp),
         );
         // Either way the group now belongs to the deferred reaper: a live
         // group is released after its members left and its fini resolved, a
@@ -167,7 +177,7 @@ impl ApplicationService {
                 "APP_LAUNCHED handle={}:{} path={}",
                 handle.slot,
                 handle.generation,
-                path
+                namespace.root_path()
             );
         }
         result
@@ -179,7 +189,7 @@ impl ApplicationService {
     fn prepare(
         &self,
         group: &ThreadGroup,
-        path: &str,
+        namespace: &ApplicationNamespace,
         argv: &[Vec<u8>],
         envp: &[Vec<u8>],
     ) -> Result<(), ApplicationLaunchError> {
@@ -198,55 +208,18 @@ impl ApplicationService {
             })
             .collect();
 
-        // Namespace-replacement plan §3.2: capture the working directory once
-        // at launch start and resolve the (possibly relative) input against
-        // that snapshot, so a mid-load `chdir()` cannot change what the rest
-        // of this launch means. Everything downstream uses the normalized
-        // absolute `root_path`.
-        let launch_pwd = crate::vfs::get_working_dir().get_full_path();
-        let namespace = crate::application::namespace::ApplicationNamespace::from_launch_path(
-            path,
-            &launch_pwd,
-            crate::application::board_dynamic_profile(),
-            self.system_domain,
-        )
-        .ok_or(ApplicationLaunchError::PrepareFailed)?;
         let root_path = namespace.root_path();
-
-        let root = self
+        let plan = NamespaceLoadPlanner::new(
+            namespace,
+            self.loader.catalog(),
+            blueos_loader::SessionLimits::DEFAULT,
+        )
+        .plan()
+        .map_err(|error| prepare_failed("plan namespace", &error))?;
+        let product = self
             .loader
-            .open_root(root_path, None)
-            .map_err(|error| prepare_failed("open root", &error))?;
-        // C30 §7.2: a manifest-closed package links through the composite
-        // resolver (private edges + atomic system batch); any other path uses
-        // the single-app system resolver. The manifest catalog keys packages
-        // by their absolute root path, so look up the resolved `root_path`.
-        #[cfg(boot_dynamic_seed)]
-        let product = match crate::application::package::find_root(root_path) {
-            Some(package) => {
-                let profile = crate::application::package::profile_for(package)
-                    .map_err(|error| ApplicationLaunchError::PrepareFailed)?;
-                self.loader
-                    .link_package(root, package, profile, group)
-                    .map_err(|error| prepare_failed("link package", &error))?
-            }
-            None => {
-                // §9.1: the board policy picks the dynamic profile; a
-                // manifest-closed package records it, a bare application
-                // uses the board's default.
-                let profile = namespace.profile();
-                self.loader
-                    .link(root, profile, group)
-                    .map_err(|error| prepare_failed("link application", &error))?
-            }
-        };
-        #[cfg(not(boot_dynamic_seed))]
-        let product = {
-            let profile = namespace.profile();
-            self.loader
-                .link(root, profile, group)
-                .map_err(|error| prepare_failed("link application", &error))?
-        };
+            .link(plan, namespace.profile(), group)
+            .map_err(|error| prepare_failed("link application", &error))?;
 
         let handle = group
             .handle()

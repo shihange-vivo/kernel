@@ -65,7 +65,7 @@ const REAPER_POLL_MILLIS: u64 = 10;
 pub struct ApplicationReaper {
     registry: SystemDsoRegistry,
     memory: FlatImageMemory,
-    /// The fixed system library catalog, for the per-SONAME quiescence
+    /// The fixed system library catalog, for the per-path quiescence
     /// policy (C31-d, §8.5): cached forever vs. fini + unload.
     catalog: &'static SystemLibraryPaths,
     /// Every group a launch handed over — successfully or failed — waiting to
@@ -243,24 +243,23 @@ impl ApplicationReaper {
             memory.release_committed(lease);
         }
 
-        // `_system` (the first-loading raw leases) are intentionally dropped
-        // without release: Phase 1 keeps every system DSO resident so a later
-        // import reuses the same mapped instance (§13.3). Dropping the raw
-        // lease is a no-op on the backing (the allocation entry remains in the
-        // shared service); no `release_committed`/`abort_image` call happens.
+        // `_system` contains the link receipt's raw first-load handles. The
+        // registry now owns those backings, so the receipt handles are dropped
+        // without releasing memory; the registry either keeps the instance
+        // cached or hands its allocation to the quiescence worker below.
         drop(_system);
 
         let imported_dsos = system_leases.len();
         let mut quiescence: Vec<(LinkDomainId, DependencyName, bool)> = Vec::new();
         for lease in system_leases {
             let domain = lease.domain();
-            let soname = lease.soname().clone();
+            let key = lease.key().clone();
             let keep_cached = self
                 .catalog
-                .resolve(soname.as_bytes())
+                .resolve_key(&key)
                 .map(|entry| entry.keep_cached)
                 .unwrap_or(true);
-            quiescence.push((domain, soname, keep_cached));
+            quiescence.push((domain, key, keep_cached));
             drop(lease);
         }
 
@@ -269,9 +268,8 @@ impl ApplicationReaper {
             let mut request = 0;
             while request < quiescence.len() {
                 let resolution = {
-                    let (domain, soname, keep_cached) = &quiescence[request];
-                    self.registry
-                        .resolve_quiescence(*domain, soname, *keep_cached)
+                    let (domain, key, keep_cached) = &quiescence[request];
+                    self.registry.resolve_quiescence(*domain, key, *keep_cached)
                 };
                 match resolution {
                     Some(QuiescenceResolution::KeptCached) => {
@@ -283,7 +281,7 @@ impl ApplicationReaper {
                         let mut unloaded_names = Vec::new();
                         for backing in backings {
                             let crate::application::registry::SystemUnloadBacking {
-                                soname,
+                                key,
                                 allocation,
                                 fini_plan,
                                 dependencies,
@@ -300,25 +298,25 @@ impl ApplicationReaper {
                                 }
                             }
                             log::info!(
-                                "DSO_FINI soname={}",
-                                core::str::from_utf8(soname.as_bytes()).unwrap_or("<non-utf8>")
+                                "DSO_FINI path={}",
+                                core::str::from_utf8(key.as_bytes()).unwrap_or("<non-utf8>")
                             );
                             memory.release_committed(allocation);
                             log::info!(
-                                "DSO_UNLOAD soname={}",
-                                core::str::from_utf8(soname.as_bytes()).unwrap_or("<non-utf8>")
+                                "DSO_UNLOAD path={}",
+                                core::str::from_utf8(key.as_bytes()).unwrap_or("<non-utf8>")
                             );
                             // Provider SCCs stay live until this member's fini
                             // and backing release are complete.
                             drop(dependencies);
-                            unloaded_names.push(soname);
+                            unloaded_names.push(key);
                         }
                         let finished = self.registry.finish_unload(batch);
                         debug_assert!(finished.is_ok());
                         if finished.is_err() {
                             log::error!("system DSO unload completion rejected");
                         }
-                        quiescence.retain(|(_, soname, _)| !unloaded_names.contains(soname));
+                        quiescence.retain(|(_, key, _)| !unloaded_names.contains(key));
                         made_progress = true;
                     }
                     None => request += 1,

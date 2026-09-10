@@ -54,6 +54,7 @@ _shared_deps = [
   "//external/vendor/embedded-io-0.6.1:embedded_io",
   "//external/vendor/heapless-0.8.0:heapless",
   "//external/vendor/log-0.4.28:log",
+  "//external/vendor/mipidsi-0.10.0:mipidsi",
   "//external/vendor/num-traits-0.2.19:num_traits",
   "//external/vendor/safe-mmio-0.2.5:safe_mmio",
   "//external/vendor/spin-0.9.8:spin",
@@ -71,10 +72,10 @@ _shared_deps = [
   "//kernel/kconfig:generate_rustflags_file",
   "//kernel/loader:blueos_loader",
   "//libc",
-  "//external/vendor/mipidsi-0.10.0:mipidsi"
 ]
 
-# GCC provides __atomic builtins natively; skip the clang-derived libatomic for GCC toolchains.
+# GCC provides __atomic builtins natively; skip the clang-derived libatomic for
+# GCC toolchains.
 if (current_toolchain != "//build/toolchain:gcc_fv_thumbv8m") {
   _shared_deps += [ ":atomic" ]
 }
@@ -179,7 +180,7 @@ build_rust("blueos") {
   public_deps += [ "//kernel/kconfig:generate_rustflags_file" ]
   if (defined(boot_dynamic_seed) && boot_dynamic_seed) {
     public_deps += [ ":boot_seed_blobs" ]
-    deps += [ ":app_package_catalog" ]
+    deps += [ ":boot_seed_catalog" ]
     cfgs += [ "boot_dynamic_seed" ]
   }
   public_configs += [
@@ -205,6 +206,7 @@ build_rust("kernel_image") {
     "//libc",
     "//librs",
   ]
+
   # The board runners read the generated rustflags file, so the kconfig
   # generation must be reachable through public deps.
   public_deps = [ "//kernel/kconfig:generate_rustflags_file" ]
@@ -218,23 +220,35 @@ build_rust("kernel_image") {
 
 # C29 §18.1: embed the dynamic system image (the hello PIE and libc.so.1)
 # into the kernel so boot can seed the root tmpfs without semihosting.
-# Gated per board via `boot_dynamic_seed` (only qemu_mps2_an385 for Phase 1).
+# Gated per board via `boot_dynamic_seed` (currently qemu_mps2_an385).
 if (defined(boot_dynamic_seed) && boot_dynamic_seed) {
+  _multi_layout =
+      "${root_gen_dir}/apps/example/dynamic/multi_dso/multi_layout.json"
+  _cycle_layout =
+      "${root_gen_dir}/apps/example/dynamic/cycle_demo/cycle_demo_layout.json"
+  _scope_layout =
+      "${root_gen_dir}/apps/example/dynamic/scope_demo/scope_demo_layout.json"
+  _scope_bad_layout =
+      "${root_gen_dir}/apps/example/dynamic/scope_bad/scope_bad_layout.json"
+  _tls_layout =
+      "${root_gen_dir}/apps/example/dynamic/tls_demo/tls_demo_layout.json"
+
   action("gen_boot_seed_blob_asm") {
     script = "//build/scripts/gen_seed_blob_asm.py"
     deps = [
-      "//apps/example/dynamic/cycle_demo:cycle_demo_manifest",
-      "//apps/example/dynamic/hello:hello",
-      "//apps/example/dynamic/multi_dso:multi_manifest",
-      "//apps/example/dynamic/scope_bad:scope_bad_manifest",
-      "//apps/example/dynamic/scope_demo:scope_demo_manifest",
+      "//apps/example/dynamic/cycle_demo:cycle_demo_layout",
+      "//apps/example/dynamic/hello",
+      "//apps/example/dynamic/multi_dso:multi_layout",
+      "//apps/example/dynamic/scope_bad:scope_bad_layout",
+      "//apps/example/dynamic/scope_demo:scope_demo_layout",
       "//apps/example/dynamic/scope_demo:scope_sys",
-      "//apps/example/dynamic/tls_demo:tls_demo_manifest",
-      "//apps/shell:shell",
+      "//apps/example/dynamic/tls_demo:tls_demo_layout",
+      "//apps/shell",
       "//librs:libc",
       "//librs:libc_freeze",
     ]
     outfile = "${target_gen_dir}/boot_seed_blobs.S"
+
     # The embedded artifacts are explicit inputs so a rebuilt artifact
     # re-runs the generator (and the digest comment in the output makes the
     # restat'd action dirty the assembler edge).
@@ -244,12 +258,8 @@ if (defined(boot_dynamic_seed) && boot_dynamic_seed) {
       "${root_out_dir}/lib/liblibrs.frozen.so",
       "${root_out_dir}/lib/libscope_sys.so",
     ]
-    # The package template emits each layout JSON next to its manifest.
-    _multi_layout = "${root_gen_dir}/apps/example/dynamic/multi_dso/multi_layout.json"
-    _cycle_layout = "${root_gen_dir}/apps/example/dynamic/cycle_demo/cycle_demo_layout.json"
-    _scope_layout = "${root_gen_dir}/apps/example/dynamic/scope_demo/scope_demo_layout.json"
-    _scope_bad_layout = "${root_gen_dir}/apps/example/dynamic/scope_bad/scope_bad_layout.json"
-    _tls_layout = "${root_gen_dir}/apps/example/dynamic/tls_demo/tls_demo_layout.json"
+
+    # Each application bundle emits an artifact-to-VFS layout.
     args = [
       "--out",
       rebase_path(outfile),
@@ -281,45 +291,47 @@ if (defined(boot_dynamic_seed) && boot_dynamic_seed) {
     configs += [ "//build/boards/${board}:kernel_config" ]
   }
 
-  # C30 §6.1: the frozen application-package catalog, compiled from the
-  # generated manifest into a standalone rlib the kernel resolver consumes.
-  action("gen_app_package_catalog") {
-    script = "//build/scripts/gen_app_package_catalog.py"
+  # Generate only the VFS seed-file view. Runtime dependency resolution reads
+  # the installed ELFs and does not consume build-time package metadata.
+  action("gen_boot_seed_catalog") {
+    script = "//build/scripts/gen_boot_seed_catalog.py"
     deps = [
-      "//apps/example/dynamic/cycle_demo:cycle_demo_manifest",
-      "//apps/example/dynamic/multi_dso:multi_manifest",
-      "//apps/example/dynamic/scope_bad:scope_bad_manifest",
-      "//apps/example/dynamic/scope_demo:scope_demo_manifest",
-      "//apps/example/dynamic/tls_demo:tls_demo_manifest",
+      "//apps/example/dynamic/cycle_demo:cycle_demo_layout",
+      "//apps/example/dynamic/multi_dso:multi_layout",
+      "//apps/example/dynamic/scope_bad:scope_bad_layout",
+      "//apps/example/dynamic/scope_demo:scope_demo_layout",
+      "//apps/example/dynamic/tls_demo:tls_demo_layout",
     ]
-    _multi_manifest = "${root_gen_dir}/apps/example/dynamic/multi_dso/multi_manifest.json"
-    _cycle_manifest = "${root_gen_dir}/apps/example/dynamic/cycle_demo/cycle_demo_manifest.json"
-    _scope_manifest = "${root_gen_dir}/apps/example/dynamic/scope_demo/scope_demo_manifest.json"
-    _scope_bad_manifest = "${root_gen_dir}/apps/example/dynamic/scope_bad/scope_bad_manifest.json"
-    _tls_manifest = "${root_gen_dir}/apps/example/dynamic/tls_demo/tls_demo_manifest.json"
-    outfile = "${target_gen_dir}/app_package_catalog.rs"
+    outfile = "${target_gen_dir}/boot_seed_catalog.rs"
+    inputs = [
+      _multi_layout,
+      _cycle_layout,
+      _scope_layout,
+      _scope_bad_layout,
+      _tls_layout,
+    ]
     args = [
-      "--manifest",
-      rebase_path(_multi_manifest),
-      "--manifest",
-      rebase_path(_cycle_manifest),
-      "--manifest",
-      rebase_path(_scope_manifest),
-      "--manifest",
-      rebase_path(_scope_bad_manifest),
-      "--manifest",
-      rebase_path(_tls_manifest),
+      "--layout",
+      rebase_path(_multi_layout),
+      "--layout",
+      rebase_path(_cycle_layout),
+      "--layout",
+      rebase_path(_scope_layout),
+      "--layout",
+      rebase_path(_scope_bad_layout),
+      "--layout",
+      rebase_path(_tls_layout),
       "--out",
       rebase_path(outfile),
     ]
     outputs = [ outfile ]
   }
 
-  build_rust("app_package_catalog") {
+  build_rust("boot_seed_catalog") {
     crate_type = "rlib"
-    sources = get_target_outputs(":gen_app_package_catalog")
+    sources = get_target_outputs(":gen_boot_seed_catalog")
     edition = "2021"
-    deps = [ ":gen_app_package_catalog" ]
+    deps = [ ":gen_boot_seed_catalog" ]
   }
 }
 

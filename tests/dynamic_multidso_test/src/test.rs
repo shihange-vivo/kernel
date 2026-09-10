@@ -2,11 +2,11 @@
 // ASSERT-SUCC: Dynamic multidso test ended
 // ASSERT-FAIL: Backtrace in Panic.*
 // ASSERT-FAIL: ASSERTION FAILED.*
-// COUNT: DSO_LOAD soname=libc\.so\.1 == 1
-// COUNT: DSO_REUSE soname=libc\.so\.1 == 1
-// COUNT: PKG_LOAD soname=libfoo\.so\.1 path=/apps/multi/lib/libfoo\.so\.1 == 2
-// COUNT: PKG_LOAD soname=libbar\.so\.1 path=/apps/multi/lib/libbar\.so\.1 == 2
-// COUNT: PKG_LOAD soname=libcommon\.so\.1 path=/apps/multi/lib/libcommon\.so\.1 == 2
+// COUNT: DSO_LOAD path=/system/lib/libc\.so\.1 == 1
+// COUNT: DSO_REUSE path=/system/lib/libc\.so\.1 == 1
+// COUNT: NS_LOAD path=/apps/multi/lib/libfoo\.so\.1 == 2
+// COUNT: NS_LOAD path=/apps/multi/lib/libbar\.so\.1 == 2
+// COUNT: NS_LOAD path=/apps/multi/lib/libcommon\.so\.1 == 2
 // COUNT: APP_LAUNCHED handle=.*:1 path=/apps/multi/app\.elf == 1
 // COUNT: APP_LAUNCHED handle=.*:2 path=/apps/multi/app\.elf == 1
 // COUNT: APP_REAP handle=.*:1 private_images=4 imported_dsos=1 == 1
@@ -27,13 +27,13 @@
 #![reexport_test_harness_main = "dynamic_multidso_test_main"]
 #![feature(c_size_t)]
 
-//! C30-d vertical test: launch a real manifest-closed multi-DSO application
-//! package through the full kernel path — package manifest lookup, atomic
-//! system batch acquire, private DSO closure resolution, ARM32 NOW
+//! Launch a real multi-DSO application through the runtime namespace path —
+//! read-only dependency planning, atomic system batch acquire, private DSO
+//! search, ARM32 NOW
 //! relocation, private init/fini ordering, application exit and deferred
 //! reaping — on `qemu_mps2_an385` (§7.6).
 //!
-//! The package (`apps/example/dynamic/multi_dso`: root + foo/bar/common
+//! The bundle (`apps/example/dynamic/multi_dso`: root + foo/bar/common
 //! private DSOs, all importing the shared libc) is embedded in the kernel
 //! binary by the boot seed blobs and seeded into the root tmpfs by the boot
 //! seed entry point, so the test exercises the same boot path a real boot
@@ -41,11 +41,11 @@
 //!
 //! * each private identity maps exactly once per group — foo and bar both
 //!   `DT_NEEDED` libcommon, but the diamond loads it a single time (one
-//!   `PKG_LOAD` line per SONAME per launch);
+//!   `NS_LOAD` line per resolved path per launch);
 //! * each group's exit releases all four private allocations (root + foo +
 //!   bar + common) in exactly one reap (`APP_REAP ... private_images=4`).
 //!
-//! Launching the package twice additionally proves per-group private state:
+//! Launching the application twice additionally proves per-group private state:
 //! the second group maps the same private DSOs again instead of sharing the
 //! first group's relocated images.
 
@@ -59,7 +59,7 @@ use core::sync::atomic::{AtomicUsize, Ordering};
 use librs::pthread;
 use semihosting::println;
 
-/// Launch the multi package and wait (bounded) for the deferred reaper to
+/// Launch the multi app and wait (bounded) for the deferred reaper to
 /// recycle its slot, then assert the public state is gone. Returns the handle
 /// whose generation the relaunch assertion compares against.
 fn launch_and_wait(
@@ -69,7 +69,7 @@ fn launch_and_wait(
     argv.push(b"/apps/multi/app.elf".to_vec());
     let handle = service
         .spawn("/apps/multi/app.elf", argv, Vec::new())
-        .expect("spawn multi package");
+        .expect("spawn multi app");
 
     // Bounded poll: the reaper scans every REAPER_POLL_MILLIS and the app
     // exits within milliseconds of starting.
@@ -84,24 +84,24 @@ fn launch_and_wait(
             blueos::time::Tick::from_millis(50),
         );
     }
-    panic!("multi package was not reaped within the wait bound");
+    panic!("multi app was not reaped within the wait bound");
 }
 
 #[test]
-fn multidso_package_vertical() {
-    // Boot installed the embedded package artifacts and initialized the
+fn multidso_namespace_vertical() {
+    // Boot installed the embedded bundle artifacts and initialized the
     // runtime (§18.2); this idempotent call retrieves the same service without
     // reseeding the VFS.
     let service = runtime::init();
 
     // First launch: this link is the first loading generation for libc.so.1
-    // (DSO_LOAD); the composite resolver walks the manifest closure (root ->
-    // foo/bar -> common, system edges on the Ready libc) and the group is
+    // (DSO_LOAD); the namespace planner walks the ELF closure (root ->
+    // foo/bar -> common, system edges on libc) and the group is
     // reaped with all four private allocations and its one imported lease.
     let first = launch_and_wait(service);
 
     // Second launch: the Ready libc instance is imported (DSO_REUSE) and the
-    // package-private DSOs map again into the fresh group; the slot is
+    // private DSOs map again into the fresh group; the slot is
     // recycled with a bumped generation (§14.3).
     let second = launch_and_wait(service);
     assert_eq!(first.slot, second.slot, "slot must be recycled");
