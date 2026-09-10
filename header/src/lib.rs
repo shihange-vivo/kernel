@@ -14,6 +14,8 @@
 
 #![no_std]
 
+pub mod application;
+
 pub mod syscalls {
     //! BlueOS's syscall calling convention is compatible with Linux.
     // FIXME: We should really consider stable syscall nr.
@@ -91,6 +93,13 @@ pub mod syscalls {
         TimerSetTime,
         TimerGetOverrun,
         Rename,
+        // Application lifecycle syscalls (C20, §9.3). Appended before
+        // `LastNR` so every pre-existing number is unchanged; never insert
+        // between the old members.
+        ApplicationLaunch,
+        ApplicationInitComplete,
+        ApplicationBeginExit,
+        ApplicationFinishExit,
         LastNR,
     }
 }
