@@ -12,20 +12,33 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Structured errors shared by positional reads and loading stages.
-
+use alloc::boxed::Box;
 use core::fmt::Debug;
+
+use crate::address::TargetAddress;
 
 pub type LoadResult<T> = core::result::Result<T, LoadError>;
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug)]
 pub enum LoadStage {
     Beginning,
     Admit,
     Inspect,
+    Plan,
+    Allocate,
+    Map,
+    Decode,
+    Relocate,
+    Cache,
+    Seal,
+    Publish,
+    Discover,
+    Scope,
+    LinkRelocate,
+    LinkSeal,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug)]
 pub enum LoadErrorKind {
     BadElf,
     UnsupportedByProfile,
@@ -33,25 +46,55 @@ pub enum LoadErrorKind {
     IntegerOverflow,
     ResourceLimit,
     OutOfMemory,
+    InvalidAlignment,
+    PermissionConflict,
+    IdentityConflict,
+    AmbiguousStrongDefinition,
     Backend,
     Io,
+    IncorrectLayout,
+    NotAllocated,
 }
 
-#[derive(Debug, Eq, PartialEq)]
+#[derive(Debug)]
 pub enum HeaderField {
     Magic,
     Class,
     Endian,
     Version,
     OsAbi,
-    AbiVersion,
     Type,
     Machine,
     Flags,
+    Entry,
     HeaderSize,
     ProgramHeaderSize,
-    ProgramHeaderCount,
     ProgramHeaderTable,
+}
+
+#[derive(Debug)]
+pub enum LimitKind {
+    FileLength,
+    ProgramHeaderCount,
+    LoadSegmentCount,
+    ImageSpan,
+    SegmentAlignment,
+    LayoutBytes,
+    DynamicEntryCount,
+    RelocationCount,
+    RuntimeMetadataBytes,
+    RelocationOperationBytes,
+    StringTableBytes,
+    ProtectionRangeCount,
+    ImageCount,
+    DependencyEdgeCount,
+    DependencyDepth,
+    TotalImageBytes,
+    TotalRuntimeMetadataBytes,
+    TotalRelocations,
+    SymbolLookups,
+    SymbolNameLength,
+    DependencyNameLength,
 }
 
 #[derive(Debug)]
@@ -63,15 +106,14 @@ pub enum ProgramHeaderField {
     DuplicatePhdr,
     DuplicateRelro,
     DuplicateStack,
+    DuplicateInterpreter,
+    DuplicateTls,
     UnsupportedInterpreter,
     UnsupportedTls,
     ExecutableStack,
-}
-
-#[derive(Debug)]
-pub enum LimitKind {
-    FileLength,
-    ProgramHeaderCount,
+    Permissions,
+    Align,
+    UnknownField,
 }
 
 #[non_exhaustive]
@@ -87,10 +129,45 @@ pub enum ErrorContext {
         field: HeaderField,
         value: u64,
     },
+    TargetRange {
+        start: TargetAddress,
+        len: u64,
+        align: u64,
+    },
     ProgramHeader {
         index: u16,
         field: ProgramHeaderField,
         value: u64,
+    },
+    Allocation {
+        base: TargetAddress,
+        len: u64,
+        align: u64,
+    },
+    MemoryAccess {
+        allocation_base: TargetAddress,
+        allocation_len: u64,
+        allocation_align: u64,
+        offset: u64,
+        len: u64,
+    },
+    DynamicTag {
+        tag: u64,
+        value: u64,
+    },
+    Relocation {
+        offset: TargetAddress,
+        raw_type: u32,
+        symbol_index: u32,
+    },
+    Dependency {
+        requester: u32,
+        needed: Box<[u8]>,
+    },
+    Symbol {
+        image: u32,
+        index: u32,
+        name: Box<[u8]>,
     },
     Limit {
         resource: LimitKind,
@@ -115,7 +192,6 @@ impl LoadError {
         }
     }
 
-    /// Keep the first stage attached while the error crosses outer layers.
     #[inline]
     pub const fn at_stage(mut self, stage: LoadStage) -> Self {
         if self.stage.is_none() {
