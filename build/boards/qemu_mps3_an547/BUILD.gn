@@ -112,7 +112,7 @@ blueos_board("qemu_mps3_an547") {
   }
   default = [
     "//example:check_apps",
-    "//shell:shell_runner",
+    "//shell:shell_default",
   ]
   check_all = check_all_on_virtual_board + clippy_all_on_virtual_board +
               [ "//example:check_apps" ]

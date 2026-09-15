@@ -23,7 +23,7 @@ group("check_apps") {
     "//example/net:net_example",
     "//example/no_std:no_std_example_runner",
   ]
-  if (defined(dynamic_loader) && dynamic_loader) {
+  if (dynamic_loader) {
     deps += [
       "//example/dynamic/clang_c",
       "//example/dynamic/clang_cxx",

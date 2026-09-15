@@ -68,7 +68,7 @@ blueos_board("qemu_virt64_aarch64") {
 
   default = [
     "//example:check_apps",
-    "//shell:shell_runner",
+    "//shell:shell_default",
   ]
   _check_all = check_all_on_virtual_board + clippy_all_on_virtual_board
   check_all = default + filter_exclude(_check_all, [ "//kernel/adapter*" ])
