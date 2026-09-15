@@ -54,6 +54,21 @@ import("//build/boards/${board}.gni")
 import("//build/config/build_config.gni")
 import("//build/toolchain/toolchain_info.gni")
 
+declare_args() {
+  # Enable the kernel application runtime, shared libc and dynamic shell.
+  dynamic_loader = defined(board_dynamic_loader) && board_dynamic_loader
+}
+
+declare_args() {
+  # QEMU boot policy: install host artifacts into tmpfs over semihosting.
+  # This can be disabled while keeping the loader and dynamic applications.
+  boot_dynamic_seed = dynamic_loader && defined(board_boot_dynamic_seed) &&
+                      board_boot_dynamic_seed
+}
+
+assert(!boot_dynamic_seed || dynamic_loader,
+       "boot_dynamic_seed requires dynamic_loader=true")
+
 # The board .gni selects one entry from toolchain_info.
 assert(defined(board_default_toolchain),
        "${board}.gni must set board_default_toolchain")
