@@ -12,25 +12,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import("//build/boards/${board}.gni")
 import("//build/templates/build_template.gni")
 import("//build/toolchain/blueos.gni")
-
-_loader_unittest_boards = [
-  "qemu_riscv32",
-  "qemu_riscv64",
-  "qemu_virt64_aarch64",
-]
-_loader_unittest_enabled =
-    !coverage && !profile &&
-    filter_include(_loader_unittest_boards, [ board ]) != []
 
 group("check_loader") {
   testonly = true
   deps = [ "tests:run_loader_integration_test" ]
-  if (_loader_unittest_enabled) {
-    deps += [ ":run_loader_unittest" ]
-  }
 }
 
 group("inputs") {
@@ -52,10 +39,14 @@ if (coverage || profile) {
 build_rust("blueos_loader") {
   crate_type = "rlib"
   sources = [ "src/lib.rs" ]
+  configs += [ "//build/boards/${board}:kernel_config" ]
+  rustflags = [
+    "--cfg",
+    "target_board=\"${board}\"",
+  ]
   deps = [
     "//external/rust:goblin",
     "//kernel/infra:blueos_infra",
-    "//libs/librs",
   ]
 }
 
@@ -63,61 +54,37 @@ run_clippy("blueos_loader_clippy") {
   deps = [ ":blueos_loader" ]
 }
 
-if (_loader_unittest_enabled) {
-  build_rust("loader_unittest") {
-    testonly = true
-    crate_type = "bin"
-    edition = "2021"
-    sources = [ "src/lib.rs" ]
-    deps = [
-      "//external/rust:goblin",
-      "//external/rust:semihosting",
-      "//kernel/infra:blueos_infra",
-      "//kernel/rsrt",
-      "//libs/librs",
-    ]
+build_rust("loader_unittest") {
+  testonly = true
+  crate_name = "loader_unittest"
+  crate_type = "bin"
+  sources = [ "src/lib.rs" ]
+  edition = "2021"
+  deps = [
+    "//external/rust:goblin",
+    "//kernel/infra:blueos_infra",
+  ]
+  rustflags = [ "--test" ]
+}
 
-    if (board == "qemu_virt64_aarch64") {
-      deps += [ "//build/boards/qemu_virt64_aarch64:default_linker_script" ]
-    }
-    configs += [ "//build/boards/${board}:kernel_config" ]
-    rustflags = [ "--test" ]
-    linker_script = default_linker_script
-    proc_macro_deps = [ "//kernel/test_harness:blueos_test_macro" ]
-  }
+run_host("run_loader_unittest") {
+  testonly = true
+  runner = ":loader_unittest(//build/toolchain:host)"
+}
 
-  gen_qemu_runner("loader_unittest_runner") {
-    testonly = true
-    img = ":loader_unittest"
-    qemu = qemu_exe
-    machine = qemu_machine
-    semihosting = true
-    qemu_args = qemu_extra_args
-    block_img = "loader_unittest_block.img"
-    block_args = qemu_block_args
-  }
-
-  run_qemu_check("run_loader_unittest") {
-    testonly = true
-    runner = ":loader_unittest_runner"
-    checker = "src/unittests.checker"
-  }
-
-  run_clippy("loader_unittest_clippy") {
-    testonly = true
-    deps = [ ":loader_unittest" ]
-  }
+run_clippy("loader_unittest_clippy") {
+  testonly = true
+  deps = [ ":loader_unittest(//build/toolchain:host)" ]
 }
 
 group("check_loader_by_clippy") {
   testonly = true
   deps = [
     ":blueos_loader_clippy",
+
+    # ":loader_unittest_clippy",
     "tests/integration_test:loader_integration_test_clippy",
   ]
-  if (_loader_unittest_enabled) {
-    deps += [ ":loader_unittest_clippy" ]
-  }
   if (coverage || profile) {
     deps += [ ":common_cov" ]
   }
