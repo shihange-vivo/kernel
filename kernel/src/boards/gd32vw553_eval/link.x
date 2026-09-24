@@ -32,13 +32,17 @@ SECTIONS
     *(.text .text.*)
   } >FLASH AT>FLASH
 
-  .rodata : {
+  .rodata (READONLY) : {
     . = ALIGN(4);
     *(.srodata .srodata.*)
     *(.rodata .rodata.*)
+    *(.rdata)
+    *(.gnu.linkonce.r.*)
+    *(.data.rel.ro .data.rel.ro.* .sdata.rel.ro .sdata.rel.ro.*)
+    *(.got .got.* .igot .igot.*)
   } >FLASH AT>FLASH
 
-  .init_array : {
+  .init_array (READONLY) : {
     . = ALIGN(4);
     PROVIDE_HIDDEN(__init_array_start = .);
     KEEP (*(SORT_BY_INIT_PRIORITY(.init_array.*)))
@@ -46,7 +50,7 @@ SECTIONS
     PROVIDE_HIDDEN(__init_array_end = .);
   } >FLASH AT>FLASH
 
-  .bk_app_array : {
+  .bk_app_array (READONLY) : {
     . = ALIGN(4);
     PROVIDE_HIDDEN(__bk_app_array_start = .);
     KEEP (*(SORT_BY_INIT_PRIORITY(.bk_app_array.*)))
@@ -65,8 +69,6 @@ SECTIONS
   } >RAM AT>FLASH
 
   .data : {
-    *(.rdata)
-    *(.gnu.linkonce.r.*)
     *(.data .data.*)
     *(.gnu.linkonce.d.*)
     . = ALIGN(8);
