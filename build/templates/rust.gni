@@ -149,6 +149,7 @@ template("build_rust") {
                            "output_dir",
                            "output_name",
                            "testonly",
+                           "data_deps",
                          ],
                          [
                            "configs",
