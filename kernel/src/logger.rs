@@ -49,6 +49,9 @@ impl log::Log for Logger {
         if !self.enabled(record.metadata()) {
             return;
         }
+        // Formatting emits several writes; keep complete records together
+        // when application threads run on different CPUs.
+        let _guard = LOGGER_MUTEX.irqsave_lock();
         let timestamp = time::now().as_millis();
         let tid = scheduler::current_thread_id();
         let cpu = arch::current_cpu_id();
