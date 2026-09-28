@@ -456,7 +456,7 @@ impl InodeOps for TmpInode {
         // hold the inode lock: a concurrent writer to the same device would
         // otherwise spin on the write lock behind a blocked reader. Clone the
         // device handle under the lock and do the I/O outside it.
-        #[cfg(armv7m)]
+        #[cfg(any(armv7m, armv8m))]
         if let Some(device) = {
             let inner = self.inner.read();
             inner.as_device().cloned()
@@ -467,7 +467,7 @@ impl InodeOps for TmpInode {
         }
 
         let inner = self.inner.read();
-        #[cfg(not(armv7m))]
+        #[cfg(not(any(armv7m, armv8m)))]
         if let Some(device) = inner.as_device() {
             return device
                 .read(offset as u64, buf, nonblock)
@@ -490,7 +490,7 @@ impl InodeOps for TmpInode {
     fn write_at(&self, offset: usize, buf: &[u8], nonblock: bool) -> Result<usize, Error> {
         // Symmetric with `read_at`: device writes run outside the inode lock
         // so a blocked device reader never starves device writers.
-        #[cfg(armv7m)]
+        #[cfg(any(armv7m, armv8m))]
         if let Some(device) = {
             let inner = self.inner.read();
             inner.as_device().cloned()
@@ -501,7 +501,7 @@ impl InodeOps for TmpInode {
         }
 
         let mut inner = self.inner.write();
-        #[cfg(not(armv7m))]
+        #[cfg(not(any(armv7m, armv8m)))]
         if let Some(device) = inner.as_device() {
             return device
                 .write(offset as u64, buf, nonblock)
