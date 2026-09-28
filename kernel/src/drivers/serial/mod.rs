@@ -92,12 +92,12 @@ impl Serial {
             return Ok(bytes.len());
         }
 
-        if is_in_irq() || !is_schedule_ready() {
+        if is_in_irq() || !crate::arch::local_irq_enabled() || !is_schedule_ready() {
             // Caution: logging in IRQ context can extend interrupt-off latency.
             //
             // We intentionally use polling here (same behavior as `kearly_printkln!`) instead
             // of waiting for TX IRQ progress:
-            // 1) some IRQ contexts run with interrupts masked;
+            // 1) IRQ contexts and serialized kernel logs can mask interrupts;
             // 2) current IRQ priority may be higher than UART TX IRQ, so TX handler cannot run.
             //
             // In those cases, relying on TX interrupt-driven drain may stall forever. Polling
