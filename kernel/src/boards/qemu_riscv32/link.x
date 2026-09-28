@@ -7,6 +7,8 @@
 OUTPUT_ARCH("riscv")
 ENTRY(_start)
 
+PROVIDE(__blueos_heap_size = 0x800000);
+
 /* Fixed-address firmware has no runtime relocations or lazy GOT binding. */
 PHDRS
 {
@@ -86,7 +88,7 @@ SECTIONS
   .heap : {
     . = ALIGN(4096);
     __heap_start = .;
-    . += 0x800000;
+    . += __blueos_heap_size;
     __heap_end = .;
   } :data
 
