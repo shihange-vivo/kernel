@@ -191,6 +191,9 @@ pub fn update_ready_thread_priority(
     }
 
     let mut thread_guard = t.lock();
+    // This is a scheduling-parameter change, not temporary inheritance. Mutex
+    // release must restore the newly requested priority.
+    thread_guard.set_origin_priority(new_priority);
     thread_guard.set_priority(new_priority);
     drop(thread_guard);
 
