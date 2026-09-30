@@ -454,6 +454,9 @@ pub(crate) fn program_header_error(index: u16, field: ProgramHeaderField, value:
 mod tests {
     use super::*;
 
+    #[cfg(target_os = "blueos")]
+    use blueos_test_macro::test;
+
     #[test]
     fn infers_program_header_vaddr_from_containing_load_segment() {
         let load_segments = [LoadSegmentInfo::new(

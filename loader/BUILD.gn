@@ -12,15 +12,21 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import("//build/boards/${board}.gni")
 import("//build/templates/build_template.gni")
 import("//build/toolchain/blueos.gni")
 
+_loader_unittest_on_qemu = false
+if (defined(qemu_exe)) {
+  _loader_unittest_on_qemu = qemu_exe != ""
+}
+
 group("check_loader") {
   testonly = true
-  deps = [
-    ":run_loader_unittest",
-    "tests:run_loader_integration_test",
-  ]
+  deps = [ "tests:run_loader_integration_test" ]
+  if (_loader_unittest_on_qemu) {
+    deps += [ ":run_loader_unittest" ]
+  }
 }
 
 group("inputs") {
@@ -57,27 +63,76 @@ run_clippy("blueos_loader_clippy") {
   deps = [ ":blueos_loader" ]
 }
 
-build_rust("loader_unittest") {
-  testonly = true
-  crate_name = "loader_unittest"
-  crate_type = "bin"
-  sources = [ "src/lib.rs" ]
-  edition = "2021"
-  deps = [
-    "//external/vendor/goblin-0.9.3:goblin",
-    "//kernel/infra:blueos_infra",
-  ]
-  rustflags = [ "--test" ]
-}
+if (_loader_unittest_on_qemu) {
+  build_rust("loader_unittest") {
+    testonly = true
+    crate_name = "loader_unittest"
+    crate_type = "bin"
+    sources = [ "src/lib.rs" ]
+    edition = "2021"
+    deps = [
+      "//external/vendor/goblin-0.9.3:goblin",
+      "//kernel/infra:blueos_infra",
+    ]
+    rustflags = [ "--test" ]
+    configs += [ "//build/boards/${board}:kernel_config" ]
+    rustflags += [
+      "--cfg",
+      "target_board=\"${board}\"",
+    ]
+    deps += [
+      "//external/vendor/semihosting-0.1.20:semihosting",
+      "//kernel/kernel:blueos",
+      "//kernel/rsrt",
+      "//libc",
+      "//librs",
+    ]
+    linker_script = default_linker_script
+    proc_macro_deps = [ "//kernel/test_harness:blueos_test_macro" ]
+  }
 
-run_host("run_loader_unittest") {
-  testonly = true
-  runner = ":loader_unittest(//build/toolchain:host)"
-}
+  if (defined(qemu_use_esp32_loader) && qemu_use_esp32_loader) {
+    gen_esp32_qemu_runner("loader_unittest_runner") {
+      testonly = true
+      elf = ":loader_unittest"
+      chip = "${chip}"
+      bootloader = qemu_esp32_bootloader_bin
+      partition_table = qemu_esp32_partition_table_bin
+      qemu = qemu_exe
+      machine = qemu_machine
+      qemu_args = qemu_extra_args
+      net_args = qemu_net_args
+      block_args = qemu_block_args
+      semihosting = true
+    }
+  } else {
+    gen_qemu_runner("loader_unittest_runner") {
+      testonly = true
+      img = ":loader_unittest"
+      qemu = qemu_exe
+      machine = qemu_machine
+      semihosting = true
+      qemu_args = qemu_extra_args
+      block_img = "loader_unittest_block.img"
+      block_args = qemu_block_args
+    }
+  }
 
-run_clippy("loader_unittest_clippy") {
-  testonly = true
-  deps = [ ":loader_unittest(//build/toolchain:host)" ]
+  run_qemu_check("run_loader_unittest") {
+    testonly = true
+    runner = ":loader_unittest_runner"
+    if (coverage) {
+      img = ":loader_unittest"
+      checker = "tests/cov/lib.rs"
+    } else {
+      checker = "src/unittests.checker"
+    }
+  }
+
+  run_clippy("loader_unittest_clippy") {
+    testonly = true
+    deps = [ ":loader_unittest" ]
+  }
 }
 
 group("check_loader_by_clippy") {

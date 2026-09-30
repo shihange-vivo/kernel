@@ -13,6 +13,13 @@
 // limitations under the License.
 
 #![no_std]
+#![cfg_attr(all(test, target_os = "blueos"), feature(custom_test_frameworks))]
+#![cfg_attr(all(test, target_os = "blueos"), test_runner(loader_test_runner))]
+#![cfg_attr(
+    all(test, target_os = "blueos"),
+    reexport_test_harness_main = "loader_test_main"
+)]
+#![cfg_attr(all(test, target_os = "blueos"), no_main)]
 #![feature(c_size_t)]
 #![feature(let_chains)]
 
@@ -312,8 +319,57 @@ pub fn load_elf(buffer: &[u8], mapper: &mut MemoryMapper) -> Result {
     load_elf_from_reader(SliceElfReader::new(buffer), mapper)
 }
 
-#[cfg(test)]
-extern crate std;
+#[cfg(all(test, target_os = "blueos"))]
+extern crate rsrt;
+
+#[cfg(all(test, target_os = "blueos"))]
+use alloc::sync::Arc;
+#[cfg(all(test, target_os = "blueos"))]
+use core::sync::atomic::{AtomicUsize, Ordering};
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(all(test, target_os = "blueos"))]
+pub fn loader_test_runner(tests: &[&dyn Fn()]) {
+    semihosting::println!("Loader unittest started");
+    semihosting::println!("Running {} tests", tests.len());
+    for test in tests {
+        test();
+    }
+    semihosting::println!("Loader unittest ended");
+
+    #[cfg(coverage)]
+    blueos::coverage::write_coverage_data();
+}
+
+#[cfg(all(test, target_os = "blueos"))]
+fn run_loader_tests_on_own_stack() {
+    // Debug builds can overflow the 12 KiB main-thread stack in loader decode paths.
+    const STACK_SIZE: usize = 64 * 1024;
+
+    let done = Arc::new(AtomicUsize::new(0));
+    let worker_done = done.clone();
+    let worker = blueos::thread::spawn_with_stack(STACK_SIZE, move || {
+        librs::pthread::register_my_posix_tcb();
+        loader_test_main();
+        worker_done.store(1, Ordering::Release);
+        let _ = blueos::sync::atomic_wake(&worker_done, usize::MAX);
+    });
+    assert!(
+        worker.is_some(),
+        "loader unittest: no {STACK_SIZE}-byte stack"
+    );
+
+    while done.load(Ordering::Acquire) == 0 {
+        let _ = blueos::sync::atomic_wait(&done, 0, blueos::time::Tick::MAX);
+    }
+}
+
+#[cfg(all(test, target_os = "blueos"))]
+#[no_mangle]
+extern "C" fn main() -> i32 {
+    librs::pthread::register_my_posix_tcb();
+    run_loader_tests_on_own_stack();
+    0
+}
