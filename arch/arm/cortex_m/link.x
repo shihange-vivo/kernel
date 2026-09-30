@@ -90,13 +90,52 @@ SECTIONS
 
   . = ALIGN(4);
   __rodata_start = .;
-  .rodata (READONLY) :
-  {
-    *(.rodata*)
-    /* Static firmware resolves these relocations at link time. */
-    *(.data.rel.ro .data.rel.ro.* .sdata.rel.ro .sdata.rel.ro.*)
+  .rodata : { *(.rodata*) } > FLASH
+  __rodata_end = .;
 
-    /* Startup and interrupt registration tables are only read at runtime. */
+  .ARM.extab :
+  {
+    *(.ARM.extab* .gnu.linkonce.armextab.*)
+  } > FLASH
+
+  __exidx_start = .;
+  .ARM.exidx :
+  {
+    *(.ARM.exidx* .gnu.linkonce.armexidx.*)
+  } > FLASH
+  __exidx_end = .;
+
+  /* Put .bss to RAM */
+  .zero.table :
+  {
+    . = ALIGN(4);
+    __zero_table_start = .;
+    LONG (__bss_start)
+    LONG ((__bss_end - __bss_start) / 4)
+    __zero_table_end = .;
+  } > FLASH
+
+  /* Put .data to RAM */
+  .copy.table :
+  {
+    . = ALIGN(4);
+    __copy_table_start = .;
+    LONG (__etext)
+    LONG (__data_start)
+    LONG ((__data_end - __data_start) / 4)
+    __copy_table_end = .;
+  } > FLASH
+
+  __etext = ALIGN (4);
+
+  .data : AT (__etext)
+  {
+    . = ALIGN(4);
+    __data_start = .;
+    *(vtable)
+    *(.data)
+    *(.data.*)
+
     . = ALIGN(4);
     PROVIDE_HIDDEN (__preinit_array_start = .);
     KEEP(*(.preinit_array))
@@ -126,55 +165,6 @@ SECTIONS
     KEEP(*(.isr.reg))
     PROVIDE_HIDDEN(__isr_array_end = .);
 
-    /* The final static image has no runtime relocations for GOT entries. */
-    . = ALIGN(4);
-    *(.got .got.* .igot .igot.*)
-  } > FLASH
-  __rodata_end = .;
-
-  .ARM.extab :
-  {
-    *(.ARM.extab* .gnu.linkonce.armextab.*)
-  } > FLASH
-
-  __exidx_start = .;
-  .ARM.exidx :
-  {
-    *(.ARM.exidx* .gnu.linkonce.armexidx.*)
-  } > FLASH
-  __exidx_end = .;
-
-  /* Put .bss to RAM */
-  .zero.table (READONLY) :
-  {
-    . = ALIGN(4);
-    __zero_table_start = .;
-    LONG (__bss_start)
-    LONG ((__bss_end - __bss_start) / 4)
-    __zero_table_end = .;
-  } > FLASH
-
-  /* Put .data to RAM */
-  .copy.table (READONLY) :
-  {
-    . = ALIGN(4);
-    __copy_table_start = .;
-    LONG (__etext)
-    LONG (__data_start)
-    LONG ((__data_end - __data_start) / 4)
-    __copy_table_end = .;
-  } > FLASH
-
-  __etext = ALIGN (4);
-
-  .data : AT (__etext)
-  {
-    . = ALIGN(4);
-    __data_start = .;
-    *(vtable)
-    *(.data)
-    *(.data.*)
-
     . = ALIGN(4);
     __start___llvm_prf_cnts = .;
     KEEP(*(__llvm_prf_cnts))
@@ -186,6 +176,20 @@ SECTIONS
     __stop___llvm_prf_data = .;
 
     KEEP(*(.jcr*))
+
+    /*
+     * Keep GOT sections inside the copied data range. The linker may emit
+     * PC-relative loads through .got for optimized Rust code even in this
+     * bare-metal image; if .got becomes an orphan section after __data_end,
+     * the startup copy table leaves it zeroed in RAM and indirect calls can
+     * branch through a null entry.
+     */
+    . = ALIGN(4);
+    *(.got)
+    *(.got.*)
+    *(.igot.*)
+    *(.got.plt)
+    *(.igot.plt)
 
     . = ALIGN(4);
     __data_end = .;

@@ -9,14 +9,6 @@ ENTRY(_start)
 
 PROVIDE(__blueos_heap_size = 0x800000);
 
-/* Fixed-address firmware has no runtime relocations or lazy GOT binding. */
-PHDRS
-{
-  text PT_LOAD FLAGS(5);   /* PF_R | PF_X */
-  rodata PT_LOAD FLAGS(4); /* PF_R */
-  data PT_LOAD FLAGS(6);   /* PF_R | PF_W */
-}
-
 SECTIONS
 {
   /*
@@ -33,40 +25,14 @@ SECTIONS
     *(.text .text.*)
     . = ALIGN(0x1000);
     PROVIDE(etext = .);
-  } :text
+  }
 
-  .trap.handler : {
-    *(.trap.handler .trap.handler.*)
-  } :text
-
-  .rodata (READONLY) : {
+  .rodata : {
     . = ALIGN(16);
     *(.srodata .srodata.*) /* do not need to distinguish this from .rodata */
     . = ALIGN(16);
     *(.rodata .rodata.*)
-    *(.data.rel.ro .data.rel.ro.* .sdata.rel.ro .sdata.rel.ro.*)
-    *(.got .got.* .igot .igot.*)
-  } :rodata
-
-  /* Initialize C runtime. */
-  /* .ctors and .dtors should not appear since we don't have C++ code at present. */
-  .init_array (READONLY) : ALIGN(16) {
-    PROVIDE_HIDDEN(__init_array_start = .);
-    KEEP (*(SORT_BY_INIT_PRIORITY(.init_array.*)))
-    KEEP (*(.init_array))
-    PROVIDE_HIDDEN(__init_array_end = .);
-  } :rodata
-
-  .bk_app_array (READONLY) : ALIGN(16) {
-    PROVIDE_HIDDEN(__bk_app_array_start = .);
-    KEEP (*(SORT_BY_INIT_PRIORITY(.bk_app_array.*)))
-    KEEP (*(.bk_app_array))
-    PROVIDE_HIDDEN(__bk_app_array_end = .);
-  } :rodata
-
-  .eh_frame : {
-    *(.eh_frame .eh_frame.*)
-  } :rodata
+  }
 
   .data : {
     . = ALIGN(16);
@@ -74,7 +40,7 @@ SECTIONS
     *(.sdata .sdata.*) /* do not need to distinguish this from .data */
     . = ALIGN(16);
     *(.data .data.*)
-  } :data
+  }
 
   .bss : {
     . = ALIGN(16);
@@ -83,14 +49,32 @@ SECTIONS
     . = ALIGN(16);
     *(.bss .bss.*)
     __bss_end = .;
-  } :data
+  }
+
+  /* Initialize C runtime. */
+  /* .ctors and .dtors should not appear since we don't have C++ code at present. */
+  .init_array : {
+    . = ALIGN(16);
+    PROVIDE_HIDDEN(__init_array_start = .);
+    KEEP (*(SORT_BY_INIT_PRIORITY(.init_array.*)))
+    KEEP (*(.init_array))
+    PROVIDE_HIDDEN(__init_array_end = .);
+  }
+
+  .bk_app_array : {
+    . = ALIGN(16);
+    PROVIDE_HIDDEN(__bk_app_array_start = .);
+    KEEP (*(SORT_BY_INIT_PRIORITY(.bk_app_array.*)))
+    KEEP (*(.bk_app_array))
+    PROVIDE_HIDDEN(__bk_app_array_end = .);
+  }
 
   .heap : {
     . = ALIGN(4096);
     __heap_start = .;
     . += __blueos_heap_size;
     __heap_end = .;
-  } :data
+  }
 
   /* Ignore .fini_array since we are building a kernel which has no chance to
    * execute code in .fini_array. */
@@ -100,7 +84,7 @@ SECTIONS
     __sys_stack_start = .;
     . += 0x80000;
     __sys_stack_end = .;
-  } :data
+  }
 
   PROVIDE(_end = .);
 }

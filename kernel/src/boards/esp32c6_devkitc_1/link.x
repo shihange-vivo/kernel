@@ -37,8 +37,9 @@ MEMORY
 
     /* On C6 the bootloader maps a single flash window at 0x42000000 for both
        code and rodata (unlike C3, where DROM 0x3C000000 < IROM 0x42000000 are
-       separate windows). The bootloader requires the app description to be
-       the first segment after the image header. With two regions (IROM 0x42000000,
+       separate windows). esptool writes image segments in ascending vaddr
+       order, and the bootloader requires the app description to be the first
+       segment after the image header. With two regions (IROM 0x42000000,
        DROM 0x42800000) the .text segment ends up before .rodata_desc and the
        app_desc magic is no longer at the start of the partition, producing
        "Failed to fetch app description header" / "not bootable".
@@ -93,49 +94,16 @@ SECTIONS {
     *(.sdata .sdata.* .sdata2 .sdata2.*);
     _sdata_end = ABSOLUTE(.);
     . = ALIGN(4);
-    /* Keep these ESP-specific constants in RAM near __global_pointer$. */
-    *(.rodata.*_esp_hal_internal_handler*)
-    *(.rodata..Lswitch.table.*)
-    *(.rodata.cst*)
-    . = ALIGN(4);
   } > RWDATA
-
-  /* Keep the app description first in flash and adjacent to .rodata in the
-     ELF section order so esptool can merge their shared 64 KB mapping. */
-  .rodata_desc : ALIGN(0x10)
-  {
-      KEEP(*(.rodata_desc));
-      KEEP(*(.rodata_desc.*));
-      . = ALIGN(0x10);
-  } > RODATA
-
-  .rodata (READONLY) : ALIGN(0x10)
-  {
-    . = ALIGN (4);
-    *(.rodata .rodata.*)
-    *(.srodata .srodata.*)
-    /* Link-time resolved pointers and GOT entries stay in flash. */
-    *(.data.rel.ro .data.rel.ro.* .sdata.rel.ro .sdata.rel.ro.*)
-    *(.got .got.* .igot .igot.*)
-    . = ALIGN(4);
-
-    PROVIDE_HIDDEN(__bk_app_array_start = .);
-    KEEP (*(SORT_BY_INIT_PRIORITY(.bk_app_array.*)))
-    KEEP (*(.bk_app_array))
-    PROVIDE_HIDDEN(__bk_app_array_end = .);
-
-    . = ALIGN(4);
-    PROVIDE(__init_array_start = .);
-    KEEP (*(SORT_BY_INIT_PRIORITY(.init_array.*)))
-    KEEP (*(EXCLUDE_FILE (*crtend.* *crtbegin.*) .init_array))
-    PROVIDE(__init_array_end = .);
-    . = ALIGN(4);
-  } > RODATA
 
   .data : ALIGN(4)
   {
     _data_start = ABSOLUTE(.);
     . = ALIGN (4);
+
+    *(.rodata.*_esp_hal_internal_handler*)
+    *(.rodata..Lswitch.table.*)
+    *(.rodata.cst*)
 
     *(.data .data.*);
     *(.data1)
@@ -171,6 +139,35 @@ SECTIONS {
     *(.uninit .uninit.*)
     . = ALIGN(4);
   } > RWDATA
+}
+
+SECTIONS {
+  /* For ESP App Description, must be placed first in image */
+  .rodata_desc : ALIGN(0x10)
+  {
+      KEEP(*(.rodata_desc));
+      KEEP(*(.rodata_desc.*));
+  } > RODATA
+
+  .rodata : ALIGN(0x10)
+  {
+    . = ALIGN (4);
+    *(.rodata .rodata.*)
+    *(.srodata .srodata.*)
+    . = ALIGN(4);
+
+    PROVIDE_HIDDEN(__bk_app_array_start = .);
+    KEEP (*(SORT_BY_INIT_PRIORITY(.bk_app_array.*)))
+    KEEP (*(.bk_app_array))
+    PROVIDE_HIDDEN(__bk_app_array_end = .);
+
+    . = ALIGN(4);
+    PROVIDE(__init_array_start = .);
+    KEEP (*(SORT_BY_INIT_PRIORITY(.init_array.*)))
+    KEEP (*(EXCLUDE_FILE (*crtend.* *crtbegin.*) .init_array))
+    PROVIDE(__init_array_end = .);
+    . = ALIGN(4);
+  } > RODATA
 }
 
 SECTIONS {
