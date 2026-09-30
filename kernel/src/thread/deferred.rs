@@ -31,11 +31,11 @@
 //! a context where the cleanup is allowed to do whatever it does.
 
 use crate::{
-    sync::{atomic_wake, spinlock::SpinLock},
+    sync::{spinlock::SpinLock, WaitSignal},
     thread::Entry,
+    time::Tick,
 };
 use alloc::vec::Vec;
-use core::sync::atomic::{AtomicUsize, Ordering};
 
 /// A posted cleanup.
 ///
@@ -56,22 +56,22 @@ unsafe impl Sync for Deferred {}
 static QUEUE: SpinLock<Vec<Deferred>> = SpinLock::new(Vec::new());
 
 /// Bumped whenever something the reaper waits for changes: a posted cleanup,
-/// or a group newly registered for reaping. Waiting on this address is what
-/// lets the reaper notice new work without waiting out its poll bound.
-static GENERATION: AtomicUsize = AtomicUsize::new(0);
+/// or a group newly registered for reaping. The inline wait queue keeps reaper
+/// polling from allocating and freeing heap storage on every pass.
+static SIGNAL: WaitSignal = WaitSignal::new();
 
-/// The value to wait on, and the address to wait at.
+/// The generation to wait on.
 ///
 /// Load the generation *before* inspecting the queue or the pending groups: a
 /// post that lands mid-scan then moves the value the following wait compares
 /// against, instead of being slept through.
 pub fn generation() -> usize {
-    GENERATION.load(Ordering::Acquire)
+    SIGNAL.sequence()
 }
 
-/// The wait address paired with [`generation`].
-pub fn wait_address() -> &'static AtomicUsize {
-    &GENERATION
+/// Wait for a change to the generation, or until the bounded poll expires.
+pub fn wait(generation: usize, timeout: Tick) {
+    let _ = SIGNAL.wait(generation, timeout);
 }
 
 /// Wake the reaper without posting work.
@@ -79,8 +79,7 @@ pub fn wait_address() -> &'static AtomicUsize {
 /// Only call this from a context that may take scheduler and wait-list locks.
 /// Producers running in the context-switch path use [`defer`] instead.
 pub fn notify() {
-    GENERATION.fetch_add(1, Ordering::Release);
-    let _ = atomic_wake(&GENERATION, usize::MAX);
+    SIGNAL.notify();
 }
 
 /// Post `entry` for the reaper to run.
@@ -89,13 +88,13 @@ pub fn notify() {
 /// never dropped: it either runs or is still in the queue.
 ///
 /// This runs in the context-switch path, so it only queues and advances the
-/// generation. Waking a waiter walks the global wait list and re-queues the
+/// generation. Waking a waiter takes the wait queue and re-queues the
 /// woken thread, which is more than the switch path should do; the reaper's
 /// poll bound is what makes it observe the post, and a wake is not needed for
-/// correctness because `atomic_wait` re-checks the generation it was given.
+/// correctness because the wait re-checks the generation it was given.
 pub fn defer(entry: Entry) {
     QUEUE.irqsave_lock().push(Deferred(entry));
-    GENERATION.fetch_add(1, Ordering::Release);
+    SIGNAL.advance();
 }
 
 /// Run everything posted so far.

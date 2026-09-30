@@ -22,7 +22,7 @@ use crate::{
     scheduler::WaitQueue,
     static_arc,
     support::ArcBufferingQueue,
-    sync::{atomic_wait, ISpinLock, SpinLockGuard},
+    sync::{ISpinLock, SpinLockGuard, WaitSignal},
     thread::{self, Entry, SystemThreadStorage, ThreadKind, ThreadNode},
     time::Tick,
     types::{impl_simple_intrusive_adapter, Arc, IlistHead},
@@ -72,7 +72,7 @@ const TASKLET_COMPLETED: usize = 4;
 
 static mut POLLER_STORAGE: SystemThreadStorage = SystemThreadStorage::new(ThreadKind::AsyncPoller);
 static mut POLLER: MaybeUninit<ThreadNode> = MaybeUninit::zeroed();
-static POLLER_WAKER: AtomicUsize = AtomicUsize::new(0);
+static POLLER_WAKER: WaitSignal = WaitSignal::new();
 static_arc! {
     ASYNC_WORK_QUEUE(AsyncWorkQueue, AsyncWorkQueue::new()),
 }
@@ -108,8 +108,7 @@ pub fn block_on(future: impl Future<Output = ()> + Send + 'static) {
 }
 
 fn wake_poller() {
-    POLLER_WAKER.fetch_add(1, Ordering::Release);
-    atomic_wait::atomic_wake(&POLLER_WAKER, 1);
+    POLLER_WAKER.notify();
 }
 
 pub fn spawn(future: impl Future<Output = ()> + Send + 'static) -> Arc<Tasklet> {
@@ -272,9 +271,9 @@ fn poll_inner() {
 
 extern "C" fn poll() {
     loop {
-        let n = POLLER_WAKER.load(Ordering::Acquire);
+        let n = POLLER_WAKER.sequence();
         poll_inner();
-        atomic_wait::atomic_wait(&POLLER_WAKER, n, Tick::MAX);
+        let _ = POLLER_WAKER.wait(n, Tick::MAX);
     }
 }
 

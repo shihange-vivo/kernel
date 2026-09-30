@@ -17,7 +17,7 @@ use crate::{
     boards::ClockImpl,
     config::MAX_THREAD_PRIORITY,
     scheduler, static_arc,
-    sync::{atomic_wait, atomic_wake, SpinLock},
+    sync::{SpinLock, WaitSignal},
     thread,
     thread::{Entry, SystemThreadStorage, ThreadKind, ThreadNode},
     time::{
@@ -32,7 +32,7 @@ use crate::{
 use alloc::boxed::Box;
 use core::{
     mem::MaybeUninit,
-    sync::atomic::{AtomicBool, AtomicUsize, Ordering},
+    sync::atomic::{AtomicBool, Ordering},
 };
 
 static_arc! {
@@ -44,7 +44,7 @@ static mut SW_TIMER_WORKER: SoftTimerWorker = SoftTimerWorker::new();
 static EXPIRE_BARRIER: SpinLock<()> = SpinLock::new(());
 
 struct SoftTimerWorker {
-    waker: AtomicUsize,
+    waker: WaitSignal,
     timers: SpinLock<TimerManager>,
     storage: SystemThreadStorage,
     thread: MaybeUninit<ThreadNode>,
@@ -53,7 +53,7 @@ struct SoftTimerWorker {
 impl SoftTimerWorker {
     pub const fn new() -> Self {
         Self {
-            waker: AtomicUsize::new(0),
+            waker: WaitSignal::new(),
             timers: SpinLock::new(TimerManager::new()),
             storage: SystemThreadStorage::new(ThreadKind::SoftTimer),
             thread: MaybeUninit::zeroed(),
@@ -63,13 +63,13 @@ impl SoftTimerWorker {
 
 extern "C" fn run_soft_timer() {
     loop {
-        let n = unsafe { &SW_TIMER_WORKER.waker }.load(Ordering::Relaxed);
+        let n = unsafe { &SW_TIMER_WORKER.waker }.sequence();
         {
             let mut w = unsafe { &SW_TIMER_WORKER.timers }.irqsave_lock();
             w.post_expire();
         }
         update_clock_interrupt();
-        atomic_wait(unsafe { &SW_TIMER_WORKER.waker }, n, Tick::MAX);
+        let _ = unsafe { &SW_TIMER_WORKER.waker }.wait(n, Tick::MAX);
     }
 }
 
@@ -81,8 +81,7 @@ fn wake_up_soft_timer_worker(deadline: Tick) -> Option<Tick> {
         w.expire(deadline);
         res = w.next_deadline();
     }
-    unsafe { &SW_TIMER_WORKER.waker }.fetch_add(1, Ordering::Relaxed);
-    atomic_wake(unsafe { &SW_TIMER_WORKER.waker }, 1);
+    unsafe { &SW_TIMER_WORKER.waker }.notify();
     res
 }
 

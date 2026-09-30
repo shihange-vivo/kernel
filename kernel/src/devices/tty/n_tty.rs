@@ -21,7 +21,10 @@ use crate::{
 };
 use alloc::{collections::VecDeque, string::String, sync::Arc, vec::Vec};
 use blueos_driver::uart::{DataBits, UartConfig};
-use core::sync::atomic::{AtomicUsize, Ordering};
+use core::{
+    fmt,
+    sync::atomic::{AtomicUsize, Ordering},
+};
 use embedded_io::ErrorKind;
 use libc::{c_int, TCFLSH, TCGETS, TCIFLUSH, TCSBRK, TCSETS, TCSETSF, TCSETSW, TCXONC};
 use spin::Mutex;
@@ -39,6 +42,32 @@ pub struct Tty {
     history: Mutex<VecDeque<String>>,
     history_cursor: AtomicUsize,
     spec_key: Mutex<Option<SpecKey>>,
+}
+
+struct ConsoleWriter<'a> {
+    writer: &'a mut dyn fmt::Write,
+    oflag: Oflags,
+}
+
+impl fmt::Write for ConsoleWriter<'_> {
+    fn write_str(&mut self, s: &str) -> fmt::Result {
+        if !self.oflag.contains(Oflags::OPOST) {
+            return self.writer.write_str(s);
+        }
+
+        let mut start = 0;
+        for (index, byte) in s.bytes().enumerate() {
+            let replacement = match byte {
+                b'\n' if self.oflag.contains(Oflags::ONLCR) => "\r\n",
+                b'\r' if self.oflag.contains(Oflags::OCRNL) => "\n",
+                _ => continue,
+            };
+            self.writer.write_str(&s[start..index])?;
+            self.writer.write_str(replacement)?;
+            start = index + 1;
+        }
+        self.writer.write_str(&s[start..])
+    }
 }
 
 impl Tty {
@@ -323,6 +352,12 @@ impl Device for Tty {
         } else {
             self.dev.send_bytes(buf, is_nonblocking)
         }
+    }
+
+    fn write_fmt(&self, args: fmt::Arguments<'_>) -> fmt::Result {
+        let oflag = self.termios.lock().oflag;
+        self.dev
+            .with_polling_writer(|writer| fmt::write(&mut ConsoleWriter { writer, oflag }, args))
     }
 
     fn ioctl(&self, request: u32, arg: usize) -> Result<(), ErrorKind> {

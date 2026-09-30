@@ -53,7 +53,7 @@ pub struct ReapReport {
     pub imported_dsos: usize,
 }
 
-/// The bound between two reaper scans: the thread parks on an atomic wait with
+/// The bound between two reaper scans: the thread parks on a wait signal with
 /// this timeout, then re-checks every pending group. Member exits and lifecycle
 /// transitions are all lock-free observable state, so a short bounded poll is
 /// the wait primitive; registration still wakes the thread promptly.
@@ -123,8 +123,7 @@ impl ApplicationReaper {
             // A bounded wait: member exits and lifecycle transitions are plain
             // shared state with no wake plumbing into this thread, so the poll
             // bound is what makes the reaper eventually observe them.
-            let _ = crate::sync::atomic_wait(
-                deferred::wait_address(),
+            deferred::wait(
                 generation,
                 crate::time::Tick::from_millis(REAPER_POLL_MILLIS),
             );

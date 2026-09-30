@@ -6,6 +6,7 @@
 // CHECK-SUCC: STACK_RECLAIM round=2
 // CHECK-SUCC: STACK_RECLAIM round=3
 // CHECK-SUCC: \[       OK \] released_slots_do_not_retain_membership_storage
+// CHECK-SUCC: \[       OK \] background_waits_do_not_change_heap_usage
 
 #![no_main]
 #![no_std]
@@ -101,6 +102,20 @@ fn application_launch_resources_are_reclaimed() {
             used.saturating_sub(previous)
         );
         previous = used;
+    }
+}
+
+#[test]
+fn background_waits_do_not_change_heap_usage() {
+    static WAIT: blueos::sync::WaitSignal = blueos::sync::WaitSignal::new();
+    let service = runtime::init();
+    launch_fixture(service);
+    let previous = heap_used();
+    // Cross several reaper polls and clock interrupts. Park without allocating
+    // a futex entry of our own; idle workers must leave the heap unchanged.
+    for _ in 0..40 {
+        let _ = WAIT.wait(WAIT.sequence(), blueos::time::Tick(1));
+        assert_eq!(heap_used(), previous, "idle worker changed heap usage");
     }
 }
 

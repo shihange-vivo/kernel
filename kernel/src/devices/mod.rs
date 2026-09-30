@@ -20,7 +20,7 @@ use blueos_infra::{
     tinyarc::TinyArc,
 };
 use core::{
-    fmt::Debug,
+    fmt::{self, Debug},
     sync::atomic::{AtomicBool, AtomicU32, Ordering},
 };
 use embedded_io::ErrorKind;
@@ -197,6 +197,20 @@ pub trait Device: Send + Sync {
     }
     fn read(&self, pos: u64, buf: &mut [u8], is_nonblocking: bool) -> Result<usize, ErrorKind>;
     fn write(&self, pos: u64, buf: &[u8], is_nonblocking: bool) -> Result<usize, ErrorKind>;
+    /// Write a formatted console record. Console devices can override this to
+    /// serialize all formatting fragments with other writers.
+    fn write_fmt(&self, args: fmt::Arguments<'_>) -> fmt::Result {
+        struct Writer<'a, D: ?Sized>(&'a D);
+
+        impl<D: Device + ?Sized> fmt::Write for Writer<'_, D> {
+            fn write_str(&mut self, s: &str) -> fmt::Result {
+                let _ = self.0.write(0, s.as_bytes(), true);
+                Ok(())
+            }
+        }
+
+        fmt::write(&mut Writer(self), args)
+    }
     fn ioctl(&self, request: u32, arg: usize) -> Result<(), ErrorKind> {
         Err(ErrorKind::Unsupported)
     }

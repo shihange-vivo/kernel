@@ -176,7 +176,6 @@ impl NetworkManager {
             // Step3 : get next poll time from smoltcp network stack
             {
                 let sleep_time = iface_list::iter()
-                    .iter()
                     .map(|iface| {
                         let Ok(millis_i64) = i64::try_from(sysclk::now().as_millis()) else {
                             return DEFAULT_DELAY_TIME_IN_MILLIS;

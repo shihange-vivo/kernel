@@ -14,6 +14,7 @@
 
 use core::{
     cell::{Cell, RefCell},
+    fmt,
     sync::atomic::{AtomicUsize, Ordering},
 };
 
@@ -25,6 +26,7 @@ use crate::{
     scheduler::{self, is_schedule_ready, yield_me},
     support::DisableInterruptGuard,
     sync::{atomic_wait, atomic_wake, SpinLock},
+    thread::Thread,
     time::{self, Tick},
 };
 use blueos_driver::uart::{InterruptType, UartConfig, UartCtrlStatus};
@@ -52,17 +54,13 @@ pub struct Serial {
 }
 
 /// Safety:
-/// - Single-core: thread-side enqueue is serialized by `tx_lock`; TX IRQ is disabled around
-///   enqueue/retry critical region to avoid producer-side interleaving with TX ISR.
-///
-/// - SMP: accesses to `tx_buffer/tx_head/tx_end` in TX producer/consumer paths are additionally
-///   serialized by `critical_section_guard` so these shared fields are not concurrently mutated.
-/// - Pending TX IRQ may still run once after a disable operation due to interrupt timing, but this
-///   is treated as timing jitter (observable send time variation), not a duplicated-byte data race.
 /// - Thread-side enqueue is serialized by `tx_lock`.
-/// - TX-side dequeue only advances `tx_end` and runs with interrupt context rules.
-/// - `send_bytes` disables TX interrupt around enqueue/retry critical region, so producer-side
-///   updates to `tx_buffer/tx_head` are not interleaved by TX ISR.
+/// - TX producers and consumers protect the ring and UART with
+///   `critical_section_guard`, which also masks local interrupts.
+/// - Formatted records hold this guard across all formatting fragments. A thread
+///   waiting for TX space releases it so IRQ and polling writers can make progress.
+/// - RX uses this guard on SMP; on a single core the ISR and interrupt-masked
+///   thread-side accesses cannot run concurrently.
 unsafe impl Sync for Serial {}
 
 pub static TTY_SERIAL: Serial = Serial {
@@ -81,6 +79,38 @@ pub static TTY_SERIAL: Serial = Serial {
 };
 
 impl Serial {
+    /// Keep a complete formatted record together with respect to UART producers
+    /// and the TX interrupt handler. Polling allows this from IRQ context too.
+    pub fn with_polling_writer(
+        &self,
+        write: impl FnOnce(&mut dyn fmt::Write) -> fmt::Result,
+    ) -> fmt::Result {
+        #[cfg(usb_serial)]
+        if self.dev.is_bus_busy() {
+            return Ok(());
+        }
+
+        // Do not take tx_lock here: a thread holding it may be waiting for TX
+        // interrupt progress on the CPU that is printing this record.
+        // Draining can wake that thread; do not switch while owning the UART.
+        let _preempt = (is_schedule_ready() && !is_in_irq()).then(Thread::try_preempt_me);
+        let _lock = self.critical_section_guard.irqsave_lock();
+        self.drain_tx_polling();
+
+        struct Writer<'a>(&'a Serial);
+
+        impl fmt::Write for Writer<'_> {
+            fn write_str(&mut self, s: &str) -> fmt::Result {
+                for &byte in s.as_bytes() {
+                    self.0.send_byte_polling(byte);
+                }
+                Ok(())
+            }
+        }
+
+        write(&mut Writer(self))
+    }
+
     pub fn send_bytes(&self, bytes: &[u8], is_nonblocking: bool) -> Result<usize, ErrorKind> {
         // FIXME: USB-Serial-JTAG has no transmit consumer until the host enumerates
         // the device. Do not fill the software ring in that state: a later blocking
@@ -103,8 +133,9 @@ impl Serial {
             // In those cases, relying on TX interrupt-driven drain may stall forever. Polling
             // guarantees forward progress for emergency logs, but callers should keep IRQ logs
             // short and infrequent.
-            #[cfg(smp)]
+            let _preempt = (is_schedule_ready() && !is_in_irq()).then(Thread::try_preempt_me);
             let _lock = self.critical_section_guard.irqsave_lock();
+            self.drain_tx_polling();
             for &b in bytes {
                 self.send_byte_polling(b);
             }
@@ -112,20 +143,20 @@ impl Serial {
         } else {
             let mut nbytes = 0;
             let _spinlock = self.tx_lock.write();
+            let mut lock = self.critical_section_guard.irqsave_lock();
             self.dev.disable_interrupt(InterruptType::Tx);
             'e: for &b in bytes {
-                #[cfg(smp)]
-                let _lock = self.critical_section_guard.irqsave_lock();
-
                 match self.send_byte_fifo(b) {
                     Ok(()) => {
                         nbytes += 1;
                     }
                     Err(ErrorKind::OutOfMemory) => {
                         if !is_nonblocking {
-                            #[cfg(smp)]
-                            drop(_lock);
                             'i: loop {
+                                // Release the UART lock while waiting for space;
+                                // other writers cannot enter between enqueue
+                                // fragments unless the software FIFO fills up.
+                                drop(lock);
                                 let tx_seq = self.tx_futex.load(Ordering::Acquire);
                                 // If the FIFO is full and we're in blocking mode, we need to
                                 // trigger the TX interrupt to start sending out the data in FIFO.
@@ -139,9 +170,8 @@ impl Serial {
                                 } else {
                                     while (self.is_tx_full()) {}
                                 }
+                                lock = self.critical_section_guard.irqsave_lock();
                                 self.dev.disable_interrupt(InterruptType::Tx);
-                                #[cfg(smp)]
-                                let _lock = self.critical_section_guard.irqsave_lock();
                                 match self.send_byte_fifo(b) {
                                     Ok(()) => break 'i,
                                     Err(ErrorKind::OutOfMemory) => {
@@ -160,6 +190,7 @@ impl Serial {
                     }
                 }
             }
+            drop(lock);
             self.trigger_tx_interrupt();
             Ok(nbytes)
         }
@@ -328,6 +359,7 @@ impl Serial {
 
     #[inline(always)]
     fn send_control_char(&self, ch: u8) -> Result<(), ErrorKind> {
+        let _lock = self.critical_section_guard.irqsave_lock();
         self.send_byte_polling(ch);
         Ok(())
     }
@@ -358,6 +390,16 @@ impl Serial {
         self.dev.flush_tx_fifo();
     }
 
+    // Caller holds critical_section_guard. Send queued bytes before switching to
+    // polling, so a record cannot overtake output already accepted into the ring.
+    fn drain_tx_polling(&self) {
+        use blueos_hal::HasFifo;
+        while self.tx_head.get() != self.tx_end.get() {
+            while self.consumer_byte() {}
+            self.dev.flush_tx_fifo();
+        }
+    }
+
     #[inline(always)]
     fn send_byte_fifo(&self, c: u8) -> Result<(), ErrorKind> {
         let tx_next = (self.tx_head.get() + 1) % CONFIG_SERIAL_TX_FIFO_SIZE;
@@ -377,6 +419,7 @@ impl Serial {
         // handler to run before we finish updating the TX buffer state. But it's not a problem as the interrupt
         // handler will check the buffer state and return immediately if there's no data to send.
         // So we can just accept this minor timing jitter for simplicity.
+        let _preempt = (is_schedule_ready() && !is_in_irq()).then(Thread::try_preempt_me);
         let _lock = self.critical_section_guard.irqsave_lock();
         self.dev.enable_interrupt(InterruptType::Tx);
         // FIXME: In the certain SoCs that TX is an edge interrupt. It only fires

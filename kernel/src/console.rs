@@ -52,6 +52,10 @@ impl fmt::Write for Console {
         let _ = get_console().write(0, s.as_bytes(), true);
         Ok(())
     }
+
+    fn write_fmt(&mut self, args: fmt::Arguments<'_>) -> fmt::Result {
+        get_console().write_fmt(args)
+    }
 }
 
 pub struct EarlyConsole;

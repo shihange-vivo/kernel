@@ -49,9 +49,14 @@ pub fn register(iface: Arc<NetIface>, link: Arc<spin::RwLock<dyn LinkLayer>>, se
     }
 }
 
-/// Iterate over all registered interfaces (snapshot).
-pub fn iter() -> Vec<Arc<NetIface>> {
-    NET_IFACE_LIST.read().clone()
+/// Iterate over the interfaces registered when iteration starts.
+///
+/// Registration only appends to the list. Capture its length, then clone each
+/// interface under a short read lock: the original prefix stays valid without
+/// allocating a vector or holding the registry lock while polling interfaces.
+pub fn iter() -> impl Iterator<Item = Arc<NetIface>> {
+    let count = NET_IFACE_LIST.read().len();
+    (0..count).map(|index| NET_IFACE_LIST.read()[index].clone())
 }
 
 /// Look up an interface by predicate.
@@ -77,4 +82,20 @@ pub fn len() -> usize {
 /// Check whether the list is empty.
 pub fn is_empty() -> bool {
     NET_IFACE_LIST.read().is_empty()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use blueos_test_macro::test;
+
+    #[test]
+    fn test_iface_iteration_does_not_allocate() {
+        assert!(!is_empty(), "boot must register the loopback interface");
+        let used = crate::allocator::memory_info().used;
+        for iface in iter() {
+            assert_eq!(crate::allocator::memory_info().used, used);
+            drop(iface);
+        }
+    }
 }

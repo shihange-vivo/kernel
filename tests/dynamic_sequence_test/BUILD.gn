@@ -26,6 +26,7 @@ build_rust("dynamic_sequence_test") {
   edition = "2021"
   sources = [ "src/test.rs" ]
   deps = [
+    "//external/vendor/log-0.4.28:log",
     "//external/vendor/semihosting-0.1.20:semihosting",
     "//kernel/kernel:blueos",
     "//kernel/rsrt",
