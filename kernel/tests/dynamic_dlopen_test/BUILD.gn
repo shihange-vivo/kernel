@@ -27,6 +27,7 @@ build_rust("dynamic_dlopen_test") {
     "//kernel/kernel:blueos",
     "//kernel/rsrt",
     "//kernel/scal:blueos_scal",
+    "//kernel/tests/support:dynamic_test_support",
     "//libs/libc",
     "//libs/librs",
   ]
