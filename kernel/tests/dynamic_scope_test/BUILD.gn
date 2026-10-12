@@ -33,6 +33,7 @@ build_rust("dynamic_scope_test") {
     "//kernel/kernel:blueos",
     "//kernel/loader:blueos_loader",
     "//kernel/rsrt",
+    "//kernel/tests/support:dynamic_test_support",
     "//libs/libc",
     "//libs/librs",
   ]
