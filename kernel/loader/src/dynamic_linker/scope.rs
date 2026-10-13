@@ -26,12 +26,12 @@
 use alloc::vec::Vec;
 
 use crate::{
-    address::TargetAddress,
     dynamic_linker::{
         graph::DependencyGraph, session::SessionUsage, ImageId, ImageOwnership, SymbolBinding,
         SymbolDefinition, SymbolEntry, SymbolTable, SymbolType, SymbolVisibility,
     },
     error::{ErrorContext, LoadErrorKind, LoadStage},
+    memory::address::TargetAddress,
     profile::SessionLimits,
     LoadError, LoadResult,
 };

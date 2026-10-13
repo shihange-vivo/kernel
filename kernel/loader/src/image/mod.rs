@@ -12,6 +12,13 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+//! Single-image ELF loading stages.
+//!
+//! `image_loader` defines the staged loader. Follow `admit` → `inspect` → `plan`
+//! → `allocate` → `map` → `decode`; `seal` describes final protections. `scan`
+//! extracts dependency metadata without mapping and `features` classifies
+//! dynamic features. Multi-image linking is handled by `dynamic_linker`.
+
 mod admit;
 mod allocate;
 mod decode;

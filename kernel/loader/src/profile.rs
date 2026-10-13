@@ -34,7 +34,7 @@ use goblin::elf::{
 
 use crate::{
     error::{ErrorContext, LimitKind, LoadErrorKind},
-    memory_mapper::MemoryPermissions,
+    memory::MemoryPermissions,
     LoadError, LoadResult,
 };
 

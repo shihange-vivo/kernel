@@ -29,7 +29,6 @@
 use alloc::{sync::Arc, vec::Vec};
 
 use crate::{
-    address::{TargetAddress, TargetRange},
     dynamic_linker::{
         artifact::{ArtifactIdentity, DependencyName},
         graph::DependencyNode,
@@ -40,7 +39,10 @@ use crate::{
     elf::LoadSegmentInfo,
     error::{ErrorContext, LoadErrorKind},
     image::LoadedRegion,
-    memory_mapper::MemoryPermissions,
+    memory::{
+        address::{TargetAddress, TargetRange},
+        MemoryPermissions,
+    },
     profile::LoadProfile,
     LoadError, LoadResult,
 };

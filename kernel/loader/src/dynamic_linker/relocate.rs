@@ -23,7 +23,6 @@
 use alloc::vec::Vec;
 
 use crate::{
-    address::{TargetAddress, TargetRange},
     dynamic_linker::{
         session::SessionUsage, ImageId, ResolvedSymbol, RuntimeImageMetadata, ScopeSet,
         SymbolBinding, SymbolDefinition, SymbolRegionKind, SymbolTable, SymbolVisibility,
@@ -32,9 +31,10 @@ use crate::{
     error::{ErrorContext, LoadErrorKind, LoadStage},
     image::{LoadedRegion, RelocationAddend, RelocationRecord},
     memory::{
-        AllocationOffset, AllocationRollbackLog, ImageAllocation, ImageMemory, SessionAllocation,
+        address::{TargetAddress, TargetRange},
+        AllocationOffset, AllocationRollbackLog, ImageAllocation, ImageMemory, MemoryPermissions,
+        SessionAllocation,
     },
-    memory_mapper::MemoryPermissions,
     profile::{ElfMachine, LoadProfile, SessionLimits},
     relocation::{AddendEncoding, ArchRelocator, RelocationKind, TargetWord, WordWidth},
     LoadError, LoadResult,
@@ -649,7 +649,7 @@ pub(crate) fn locate_region_offset(
 fn segment_is_writable(segments: &[LoadSegmentInfo], vaddr: TargetAddress, len: u64) -> bool {
     segments.iter().any(|segment| {
         segment.permissions().contains(MemoryPermissions::WRITE)
-            && crate::address::TargetRange::new(segment.vaddr(), segment.memory_size())
+            && crate::memory::address::TargetRange::new(segment.vaddr(), segment.memory_size())
                 .contains_span(vaddr, len)
     })
 }

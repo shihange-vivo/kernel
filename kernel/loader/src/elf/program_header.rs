@@ -13,8 +13,8 @@
 // limitations under the License.
 
 use crate::{
-    address::TargetAddress,
     image::{read_u32, read_u64},
+    memory::address::TargetAddress,
     profile::{ElfClass, ElfData},
     LoadResult,
 };

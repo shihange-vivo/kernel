@@ -12,6 +12,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+//! Dependency discovery before mapping: source lookup, snapshot reuse and a
+//! root-first load plan. `PlannedResolver` feeds this fixed plan to the linker.
+
 use crate::{
     dynamic_linker::{
         ArtifactIdentity, ArtifactResolver, ArtifactRole, DependencyName, DependencyRequest,

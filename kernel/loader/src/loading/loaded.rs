@@ -16,6 +16,8 @@
 
 use alloc::{sync::Arc, vec::Vec};
 
+use super::planning::LoadPlan;
+
 pub use crate::dynamic_linker::ImageDependency;
 
 use crate::{
@@ -25,7 +27,6 @@ use crate::{
     },
     error::{invalid, oom},
     memory::TargetAddress,
-    planning::LoadPlan,
     LoadResult,
 };
 

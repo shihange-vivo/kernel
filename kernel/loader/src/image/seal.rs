@@ -15,12 +15,13 @@
 use alloc::vec::Vec;
 
 use crate::{
-    address::{TargetAddress, TargetRange},
     elf::LoadSegmentInfo,
     error::{ErrorContext, LimitKind, LoadErrorKind, ProgramHeaderField},
     image::{inspect::StackKind, map::LoadedRegion, RelocationRecord},
-    memory::{AllocationOffset, ImageAllocation, ImageProtectionMemory},
-    memory_mapper::MemoryPermissions,
+    memory::{
+        address::{TargetAddress, TargetRange},
+        AllocationOffset, ImageAllocation, ImageProtectionMemory, MemoryPermissions,
+    },
     profile::ElfClass,
     LoadError, LoadResult,
 };

@@ -12,15 +12,20 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+//! Link preparation: import providers, close dependencies, freeze symbol scopes,
+//! relocate images, synchronize code caches and seal memory protections.
+
 use alloc::vec::Vec;
 
 use crate::{
-    cache::{ArchitectureCodeCache, CacheRequirements},
     dynamic_linker::{
         ArtifactIdentity, ArtifactResolver, ArtifactRole, DependencyResolution, DynamicLinker,
         ImportedImageDescriptor, SealedSession,
     },
-    memory::ImageProtectionMemory,
+    memory::{
+        cache::{ArchitectureCodeCache, CacheRequirements},
+        ImageProtectionMemory,
+    },
     profile::{LoadProfile, SessionLimits},
     reader::ElfReader,
     LoadResult,

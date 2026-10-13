@@ -25,8 +25,6 @@
 use alloc::{sync::Arc, vec::Vec};
 
 use crate::{
-    address::TargetAddress,
-    cache::CodeCache,
     dynamic_linker::{
         graph::{DependencyGraph, DiscoveryItem, DiscoveryQueue},
         lifecycle::{self, LifecycleImage, LifecyclePlans},
@@ -47,7 +45,10 @@ use crate::{
         absorb_into_session, ImageLoader, LoadedRegion, PreparedProtectionPlan, ProtectionBatch,
         SealPlan,
     },
-    memory::{AllocationRollbackLog, ImageMemory, ImageProtectionMemory, SessionAllocation},
+    memory::{
+        address::TargetAddress, cache::CodeCache, AllocationRollbackLog, ImageMemory,
+        ImageProtectionMemory, SessionAllocation,
+    },
     profile::{LoadLimits, LoadProfile, LoadRequest, SessionLimits},
     reader::ElfReader,
     relocation::ArchRelocator,
@@ -898,7 +899,7 @@ impl<'a, M: ImageProtectionMemory + ?Sized, A: ArchRelocator> RelocatedSession<'
                     .filter(|segment| {
                         segment
                             .permissions()
-                            .contains(crate::memory_mapper::MemoryPermissions::EXECUTE)
+                            .contains(crate::memory::MemoryPermissions::EXECUTE)
                             && segment.memory_size() != 0
                     })
                     .count();
@@ -940,7 +941,7 @@ impl<'a, M: ImageProtectionMemory + ?Sized, A: ArchRelocator> RelocatedSession<'
             for (segment, region) in runtime.load_segments().iter().zip(runtime.regions().iter()) {
                 if segment
                     .permissions()
-                    .contains(crate::memory_mapper::MemoryPermissions::EXECUTE)
+                    .contains(crate::memory::MemoryPermissions::EXECUTE)
                     && !region.runtime_range().is_empty()
                 {
                     executable_ranges.push(region.runtime_range());

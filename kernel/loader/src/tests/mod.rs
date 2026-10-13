@@ -12,6 +12,10 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+//! Loader unit tests and fixtures. `load` covers the host-facing complete flow,
+//! `linker` covers link preparation and publication, and `runtime` exercises
+//! linking internals. Single-image and ABI checks follow below.
+
 use goblin::elf::{
     header::{EM_ARM, EM_RISCV, ET_DYN},
     Elf,
@@ -326,9 +330,9 @@ fn fixture_builder_emits_a_parseable_elf32_header() {
 mod placement {
     use blueos_test_macro::test;
 
-    use crate::{
+    use crate::memory::{
         address::{TargetAddress, TargetRange},
-        memory::{AllocationRequest, Placement},
+        AllocationRequest, Placement,
     };
 
     #[test]
@@ -413,10 +417,12 @@ mod fixed_mapper {
     use blueos_test_macro::test;
 
     use crate::{
-        address::{TargetAddress, TargetRange},
         error::{ErrorContext, LoadErrorKind},
-        memory::{AllocationRequest, ImageMemory, Placement},
-        memory_mapper::{MemoryMapper, MemoryPermissions, MemoryRegion},
+        memory::{
+            address::{TargetAddress, TargetRange},
+            AllocationRequest, ImageMemory, MemoryMapper, MemoryPermissions, MemoryRegion,
+            Placement,
+        },
     };
 
     // SAFETY: test-only static region. Unit tests only exercise the

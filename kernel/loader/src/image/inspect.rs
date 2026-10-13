@@ -15,12 +15,14 @@
 use alloc::vec::Vec;
 
 use crate::{
-    address::{TargetAddress, TargetRange},
     dynamic_linker::{ArtifactRole, ProgramHeaderGeometry},
     elf::{DynamicSegmentInfo, ElfHeaderInfo, LoadSegmentInfo},
     error::{ErrorContext, HeaderField, LoadErrorKind, LoadStage, ProgramHeaderField},
     image::{admit::program_header_error, plan::PlannedImage, DynamicFeatureSummary},
-    memory_mapper::MemoryPermissions,
+    memory::{
+        address::{TargetAddress, TargetRange},
+        MemoryPermissions,
+    },
     profile::{supports_segment_permissions, EntryMode, LoadRequest},
     reader::ElfReader,
     LoadError, LoadResult,

@@ -15,12 +15,14 @@
 use alloc::vec::Vec;
 
 use crate::{
-    address::{TargetAddress, TargetRange},
     dynamic_linker::ProgramHeaderGeometry,
     elf::{DynamicSegmentInfo, LoadSegmentInfo},
     error::{ErrorContext, LoadErrorKind, LoadStage},
     image::{allocate::AllocatedImage, inspect::StackKind},
-    memory::{AllocationRequest, ImageAllocation, ImageLoadTransaction, ImageMemory, Placement},
+    memory::{
+        address::{TargetAddress, TargetRange},
+        AllocationRequest, ImageAllocation, ImageLoadTransaction, ImageMemory, Placement,
+    },
     profile::{ElfClass, ElfType, LoadRequest},
     reader::ElfReader,
     LoadError, LoadResult,

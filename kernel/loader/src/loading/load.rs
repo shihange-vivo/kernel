@@ -16,13 +16,15 @@
 
 use alloc::vec::Vec;
 
-use crate::{
-    dynamic_linker::{ArtifactRole, DependencyResolution},
-    error::{invalid, oom, ErrorContext, LoadErrorKind},
-    linker::{prepare_link, LinkRequest},
+use super::{
     planning::{LoadPlan, PlannedResolver},
-    profile::{LoadProfile, SessionLimits},
     publication::BackendPublisher,
+};
+
+use crate::{
+    dynamic_linker::{prepare_link, ArtifactRole, DependencyResolution, LinkRequest},
+    error::{invalid, oom, ErrorContext, LoadErrorKind},
+    profile::{LoadProfile, SessionLimits},
     trace::{emit, trace_product, LoadEvent, LoadPhase},
     ImageHandle, LoadError, LoadResult, LoadedImage, LoaderBackend,
 };

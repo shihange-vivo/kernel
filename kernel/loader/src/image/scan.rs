@@ -32,11 +32,11 @@ use alloc::vec::Vec;
 use goblin::elf::dynamic::{DT_NEEDED, DT_SONAME, DT_STRSZ, DT_STRTAB};
 
 use crate::{
-    address::{FileRange, TargetAddress, TargetRange},
     dynamic_linker::{ArtifactRole, DependencyName},
     elf::LoadSegmentInfo,
     error::{LoadErrorKind, LoadStage},
     image::{image_loader::ImageLoader, map::decode_dependency_name_at},
+    memory::address::{FileRange, TargetAddress, TargetRange},
     profile::{LoadLimits, LoadProfile, LoadRequest},
     reader::ElfReader,
     LoadError, LoadResult,

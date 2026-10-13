@@ -12,6 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+//! Checked arithmetic for target addresses, target ranges and file ranges.
+
 use crate::{
     error::{ErrorContext, LoadErrorKind},
     LoadError, LoadResult,

@@ -15,8 +15,8 @@
 use crate::{
     error::{ErrorContext, LoadErrorKind},
     load,
+    loading::planning::LoadPlan,
     memory::{AllocationLease, AllocationOffset, ImageMemory, MemoryPermissions, MemoryRegion},
-    planning::LoadPlan,
     profile::{LoadLimits, LoadProfile, SessionLimits},
     reader::ElfReader,
     tests::fixture::{SharedMemory, SliceElfReader},
