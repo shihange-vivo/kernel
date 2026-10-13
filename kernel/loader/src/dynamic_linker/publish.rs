@@ -27,14 +27,13 @@
 use alloc::{sync::Arc, vec::Vec};
 
 use crate::{
-    address::TargetAddress,
     dynamic_linker::{
         graph::{DependencyEdge, DependencyGraph},
         scope::RelocationBinding,
         DependencyName, ImageId, ImageOwnership, LifecyclePlans, PublishedImageDescriptor,
     },
     error::{ErrorContext, LoadErrorKind, LoadStage},
-    memory::AllocationLease,
+    memory::{address::TargetAddress, AllocationLease},
     LoadError, LoadResult,
 };
 

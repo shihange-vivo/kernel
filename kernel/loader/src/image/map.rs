@@ -21,7 +21,6 @@ use goblin::elf::dynamic::{
 };
 
 use crate::{
-    address::{FileRange, TargetAddress, TargetRange},
     dynamic_linker::{
         symbol_count_from_hash, DependencyName, ImageLifecycleMetadata, ProgramHeaderGeometry,
         RelocationTables, RuntimeImageMetadata, RuntimeImageState, SymbolTable,
@@ -36,7 +35,10 @@ use crate::{
         inspect::StackKind,
         read_u32, read_u64,
     },
-    memory::{AllocationOffset, ImageLoadTransaction, ImageMemory},
+    memory::{
+        address::{FileRange, TargetAddress, TargetRange},
+        AllocationOffset, ImageLoadTransaction, ImageMemory,
+    },
     profile::{supports_dynamic_tag, ElfClass, ElfData, LoadRequest},
     LoadError, LoadResult,
 };

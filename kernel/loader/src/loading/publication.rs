@@ -16,15 +16,18 @@
 
 use alloc::vec::Vec;
 
+use super::{
+    loaded::{build_facts, handle, LoadFacts},
+    planning::LoadPlan,
+};
+
 use crate::{
     dynamic_linker::{
         CommittingLinkProduct, ImageOwnership, LifecyclePlans, LinkContext, LinkPublisher,
         PreparedLinkManifest, RelocationBinding,
     },
     error::{oom, overflow},
-    loaded::{build_facts, handle, LoadFacts},
     memory::AllocationLease,
-    planning::LoadPlan,
     ImageHandle, LoadResult, LoaderBackend,
 };
 

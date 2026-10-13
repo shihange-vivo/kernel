@@ -12,11 +12,13 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+//! Code publication barriers and architecture-specific cache maintenance.
+
 use alloc::vec::Vec;
 
 use crate::{
-    address::{TargetAddress, TargetRange},
     error::{ErrorContext, LoadErrorKind},
+    memory::address::{TargetAddress, TargetRange},
     LoadError, LoadResult,
 };
 

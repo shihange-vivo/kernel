@@ -15,7 +15,6 @@
 use alloc::vec::Vec;
 
 use crate::{
-    address::{TargetAddress, TargetRange},
     dynamic_linker::ProgramHeaderGeometry,
     elf::{DynamicSegmentInfo, LoadSegmentInfo},
     error::{ErrorContext, LoadErrorKind, LoadStage},
@@ -23,7 +22,10 @@ use crate::{
         inspect::StackKind,
         map::{LoadedRegion, MappedImage},
     },
-    memory::{AllocationOffset, ImageLoadTransaction, ImageMemory},
+    memory::{
+        address::{TargetAddress, TargetRange},
+        AllocationOffset, ImageLoadTransaction, ImageMemory,
+    },
     profile::LoadRequest,
     reader::ElfReader,
     LoadError, LoadResult,

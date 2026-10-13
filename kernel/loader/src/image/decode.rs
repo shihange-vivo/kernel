@@ -15,10 +15,12 @@
 use alloc::vec::Vec;
 
 use crate::{
-    address::TargetAddress,
     dynamic_linker::RuntimeImageState,
     error::{ErrorContext, LoadErrorKind},
-    memory::{AllocationRollbackLog, ImageLoadTransaction, ImageMemory, SessionAllocation},
+    memory::{
+        address::TargetAddress, AllocationRollbackLog, ImageLoadTransaction, ImageMemory,
+        SessionAllocation,
+    },
     LoadError, LoadResult,
 };
 

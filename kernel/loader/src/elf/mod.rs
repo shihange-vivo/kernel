@@ -12,6 +12,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+//! ELF file structures: header validation, program headers and segment geometry.
+//! Loading policy and memory effects belong to `image`, above this layer.
+
 mod header;
 mod program_header;
 mod segment;

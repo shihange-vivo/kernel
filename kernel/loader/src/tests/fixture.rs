@@ -564,7 +564,7 @@ impl RecordingMemory {
     pub fn new(sink: Rc<RefCell<Option<AllocationRequest>>>) -> Self {
         Self {
             sink,
-            allocation: ImageAllocation::new(crate::address::TargetAddress::new(0), 0, 1),
+            allocation: ImageAllocation::new(crate::memory::address::TargetAddress::new(0), 0, 1),
         }
     }
 
@@ -592,7 +592,7 @@ impl ImageMemory for RecordingMemory {
         let (base, ownership) = match request.placement() {
             Placement::Fixed(range) => (range.start(), AllocationOwnership::BorrowedFixed),
             Placement::Anywhere => (
-                crate::address::TargetAddress::new(0x1_0000),
+                crate::memory::address::TargetAddress::new(0x1_0000),
                 AllocationOwnership::Owned,
             ),
         };

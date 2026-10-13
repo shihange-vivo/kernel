@@ -12,6 +12,10 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+//! Architecture-specific relocation rules and target-word encoding.
+//! `dynamic_linker/relocate` selects symbols and validates session-wide writes;
+//! this module implements the ARM, AArch64 and RISC-V relocation operations.
+
 mod aarch64;
 mod arm;
 mod riscv;
@@ -21,9 +25,8 @@ pub(crate) use arm::ArmRelocator;
 pub(crate) use riscv::{Riscv32Relocator, Riscv64Relocator};
 
 use crate::{
-    address::TargetAddress,
     error::{ErrorContext, LoadErrorKind},
-    memory::{AllocationOffset, ImageAllocation, ImageMemory},
+    memory::{address::TargetAddress, AllocationOffset, ImageAllocation, ImageMemory},
     profile::{ElfClass, ElfData, ElfMachine},
     LoadError, LoadResult,
 };

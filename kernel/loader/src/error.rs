@@ -15,7 +15,7 @@
 use alloc::boxed::Box;
 use core::fmt::Debug;
 
-use crate::address::TargetAddress;
+use crate::memory::address::TargetAddress;
 
 pub type LoadResult<T> = core::result::Result<T, LoadError>;
 

@@ -18,11 +18,10 @@ use blueos_test_macro::test;
 
 use crate::{
     dynamic_linker::{
-        ArtifactIdentity, ArtifactRole, CommittingLinkProduct, DependencyResolution,
-        ImageOwnership, LinkPublisher, PreparedLinkManifest, ResolvedArtifact,
+        prepare_link, ArtifactIdentity, ArtifactRole, CommittingLinkProduct, DependencyResolution,
+        ImageOwnership, LinkPublisher, LinkRequest, PreparedLinkManifest, ResolvedArtifact,
     },
     error::{ErrorContext, LoadErrorKind, LoadStage},
-    linker::{prepare_link, LinkRequest},
     memory::{AllocationLease, AllocationRequest, ImageMemory, MutationProgress, Placement},
     profile::{LoadProfile, SessionLimits},
     tests::fixture::{

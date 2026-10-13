@@ -24,11 +24,13 @@
 use alloc::{boxed::Box, vec::Vec};
 
 use crate::{
-    address::{TargetAddress, TargetRange},
     elf::LoadSegmentInfo,
     error::{ErrorContext, LoadErrorKind},
     image::{read_u16, read_u32, read_u64},
-    memory_mapper::MemoryPermissions,
+    memory::{
+        address::{TargetAddress, TargetRange},
+        MemoryPermissions,
+    },
     profile::{ElfClass, ElfData},
     LoadError, LoadResult,
 };

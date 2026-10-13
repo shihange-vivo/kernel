@@ -13,7 +13,6 @@
 // limitations under the License.
 
 use crate::{
-    address::TargetAddress,
     dynamic_linker::{
         ArtifactIdentity, ArtifactRole, DependencyGraph, DependencyResolution, DynamicLinker,
         ImageOwnership, ImportedImageDescriptor, ProgramHeaderRuntimeInfo,
@@ -21,6 +20,7 @@ use crate::{
         SymbolTable,
     },
     error::LoadErrorKind,
+    memory::address::TargetAddress,
     profile::{ElfClass, ElfData, LoadLimits, SessionLimits},
     tests::fixture::{
         native_fixture_builder, NativeRelocator, NoDependencies, SharedMemory, SliceElfReader,

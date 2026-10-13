@@ -24,7 +24,6 @@ use goblin::{
 const PT_RISCV_ATTRIBUTES: u32 = 0x7000_0003;
 
 use crate::{
-    address::{FileRange, TargetAddress, TargetRange},
     dynamic_linker::{ArtifactRole, ProgramHeaderGeometry},
     elf::{DynamicSegmentInfo, ElfHeaderInfo, LoadSegmentInfo, ProgramHeaderInfo},
     error::{ErrorContext, LoadErrorKind, LoadStage, ProgramHeaderField},
@@ -33,7 +32,10 @@ use crate::{
         inspect::{InspectedImage, StackKind},
         DynamicFeatureSummary,
     },
-    memory_mapper::MemoryPermissions,
+    memory::{
+        address::{FileRange, TargetAddress, TargetRange},
+        MemoryPermissions,
+    },
     profile::{supports_segment_permissions, ElfMachine, ElfType, LoadRequest},
     reader::ElfReader,
     LoadError, LoadResult,

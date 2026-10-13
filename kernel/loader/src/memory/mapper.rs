@@ -12,16 +12,18 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+//! Single-image memory backend with optional authorized fixed-address regions.
+
 use blueos_infra::storage::Storage;
 use core::alloc::Layout;
 
 use crate::{
-    address::TargetAddress,
     error::{ErrorContext, LoadErrorKind},
     image::{PreparedProtectionPlan, ProtectionCapabilities, ProtectionLevel},
     memory::{
-        AllocationId, AllocationLease, AllocationOffset, AllocationOwnership, AllocationRequest,
-        ImageAllocation, ImageMemory, ImageProtectionMemory, MutationProgress, Placement,
+        address::TargetAddress, AllocationId, AllocationLease, AllocationOffset,
+        AllocationOwnership, AllocationRequest, ImageAllocation, ImageMemory,
+        ImageProtectionMemory, MutationProgress, Placement,
     },
     LoadError, LoadResult,
 };

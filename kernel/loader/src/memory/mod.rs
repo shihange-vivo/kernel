@@ -12,6 +12,16 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+//! Host memory contracts, allocation ownership and rollback.
+//!
+//! `address` provides checked target and file ranges; `mapper` implements a
+//! single-image memory backend; `cache` synchronizes freshly written code.
+//! This module defines the public memory API and the internal transaction log.
+
+pub(crate) mod address;
+pub(crate) mod cache;
+mod mapper;
+
 use alloc::vec::Vec;
 
 use crate::{
@@ -19,14 +29,12 @@ use crate::{
     LoadError, LoadResult,
 };
 
-pub use crate::{
-    address::{TargetAddress, TargetRange},
-    image::{
-        PreparedProtectionPlan, ProtectionBatch, ProtectionCapabilities, ProtectionLevel,
-        ProtectionRecord,
-    },
-    memory_mapper::{MemoryMapper, MemoryPermissions, MemoryRegion},
+pub use crate::image::{
+    PreparedProtectionPlan, ProtectionBatch, ProtectionCapabilities, ProtectionLevel,
+    ProtectionRecord,
 };
+pub use address::{TargetAddress, TargetRange};
+pub use mapper::{MemoryMapper, MemoryPermissions, MemoryRegion};
 
 /// Where an image wants its memory to come from.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

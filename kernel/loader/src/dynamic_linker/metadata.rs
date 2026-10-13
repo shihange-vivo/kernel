@@ -23,10 +23,10 @@
 use alloc::vec::Vec;
 
 use crate::{
-    address::{TargetAddress, TargetRange},
     dynamic_linker::{DependencyName, SymbolTable},
     elf::LoadSegmentInfo,
     image::{LoadedRegion, RelocationRecord, StackKind},
+    memory::address::{TargetAddress, TargetRange},
     LoadResult,
 };
 

@@ -25,15 +25,16 @@
 use alloc::vec::Vec;
 
 use crate::{
-    address::{TargetAddress, TargetRange},
     dynamic_linker::{
         graph::DependencyGraph, relocate::locate_region_offset, ImageId, ImageLifecycleMetadata,
     },
     elf::LoadSegmentInfo,
     error::{ErrorContext, LoadErrorKind, LoadStage},
     image::LoadedRegion,
-    memory::{ImageMemory, SessionAllocation},
-    memory_mapper::MemoryPermissions,
+    memory::{
+        address::{TargetAddress, TargetRange},
+        ImageMemory, MemoryPermissions, SessionAllocation,
+    },
     profile::LoadProfile,
     relocation::{TargetWord, WordWidth},
     LoadError, LoadResult,

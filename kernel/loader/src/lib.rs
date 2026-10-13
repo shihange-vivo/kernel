@@ -33,6 +33,14 @@
 //! at the crate root. Reader and memory contracts live in
 //! [`reader`] and [`memory`]; ABI profiles and resource
 //! limits live in [`profile`]. The [`error`] module provides error details.
+//!
+//! # Implementation map
+//!
+//! Start with `loading/load.rs` for the complete load flow. `loading/` owns
+//! host interaction and result assembly; `image/` loads one ELF image;
+//! `dynamic_linker/` links the image closure. `memory/` supplies allocation,
+//! rollback and cache contracts; `elf/` decodes file structures and
+//! `relocation/` implements architecture-specific relocation rules.
 
 extern crate alloc;
 
@@ -44,26 +52,18 @@ pub mod reader;
 pub mod trace;
 
 // Loading and linking implementation details.
-mod address;
-mod backend;
-mod cache;
 mod dynamic_linker;
 mod elf;
 mod image;
-mod linker;
-mod load;
-mod loaded;
-mod memory_mapper;
-mod planning;
-mod publication;
+mod loading;
 mod relocation;
 
 // Frequently used entry points and types.
-pub use backend::LoaderBackend;
 pub use error::{LoadError, LoadResult};
-pub use load::{load, LoadRequest};
-pub use loaded::{ImageDependency, ImageHandle, LoadedImage};
-pub use publication::{CommittedAllocations, Publication};
+pub use loading::{
+    load, CommittedAllocations, ImageDependency, ImageHandle, LoadRequest, LoadedImage,
+    LoaderBackend, Publication,
+};
 
 #[cfg(test)]
 extern crate rsrt;

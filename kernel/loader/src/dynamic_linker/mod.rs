@@ -16,11 +16,15 @@
 //!
 //! The module owns artifact resolution, dependency discovery, symbol scope,
 //! relocation, lifecycle planning and publication.
+//! Start with `prepare` for the link flow and `session` for its state transitions.
+//! `graph`, `scope`, `symbol` and `lifecycle` contain the main algorithms;
+//! `metadata`, `published` and `publish` describe runtime facts and publication.
 
 mod artifact;
 mod graph;
 mod lifecycle;
 mod metadata;
+mod prepare;
 mod publish;
 mod published;
 mod relocate;
@@ -29,6 +33,7 @@ mod session;
 mod symbol;
 
 pub(crate) use graph::order_components;
+pub(crate) use prepare::{prepare_link, LinkRequest};
 
 #[cfg(test)]
 pub(crate) use graph::DependencyGraph;
