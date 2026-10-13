@@ -16,8 +16,79 @@
 //! of a logger, output device or test framework. Borrowed data is valid only for
 //! the synchronous [`crate::LoaderBackend::trace`] call.
 
-use crate::{dynamic_linker::ImageId, LoadError};
+use crate::{
+    dynamic_linker::{ImageId, LinkProduct},
+    LoadError, LoaderBackend,
+};
 use core::fmt;
+
+pub(crate) fn emit<B: LoaderBackend>(backend: &B, event: LoadEvent<'_>) {
+    if backend.trace_enabled() {
+        backend.trace(event);
+    }
+}
+
+pub(crate) fn trace_product<B: LoaderBackend>(backend: &B, product: &LinkProduct<B::Receipt>) {
+    if !backend.trace_enabled() {
+        return;
+    }
+    let plans = product.lifecycle_plans();
+    for (index, entry) in plans.startup().iter().enumerate() {
+        backend.trace(LoadEvent::LifecyclePlan {
+            kind: LifecycleKind::Startup,
+            index,
+            owner: entry.owner().get(),
+            address: entry.function().get(),
+        });
+    }
+    for (index, entry) in plans.group_fini().iter().enumerate() {
+        backend.trace(LoadEvent::LifecyclePlan {
+            kind: LifecycleKind::GroupFini,
+            index,
+            owner: entry.owner().get(),
+            address: entry.function().get(),
+        });
+    }
+    for plan in plans.system_fini() {
+        for (index, entry) in plan.plan().iter().enumerate() {
+            backend.trace(LoadEvent::LifecyclePlan {
+                kind: LifecycleKind::SystemFini,
+                index,
+                owner: entry.owner().get(),
+                address: entry.function().get(),
+            });
+        }
+    }
+    for edge in product.context().graph_edges() {
+        backend.trace(LoadEvent::ProviderEdge {
+            requester: edge.requester().get(),
+            provider: edge.provider().get(),
+        });
+    }
+    for entry in product.link_map() {
+        backend.trace(LoadEvent::Image {
+            owner: entry.owner().get(),
+            soname: entry.soname().map(|name| name.as_bytes()),
+            bias: entry.load_bias().get(),
+        });
+    }
+    for (group, members) in plans.sccs().iter().enumerate() {
+        backend.trace(LoadEvent::Component {
+            group,
+            members: ImageIds::new(members),
+        });
+    }
+    for binding in product.relocation_bindings() {
+        if binding.name().is_empty() {
+            continue;
+        }
+        backend.trace(LoadEvent::SymbolBinding {
+            requester: binding.requester().get(),
+            name: binding.name(),
+            provider: binding.provider().map(|id| id.get()),
+        });
+    }
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum LoadPhase {

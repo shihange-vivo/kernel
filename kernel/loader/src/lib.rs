@@ -45,22 +45,25 @@ pub mod trace;
 
 // Loading and linking implementation details.
 mod address;
-mod api;
+mod backend;
 mod cache;
 mod dynamic_linker;
 mod elf;
 mod image;
 mod linker;
+mod load;
+mod loaded;
 mod memory_mapper;
 mod planning;
+mod publication;
 mod relocation;
 
 // Frequently used entry points and types.
-pub use api::{
-    load, CommittedAllocations, ImageDependency, ImageHandle, LoadRequest, LoadedImage,
-    LoaderBackend, Publication,
-};
+pub use backend::LoaderBackend;
 pub use error::{LoadError, LoadResult};
+pub use load::{load, LoadRequest};
+pub use loaded::{ImageDependency, ImageHandle, LoadedImage};
+pub use publication::{CommittedAllocations, Publication};
 
 #[cfg(test)]
 extern crate rsrt;
