@@ -100,10 +100,6 @@ pub fn load<B: LoaderBackend>(
     result
 }
 
-fn phase<B: LoaderBackend>(backend: &B, phase: LoadPhase, completed: bool) {
-    emit(backend, LoadEvent::Phase { phase, completed });
-}
-
 fn load_inner<B: LoaderBackend>(
     request: LoadRequest<B::Source>,
     backend: &mut B,
@@ -117,7 +113,13 @@ fn load_inner<B: LoaderBackend>(
         }
     }
     let (mut plan, ready) = loop {
-        phase(backend, LoadPhase::Discover, false);
+        emit(
+            backend,
+            LoadEvent::Phase {
+                phase: LoadPhase::Discover,
+                completed: false,
+            },
+        );
         let plan = LoadPlan::build(&request, backend)?;
         emit(
             backend,
@@ -126,15 +128,33 @@ fn load_inner<B: LoaderBackend>(
                 dependencies: plan.edges.len(),
             },
         );
-        phase(backend, LoadPhase::Discover, true);
+        emit(
+            backend,
+            LoadEvent::Phase {
+                phase: LoadPhase::Discover,
+                completed: true,
+            },
+        );
         let sources = plan
             .images
             .iter()
             .map(|image| image.source.clone())
             .collect::<Vec<_>>();
-        phase(backend, LoadPhase::Acquire, false);
+        emit(
+            backend,
+            LoadEvent::Phase {
+                phase: LoadPhase::Acquire,
+                completed: false,
+            },
+        );
         let ready = backend.acquire(&sources, &request.existing)?;
-        phase(backend, LoadPhase::Acquire, true);
+        emit(
+            backend,
+            LoadEvent::Phase {
+                phase: LoadPhase::Acquire,
+                completed: true,
+            },
+        );
         for image in &ready {
             if image.descriptor.snapshot().profile() != request.profile {
                 return Err(LoadError::new(
@@ -177,7 +197,13 @@ fn load_inner<B: LoaderBackend>(
         .collect();
     let globals = request.global.iter().map(ImageHandle::imported).collect();
     let connections = plan.connections()?;
-    phase(backend, LoadPhase::Link, false);
+    emit(
+        backend,
+        LoadEvent::Phase {
+            phase: LoadPhase::Link,
+            completed: false,
+        },
+    );
     let mut memory = backend.memory();
     let mut resolver = PlannedResolver {
         plan: &mut plan,
@@ -195,11 +221,29 @@ fn load_inner<B: LoaderBackend>(
         connections,
     );
     let prepared = prepare_link(request, &mut resolver, &mut memory)?;
-    phase(backend, LoadPhase::Link, true);
+    emit(
+        backend,
+        LoadEvent::Phase {
+            phase: LoadPhase::Link,
+            completed: true,
+        },
+    );
     let mut publisher = BackendPublisher::new(backend, &plan);
-    phase(publisher.backend, LoadPhase::Publish, false);
+    emit(
+        publisher.backend,
+        LoadEvent::Phase {
+            phase: LoadPhase::Publish,
+            completed: false,
+        },
+    );
     let product = prepared.publish(&mut publisher)?;
-    phase(publisher.backend, LoadPhase::Publish, true);
+    emit(
+        publisher.backend,
+        LoadEvent::Phase {
+            phase: LoadPhase::Publish,
+            completed: true,
+        },
+    );
     let mut facts = publisher
         .facts
         .take()
@@ -209,11 +253,23 @@ fn load_inner<B: LoaderBackend>(
         .then(|| product.entry());
     trace_product(publisher.backend, &product);
     let mut loaded = LoadedImage::new(product.into_publication(), facts);
-    phase(publisher.backend, LoadPhase::Install, false);
+    emit(
+        publisher.backend,
+        LoadEvent::Phase {
+            phase: LoadPhase::Install,
+            completed: false,
+        },
+    );
     if let Err(error) = publisher.backend.complete_load(&mut loaded) {
         publisher.backend.abort_publication(loaded.into_receipt());
         return Err(error);
     }
-    phase(publisher.backend, LoadPhase::Install, true);
+    emit(
+        publisher.backend,
+        LoadEvent::Phase {
+            phase: LoadPhase::Install,
+            completed: true,
+        },
+    );
     Ok(loaded)
 }
