@@ -70,27 +70,42 @@ const LINK_STACK_SIZE: usize = 64 * 1024;
 
 /// Completion hand-off between a launch caller and its link worker.
 ///
-/// The worker stores its outcome and then bumps `epoch`; the caller parks on
-/// `epoch` and reads the outcome once it moves. A `Semaphore` would be the
+/// One worker publishes one outcome and marks completion; one caller waits
+/// for completion and takes the outcome. A `Semaphore` would be the
 /// obvious primitive but it is `!Sync` (its counter is a `Cell`), and this
 /// value has to cross the thread boundary.
-struct LinkHandoff {
+struct LinkHandoff<T> {
     /// Zero until the worker finishes, then one. Never reset.
-    epoch: AtomicUsize,
-    outcome: SpinLock<Option<Result<(), ApplicationLaunchError>>>,
+    completed: AtomicUsize,
+    outcome: SpinLock<Option<T>>,
 }
 
-struct RuntimeLinkHandoff {
-    epoch: AtomicUsize,
-    outcome: SpinLock<Option<Result<super::dynamic::PreparedLoad, i32>>>,
-}
-
-impl LinkHandoff {
+impl<T> LinkHandoff<T> {
     fn new() -> Self {
         Self {
-            epoch: AtomicUsize::new(0),
+            completed: AtomicUsize::new(0),
             outcome: SpinLock::new(None),
         }
+    }
+
+    fn complete(&self, outcome: T) {
+        *self.outcome.irqsave_lock() = Some(outcome);
+        // Publish the outcome before waking, so a caller that observes
+        // completion is guaranteed to observe the value.
+        self.completed.store(1, Ordering::Release);
+        let _ = crate::sync::atomic_wake(&self.completed, usize::MAX);
+    }
+
+    fn wait(&self) -> T {
+        while self.completed.load(Ordering::Acquire) == 0 {
+            // Re-check completion after a spurious return. The worker marks
+            // completion exactly once and never resets it.
+            let _ = crate::sync::atomic_wait(&self.completed, 0, Tick::MAX);
+        }
+        self.outcome
+            .irqsave_lock()
+            .take()
+            .expect("link worker published its result before completing")
     }
 }
 
@@ -167,27 +182,14 @@ impl ApplicationService {
         path: alloc::string::String,
         existing: Vec<super::dynamic::ExistingImage>,
     ) -> Result<super::dynamic::PreparedLoad, i32> {
-        let handoff = Arc::new(RuntimeLinkHandoff {
-            epoch: AtomicUsize::new(0),
-            outcome: SpinLock::new(None),
-        });
+        let handoff = Arc::new(LinkHandoff::new());
         let worker = handoff.clone();
         thread::spawn_with_stack(LINK_STACK_SIZE, move || {
             let result = super::dynamic::prepare_load(self, &group, &namespace, &path, existing);
-            *worker.outcome.irqsave_lock() = Some(result);
-            worker.epoch.store(1, Ordering::Release);
-            let _ = crate::sync::atomic_wake(&worker.epoch, usize::MAX);
+            worker.complete(result);
         })
         .ok_or(libc::ENOMEM)?;
-        while handoff.epoch.load(Ordering::Acquire) == 0 {
-            let _ = crate::sync::atomic_wait(&handoff.epoch, 0, Tick::MAX);
-        }
-        let result = handoff
-            .outcome
-            .irqsave_lock()
-            .take()
-            .expect("runtime link worker published its result");
-        result
+        handoff.wait()
     }
 
     /// Accept the application's init completion: first advance
@@ -289,23 +291,10 @@ impl ApplicationService {
         let worker = handoff.clone();
         thread::spawn_with_stack(LINK_STACK_SIZE, move || {
             let result = self.prepare(&group, &namespace, &argv, &envp);
-            *worker.outcome.irqsave_lock() = Some(result);
-            // Publish the outcome before waking, so a caller that observes the
-            // bump is guaranteed to observe the value.
-            worker.epoch.fetch_add(1, Ordering::Release);
-            let _ = crate::sync::atomic_wake(&worker.epoch, usize::MAX);
+            worker.complete(result);
         })
         .ok_or(ApplicationLaunchError::PrepareFailed)?;
-
-        while handoff.epoch.load(Ordering::Acquire) == 0 {
-            // A spurious return only re-reads the epoch; the worker bumps it
-            // exactly once and never resets it.
-            let _ = crate::sync::atomic_wait(&handoff.epoch, 0, Tick::MAX);
-        }
-        let mut outcome = handoff.outcome.irqsave_lock();
-        outcome
-            .take()
-            .expect("the worker stores its outcome before bumping the epoch")
+        handoff.wait()
     }
 
     /// The manager's slow prepare closure: VFS open, link preparation, start
