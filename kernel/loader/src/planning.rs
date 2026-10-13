@@ -13,14 +13,13 @@
 // limitations under the License.
 
 use crate::{
-    api::{emit, invalid, oom, overflow},
     dynamic_linker::{
         ArtifactIdentity, ArtifactResolver, ArtifactRole, DependencyName, DependencyRequest,
         DependencyResolution, ImageOwnership, ResolvedArtifact,
     },
-    error::{ErrorContext, LoadErrorKind},
+    error::{invalid, oom, overflow, ErrorContext, LoadErrorKind},
     image::ScannedArtifact,
-    trace::LoadEvent,
+    trace::{emit, LoadEvent},
     ImageHandle, LoadRequest, LoadResult, LoaderBackend,
 };
 use alloc::vec::Vec;

@@ -19,6 +19,16 @@ use crate::address::TargetAddress;
 
 pub type LoadResult<T> = core::result::Result<T, LoadError>;
 
+pub(crate) fn invalid() -> LoadError {
+    LoadError::new(LoadErrorKind::Backend, ErrorContext::None)
+}
+pub(crate) fn overflow() -> LoadError {
+    LoadError::new(LoadErrorKind::IntegerOverflow, ErrorContext::None)
+}
+pub(crate) fn oom() -> LoadError {
+    LoadError::new(LoadErrorKind::OutOfMemory, ErrorContext::None)
+}
+
 #[derive(Clone, Copy, Debug)]
 pub enum LoadStage {
     Beginning,
