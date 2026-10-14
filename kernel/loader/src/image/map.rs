@@ -12,6 +12,11 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use crate::image::{
+    symbol_count_from_hash, DependencyName, ImageLifecycleMetadata, ProgramHeaderGeometry,
+    RuntimeImageMetadata, RuntimeImageState, SymbolTable,
+};
+
 use alloc::vec::Vec;
 use goblin::elf::dynamic::{
     DT_FINI, DT_FINI_ARRAY, DT_FINI_ARRAYSZ, DT_FLAGS, DT_FLAGS_1, DT_GNU_HASH, DT_HASH, DT_INIT,
@@ -21,10 +26,6 @@ use goblin::elf::dynamic::{
 };
 
 use crate::{
-    dynamic_linker::{
-        symbol_count_from_hash, DependencyName, ImageLifecycleMetadata, ProgramHeaderGeometry,
-        RelocationTables, RuntimeImageMetadata, RuntimeImageState, SymbolTable,
-    },
     elf::{DynamicSegmentInfo, LoadSegmentInfo},
     error::{ErrorContext, LoadErrorKind, LoadStage},
     image::{
@@ -340,7 +341,7 @@ impl<M: ImageMemory> MappedImage<M> {
             self.decode_relocation_table(tags.rela(), RelocationTableKind::Rela, &mut records)
                 .map_err(|error| error.at_stage(LoadStage::Decode))?;
             self.decode_plt_relocations(&tags, &mut records)?;
-            let relocations = RelocationTables::new(records);
+            let relocations = records;
             let (symbols, needed, soname) = self
                 .decode_symbols_and_dependencies(&tags)
                 .map_err(|error| error.at_stage(LoadStage::Decode))?;

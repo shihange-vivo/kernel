@@ -15,12 +15,12 @@
 use alloc::vec::Vec;
 
 use crate::{
-    dynamic_linker::ProgramHeaderGeometry,
     elf::{DynamicSegmentInfo, LoadSegmentInfo},
     error::{ErrorContext, LoadErrorKind, LoadStage},
     image::{
         inspect::StackKind,
         map::{LoadedRegion, MappedImage},
+        ProgramHeaderGeometry,
     },
     memory::{
         address::{TargetAddress, TargetRange},

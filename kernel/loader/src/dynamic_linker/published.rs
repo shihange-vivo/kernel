@@ -26,16 +26,15 @@
 //! the unique lease stays in the publisher's receipt, and the registry's own
 //! `SystemDsoLease` lives outside this crate.
 
+use crate::image::{
+    ArtifactRole, DependencyName, ProgramHeaderRuntimeInfo, SymbolBinding, SymbolDefinition,
+    SymbolTable, SymbolVisibility,
+};
+
 use alloc::{sync::Arc, vec::Vec};
 
 use crate::{
-    dynamic_linker::{
-        artifact::{ArtifactIdentity, DependencyName},
-        graph::DependencyNode,
-        symbol::SymbolTable,
-        ArtifactRole, ImageOwnership, ProgramHeaderRuntimeInfo, SymbolBinding, SymbolDefinition,
-        SymbolVisibility,
-    },
+    dynamic_linker::{artifact::ArtifactIdentity, graph::DependencyNode, ImageOwnership},
     elf::LoadSegmentInfo,
     error::{ErrorContext, LoadErrorKind},
     image::LoadedRegion,

@@ -22,12 +22,12 @@
 //! *generates* the plan; nothing here turns a target address into a host
 //! function pointer or calls a constructor.
 
+use crate::image::ImageLifecycleMetadata;
+
 use alloc::vec::Vec;
 
 use crate::{
-    dynamic_linker::{
-        graph::DependencyGraph, relocate::locate_region_offset, ImageId, ImageLifecycleMetadata,
-    },
+    dynamic_linker::{graph::DependencyGraph, relocate::locate_region_offset, ImageId},
     elf::LoadSegmentInfo,
     error::{ErrorContext, LoadErrorKind, LoadStage},
     image::LoadedRegion,

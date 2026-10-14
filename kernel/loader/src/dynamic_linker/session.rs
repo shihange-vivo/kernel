@@ -12,21 +12,17 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Staged link session typestate and rollback.
-//!
-//! [`DynamicLinker::begin`] admits the root and absorbs it through the
-//! single-image load pipeline, transferring its allocation lease into the
-//! session rollback log. [`close_dependencies`](BuildingSession::close_dependencies)
-//! drives the bounded BFS closure, de-duplicating by identity before any new
-//! allocation. [`freeze_scopes`](BuildingSession::freeze_scopes) consumes the
-//! building session into an immutable [`ScopeSet`]. The `relocate`/`seal`
-//! transitions preserve the typestate guarantees through publication.
+//! Linking already materialized images: scope freezing, relocation, sealing
+//! and publication. `loading` supplies the fixed graph and mapped inputs.
+//! Each consuming transition keeps the allocation rollback guard armed.
+
+use crate::image::{ArtifactRole, DependencyName, RuntimeImageState, SymbolTable};
 
 use alloc::{sync::Arc, vec::Vec};
 
 use crate::{
     dynamic_linker::{
-        graph::{DependencyGraph, DiscoveryItem, DiscoveryQueue},
+        graph::DependencyGraph,
         lifecycle::{self, LifecycleImage, LifecyclePlans},
         publish::{
             self, CommittedImage, CommittingLinkProduct, LinkContext, LinkMapImage, LinkProduct,
@@ -34,23 +30,16 @@ use crate::{
         },
         relocate::{self, ProviderRegion, RelocationImage, RelocationSource, RelocationTypeSet},
         scope::RelocationBinding,
-        ArtifactIdentity, ArtifactResolver, ArtifactRole, DependencyName, DependencyRequest,
-        DependencyResolution, ImageDependency, ImageId, ImageOwnership, ImportedImageDescriptor,
-        PublishedImageDescriptor, PublishedLoadSnapshot, PublishedRegion, ResolvedArtifact,
-        RuntimeImageMetadata, RuntimeImageState, ScopeSet, SymbolTable,
+        ImageDependency, ImageId, ImageOwnership, PublishedImageDescriptor, PublishedLoadSnapshot,
+        ScopeSet,
     },
-    elf::LoadSegmentInfo,
     error::{ErrorContext, LoadErrorKind, LoadStage},
-    image::{
-        absorb_into_session, ImageLoader, LoadedRegion, PreparedProtectionPlan, ProtectionBatch,
-        SealPlan,
-    },
+    image::{PreparedProtectionPlan, ProtectionBatch, SealPlan},
     memory::{
-        address::TargetAddress, cache::CodeCache, AllocationRollbackLog, ImageMemory,
+        address::TargetAddress, cache::ArchitectureCodeCache, AllocationRollbackGuard, ImageMemory,
         ImageProtectionMemory, SessionAllocation,
     },
-    profile::{LoadLimits, LoadProfile, LoadRequest, SessionLimits},
-    reader::ElfReader,
+    profile::{LoadProfile, SessionLimits},
     relocation::ArchRelocator,
     LoadError, LoadResult,
 };
@@ -124,10 +113,10 @@ impl SessionUsage {
 /// commit the allocation. The unique lease lives only in the session rollback
 /// log.
 pub(crate) struct SessionImage {
-    image_id: ImageId,
-    role: ArtifactRole,
-    allocation: SessionAllocation,
-    state: RuntimeImageState,
+    pub(crate) image_id: ImageId,
+    pub(crate) role: ArtifactRole,
+    pub(crate) allocation: SessionAllocation,
+    pub(crate) state: RuntimeImageState,
 }
 
 /// One Ready system image imported from the registry instead of loaded.
@@ -138,8 +127,8 @@ pub(crate) struct SessionImage {
 /// this session's rollback log. The owned descriptor supplies the export
 /// surface and published regions the later stages read from.
 pub(crate) struct ImportedImage {
-    image_id: ImageId,
-    descriptor: Arc<PublishedImageDescriptor>,
+    pub(crate) image_id: ImageId,
+    pub(crate) descriptor: Arc<PublishedImageDescriptor>,
 }
 
 impl ImportedImage {
@@ -149,14 +138,12 @@ impl ImportedImage {
     }
 }
 
-/// Immutable session state while dependencies are being discovered.
-pub(crate) struct BuildingState {
-    images: Vec<SessionImage>,
-    imported: Vec<ImportedImage>,
-    scope_prefix: Vec<ImageId>,
-    discovery: DiscoveryQueue,
-    closed: bool,
-    poisoned: bool,
+/// A fixed dependency graph and all mapped or imported image inputs.
+/// Dependency discovery and mapping are completed by `loading` before linking.
+pub(crate) struct LoadedState {
+    pub(crate) images: Vec<SessionImage>,
+    pub(crate) imported: Vec<ImportedImage>,
+    pub(crate) scope_prefix: Vec<ImageId>,
 }
 
 /// Immutable session state once scopes are frozen.
@@ -183,526 +170,29 @@ pub(crate) struct SealedSessionState {
     bindings: Vec<RelocationBinding>,
 }
 
-/// The rollback authority for a live session: it owns the memory backend it
-/// aborts against and the unique allocation leases absorbed so far.
-///
-/// This is separated from [`LinkSession`] so the session itself can move fields
-/// in consuming transitions without Rust's move-out-of-`Drop` restriction, while
-/// still guaranteeing reverse-order abort on any early exit.
-struct RollbackGuard<'a, M: ImageMemory + ?Sized> {
-    memory: &'a mut M,
-    log: AllocationRollbackLog,
-}
-
-impl<M: ImageMemory + ?Sized> Drop for RollbackGuard<'_, M> {
-    fn drop(&mut self) {
-        self.log.abort_all(&mut *self.memory);
-    }
-}
-
 /// A staged, multi-image link session.
 ///
-/// `S` tracks building, frozen scopes, relocation and sealing. The session
+/// `S` tracks loaded images, frozen scopes, relocation and sealing. The session
 /// owns the dependency graph, rollback log and cross-image resource usage;
 /// the trusted [`LoadProfile`] and single [`ArchRelocator`] ensure every image
 /// reuses the same profile and relocation semantics without re-deriving them.
 #[must_use = "dropping a link session aborts its allocations"]
 pub(crate) struct LinkSession<'a, M: ImageMemory + ?Sized, S, A> {
-    rollback: RollbackGuard<'a, M>,
-    graph: DependencyGraph,
-    limits: SessionLimits,
-    usage: SessionUsage,
-    profile: LoadProfile,
-    arch: A,
-    state: S,
+    pub(crate) rollback: AllocationRollbackGuard<'a, M>,
+    pub(crate) graph: DependencyGraph,
+    pub(crate) limits: SessionLimits,
+    pub(crate) usage: SessionUsage,
+    pub(crate) profile: LoadProfile,
+    pub(crate) arch: A,
+    pub(crate) state: S,
 }
 
-pub(crate) type BuildingSession<'a, M, A> = LinkSession<'a, M, BuildingState, A>;
+pub(crate) type LoadedSession<'a, M, A> = LinkSession<'a, M, LoadedState, A>;
 pub(crate) type ScopedSession<'a, M, A> = LinkSession<'a, M, ScopedState, A>;
 pub(crate) type RelocatedSession<'a, M, A> = LinkSession<'a, M, RelocatedState, A>;
 pub(crate) type SealedSession<'a, M, A> = LinkSession<'a, M, SealedSessionState, A>;
 
-/// Multi-image linker configured with a trusted profile, a session budget and
-/// the single [`ArchRelocator`] used by every image in the link.
-pub(crate) struct DynamicLinker<A> {
-    arch: A,
-}
-
-impl<A: ArchRelocator> DynamicLinker<A> {
-    pub(crate) fn new(arch: A) -> Self {
-        Self { arch }
-    }
-
-    /// Begin a session for a scanned root. Newly resolved roots enter the
-    /// image pipeline; published shared roots reuse their pinned descriptor.
-    pub(crate) fn begin<R, Memory>(
-        self,
-        root: DependencyResolution<R>,
-        role: ArtifactRole,
-        profile: LoadProfile,
-        limits: SessionLimits,
-        memory: &mut Memory,
-    ) -> LoadResult<BuildingSession<'_, Memory, A>>
-    where
-        R: ElfReader,
-        Memory: ImageMemory + ?Sized,
-    {
-        if self.arch.machine() != profile.machine() || self.arch.class() != profile.class() {
-            return Err(
-                session_error(LoadErrorKind::UnsupportedByProfile, ErrorContext::None)
-                    .at_stage(LoadStage::Beginning),
-            );
-        }
-        match root {
-            DependencyResolution::Existing(_) => {
-                Err(session_error(LoadErrorKind::BadElf, ErrorContext::None)
-                    .at_stage(LoadStage::Beginning))
-            }
-            DependencyResolution::Load(root) => {
-                self.begin_loaded(root, profile, limits, memory, role)
-            }
-            DependencyResolution::Import(root) => {
-                if role != ArtifactRole::SharedObject {
-                    return Err(session_error(
-                        LoadErrorKind::UnsupportedByProfile,
-                        ErrorContext::None,
-                    )
-                    .at_stage(LoadStage::Beginning));
-                }
-                let (descriptor, ownership) = root.into_parts();
-                let mut graph = DependencyGraph::new(limits);
-                let id = graph.insert_root(
-                    descriptor.identity().try_clone()?,
-                    descriptor
-                        .soname()
-                        .map(DependencyName::try_clone)
-                        .transpose()?,
-                    ownership,
-                )?;
-                let mut usage = SessionUsage::default();
-                usage.record_image(0, imported_metadata_bytes(&descriptor)?, &limits)?;
-                Ok(LinkSession {
-                    rollback: RollbackGuard {
-                        memory,
-                        log: AllocationRollbackLog::new(),
-                    },
-                    graph,
-                    limits,
-                    usage,
-                    profile,
-                    arch: self.arch,
-                    state: BuildingState {
-                        images: Vec::new(),
-                        imported: alloc::vec![ImportedImage {
-                            image_id: id,
-                            descriptor
-                        }],
-                        scope_prefix: Vec::new(),
-                        discovery: DiscoveryQueue::new(limits),
-                        closed: false,
-                        poisoned: false,
-                    },
-                })
-            }
-        }
-    }
-
-    fn begin_loaded<R, Memory>(
-        self,
-        root: ResolvedArtifact<R>,
-        profile: LoadProfile,
-        limits: SessionLimits,
-        memory: &mut Memory,
-        role: ArtifactRole,
-    ) -> LoadResult<BuildingSession<'_, Memory, A>>
-    where
-        R: ElfReader,
-        Memory: ImageMemory + ?Sized,
-    {
-        // Executable roots remain session-private. Their inspected ELF type
-        // decides fixed ET_EXEC or movable ET_DYN placement in the same pipeline.
-        if !matches!(
-            root.ownership(),
-            ImageOwnership::SessionPrivate | ImageOwnership::SystemCandidate
-        ) || (role == ArtifactRole::ExecutableRoot
-            && root.ownership() != ImageOwnership::SessionPrivate)
-        {
-            return Err(
-                LoadError::new(LoadErrorKind::UnsupportedByProfile, ErrorContext::None)
-                    .at_stage(LoadStage::Beginning),
-            );
-        }
-
-        let mut guard = RollbackGuard {
-            memory,
-            log: AllocationRollbackLog::new(),
-        };
-        let mut graph = DependencyGraph::new(limits);
-        let mut usage = SessionUsage::default();
-
-        let (artifact, ownership, reader) = root.into_parts();
-        let (allocation, mut runtime) = load_runtime(
-            reader,
-            profile,
-            role,
-            limits.per_image(),
-            &mut guard.log,
-            &mut *guard.memory,
-        )?;
-
-        let soname = runtime.take_soname();
-        let metadata_bytes = session_image_metadata_bytes(&runtime, &artifact, soname.as_ref())?;
-        let root_id = graph.insert_root(artifact, soname, ownership)?;
-        validate_session_symbol_names(&runtime, &limits)?;
-        usage
-            .record_image(allocation.allocation().len(), metadata_bytes, &limits)
-            .map_err(|error| error.at_stage(LoadStage::Beginning))?;
-
-        let mut images = Vec::new();
-        images
-            .try_reserve(1)
-            .map_err(|_| LoadError::new(LoadErrorKind::OutOfMemory, ErrorContext::None))?;
-        images.push(SessionImage {
-            image_id: root_id,
-            role,
-            allocation,
-            state: runtime,
-        });
-
-        let mut discovery = DiscoveryQueue::new(limits);
-        enqueue_dependencies(
-            &mut discovery,
-            root_id,
-            images[0].state.metadata().needed(),
-            &limits,
-            LoadStage::Beginning,
-        )?;
-
-        Ok(LinkSession {
-            rollback: guard,
-            graph,
-            limits,
-            usage,
-            profile,
-            arch: self.arch,
-            state: BuildingState {
-                images,
-                imported: Vec::new(),
-                scope_prefix: Vec::new(),
-                discovery,
-                closed: false,
-                poisoned: false,
-            },
-        })
-    }
-}
-
-impl<'a, M: ImageMemory + ?Sized, A: ArchRelocator> BuildingSession<'a, M, A> {
-    /// Borrow the host's global scope before discovering the new dependency
-    /// closure. No image is relocated or initialized a second time.
-    pub(crate) fn import_scope(
-        &mut self,
-        providers: Vec<ImportedImageDescriptor>,
-    ) -> LoadResult<()> {
-        self.import_providers(providers, true)
-    }
-
-    /// Borrow providers reachable through the new closure without making them
-    /// part of the existing global prefix.
-    pub(crate) fn import_dependencies(
-        &mut self,
-        providers: Vec<ImportedImageDescriptor>,
-    ) -> LoadResult<()> {
-        self.import_providers(providers, false)
-    }
-
-    fn import_providers(
-        &mut self,
-        providers: Vec<ImportedImageDescriptor>,
-        global: bool,
-    ) -> LoadResult<()> {
-        if self.state.poisoned || (self.state.closed && global) {
-            return Err(session_error(LoadErrorKind::BadElf, ErrorContext::None));
-        }
-        let result = self.add_providers(providers, global);
-        if result.is_err() {
-            self.state.poisoned = true;
-        }
-        result
-    }
-
-    fn add_providers(
-        &mut self,
-        providers: Vec<ImportedImageDescriptor>,
-        global: bool,
-    ) -> LoadResult<()> {
-        for provider in providers {
-            let (descriptor, ownership) = provider.into_parts();
-            let id = if let Some(id) = self.graph.find_identity(descriptor.identity()) {
-                id
-            } else {
-                self.usage
-                    .record_image(0, imported_metadata_bytes(&descriptor)?, &self.limits)?;
-                self.state
-                    .imported
-                    .try_reserve(1)
-                    .map_err(|_| scope_session_oom())?;
-                let id = self.graph.insert_scope_provider(
-                    descriptor.identity().try_clone()?,
-                    descriptor
-                        .soname()
-                        .map(DependencyName::try_clone)
-                        .transpose()?,
-                    ownership,
-                )?;
-                self.state.imported.push(ImportedImage {
-                    image_id: id,
-                    descriptor,
-                });
-                id
-            };
-            if global && !self.state.scope_prefix.contains(&id) {
-                self.state
-                    .scope_prefix
-                    .try_reserve(1)
-                    .map_err(|_| scope_session_oom())?;
-                self.state.scope_prefix.push(id);
-            }
-        }
-        Ok(())
-    }
-
-    /// Restore edges beneath reused providers from the read-only closure plan.
-    /// Their backing is already linked, but consumers still need the complete
-    /// graph for transitive scopes, SCCs and retention. Discovery has finished,
-    /// so adding these structural edges cannot admit another allocation.
-    pub(crate) fn connect_dependencies(
-        &mut self,
-        connections: &[(ArtifactIdentity, ArtifactIdentity, u16)],
-    ) -> LoadResult<()> {
-        if !self.state.closed || self.state.poisoned {
-            return Err(session_error(LoadErrorKind::BadElf, ErrorContext::None));
-        }
-        for (requester, provider, needed_index) in connections {
-            let requester = self
-                .graph
-                .find_identity(requester)
-                .ok_or_else(|| session_error(LoadErrorKind::BadElf, ErrorContext::None))?;
-            let provider = self
-                .graph
-                .find_identity(provider)
-                .ok_or_else(|| session_error(LoadErrorKind::BadElf, ErrorContext::None))?;
-            if let Some(edge) =
-                self.graph.edges().iter().find(|edge| {
-                    edge.requester() == requester && edge.needed_index() == *needed_index
-                })
-            {
-                // A changed file between scan and mapping must fail rather
-                // than publish a graph disagreeing with the pre-acquired closure.
-                if edge.provider() != provider {
-                    return Err(session_error(LoadErrorKind::BadElf, ErrorContext::None));
-                }
-                continue;
-            }
-            if !matches!(
-                self.graph.node(requester).map(|node| node.ownership()),
-                Some(ImageOwnership::ExternalReady | ImageOwnership::NamespaceReady)
-            ) {
-                return Err(session_error(LoadErrorKind::BadElf, ErrorContext::None));
-            }
-            self.graph
-                .link_existing(requester, provider, *needed_index)?;
-        }
-        Ok(())
-    }
-
-    /// Drive the bounded BFS closure until the discovery queue is empty.
-    ///
-    /// Each resolved dependency is de-duplicated by identity *before* it is
-    /// loaded; an already-loaded provider only records an extra edge. A new
-    /// artifact runs the load pipeline, is absorbed into the session
-    /// rollback log, and its own `DT_NEEDED` are enqueued in encounter order.
-    pub(crate) fn close_dependencies<Resolver: ArtifactResolver>(
-        &mut self,
-        resolver: &mut Resolver,
-    ) -> LoadResult<()> {
-        if self.state.poisoned {
-            return Err(session_error(LoadErrorKind::BadElf, ErrorContext::None)
-                .at_stage(LoadStage::Discover));
-        }
-        if self.state.closed {
-            return Ok(());
-        }
-
-        let result = self.close_dependencies_inner(resolver);
-        if result.is_err() {
-            self.state.poisoned = true;
-        }
-        result
-    }
-
-    fn close_dependencies_inner<Resolver: ArtifactResolver>(
-        &mut self,
-        resolver: &mut Resolver,
-    ) -> LoadResult<()> {
-        while let Some(item) = self.state.discovery.pop() {
-            let requester = item.requester();
-            let resolved = {
-                let requester_node = self
-                    .graph
-                    .node(requester)
-                    .ok_or_else(|| session_error(LoadErrorKind::BadElf, ErrorContext::None))?;
-                let needed = needed_for(&self.state.images, requester, item.needed_index())?;
-                // Resolve against the already scanned requester's identity.
-                // File lookup and sharing policy were decided by the backend
-                // while building the complete load plan.
-                let request = DependencyRequest::new(requester_node.artifact(), needed);
-                resolver.resolve(&request).map_err(|error| {
-                    error
-                        .at_stage(LoadStage::Discover)
-                        .with_context(ErrorContext::Dependency {
-                            requester: requester.get(),
-                            needed: needed.as_bytes().into(),
-                        })
-                })?
-            };
-
-            match resolved {
-                DependencyResolution::Existing(identity) => {
-                    let provider = self.graph.find_identity(&identity).ok_or_else(|| {
-                        session_error(LoadErrorKind::BadElf, ErrorContext::None)
-                            .at_stage(LoadStage::Discover)
-                    })?;
-                    self.graph
-                        .link_existing(requester, provider, item.needed_index())
-                        .map_err(|error| error.at_stage(LoadStage::Discover))?;
-                }
-                DependencyResolution::Load(artifact) => {
-                    let (identity, ownership, reader) = artifact.into_parts();
-
-                    // Identity de-duplication happens before any allocation
-                    // so repeated requests reuse the same graph node.
-                    if let Some(existing) = self.graph.find_identity(&identity) {
-                        self.graph
-                            .link_existing(requester, existing, item.needed_index())
-                            .map_err(|error| error.at_stage(LoadStage::Discover))?;
-                        continue;
-                    }
-
-                    let (allocation, mut runtime) = load_runtime(
-                        reader,
-                        self.profile,
-                        ArtifactRole::SharedObject,
-                        self.limits.per_image(),
-                        &mut self.rollback.log,
-                        &mut *self.rollback.memory,
-                    )
-                    .map_err(|error| error.at_stage(LoadStage::Discover))?;
-
-                    let soname = runtime.take_soname();
-                    let metadata_bytes =
-                        session_image_metadata_bytes(&runtime, &identity, soname.as_ref())?;
-                    let needed = needed_for(&self.state.images, requester, item.needed_index())?;
-                    let provider = self
-                        .graph
-                        .insert_dependency(
-                            requester,
-                            needed,
-                            item.needed_index(),
-                            identity,
-                            soname,
-                            ownership,
-                        )
-                        .map_err(|error| error.at_stage(LoadStage::Discover))?;
-
-                    validate_session_symbol_names(&runtime, &self.limits)
-                        .map_err(|error| error.at_stage(LoadStage::Discover))?;
-                    self.usage
-                        .record_image(allocation.allocation().len(), metadata_bytes, &self.limits)
-                        .map_err(|error| error.at_stage(LoadStage::Discover))?;
-
-                    enqueue_dependencies(
-                        &mut self.state.discovery,
-                        provider,
-                        runtime.metadata().needed(),
-                        &self.limits,
-                        LoadStage::Discover,
-                    )?;
-
-                    self.state.images.try_reserve(1).map_err(|_| {
-                        LoadError::new(LoadErrorKind::OutOfMemory, ErrorContext::None)
-                            .at_stage(LoadStage::Discover)
-                    })?;
-                    self.state.images.push(SessionImage {
-                        image_id: provider,
-                        role: ArtifactRole::SharedObject,
-                        allocation,
-                        state: runtime,
-                    });
-                }
-
-                DependencyResolution::Import(imported) => {
-                    let (descriptor, ownership) = imported.into_parts();
-
-                    // An imported Ready image is joined to the graph and scopes
-                    // without a fresh allocation, relocation, seal, or init.
-                    // It never contributes a `DT_NEEDED` of its own
-                    // here: its dependency closure was fixed by the link that
-                    // first published it.
-                    //
-                    // Identity de-duplication mirrors the Load path: an
-                    // already-present imported provider only records an
-                    // extra edge, never a second `ImportedImage` entry.
-                    let identity = descriptor.identity().try_clone()?;
-                    if let Some(existing) = self.graph.find_identity(&identity) {
-                        self.graph
-                            .link_existing(requester, existing, item.needed_index())
-                            .map_err(|error| error.at_stage(LoadStage::Discover))?;
-                        continue;
-                    }
-
-                    let needed = needed_for(&self.state.images, requester, item.needed_index())?;
-                    let soname = descriptor
-                        .soname()
-                        .map(DependencyName::try_clone)
-                        .transpose()?;
-                    let provider = self
-                        .graph
-                        .insert_dependency(
-                            requester,
-                            needed,
-                            item.needed_index(),
-                            identity,
-                            soname,
-                            ownership,
-                        )
-                        .map_err(|error| error.at_stage(LoadStage::Discover))?;
-
-                    let metadata_bytes = imported_metadata_bytes(&descriptor)?;
-                    self.usage
-                        .record_image(0, metadata_bytes, &self.limits)
-                        .map_err(|error| error.at_stage(LoadStage::Discover))?;
-
-                    self.state.imported.try_reserve(1).map_err(|_| {
-                        LoadError::new(LoadErrorKind::OutOfMemory, ErrorContext::None)
-                            .at_stage(LoadStage::Discover)
-                    })?;
-                    self.state.imported.push(ImportedImage {
-                        image_id: provider,
-                        descriptor,
-                    });
-                }
-            }
-        }
-
-        self.state.closed = true;
-        Ok(())
-    }
-
-    /// Freeze the closed dependency graph into an immutable [`ScopeSet`].
-    ///
-    /// Consumes the building session; on any error the session is dropped and
-    /// every absorbed allocation is aborted in reverse creation order.
+impl<'a, M: ImageMemory + ?Sized, A: ArchRelocator> LoadedSession<'a, M, A> {
     pub(crate) fn freeze_scopes(self) -> LoadResult<ScopedSession<'a, M, A>> {
         let LinkSession {
             rollback,
@@ -713,19 +203,11 @@ impl<'a, M: ImageMemory + ?Sized, A: ArchRelocator> BuildingSession<'a, M, A> {
             arch,
             state,
         } = self;
-        let BuildingState {
+        let LoadedState {
             images,
             imported,
             scope_prefix,
-            discovery: _,
-            closed,
-            poisoned,
         } = state;
-
-        if !closed || poisoned {
-            return Err(LoadError::new(LoadErrorKind::BadElf, ErrorContext::None)
-                .at_stage(LoadStage::Scope));
-        }
 
         // Freezing scopes only needs graph structure. Symbol tables are
         // indexed and checked when relocation consumes the frozen scope.
@@ -885,9 +367,9 @@ impl<'a, M: ImageProtectionMemory + ?Sized, A: ArchRelocator> RelocatedSession<'
     /// Every logical seal plan, backend protection plan and executable range
     /// is prepared before the first cache/protection mutation. Publication is
     /// available only on the returned [`SealedSession`].
-    pub(crate) fn seal<C: CodeCache + ?Sized>(
+    pub(crate) fn seal(
         mut self,
-        cache: &mut C,
+        cache: &mut ArchitectureCodeCache,
     ) -> LoadResult<SealedSession<'a, M, A>> {
         let image_count = self.state.images.len();
         let total_executable_ranges =
@@ -928,7 +410,7 @@ impl<'a, M: ImageProtectionMemory + ?Sized, A: ArchRelocator> RelocatedSession<'
                 runtime.regions(),
                 runtime.relro(),
                 runtime.stack(),
-                runtime.metadata().relocations().records(),
+                runtime.metadata().relocations(),
             )
             .map_err(|error| error.at_stage(LoadStage::LinkSeal))?;
             let prepared = PreparedProtectionPlan::prepare_for_allocation(
@@ -957,13 +439,8 @@ impl<'a, M: ImageProtectionMemory + ?Sized, A: ArchRelocator> RelocatedSession<'
         requirements
             .validate_prepared(&executable_ranges, &prepared_cache)
             .map_err(|error| error.at_stage(LoadStage::LinkSeal))?;
-        let cache_scope = prepared_cache.scope();
-        let cache_maintenance = prepared_cache.maintenance();
-        let cache_sync = cache
+        cache
             .synchronize(prepared_cache)
-            .map_err(|error| error.at_stage(LoadStage::LinkSeal))?;
-        cache_sync
-            .validate_completion(&executable_ranges, cache_scope, cache_maintenance)
             .map_err(|error| error.at_stage(LoadStage::LinkSeal))?;
         for (image, prepared) in self.state.images.iter().zip(prepared_seals.into_iter()) {
             let allocation = image.allocation.allocation();
@@ -1211,145 +688,12 @@ impl<M: ImageMemory + ?Sized, A: ArchRelocator> SealedSession<'_, M, A> {
     }
 }
 
-/// Parse, map and decode one image under `profile`/`role`, then
-/// transfer the resulting allocation lease into the session rollback log and
-/// return the decoded runtime state.
-fn load_runtime<R, Memory>(
-    reader: R,
-    profile: LoadProfile,
-    role: ArtifactRole,
-    limits: &LoadLimits,
-    rollback: &mut AllocationRollbackLog,
-    memory: &mut Memory,
-) -> LoadResult<(SessionAllocation, RuntimeImageState)>
-where
-    R: ElfReader,
-    Memory: ImageMemory + ?Sized,
-{
-    let request = LoadRequest::new(profile, *limits);
-    let decoded = ImageLoader::new(reader, request)
-        .admit()?
-        .with_role(role)
-        .inspect()?
-        .plan()?
-        .allocate(memory)?
-        .map()?
-        .decode()?;
-    absorb_into_session(decoded, rollback)
-}
-
 fn session_error(kind: LoadErrorKind, context: ErrorContext) -> LoadError {
     LoadError::new(kind, context)
 }
 
 fn session_overflow() -> LoadError {
     session_error(LoadErrorKind::IntegerOverflow, ErrorContext::None)
-}
-
-fn validate_session_symbol_names(
-    runtime: &RuntimeImageState,
-    limits: &SessionLimits,
-) -> LoadResult<()> {
-    for entry in runtime.metadata().symbols().entries() {
-        let len = u32::try_from(runtime.metadata().symbols().name(entry).len())
-            .map_err(|_| session_error(LoadErrorKind::ResourceLimit, ErrorContext::None))?;
-        limits.check_symbol_name_len(len)?;
-    }
-    Ok(())
-}
-
-fn session_image_metadata_bytes(
-    runtime: &RuntimeImageState,
-    identity: &ArtifactIdentity,
-    soname: Option<&DependencyName>,
-) -> LoadResult<u64> {
-    runtime
-        .metadata()
-        .metadata_bytes()
-        .checked_add(identity.metadata_bytes())
-        .and_then(|bytes| bytes.checked_add(soname.map_or(0, |name| name.as_bytes().len() as u64)))
-        .and_then(|bytes| {
-            bytes.checked_add(
-                runtime.load_segments().len() as u64
-                    * core::mem::size_of::<LoadSegmentInfo>() as u64,
-            )
-        })
-        .and_then(|bytes| {
-            bytes.checked_add(
-                runtime.regions().len() as u64 * core::mem::size_of::<LoadedRegion>() as u64,
-            )
-        })
-        .ok_or_else(session_overflow)
-}
-
-/// The retained runtime metadata bytes an imported Ready image keeps in the
-/// session: its frozen export surface, its identity/SONAME copy, and its
-/// published regions. Charged against
-/// `SessionLimits::total_runtime_metadata_bytes` on import.
-fn imported_metadata_bytes(descriptor: &PublishedImageDescriptor) -> LoadResult<u64> {
-    descriptor
-        .exports()
-        .metadata_bytes()
-        .checked_add(descriptor.identity().metadata_bytes())
-        .and_then(|bytes| bytes.checked_add(descriptor.snapshot().metadata_bytes()))
-        .and_then(|bytes| {
-            bytes.checked_add(
-                descriptor
-                    .soname()
-                    .map_or(0, |name| name.as_bytes().len() as u64),
-            )
-        })
-        .and_then(|bytes| {
-            bytes.checked_add(
-                descriptor.regions().len() as u64 * core::mem::size_of::<PublishedRegion>() as u64,
-            )
-        })
-        .ok_or_else(session_overflow)
-}
-
-fn needed_for(
-    images: &[SessionImage],
-    requester: ImageId,
-    needed_index: u16,
-) -> LoadResult<&DependencyName> {
-    // Loaded images are stored in discovery order, not image-id order, so a
-    // requester id can outrun its dense position once an import interleaves.
-    // Look up by id (only loaded images enqueue `DT_NEEDED`, so a requester is
-    // always present here).
-    images
-        .iter()
-        .find(|image| image.image_id == requester)
-        .and_then(|image| {
-            image
-                .state
-                .metadata()
-                .needed()
-                .get(usize::from(needed_index))
-        })
-        .ok_or_else(|| {
-            session_error(LoadErrorKind::BadElf, ErrorContext::None).at_stage(LoadStage::Discover)
-        })
-}
-
-fn enqueue_dependencies(
-    queue: &mut DiscoveryQueue,
-    requester: ImageId,
-    needed: &[DependencyName],
-    limits: &SessionLimits,
-    stage: LoadStage,
-) -> LoadResult<()> {
-    for (index, name) in needed.iter().enumerate() {
-        limits
-            .check_dependency_name_len(name.as_bytes().len() as u32)
-            .map_err(|error| error.at_stage(stage))?;
-        let index = u16::try_from(index).map_err(|_| {
-            session_error(LoadErrorKind::ResourceLimit, ErrorContext::None).at_stage(stage)
-        })?;
-        queue
-            .push(DiscoveryItem::new(requester, index))
-            .map_err(|error| error.at_stage(stage))?;
-    }
-    Ok(())
 }
 
 /// Snapshot every relocation's scope decision: the
@@ -1416,8 +760,4 @@ fn link_seal_oom() -> LoadError {
 
 fn link_relocation_oom() -> LoadError {
     LoadError::new(LoadErrorKind::OutOfMemory, ErrorContext::None).at_stage(LoadStage::LinkRelocate)
-}
-
-fn scope_session_oom() -> LoadError {
-    LoadError::new(LoadErrorKind::OutOfMemory, ErrorContext::None).at_stage(LoadStage::Scope)
 }

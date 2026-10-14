@@ -24,13 +24,15 @@
 //! and the [`crate::dynamic_linker::LinkProduct`] land with , where the
 //! session's graph/scopes/images move into the committed owner.
 
+use crate::image::DependencyName;
+
 use alloc::{sync::Arc, vec::Vec};
 
 use crate::{
     dynamic_linker::{
         graph::{DependencyEdge, DependencyGraph},
         scope::RelocationBinding,
-        DependencyName, ImageId, ImageOwnership, LifecyclePlans, PublishedImageDescriptor,
+        ImageId, ImageOwnership, LifecyclePlans, PublishedImageDescriptor,
     },
     error::{ErrorContext, LoadErrorKind, LoadStage},
     memory::{address::TargetAddress, AllocationLease},

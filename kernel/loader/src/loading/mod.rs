@@ -15,14 +15,16 @@
 //! Complete-load orchestration and the host-facing API.
 //!
 //! Read `load` first: it connects dependency planning, atomic host acquisition,
-//! link preparation, publication and backend installation. `backend` defines
+//! image mapping, linking, publication and backend installation. `backend` defines
 //! host services; `planning` resolves sources and reusable snapshots;
+//! `materialize` maps its indexed plan without rediscovering dependencies;
 //! `publication` transfers allocations; `loaded` assembles result metadata.
 //! ELF loading and linking algorithms live in `image` and `dynamic_linker`.
 
 mod backend;
 mod load;
 mod loaded;
+pub(crate) mod materialize;
 pub(crate) mod planning;
 mod publication;
 

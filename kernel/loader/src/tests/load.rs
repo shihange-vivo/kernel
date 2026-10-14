@@ -282,6 +282,8 @@ fn load_observations_are_opt_in_and_complete_after_installation() {
                         (LoadPhase::Discover, true),
                         (LoadPhase::Acquire, false),
                         (LoadPhase::Acquire, true),
+                        (LoadPhase::Map, false),
+                        (LoadPhase::Map, true),
                         (LoadPhase::Link, false),
                         (LoadPhase::Link, true),
                         (LoadPhase::Publish, false),
@@ -1131,6 +1133,41 @@ fn planning_enforces_image_and_depth_limits_before_mapping() {
         assert!(matches!(error.kind(), LoadErrorKind::ResourceLimit));
     }
     assert_eq!(backend.memory.allocations.get(), 0);
+}
+
+#[test]
+fn mapping_rejects_changed_dependency_names_order_and_count() {
+    let (_, profile) = super::linker::native_fixture();
+    for changed in [&["C", "B"][..], &["B"][..], &["B", "C", "D"][..]] {
+        let mut backend = Backend::new(alloc::vec![
+            ("root", native_dso(&["B", "C"])),
+            ("B", native_dso(&[])),
+            ("C", native_dso(&[])),
+            ("D", native_dso(&[])),
+        ]);
+        let request = LoadRequest::shared_object("root", profile, SessionLimits::DEFAULT);
+        let mut plan = LoadPlan::build(&request, &mut backend).unwrap();
+        // Model a file changing between scanning and mapping. No newly declared
+        // dependency may escape the closure that was acquired from the scan.
+        plan.images[0].reader = Some(Reader(Rc::from(native_dso(changed))));
+        backend.acquire(&["root", "B", "C"], &[]).unwrap();
+        let mut memory = backend.memory();
+        let error = crate::loading::materialize::load_images(
+            &mut plan,
+            &[],
+            &[],
+            profile,
+            SessionLimits::DEFAULT,
+            &mut memory,
+            |_| {},
+        )
+        .err()
+        .expect("mapped dependency list disagrees with the acquired plan");
+        assert!(matches!(error.kind(), LoadErrorKind::BadElf));
+        assert_eq!(backend.memory.allocations.get(), 1);
+        assert!(backend.memory.mappers.borrow().is_empty());
+        assert_eq!(backend.commits, 0);
+    }
 }
 #[test]
 fn load_request_discovers_declared_dependencies() {

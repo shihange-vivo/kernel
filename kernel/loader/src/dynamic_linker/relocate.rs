@@ -20,13 +20,14 @@
 //! three-pass order (relative → data/global → PLT). All writes go through the
 //! session rollback log so a backend failure aborts the whole link.
 
+use crate::image::{
+    RuntimeImageMetadata, SymbolBinding, SymbolDefinition, SymbolTable, SymbolVisibility,
+};
+
 use alloc::vec::Vec;
 
 use crate::{
-    dynamic_linker::{
-        session::SessionUsage, ImageId, ResolvedSymbol, RuntimeImageMetadata, ScopeSet,
-        SymbolBinding, SymbolDefinition, SymbolRegionKind, SymbolTable, SymbolVisibility,
-    },
+    dynamic_linker::{session::SessionUsage, ImageId, ResolvedSymbol, ScopeSet, SymbolRegionKind},
     elf::LoadSegmentInfo,
     error::{ErrorContext, LoadErrorKind, LoadStage},
     image::{LoadedRegion, RelocationAddend, RelocationRecord},
@@ -279,7 +280,7 @@ where
         .try_reserve_exact(operation_count)
         .map_err(|_| relocation_oom())?;
     for image in images.iter().flatten() {
-        for record in image.metadata.relocations().records().iter() {
+        for record in image.metadata.relocations().iter() {
             let operation = preflight_one(
                 arch,
                 symbols,

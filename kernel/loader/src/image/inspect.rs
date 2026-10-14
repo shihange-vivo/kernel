@@ -12,10 +12,11 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use crate::image::{ArtifactRole, ProgramHeaderGeometry};
+
 use alloc::vec::Vec;
 
 use crate::{
-    dynamic_linker::{ArtifactRole, ProgramHeaderGeometry},
     elf::{DynamicSegmentInfo, ElfHeaderInfo, LoadSegmentInfo},
     error::{ErrorContext, HeaderField, LoadErrorKind, LoadStage, ProgramHeaderField},
     image::{admit::program_header_error, plan::PlannedImage, DynamicFeatureSummary},

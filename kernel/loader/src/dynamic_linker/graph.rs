@@ -17,15 +17,17 @@
 //!
 //! The graph records *structure* only: which artifact depends on which. It
 //! never resolves names, reads ELF bytes, or owns an allocation. The discovery
-//! driver (the link session) feeds it resolved `ArtifactIdentity`/`SONAME`
+//! materialization layer feeds it planned `ArtifactIdentity`/`SONAME`
 //! facts; this module enforces identity de-duplication and the quotas
 //! of `SessionLimits`, and derives the dependency-first order required by lifecycle
 //! planning.
 
+use crate::image::DependencyName;
+
 use alloc::vec::Vec;
 
 use crate::{
-    dynamic_linker::{ArtifactIdentity, DependencyName, ImageId, ImageOwnership},
+    dynamic_linker::{ArtifactIdentity, ImageId, ImageOwnership},
     error::{ErrorContext, LoadErrorKind},
     profile::SessionLimits,
     LoadError, LoadResult,
@@ -442,60 +444,6 @@ fn image_groups_with_capacities(counts: &[usize]) -> LoadResult<Vec<Vec<ImageId>
         groups.push(members);
     }
     Ok(groups)
-}
-
-/// FIFO of pending dependency resolutions, bounded by the session edge budget.
-///
-/// The discovery driver pushes one item per `DT_NEEDED` in encounter order and
-/// pops in the same order, giving the stable BFS of the dependency closure.
-pub(crate) struct DiscoveryQueue {
-    pending: alloc::collections::VecDeque<DiscoveryItem>,
-    limits: SessionLimits,
-}
-
-pub(crate) struct DiscoveryItem {
-    requester: ImageId,
-    needed_index: u16,
-}
-
-impl DiscoveryItem {
-    pub(crate) const fn new(requester: ImageId, needed_index: u16) -> Self {
-        Self {
-            requester,
-            needed_index,
-        }
-    }
-
-    pub const fn requester(&self) -> ImageId {
-        self.requester
-    }
-
-    pub const fn needed_index(&self) -> u16 {
-        self.needed_index
-    }
-}
-
-impl DiscoveryQueue {
-    pub(crate) const fn new(limits: SessionLimits) -> Self {
-        Self {
-            pending: alloc::collections::VecDeque::new(),
-            limits,
-        }
-    }
-
-    pub(crate) fn push(&mut self, item: DiscoveryItem) -> LoadResult<()> {
-        self.limits
-            .check_dependency_edge_count(self.pending.len() as u32 + 1)?;
-        self.pending
-            .try_reserve(1)
-            .map_err(|_| graph_error(LoadErrorKind::OutOfMemory, ErrorContext::None))?;
-        self.pending.push_back(item);
-        Ok(())
-    }
-
-    pub(crate) fn pop(&mut self) -> Option<DiscoveryItem> {
-        self.pending.pop_front()
-    }
 }
 
 /// Tarjan-free Kosaraju SCC over an out-adjacency, returning the component

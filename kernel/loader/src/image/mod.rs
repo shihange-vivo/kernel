@@ -17,7 +17,8 @@
 //! `image_loader` defines the staged loader. Follow `admit` → `inspect` → `plan`
 //! → `allocate` → `map` → `decode`; `seal` describes final protections. `scan`
 //! extracts dependency metadata without mapping and `features` classifies
-//! dynamic features. Multi-image linking is handled by `dynamic_linker`.
+//! dynamic features. `metadata` and `symbol` describe each decoded image.
+//! Multi-image linking is handled by `dynamic_linker`.
 
 mod admit;
 mod allocate;
@@ -26,9 +27,11 @@ mod features;
 mod image_loader;
 mod inspect;
 mod map;
+mod metadata;
 mod plan;
 pub mod scan;
 mod seal;
+mod symbol;
 
 pub(crate) use decode::{absorb_into_session, RelocationAddend, RelocationRecord};
 pub(crate) use features::DynamicFeatureSummary;
@@ -39,4 +42,13 @@ pub(crate) use scan::ScannedArtifact;
 pub use seal::{
     PreparedProtectionPlan, ProtectionBatch, ProtectionCapabilities, ProtectionLevel,
     ProtectionRecord, SealPlan,
+};
+
+pub(crate) use metadata::{
+    ArtifactRole, DependencyName, ImageLifecycleMetadata, ProgramHeaderGeometry,
+    ProgramHeaderRuntimeInfo, RuntimeImageMetadata, RuntimeImageState,
+};
+pub(crate) use symbol::{
+    symbol_count_from_hash, SymbolBinding, SymbolDefinition, SymbolEntry, SymbolTable, SymbolType,
+    SymbolVisibility,
 };

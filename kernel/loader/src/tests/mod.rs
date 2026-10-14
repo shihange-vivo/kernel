@@ -52,9 +52,8 @@ mod soname_relaxation {
     use goblin::elf::header::{EM_RISCV, ET_DYN};
 
     use crate::{
-        dynamic_linker::ArtifactRole,
         error::{LoadErrorKind, ProgramHeaderField},
-        image::ImageLoader,
+        image::{ArtifactRole, ImageLoader},
         profile::{LoadLimits, LoadProfile, LoadRequest},
         tests::fixture::{ElfFixtureBuilder, SliceElfReader},
     };
@@ -145,8 +144,7 @@ mod dependency_scan {
     };
 
     use crate::{
-        dynamic_linker::ArtifactRole,
-        image::scan::scan_root_or_dependency,
+        image::{scan::scan_root_or_dependency, ArtifactRole},
         profile::{LoadLimits, LoadProfile},
         tests::fixture::{ElfFixtureBuilder, SliceElfReader},
     };

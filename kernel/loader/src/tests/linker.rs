@@ -12,21 +12,18 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use crate::image::ArtifactRole;
+
 use alloc::vec::Vec;
 
 use blueos_test_macro::test;
 
 use crate::{
-    dynamic_linker::{
-        prepare_link, ArtifactIdentity, ArtifactRole, CommittingLinkProduct, DependencyResolution,
-        ImageOwnership, LinkPublisher, LinkRequest, PreparedLinkManifest, ResolvedArtifact,
-    },
+    dynamic_linker::{prepare_link, CommittingLinkProduct, LinkPublisher, PreparedLinkManifest},
     error::{ErrorContext, LoadErrorKind, LoadStage},
     memory::{AllocationLease, AllocationRequest, ImageMemory, MutationProgress, Placement},
     profile::{LoadProfile, SessionLimits},
-    tests::fixture::{
-        native_fixture_builder, NoDependencies, SharedMemory, SliceElfReader, NATIVE_PROFILE,
-    },
+    tests::fixture::{native_fixture_builder, SharedMemory, NATIVE_PROFILE},
     LoadError, LoadResult,
 };
 
@@ -41,17 +38,29 @@ pub(super) fn native_fixture() -> (Vec<u8>, LoadProfile) {
     )
 }
 
-fn request(bytes: &[u8], profile: LoadProfile) -> LinkRequest<SliceElfReader<'_>> {
-    LinkRequest::new(
-        DependencyResolution::Load(ResolvedArtifact::new(
-            ArtifactIdentity::from_bytes(b"native-root").unwrap(),
-            ImageOwnership::SessionPrivate,
-            SliceElfReader::new(bytes),
-        )),
+fn prepare<'m>(
+    bytes: &[u8],
+    profile: LoadProfile,
+    memory: &'m mut SharedMemory,
+) -> LoadResult<
+    crate::dynamic_linker::SealedSession<'m, SharedMemory, crate::relocation::NativeRelocator>,
+> {
+    let mut plan = crate::tests::fixture::single_plan(
+        bytes,
         ArtifactRole::ExecutableRoot,
         profile,
         SessionLimits::DEFAULT,
-    )
+    )?;
+    let images = crate::loading::materialize::load_images(
+        &mut plan,
+        &[],
+        &[],
+        profile,
+        SessionLimits::DEFAULT,
+        memory,
+        |_| {},
+    )?;
+    prepare_link(images)
 }
 
 #[derive(Default)]
@@ -93,8 +102,7 @@ fn assert_memory_reusable(memory: &mut SharedMemory) {
 fn prepared_link_drop_rolls_back_allocation() {
     let (bytes, profile) = native_fixture();
     let mut memory = SharedMemory::new(true);
-    let prepared = prepare_link(request(&bytes, profile), &mut NoDependencies, &mut memory)
-        .expect("prepare complete link");
+    let prepared = prepare(&bytes, profile, &mut memory).expect("prepare complete link");
     drop(prepared);
     assert_memory_reusable(&mut memory);
 }
@@ -104,8 +112,7 @@ fn prepared_link_publish_transfers_allocation_once() {
     let (bytes, profile) = native_fixture();
     let mut memory = SharedMemory::new(true);
     let mut publisher = Publisher::default();
-    let prepared = prepare_link(request(&bytes, profile), &mut NoDependencies, &mut memory)
-        .expect("prepare complete link");
+    let prepared = prepare(&bytes, profile, &mut memory).expect("prepare complete link");
     assert_eq!(publisher.commits, 0);
     let product = prepared.publish(&mut publisher).expect("publish");
     assert_eq!(publisher.commits, 1);
@@ -125,8 +132,7 @@ fn prepared_link_publish_failure_rolls_back_allocation() {
         reject: true,
         commits: 0,
     };
-    let prepared = prepare_link(request(&bytes, profile), &mut NoDependencies, &mut memory)
-        .expect("prepare complete link");
+    let prepared = prepare(&bytes, profile, &mut memory).expect("prepare complete link");
     let error = prepared
         .publish(&mut publisher)
         .err()

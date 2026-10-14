@@ -23,46 +23,70 @@
 use alloc::vec::Vec;
 
 use crate::{
-    dynamic_linker::{DependencyName, SymbolTable},
     elf::LoadSegmentInfo,
-    image::{LoadedRegion, RelocationRecord, StackKind},
+    error::LoadErrorKind,
+    image::{LoadedRegion, RelocationRecord, StackKind, SymbolTable},
     memory::address::{TargetAddress, TargetRange},
-    LoadResult,
+    LoadError, LoadResult,
 };
 
-/// The `DT_REL`/`DT_RELA`/`DT_JMPREL` table descriptors plus their decoded
-/// records.
-///
-/// The records are combined in table order (`REL` before `RELA` before
-/// `JMPREL`) and retain their ELF symbol indices; only the relocation
-/// semantics supported by the relative relocation engine survive decode
-/// (`symbol_index == 0` for the relative engine); the session engine also
-/// retains symbol-bound records for scope resolution.
-pub(crate) struct RelocationTables {
-    records: Vec<RelocationRecord>,
+/// How one artifact participates in a link session.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ArtifactRole {
+    /// The link root: must carry a canonical entry fully inside an executable
+    /// region and is published as the application entry.
+    ExecutableRoot,
+    /// A dependent shared object: may have `e_entry == 0` and may omit
+    /// `DT_SONAME` (two SONAME-less files are distinguished by identity and
+    /// path at the resolver layer).
+    SharedObject,
 }
 
-impl RelocationTables {
-    #[inline]
-    pub(crate) fn new(records: Vec<RelocationRecord>) -> Self {
-        Self { records }
-    }
+/// Owned, validated dependency name (a `DT_NEEDED` or `DT_SONAME` value).
+///
+/// Construction validates that the source bytes form a single NUL-terminated
+/// name with no embedded NUL; the stored value is the name without its
+/// terminator. First-version comparison is by ELF raw bytes; the resolver's
+/// catalog key must canonicalize consistently rather than normalizing case or
+/// path separators per layer.
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub struct DependencyName {
+    name: Vec<u8>,
+}
 
-    #[inline]
-    pub(crate) fn empty() -> Self {
-        Self {
-            records: Vec::new(),
+impl DependencyName {
+    /// Validate and copy `bytes`, which must end with exactly one NUL and
+    /// contain no other NUL or empty name before it.
+    pub fn from_terminated(bytes: &[u8]) -> LoadResult<Self> {
+        let name_len = bytes.len().checked_sub(1).filter(|_| {
+            bytes.last() == Some(&0) && bytes[..bytes.len() - 1].iter().all(|byte| *byte != 0)
+        });
+        let Some(name_len) = name_len else {
+            return Err(LoadError::new(
+                LoadErrorKind::BadElf,
+                crate::error::ErrorContext::None,
+            ));
+        };
+        if name_len == 0 {
+            return Err(LoadError::new(
+                LoadErrorKind::BadElf,
+                crate::error::ErrorContext::None,
+            ));
         }
+        Ok(Self {
+            name: try_copy_bytes(&bytes[..name_len])?,
+        })
     }
 
     #[inline]
-    pub(crate) fn records(&self) -> &[RelocationRecord] {
-        &self.records
+    pub fn as_bytes(&self) -> &[u8] {
+        &self.name
     }
 
-    #[inline]
-    pub(crate) fn len(&self) -> usize {
-        self.records.len()
+    pub(crate) fn try_clone(&self) -> LoadResult<Self> {
+        Ok(Self {
+            name: try_copy_bytes(&self.name)?,
+        })
     }
 }
 
@@ -236,7 +260,7 @@ pub(crate) struct RuntimeImageMetadata {
     needed: Vec<DependencyName>,
     soname: Option<DependencyName>,
     symbols: SymbolTable,
-    relocations: RelocationTables,
+    relocations: Vec<RelocationRecord>,
     lifecycle: ImageLifecycleMetadata,
     program_headers: ProgramHeaderRuntimeInfo,
 }
@@ -247,7 +271,7 @@ impl RuntimeImageMetadata {
         needed: Vec<DependencyName>,
         soname: Option<DependencyName>,
         symbols: SymbolTable,
-        relocations: RelocationTables,
+        relocations: Vec<RelocationRecord>,
         lifecycle: ImageLifecycleMetadata,
         program_headers: ProgramHeaderRuntimeInfo,
     ) -> Self {
@@ -267,7 +291,7 @@ impl RuntimeImageMetadata {
             Vec::new(),
             None,
             SymbolTable::empty(),
-            RelocationTables::empty(),
+            Vec::new(),
             ImageLifecycleMetadata::empty(),
             program_headers,
         )
@@ -297,7 +321,7 @@ impl RuntimeImageMetadata {
     }
 
     #[inline]
-    pub(crate) const fn relocations(&self) -> &RelocationTables {
+    pub(crate) fn relocations(&self) -> &[RelocationRecord] {
         &self.relocations
     }
 
@@ -443,4 +467,13 @@ impl RuntimeImageState {
             symbols,
         )
     }
+}
+
+fn try_copy_bytes(bytes: &[u8]) -> LoadResult<Vec<u8>> {
+    let mut copy = Vec::new();
+    copy.try_reserve_exact(bytes.len()).map_err(|_| {
+        LoadError::new(LoadErrorKind::OutOfMemory, crate::error::ErrorContext::None)
+    })?;
+    copy.extend_from_slice(bytes);
+    Ok(copy)
 }

@@ -12,6 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use crate::image::{ArtifactRole, ProgramHeaderGeometry};
+
 use alloc::vec::Vec;
 use goblin::{
     elf::program_header::{
@@ -24,7 +26,6 @@ use goblin::{
 const PT_RISCV_ATTRIBUTES: u32 = 0x7000_0003;
 
 use crate::{
-    dynamic_linker::{ArtifactRole, ProgramHeaderGeometry},
     elf::{DynamicSegmentInfo, ElfHeaderInfo, LoadSegmentInfo, ProgramHeaderInfo},
     error::{ErrorContext, LoadErrorKind, LoadStage, ProgramHeaderField},
     image::{

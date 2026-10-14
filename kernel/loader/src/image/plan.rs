@@ -15,10 +15,9 @@
 use alloc::vec::Vec;
 
 use crate::{
-    dynamic_linker::ProgramHeaderGeometry,
     elf::{DynamicSegmentInfo, LoadSegmentInfo},
     error::{ErrorContext, LoadErrorKind, LoadStage},
-    image::{allocate::AllocatedImage, inspect::StackKind},
+    image::{allocate::AllocatedImage, inspect::StackKind, ProgramHeaderGeometry},
     memory::{
         address::{TargetAddress, TargetRange},
         AllocationRequest, ImageAllocation, ImageLoadTransaction, ImageMemory, Placement,

@@ -24,6 +24,15 @@ pub(crate) use aarch64::AArch64Relocator;
 pub(crate) use arm::ArmRelocator;
 pub(crate) use riscv::{Riscv32Relocator, Riscv64Relocator};
 
+#[cfg(target_arch = "aarch64")]
+pub(crate) use aarch64::AArch64Relocator as NativeRelocator;
+#[cfg(target_arch = "arm")]
+pub(crate) use arm::ArmRelocator as NativeRelocator;
+#[cfg(target_arch = "riscv32")]
+pub(crate) use riscv::Riscv32Relocator as NativeRelocator;
+#[cfg(target_arch = "riscv64")]
+pub(crate) use riscv::Riscv64Relocator as NativeRelocator;
+
 use crate::{
     error::{ErrorContext, LoadErrorKind},
     memory::{address::TargetAddress, AllocationOffset, ImageAllocation, ImageMemory},
