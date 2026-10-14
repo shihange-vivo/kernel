@@ -109,73 +109,6 @@ impl PreparedCacheSync {
     pub const fn maintenance(&self) -> CacheMaintenance {
         self.maintenance
     }
-
-    pub fn complete(self) -> CacheSyncOutcome {
-        CacheSyncOutcome {
-            executable_ranges: self.executable_ranges,
-            scope: self.scope,
-            maintenance: self.maintenance,
-        }
-    }
-}
-
-#[derive(Clone, Debug)]
-pub(crate) struct CacheSyncOutcome {
-    executable_ranges: Vec<TargetRange>,
-    scope: ExecutionScope,
-    maintenance: CacheMaintenance,
-}
-
-impl CacheSyncOutcome {
-    pub fn executable_ranges(&self) -> &[TargetRange] {
-        &self.executable_ranges
-    }
-
-    pub const fn scope(&self) -> ExecutionScope {
-        self.scope
-    }
-
-    pub const fn maintenance(&self) -> CacheMaintenance {
-        self.maintenance
-    }
-
-    pub(crate) fn validate_completion(
-        &self,
-        executable_ranges: &[TargetRange],
-        prepared_scope: ExecutionScope,
-        prepared_maintenance: CacheMaintenance,
-    ) -> LoadResult<()> {
-        if self.executable_ranges() == executable_ranges
-            && self.scope() == prepared_scope
-            && self.maintenance() == prepared_maintenance
-        {
-            Ok(())
-        } else {
-            Err(cache_contract_error(executable_ranges))
-        }
-    }
-}
-
-pub(crate) trait CodeCache {
-    fn requirements(&self) -> CacheRequirements;
-
-    fn prepare(&self, executable_ranges: &[TargetRange]) -> LoadResult<PreparedCacheSync>;
-
-    fn synchronize(&mut self, prepared: PreparedCacheSync) -> LoadResult<CacheSyncOutcome>;
-}
-
-impl<C: CodeCache + ?Sized> CodeCache for &mut C {
-    fn requirements(&self) -> CacheRequirements {
-        (**self).requirements()
-    }
-
-    fn prepare(&self, executable_ranges: &[TargetRange]) -> LoadResult<PreparedCacheSync> {
-        (**self).prepare(executable_ranges)
-    }
-
-    fn synchronize(&mut self, prepared: PreparedCacheSync) -> LoadResult<CacheSyncOutcome> {
-        (**self).synchronize(prepared)
-    }
 }
 
 pub(crate) struct ArchitectureCodeCache {
@@ -187,25 +120,25 @@ impl ArchitectureCodeCache {
     pub const fn new(requirements: CacheRequirements) -> Self {
         Self { requirements }
     }
-}
-
-impl CodeCache for ArchitectureCodeCache {
-    fn requirements(&self) -> CacheRequirements {
+    pub(crate) fn requirements(&self) -> CacheRequirements {
         self.requirements
     }
 
-    fn prepare(&self, executable_ranges: &[TargetRange]) -> LoadResult<PreparedCacheSync> {
+    pub(crate) fn prepare(
+        &self,
+        executable_ranges: &[TargetRange],
+    ) -> LoadResult<PreparedCacheSync> {
         let (scope, maintenance) = architecture_cache_capability()?;
         PreparedCacheSync::try_new(executable_ranges, scope, maintenance)
     }
 
-    fn synchronize(&mut self, prepared: PreparedCacheSync) -> LoadResult<CacheSyncOutcome> {
+    pub(crate) fn synchronize(&mut self, prepared: PreparedCacheSync) -> LoadResult<()> {
         let (scope, maintenance) = architecture_cache_capability()?;
         if prepared.scope() != scope || prepared.maintenance() != maintenance {
             return Err(cache_capability_error());
         }
         let Some(first_range) = prepared.executable_ranges().first().copied() else {
-            return Ok(prepared.complete());
+            return Ok(());
         };
 
         #[cfg(any(target_arch = "riscv32", target_arch = "riscv64"))]
@@ -243,7 +176,7 @@ impl CodeCache for ArchitectureCodeCache {
         )))]
         return Err(cache_error(first_range));
 
-        Ok(prepared.complete())
+        Ok(())
     }
 }
 

@@ -94,7 +94,9 @@ pub(crate) fn trace_product<B: LoaderBackend>(backend: &B, product: &LinkProduct
 pub enum LoadPhase {
     Discover,
     Acquire,
-    /// Includes mapping, scopes, relocation, cache maintenance and sealing.
+    /// Map and decode every new image in the acquired plan.
+    Map,
+    /// Freeze scopes, relocate, synchronize caches and seal permissions.
     Link,
     Publish,
     /// The backend installs the published receipt; constructors run later.

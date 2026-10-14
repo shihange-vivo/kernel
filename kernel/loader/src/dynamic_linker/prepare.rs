@@ -12,115 +12,22 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Link preparation: import providers, close dependencies, freeze symbol scopes,
-//! relocate images, synchronize code caches and seal memory protections.
-
-use alloc::vec::Vec;
+//! Link already mapped images: freeze symbol scopes, relocate, synchronize
+//! code caches and seal final memory protections.
 
 use crate::{
-    dynamic_linker::{
-        ArtifactIdentity, ArtifactResolver, ArtifactRole, DependencyResolution, DynamicLinker,
-        ImportedImageDescriptor, SealedSession,
-    },
+    dynamic_linker::{LoadedSession, SealedSession},
     memory::{
         cache::{ArchitectureCodeCache, CacheRequirements},
         ImageProtectionMemory,
     },
-    profile::{LoadProfile, SessionLimits},
-    reader::ElfReader,
+    relocation::NativeRelocator,
     LoadResult,
 };
 
-#[cfg(target_arch = "aarch64")]
-use crate::relocation::AArch64Relocator as PlatformRelocator;
-#[cfg(target_arch = "arm")]
-use crate::relocation::ArmRelocator as PlatformRelocator;
-#[cfg(target_arch = "riscv32")]
-use crate::relocation::Riscv32Relocator as PlatformRelocator;
-#[cfg(target_arch = "riscv64")]
-use crate::relocation::Riscv64Relocator as PlatformRelocator;
-
-/// Inputs for an executable launch or a runtime shared-object load.
-///
-/// The kernel supplies a trusted ABI profile, resource limits and pinned
-/// namespace providers. The loader selects its native relocator and owns all
-/// dependency discovery, scope, relocation, cache and protection transitions.
-pub(crate) struct LinkRequest<R> {
-    root: DependencyResolution<R>,
-    role: ArtifactRole,
-    profile: LoadProfile,
-    limits: SessionLimits,
-    global: Vec<ImportedImageDescriptor>,
-    dependencies: Vec<ImportedImageDescriptor>,
-    connections: Vec<(ArtifactIdentity, ArtifactIdentity, u16)>,
-}
-
-impl<R> LinkRequest<R> {
-    /// The root has already been validated for the caller's selected purpose.
-    pub(crate) fn new(
-        root: DependencyResolution<R>,
-        role: ArtifactRole,
-        profile: LoadProfile,
-        limits: SessionLimits,
-    ) -> Self {
-        Self {
-            root,
-            role,
-            profile,
-            limits,
-            global: Vec::new(),
-            dependencies: Vec::new(),
-            connections: Vec::new(),
-        }
-    }
-
-    /// Supply the ordered global symbol scope and already loaded dependency
-    /// providers. The kernel must keep their backings pinned until publication
-    /// transfers that responsibility to its publisher receipt.
-    pub(crate) fn with_namespace(
-        mut self,
-        global: Vec<ImportedImageDescriptor>,
-        dependencies: Vec<ImportedImageDescriptor>,
-        connections: Vec<(ArtifactIdentity, ArtifactIdentity, u16)>,
-    ) -> Self {
-        self.global = global;
-        self.dependencies = dependencies;
-        self.connections = connections;
-        self
-    }
-}
-
-/// Prepare the complete dependency closure for a launch or runtime load.
-///
-/// On success every new image is mapped, relocated, cache-synchronized and
-/// sealed. The resolver retains its kernel-owned permits and provider leases;
-/// the caller can hand them to its publisher before consuming the preparation
-/// with [`SealedSession::publish`]. On failure all new allocations are aborted.
-pub(crate) fn prepare_link<'m, R, Resolver, M>(
-    request: LinkRequest<R>,
-    resolver: &mut Resolver,
-    memory: &'m mut M,
-) -> LoadResult<SealedSession<'m, M, PlatformRelocator>>
-where
-    R: ElfReader,
-    Resolver: ArtifactResolver,
-    M: ImageProtectionMemory + ?Sized,
-{
-    let LinkRequest {
-        root,
-        role,
-        profile,
-        limits,
-        global,
-        dependencies,
-        connections,
-    } = request;
-    let linker = DynamicLinker::new(PlatformRelocator);
-    let mut session = linker.begin(root, role, profile, limits, memory)?;
-    session.import_scope(global)?;
-    session.close_dependencies(resolver)?;
-    session.import_dependencies(dependencies)?;
-    session.connect_dependencies(&connections)?;
+pub(crate) fn prepare_link<M: ImageProtectionMemory + ?Sized>(
+    images: LoadedSession<'_, M, NativeRelocator>,
+) -> LoadResult<SealedSession<'_, M, NativeRelocator>> {
     let mut cache = ArchitectureCodeCache::new(CacheRequirements::CURRENT_EXECUTION_CONTEXT);
-    session.freeze_scopes()?.relocate()?.seal(&mut cache)
+    images.freeze_scopes()?.relocate()?.seal(&mut cache)
 }

@@ -649,3 +649,16 @@ impl<M: ImageProtectionMemory + ?Sized> ImageProtectionMemory for &mut M {
         (**self).apply_protection(allocation, batch)
     }
 }
+
+/// Owns every new allocation until publication drains the rollback log.
+#[must_use = "dropping the allocation batch aborts its images"]
+pub(crate) struct AllocationRollbackGuard<'a, M: ImageMemory + ?Sized> {
+    pub(crate) memory: &'a mut M,
+    pub(crate) log: AllocationRollbackLog,
+}
+
+impl<M: ImageMemory + ?Sized> Drop for AllocationRollbackGuard<'_, M> {
+    fn drop(&mut self) {
+        self.log.abort_all(&mut *self.memory);
+    }
+}

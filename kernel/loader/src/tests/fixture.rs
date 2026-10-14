@@ -24,7 +24,6 @@ use goblin::{
 };
 
 use crate::{
-    dynamic_linker::{ArtifactResolver, DependencyRequest, DependencyResolution},
     error::{ErrorContext, LoadErrorKind},
     profile::{ElfClass, LoadProfile},
     reader::ElfReader,
@@ -400,17 +399,26 @@ fn write_u64(bytes: &mut [u8], offset: usize, value: u64) {
     bytes[offset..offset + 8].copy_from_slice(&value.to_le_bytes());
 }
 
-pub(super) struct NoDependencies;
-
-impl ArtifactResolver for NoDependencies {
-    type Reader = SliceElfReader<'static>;
-
-    fn resolve(
-        &mut self,
-        _: &DependencyRequest<'_>,
-    ) -> LoadResult<DependencyResolution<Self::Reader>> {
-        panic!("fixture has no dependencies")
-    }
+pub(super) fn single_plan(
+    bytes: &[u8],
+    role: crate::image::ArtifactRole,
+    profile: LoadProfile,
+    limits: crate::profile::SessionLimits,
+) -> LoadResult<crate::loading::planning::LoadPlan<(), SliceElfReader<'_>>> {
+    let reader = SliceElfReader::new(bytes);
+    let scanned =
+        crate::image::scan::scan_root_or_dependency(&reader, profile, role, *limits.per_image())?;
+    Ok(crate::loading::planning::LoadPlan {
+        images: alloc::vec![crate::loading::planning::PlannedImage {
+            source: (),
+            identity: crate::dynamic_linker::ArtifactIdentity::from_bytes(b"native-root")?,
+            shared: false,
+            reader: Some(reader),
+            snapshot: None,
+            scanned,
+        }],
+        edges: Vec::new(),
+    })
 }
 
 /// Shared real-memory backend for load, link and runtime pipeline tests.

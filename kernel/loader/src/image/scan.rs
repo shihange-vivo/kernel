@@ -27,12 +27,13 @@
 //! session acquire every system permit atomically instead of taking them
 //! one-by-one and risking an ABBA deadlock with a concurrent session.
 
+use crate::image::{ArtifactRole, DependencyName};
+
 use alloc::vec::Vec;
 
 use goblin::elf::dynamic::{DT_NEEDED, DT_SONAME, DT_STRSZ, DT_STRTAB};
 
 use crate::{
-    dynamic_linker::{ArtifactRole, DependencyName},
     elf::LoadSegmentInfo,
     error::{LoadErrorKind, LoadStage},
     image::{image_loader::ImageLoader, map::decode_dependency_name_at},

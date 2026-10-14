@@ -14,54 +14,35 @@
 
 //! Multi-image dynamic linking for applications and runtime shared objects.
 //!
-//! The module owns artifact resolution, dependency discovery, symbol scope,
-//! relocation, lifecycle planning and publication.
+//! The module consumes mapped image metadata and a fixed dependency graph.
+//! It owns symbol scopes, cross-image relocation, lifecycle plans and publication.
+//! `loading` discovers and maps the closure; `image` decodes each ELF.
 //! Start with `prepare` for the link flow and `session` for its state transitions.
-//! `graph`, `scope`, `symbol` and `lifecycle` contain the main algorithms;
-//! `metadata`, `published` and `publish` describe runtime facts and publication.
 
 mod artifact;
 mod graph;
 mod lifecycle;
-mod metadata;
 mod prepare;
 mod publish;
 mod published;
 mod relocate;
 mod scope;
 mod session;
-mod symbol;
 
-pub(crate) use graph::order_components;
-pub(crate) use prepare::{prepare_link, LinkRequest};
-
-#[cfg(test)]
-pub(crate) use graph::DependencyGraph;
-#[cfg(test)]
-pub(crate) use session::SessionUsage;
-
-pub(crate) use artifact::{
-    ArtifactIdentity, ArtifactResolver, ArtifactRole, DependencyName, DependencyRequest,
-    DependencyResolution, ImageId, ImageOwnership, ResolvedArtifact,
-};
-
-pub use published::ImageDependency;
-pub(crate) use published::{
-    ImportedImageDescriptor, PublishedImageDescriptor, PublishedLoadSnapshot, PublishedRegion,
-};
-
+pub(crate) use artifact::{ArtifactIdentity, ImageId, ImageOwnership};
+pub(crate) use graph::{order_components, DependencyGraph};
 pub(crate) use lifecycle::{LifecycleEntry, LifecyclePlans};
-pub(crate) use metadata::{
-    ImageLifecycleMetadata, ProgramHeaderGeometry, ProgramHeaderRuntimeInfo, RelocationTables,
-    RuntimeImageMetadata, RuntimeImageState,
-};
+pub(crate) use prepare::prepare_link;
 pub(crate) use publish::{
     CommittedImage, CommittingLinkProduct, LinkContext, LinkProduct, LinkPublisher,
     PreparedLinkManifest,
 };
+pub use published::ImageDependency;
+pub(crate) use published::{
+    ImportedImageDescriptor, PublishedImageDescriptor, PublishedLoadSnapshot, PublishedRegion,
+};
 pub(crate) use scope::{RelocationBinding, ResolvedSymbol, ScopeSet, SymbolRegionKind};
-pub(crate) use session::{DynamicLinker, SealedSession};
-pub(crate) use symbol::{
-    symbol_count_from_hash, SymbolBinding, SymbolDefinition, SymbolEntry, SymbolTable, SymbolType,
-    SymbolVisibility,
+pub(crate) use session::{
+    ImportedImage, LinkSession, LoadedSession, LoadedState, SealedSession, SessionImage,
+    SessionUsage,
 };

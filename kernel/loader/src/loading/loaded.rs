@@ -39,6 +39,10 @@ pub struct ImageHandle {
 }
 
 impl ImageHandle {
+    pub(crate) fn new(descriptor: Arc<PublishedImageDescriptor>, shared: bool) -> Self {
+        Self { descriptor, shared }
+    }
+
     pub fn identity(&self) -> &[u8] {
         self.descriptor.identity().as_bytes()
     }
@@ -189,13 +193,13 @@ impl<Receipt> LoadedImage<Receipt> {
 }
 
 pub(crate) fn handle(image: &crate::dynamic_linker::CommittedImage) -> ImageHandle {
-    ImageHandle {
-        descriptor: image.descriptor_handle(),
-        shared: matches!(
+    ImageHandle::new(
+        image.descriptor_handle(),
+        matches!(
             image.ownership(),
             ImageOwnership::SystemCandidate | ImageOwnership::ExternalReady
         ),
-    }
+    )
 }
 
 fn shared_retention_edges<'a>(

@@ -13,13 +13,12 @@
 // limitations under the License.
 
 //! Dependency discovery before mapping: source lookup, snapshot reuse and a
-//! root-first load plan. `PlannedResolver` feeds this fixed plan to the linker.
+//! root-first load plan. Materialization follows its indexed edges directly.
+
+use crate::image::{ArtifactRole, DependencyName};
 
 use crate::{
-    dynamic_linker::{
-        ArtifactIdentity, ArtifactResolver, ArtifactRole, DependencyName, DependencyRequest,
-        DependencyResolution, ImageOwnership, ResolvedArtifact,
-    },
+    dynamic_linker::ArtifactIdentity,
     error::{invalid, oom, overflow, ErrorContext, LoadErrorKind},
     image::ScannedArtifact,
     trace::{emit, LoadEvent},
@@ -30,16 +29,15 @@ use alloc::vec::Vec;
 pub(crate) struct PlannedImage<S, R> {
     pub(crate) source: S,
     pub(crate) identity: ArtifactIdentity,
-    shared: bool,
-    reader: Option<R>,
-    snapshot: Option<ImageHandle>,
+    pub(crate) shared: bool,
+    pub(crate) reader: Option<R>,
+    pub(crate) snapshot: Option<ImageHandle>,
     pub(crate) scanned: ScannedArtifact,
-    traced: bool,
 }
 pub(crate) struct PlannedEdge {
     pub(crate) requester: usize,
     pub(crate) provider: usize,
-    needed_index: u16,
+    pub(crate) needed_index: u16,
 }
 pub(crate) struct LoadPlan<S, R> {
     pub(crate) images: Vec<PlannedImage<S, R>>,
@@ -84,20 +82,6 @@ impl<S, R> LoadPlan<S, R> {
         self.images
             .iter()
             .any(|image| image.identity.as_bytes() == identity)
-    }
-    pub(crate) fn connections(&self) -> LoadResult<Vec<(ArtifactIdentity, ArtifactIdentity, u16)>> {
-        let mut connections = Vec::new();
-        connections
-            .try_reserve_exact(self.edges.len())
-            .map_err(|_| oom())?;
-        for edge in &self.edges {
-            connections.push((
-                self.images[edge.requester].identity.try_clone()?,
-                self.images[edge.provider].identity.try_clone()?,
-                edge.needed_index,
-            ));
-        }
-        Ok(connections)
     }
     pub(crate) fn metadata_bytes(&self) -> LoadResult<u64> {
         let mut bytes = core::mem::size_of::<Self>() as u64
@@ -293,7 +277,6 @@ fn scan<B: LoaderBackend>(
                 reader: None,
                 snapshot: Some(snapshot),
                 scanned,
-                traced: false,
             });
         }
         if reuse_required {
@@ -322,104 +305,9 @@ fn scan<B: LoaderBackend>(
         reader: Some(reader),
         snapshot: None,
         scanned,
-        traced: false,
     })
 }
 
 fn unsupported() -> crate::LoadError {
     crate::LoadError::new(LoadErrorKind::UnsupportedByProfile, ErrorContext::None)
-}
-
-pub(crate) struct PlannedResolver<'a, B: LoaderBackend> {
-    pub(crate) plan: &'a mut LoadPlan<B::Source, B::Reader>,
-    pub(crate) backend: &'a mut B,
-    pub(crate) providers: &'a [ImageHandle],
-}
-
-impl<B: LoaderBackend> PlannedResolver<'_, B> {
-    pub(crate) fn load_root(&mut self) -> LoadResult<ResolvedArtifact<B::Reader>> {
-        self.load_index(0)
-    }
-    fn load_index(&mut self, index: usize) -> LoadResult<ResolvedArtifact<B::Reader>> {
-        let image = &mut self.plan.images[index];
-        // Every new source transfers its original reader exactly once.
-        let reader = image.reader.take().ok_or_else(invalid)?;
-        let ownership = if image.shared {
-            ImageOwnership::SystemCandidate
-        } else {
-            ImageOwnership::SessionPrivate
-        };
-        if !image.traced {
-            image.traced = true;
-            emit(
-                self.backend,
-                LoadEvent::ImageLoadStarted {
-                    path: image.identity.as_bytes(),
-                    system: image.shared,
-                },
-            );
-        }
-        Ok(ResolvedArtifact::new(
-            image.identity.try_clone()?,
-            ownership,
-            reader,
-        ))
-    }
-    pub(crate) fn resolve_index(
-        &mut self,
-        index: usize,
-    ) -> LoadResult<DependencyResolution<B::Reader>> {
-        let image = &mut self.plan.images[index];
-        if let Some(provider) = self
-            .providers
-            .iter()
-            .find(|provider| provider.identity() == image.identity.as_bytes())
-        {
-            if !image.traced {
-                image.traced = true;
-                emit(
-                    self.backend,
-                    LoadEvent::ImageReused {
-                        path: provider.identity(),
-                        system: image.shared,
-                    },
-                );
-            }
-            return Ok(DependencyResolution::Import(provider.imported()));
-        }
-        if image.reader.is_none() {
-            if image.snapshot.is_some() {
-                return Err(invalid());
-            }
-            return Ok(DependencyResolution::Existing(image.identity.try_clone()?));
-        }
-        self.load_index(index).map(DependencyResolution::Load)
-    }
-}
-
-impl<B: LoaderBackend> ArtifactResolver for PlannedResolver<'_, B> {
-    type Reader = B::Reader;
-    fn resolve(
-        &mut self,
-        request: &DependencyRequest<'_>,
-    ) -> LoadResult<DependencyResolution<Self::Reader>> {
-        let requester = self
-            .plan
-            .images
-            .iter()
-            .position(|image| &image.identity == request.requester())
-            .ok_or_else(invalid)?;
-        let provider = self
-            .plan
-            .edges
-            .iter()
-            .find(|edge| {
-                edge.requester == requester
-                    && &self.plan.images[requester].scanned.needed[edge.needed_index as usize]
-                        == request.needed()
-            })
-            .ok_or_else(invalid)?
-            .provider;
-        self.resolve_index(provider)
-    }
 }

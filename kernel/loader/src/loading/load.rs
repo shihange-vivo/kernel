@@ -14,15 +14,14 @@
 
 //! Load requests and orchestration of discovery, linking, publication and installation.
 
+use crate::image::ArtifactRole;
+
 use alloc::vec::Vec;
 
-use super::{
-    planning::{LoadPlan, PlannedResolver},
-    publication::BackendPublisher,
-};
+use super::{materialize::load_images, planning::LoadPlan, publication::BackendPublisher};
 
 use crate::{
-    dynamic_linker::{prepare_link, ArtifactRole, DependencyResolution, LinkRequest},
+    dynamic_linker::prepare_link,
     error::{invalid, oom, ErrorContext, LoadErrorKind},
     profile::{LoadProfile, SessionLimits},
     trace::{emit, trace_product, LoadEvent, LoadPhase},
@@ -192,13 +191,30 @@ fn load_inner<B: LoaderBackend>(
             providers.push(image);
         }
     }
-    let dependencies = providers
-        .iter()
-        .filter(|image| plan.contains(image.identity()))
-        .map(ImageHandle::imported)
-        .collect();
-    let globals = request.global.iter().map(ImageHandle::imported).collect();
-    let connections = plan.connections()?;
+    let mut memory = backend.memory();
+    emit(
+        backend,
+        LoadEvent::Phase {
+            phase: LoadPhase::Map,
+            completed: false,
+        },
+    );
+    let images = load_images(
+        &mut plan,
+        &providers,
+        &request.global,
+        request.profile,
+        request.limits,
+        &mut memory,
+        |event| emit(backend, event),
+    )?;
+    emit(
+        backend,
+        LoadEvent::Phase {
+            phase: LoadPhase::Map,
+            completed: true,
+        },
+    );
     emit(
         backend,
         LoadEvent::Phase {
@@ -206,23 +222,7 @@ fn load_inner<B: LoaderBackend>(
             completed: false,
         },
     );
-    let mut memory = backend.memory();
-    let mut resolver = PlannedResolver {
-        plan: &mut plan,
-        backend,
-        providers: &providers,
-    };
-    let role = resolver.plan.images[0].scanned.role;
-    let root = match role {
-        ArtifactRole::ExecutableRoot => DependencyResolution::Load(resolver.load_root()?),
-        ArtifactRole::SharedObject => resolver.resolve_index(0)?,
-    };
-    let request = LinkRequest::new(root, role, request.profile, request.limits).with_namespace(
-        globals,
-        dependencies,
-        connections,
-    );
-    let prepared = prepare_link(request, &mut resolver, &mut memory)?;
+    let prepared = prepare_link(images)?;
     emit(
         backend,
         LoadEvent::Phase {
@@ -250,8 +250,7 @@ fn load_inner<B: LoaderBackend>(
         .facts
         .take()
         .expect("publication prepared result metadata");
-    facts.entry = (plan.images[0].scanned.role
-        == crate::dynamic_linker::ArtifactRole::ExecutableRoot)
+    facts.entry = (plan.images[0].scanned.role == crate::image::ArtifactRole::ExecutableRoot)
         .then(|| product.entry());
     trace_product(publisher.backend, &product);
     let mut loaded = LoadedImage::new(product.into_publication(), facts);

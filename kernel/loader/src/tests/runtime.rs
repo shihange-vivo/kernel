@@ -12,20 +12,17 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use crate::image::{ArtifactRole, ProgramHeaderRuntimeInfo, SymbolTable};
+
 use crate::{
     dynamic_linker::{
-        ArtifactIdentity, ArtifactRole, DependencyGraph, DependencyResolution, DynamicLinker,
-        ImageOwnership, ImportedImageDescriptor, ProgramHeaderRuntimeInfo,
-        PublishedImageDescriptor, PublishedLoadSnapshot, ResolvedArtifact, ScopeSet, SessionUsage,
-        SymbolTable,
+        ArtifactIdentity, DependencyGraph, ImageOwnership, PublishedImageDescriptor,
+        PublishedLoadSnapshot, ScopeSet, SessionUsage,
     },
     error::LoadErrorKind,
     memory::address::TargetAddress,
     profile::{ElfClass, ElfData, LoadLimits, SessionLimits},
-    tests::fixture::{
-        native_fixture_builder, NativeRelocator, NoDependencies, SharedMemory, SliceElfReader,
-        NATIVE_PROFILE,
-    },
+    tests::fixture::{native_fixture_builder, SharedMemory, SliceElfReader, NATIVE_PROFILE},
 };
 use alloc::{sync::Arc, vec::Vec};
 
@@ -82,10 +79,64 @@ fn descriptor(name: &[u8], table: SymbolTable) -> Arc<PublishedImageDescriptor> 
     )
 }
 
+fn load_single<'m>(
+    bytes: &[u8],
+    role: ArtifactRole,
+    memory: &'m mut SharedMemory,
+) -> crate::LoadResult<
+    crate::dynamic_linker::LoadedSession<'m, SharedMemory, crate::relocation::NativeRelocator>,
+> {
+    let mut plan =
+        crate::tests::fixture::single_plan(bytes, role, NATIVE_PROFILE, SessionLimits::DEFAULT)?;
+    crate::loading::materialize::load_images(
+        &mut plan,
+        &[],
+        &[],
+        NATIVE_PROFILE,
+        SessionLimits::DEFAULT,
+        memory,
+        |_| {},
+    )
+}
+
+fn import_single<'m>(
+    provider: Arc<PublishedImageDescriptor>,
+    role: ArtifactRole,
+    globals: &[crate::ImageHandle],
+    limits: SessionLimits,
+    memory: &'m mut SharedMemory,
+) -> crate::LoadResult<
+    crate::dynamic_linker::LoadedSession<'m, SharedMemory, crate::relocation::NativeRelocator>,
+> {
+    let handle = crate::ImageHandle::new(provider.clone(), false);
+    let mut plan = crate::loading::planning::LoadPlan {
+        images: alloc::vec![crate::loading::planning::PlannedImage {
+            source: (),
+            identity: provider.identity().try_clone()?,
+            shared: false,
+            reader: None::<SliceElfReader<'static>>,
+            snapshot: Some(handle.clone()),
+            scanned: crate::image::ScannedArtifact {
+                role,
+                declared_soname: None,
+                needed: Vec::new()
+            },
+        }],
+        edges: Vec::new(),
+    };
+    crate::loading::materialize::load_images(
+        &mut plan,
+        &[handle],
+        globals,
+        NATIVE_PROFILE,
+        limits,
+        memory,
+        |_| {},
+    )
+}
+
 #[test]
 fn runtime_shared_root_accepts_zero_entry_without_weakening_executable_admission() {
-    // PT_DYNAMIC follows two program headers. PT_LOAD starts at the ELF
-    // header's end, so the dynamic table is two native phdr widths beyond it.
     let dynamic_vaddr = match NATIVE_PROFILE.class() {
         ElfClass::Elf32 => 0x1040,
         ElfClass::Elf64 => 0x1070,
@@ -95,37 +146,12 @@ fn runtime_shared_root_accepts_zero_entry_without_weakening_executable_admission
         .with_dynamic_segment(dynamic_vaddr)
         .build();
     let mut memory = SharedMemory::new(true);
-    let executable = DynamicLinker::new(NativeRelocator).begin(
-        DependencyResolution::Load(ResolvedArtifact::new(
-            identity(b"app"),
-            ImageOwnership::SessionPrivate,
-            SliceElfReader::new(&bytes),
-        )),
-        ArtifactRole::ExecutableRoot,
-        NATIVE_PROFILE,
-        SessionLimits::DEFAULT,
-        &mut memory,
-    );
+    let executable = load_single(&bytes, ArtifactRole::ExecutableRoot, &mut memory);
     assert!(executable.is_err());
     drop(executable);
     assert_eq!(memory.allocations.get(), 0);
-
-    let mut shared = DynamicLinker::new(NativeRelocator)
-        .begin(
-            DependencyResolution::Load(ResolvedArtifact::new(
-                identity(b"dso"),
-                ImageOwnership::SessionPrivate,
-                SliceElfReader::new(&bytes),
-            )),
-            ArtifactRole::SharedObject,
-            NATIVE_PROFILE,
-            SessionLimits::DEFAULT,
-            &mut memory,
-        )
-        .unwrap();
-    shared.close_dependencies(&mut NoDependencies).unwrap();
-    let relocated = shared.freeze_scopes().unwrap().relocate().unwrap();
-    drop(relocated);
+    let shared = load_single(&bytes, ArtifactRole::SharedObject, &mut memory).unwrap();
+    drop(shared.freeze_scopes().unwrap().relocate().unwrap());
     assert_eq!(memory.allocations.get(), 1);
     assert!(memory.mappers.borrow().is_empty());
 }
@@ -134,10 +160,10 @@ fn runtime_shared_root_accepts_zero_entry_without_weakening_executable_admission
 fn runtime_imported_root_and_duplicate_scope_do_not_allocate_backings() {
     let provider = descriptor(b"ready", SymbolTable::empty());
     let mut memory = SharedMemory::new(true);
-    let executable = DynamicLinker::new(NativeRelocator).begin::<SliceElfReader<'static>, _>(
-        DependencyResolution::Import(ImportedImageDescriptor::namespace(provider.clone())),
+    let executable = import_single(
+        provider.clone(),
         ArtifactRole::ExecutableRoot,
-        NATIVE_PROFILE,
+        &[],
         SessionLimits::DEFAULT,
         &mut memory,
     );
@@ -146,28 +172,24 @@ fn runtime_imported_root_and_duplicate_scope_do_not_allocate_backings() {
         .expect("an executable root must be newly loaded");
     assert!(matches!(error.kind(), LoadErrorKind::UnsupportedByProfile));
     assert_eq!(memory.allocations.get(), 0);
-    let mut shared = DynamicLinker::new(NativeRelocator)
-        .begin::<SliceElfReader<'static>, _>(
-            DependencyResolution::Import(ImportedImageDescriptor::namespace(provider.clone())),
-            ArtifactRole::SharedObject,
-            NATIVE_PROFILE,
-            SessionLimits::DEFAULT,
-            &mut memory,
-        )
-        .unwrap();
-    shared
-        .import_scope(alloc::vec![
-            ImportedImageDescriptor::namespace(provider.clone()),
-            ImportedImageDescriptor::namespace(provider)
-        ])
-        .unwrap();
-    shared.close_dependencies(&mut NoDependencies).unwrap();
+    let globals = [
+        crate::ImageHandle::new(provider.clone(), false),
+        crate::ImageHandle::new(provider.clone(), false),
+    ];
+    let shared = import_single(
+        provider,
+        ArtifactRole::SharedObject,
+        &globals,
+        SessionLimits::DEFAULT,
+        &mut memory,
+    )
+    .unwrap();
     drop(shared.freeze_scopes().unwrap().relocate().unwrap());
     assert_eq!(memory.allocations.get(), 0);
 }
 
 #[test]
-fn failed_runtime_scope_import_poisoning_prevents_partial_publication() {
+fn failed_namespace_import_cannot_leave_a_partially_publishable_session() {
     let limits = SessionLimits::new(
         LoadLimits::DEFAULT,
         1,
@@ -181,28 +203,25 @@ fn failed_runtime_scope_import_poisoning_prevents_partial_publication() {
         256,
     );
     let mut memory = SharedMemory::new(true);
-    let mut shared = DynamicLinker::new(NativeRelocator)
-        .begin::<SliceElfReader<'static>, _>(
-            DependencyResolution::Import(ImportedImageDescriptor::namespace(descriptor(
-                b"root",
-                SymbolTable::empty(),
-            ))),
-            ArtifactRole::SharedObject,
-            NATIVE_PROFILE,
-            limits,
-            &mut memory,
-        )
-        .unwrap();
-    let error = shared
-        .import_scope(alloc::vec![ImportedImageDescriptor::namespace(descriptor(
-            b"excess",
-            SymbolTable::empty()
-        ))])
-        .unwrap_err();
+    let root = descriptor(b"root", SymbolTable::empty());
+    let globals = [crate::ImageHandle::new(
+        descriptor(b"excess", SymbolTable::empty()),
+        false,
+    )];
+    let error = import_single(
+        root.clone(),
+        ArtifactRole::SharedObject,
+        &globals,
+        limits,
+        &mut memory,
+    )
+    .err()
+    .expect("scope exceeds image limit");
     assert!(matches!(error.kind(), LoadErrorKind::ResourceLimit));
-    assert!(shared.close_dependencies(&mut NoDependencies).is_err());
-    assert!(shared.freeze_scopes().is_err());
     assert_eq!(memory.allocations.get(), 0);
+    let shared = import_single(root, ArtifactRole::SharedObject, &[], limits, &mut memory).unwrap();
+    drop(shared.freeze_scopes().unwrap().relocate().unwrap());
+    assert!(memory.mappers.borrow().is_empty());
 }
 
 #[test]

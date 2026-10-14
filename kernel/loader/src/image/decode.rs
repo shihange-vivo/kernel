@@ -15,8 +15,8 @@
 use alloc::vec::Vec;
 
 use crate::{
-    dynamic_linker::RuntimeImageState,
     error::{ErrorContext, LoadErrorKind},
+    image::RuntimeImageState,
     memory::{
         address::TargetAddress, AllocationRollbackLog, ImageLoadTransaction, ImageMemory,
         SessionAllocation,

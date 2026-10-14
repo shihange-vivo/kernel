@@ -23,13 +23,14 @@
 //! `max_symbol_lookups` — that counter is mutable session state, so it lives
 //! outside this immutable value.
 
+use crate::image::{
+    SymbolBinding, SymbolDefinition, SymbolEntry, SymbolTable, SymbolType, SymbolVisibility,
+};
+
 use alloc::vec::Vec;
 
 use crate::{
-    dynamic_linker::{
-        graph::DependencyGraph, session::SessionUsage, ImageId, ImageOwnership, SymbolBinding,
-        SymbolDefinition, SymbolEntry, SymbolTable, SymbolType, SymbolVisibility,
-    },
+    dynamic_linker::{graph::DependencyGraph, session::SessionUsage, ImageId, ImageOwnership},
     error::{ErrorContext, LoadErrorKind, LoadStage},
     memory::address::TargetAddress,
     profile::SessionLimits,
