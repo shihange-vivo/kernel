@@ -12,9 +12,10 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Loader unit tests and fixtures. `load` covers the host-facing complete flow,
-//! `linker` covers link preparation and publication, and `runtime` exercises
-//! linking internals. Single-image and ABI checks follow below.
+//! Loader unit tests and fixtures. `admission` covers ELF header and
+//! program-header policies; `load` covers the host-facing complete flow;
+//! `linker` covers link preparation and publication; `runtime` exercises
+//! linking internals. Additional single-image and ABI checks follow below.
 
 use goblin::elf::{
     header::{EM_ARM, EM_RISCV, ET_DYN},
@@ -23,6 +24,7 @@ use goblin::elf::{
 
 use crate::tests::fixture::ElfFixtureBuilder;
 
+mod admission;
 mod fixture;
 mod linker;
 mod load;

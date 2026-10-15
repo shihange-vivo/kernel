@@ -16,7 +16,8 @@
 //!
 //! [`LoadProfile`] describes the accepted ELF architecture and ABI;
 //! [`LoadLimits`] and [`SessionLimits`] bound image and link resource usage.
-//! Per-image requests and supported-feature policies remain crate-private.
+//! Program-header admission is caller-configurable; per-image requests and
+//! dynamic-feature checks remain crate-private.
 
 use goblin::elf::{
     dynamic::{
@@ -30,10 +31,14 @@ use goblin::elf::{
         ELFCLASS32, ELFCLASS64, ELFDATA2LSB, ELFDATA2MSB, EM_AARCH64, EM_ARM, EM_RISCV, ET_DYN,
         ET_EXEC,
     },
+    program_header::{
+        PF_X, PT_ARM_EXIDX, PT_DYNAMIC, PT_GNU_EH_FRAME, PT_GNU_RELRO, PT_GNU_STACK, PT_INTERP,
+        PT_LOAD, PT_NOTE, PT_NULL, PT_PHDR, PT_TLS,
+    },
 };
 
 use crate::{
-    error::{ErrorContext, LimitKind, LoadErrorKind},
+    error::{ErrorContext, LimitKind, LoadErrorKind, ProgramHeaderField},
     memory::MemoryPermissions,
     LoadError, LoadResult,
 };
@@ -120,6 +125,31 @@ const EF_RISCV_FLOAT_ABI_MASK: u32 = 0x0000_0006;
 const EF_RISCV_FLOAT_ABI_SOFT: u32 = 0x0000_0000;
 const EF_RISCV_RVE: u32 = 0x0000_0008;
 
+/// Processor-specific program header locating RISC-V build attributes.
+const PT_RISCV_ATTRIBUTES: u32 = 0x7000_0003;
+
+// Common entries form the prefix. Keep the RISC-V entry last so the default
+// policies can share this table without duplicating the common types.
+const DEFAULT_PROGRAM_HEADERS: [u32; 9] = [
+    PT_NULL,
+    PT_LOAD,
+    PT_DYNAMIC,
+    PT_NOTE,
+    PT_PHDR,
+    PT_GNU_EH_FRAME,
+    PT_GNU_RELRO,
+    PT_GNU_STACK,
+    PT_RISCV_ATTRIBUTES,
+];
+
+// The private ARM profile uses the same common prefix with its own
+// processor-specific entry. Build its table without repeating the whitelist.
+const DEFAULT_ARM_PROGRAM_HEADERS: [u32; 9] = {
+    let mut headers = DEFAULT_PROGRAM_HEADERS;
+    headers[headers.len() - 1] = PT_ARM_EXIDX;
+    headers
+};
+
 /// Bit-level `e_flags` admission policy for one ELF machine.
 ///
 /// `e_flags` is machine-defined; a policy only ever names the bits its
@@ -148,6 +178,52 @@ impl HeaderFlagsPolicy {
     #[inline]
     pub const fn accepts(self, flags: u32) -> bool {
         (flags & self.mask) == self.required && (flags & self.forbidden) == 0
+    }
+}
+
+/// Caller-defined program-header admission policy.
+///
+/// `new()` replaces the base whitelist. A profile can also retain that list
+/// and configure additional types for one load. Accepting metadata does not
+/// implement its runtime semantics; matching loading and stack support are
+/// still required before executing the image.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ProgramHeaderPolicy {
+    allowed_types: &'static [u32],
+    additional_types: &'static [u32],
+    executable_stack: bool,
+}
+
+impl ProgramHeaderPolicy {
+    pub const fn new(allowed_types: &'static [u32], executable_stack: bool) -> Self {
+        Self {
+            allowed_types,
+            additional_types: &[],
+            executable_stack,
+        }
+    }
+
+    /// Base whitelist, excluding the separately configured additional types.
+    pub const fn allowed_types(&self) -> &'static [u32] {
+        self.allowed_types
+    }
+
+    pub const fn additional_types(&self) -> &'static [u32] {
+        self.additional_types
+    }
+
+    /// Change stack admission while retaining the program-header whitelist.
+    pub const fn with_executable_stack(mut self, allowed: bool) -> Self {
+        self.executable_stack = allowed;
+        self
+    }
+
+    fn accepts_type(&self, kind: u32) -> bool {
+        self.allowed_types.contains(&kind) || self.additional_types.contains(&kind)
+    }
+
+    const fn accepts_stack_flags(&self, flags: u32) -> bool {
+        self.executable_stack || flags & PF_X == 0
     }
 }
 
@@ -227,6 +303,7 @@ pub struct LoadProfile {
     machine: ElfMachine,
     header_flags: HeaderFlagsPolicy,
     entry_mode: EntryMode,
+    program_headers: ProgramHeaderPolicy,
 }
 
 impl LoadProfile {
@@ -244,6 +321,18 @@ impl LoadProfile {
             machine,
             header_flags,
             entry_mode,
+            program_headers: ProgramHeaderPolicy::new(
+                match machine {
+                    ElfMachine::Riscv => &DEFAULT_PROGRAM_HEADERS,
+                    ElfMachine::Arm => &DEFAULT_ARM_PROGRAM_HEADERS,
+                    _ => {
+                        DEFAULT_PROGRAM_HEADERS
+                            .split_at(DEFAULT_PROGRAM_HEADERS.len() - 1)
+                            .0
+                    }
+                },
+                false,
+            ),
         }
     }
 
@@ -348,6 +437,61 @@ impl LoadProfile {
     #[inline]
     pub const fn entry_mode(&self) -> EntryMode {
         self.entry_mode
+    }
+
+    pub const fn program_header_policy(&self) -> ProgramHeaderPolicy {
+        self.program_headers
+    }
+
+    /// Replace the default program-header and stack admission policy.
+    pub const fn with_program_header_policy(mut self, policy: ProgramHeaderPolicy) -> Self {
+        self.program_headers = policy;
+        self
+    }
+
+    /// Set additional accepted types while retaining the base whitelist and stack policy.
+    /// Calling this again replaces the extension list; an empty list clears it.
+    pub const fn set_additional_program_headers(&mut self, types: &'static [u32]) {
+        self.program_headers.additional_types = types;
+    }
+
+    /// Configure additional types when constructing a profile.
+    pub const fn with_additional_program_headers(mut self, types: &'static [u32]) -> Self {
+        self.set_additional_program_headers(types);
+        self
+    }
+
+    pub(crate) fn check_program_header(&self, index: u16, kind: u32) -> LoadResult<()> {
+        if self.program_headers.accepts_type(kind) {
+            return Ok(());
+        }
+        let field = match kind {
+            PT_INTERP => ProgramHeaderField::UnsupportedInterpreter,
+            PT_TLS => ProgramHeaderField::UnsupportedTls,
+            _ => ProgramHeaderField::Type,
+        };
+        Err(LoadError::new(
+            LoadErrorKind::UnsupportedByProfile,
+            ErrorContext::ProgramHeader {
+                index,
+                field,
+                value: u64::from(kind),
+            },
+        ))
+    }
+
+    pub(crate) fn check_stack_flags(&self, index: u16, flags: u32) -> LoadResult<()> {
+        if self.program_headers.accepts_stack_flags(flags) {
+            return Ok(());
+        }
+        Err(LoadError::new(
+            LoadErrorKind::UnsupportedByProfile,
+            ErrorContext::ProgramHeader {
+                index,
+                field: ProgramHeaderField::ExecutableStack,
+                value: u64::from(flags),
+            },
+        ))
     }
 }
 

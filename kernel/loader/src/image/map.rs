@@ -26,7 +26,7 @@ use goblin::elf::dynamic::{
 };
 
 use crate::{
-    elf::{DynamicSegmentInfo, LoadSegmentInfo},
+    elf::{read_u32, read_u64, DynamicSegmentInfo, LoadSegmentInfo},
     error::{ErrorContext, LoadErrorKind, LoadStage},
     image::{
         decode::{
@@ -34,7 +34,6 @@ use crate::{
             RelocationTableTags,
         },
         inspect::StackKind,
-        read_u32, read_u64,
     },
     memory::{
         address::{FileRange, TargetAddress, TargetRange},

@@ -24,9 +24,8 @@
 use alloc::{boxed::Box, vec::Vec};
 
 use crate::{
-    elf::LoadSegmentInfo,
+    elf::{read_u16, read_u32, read_u64, LoadSegmentInfo},
     error::{ErrorContext, LoadErrorKind},
-    image::{read_u16, read_u32, read_u64},
     memory::{
         address::{TargetAddress, TargetRange},
         MemoryPermissions,

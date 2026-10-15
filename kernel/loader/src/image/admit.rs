@@ -17,13 +17,11 @@ use crate::image::{ArtifactRole, ProgramHeaderGeometry};
 use alloc::vec::Vec;
 use goblin::{
     elf::program_header::{
-        PF_R, PF_W, PF_X, PT_ARM_EXIDX, PT_DYNAMIC, PT_GNU_EH_FRAME, PT_GNU_RELRO, PT_GNU_STACK,
-        PT_INTERP, PT_LOAD, PT_NOTE, PT_PHDR, PT_TLS,
+        PF_R, PF_W, PF_X, PT_DYNAMIC, PT_GNU_RELRO, PT_GNU_STACK, PT_INTERP, PT_LOAD, PT_NULL,
+        PT_PHDR, PT_TLS,
     },
     elf64,
 };
-
-const PT_RISCV_ATTRIBUTES: u32 = 0x7000_0003;
 
 use crate::{
     elf::{DynamicSegmentInfo, ElfHeaderInfo, LoadSegmentInfo, ProgramHeaderInfo},
@@ -37,7 +35,7 @@ use crate::{
         address::{FileRange, TargetAddress, TargetRange},
         MemoryPermissions,
     },
-    profile::{supports_segment_permissions, ElfMachine, ElfType, LoadRequest},
+    profile::{supports_segment_permissions, ElfType, LoadRequest},
     reader::ElfReader,
     LoadError, LoadResult,
 };
@@ -56,6 +54,7 @@ fn missing_dynamic_error() -> LoadError {
     )
 }
 
+#[must_use = "consume the admitted image with inspect() to validate program headers"]
 pub(crate) struct AdmittedImage<R: ElfReader> {
     reader: R,
     header: ElfHeaderInfo,
@@ -90,58 +89,95 @@ impl<R: ElfReader> AdmittedImage<R> {
         self
     }
 
+    #[inline]
+    pub const fn header(&self) -> &ElfHeaderInfo {
+        &self.header
+    }
+
     pub fn inspect(self) -> LoadResult<InspectedImage<R>> {
+        self.inspect_inner()
+            .map_err(|error| error.at_stage(LoadStage::Inspect))
+    }
+
+    fn inspect_inner(self) -> LoadResult<InspectedImage<R>> {
         let count = self.header.program_header_count();
         self.request
             .limits()
-            .check_load_segment_count(count.into())
-            .map_err(|error| error.at_stage(LoadStage::Inspect))?;
+            .check_load_segment_count(count.into())?;
         let mut load_segments = Vec::new();
         load_segments
             .try_reserve_exact(usize::from(count))
-            .map_err(|_| {
-                LoadError::new(LoadErrorKind::OutOfMemory, ErrorContext::None)
-                    .at_stage(LoadStage::Inspect)
-            })?;
+            .map_err(|_| LoadError::new(LoadErrorKind::OutOfMemory, ErrorContext::None))?;
 
         let entry_size = usize::from(self.header.program_header_entry_size());
         let mut raw = [0; elf64::program_header::SIZEOF_PHDR];
         let mut dynamic = None;
         let mut relro = None;
         let mut stack = StackKind::NotDeclared;
-        let mut interpreter = None;
-        let mut tls = None;
         let mut phdr_vaddr = None;
+        let mut seen_singletons = 0u8;
 
         for index in 0..count {
             let offset = self
                 .header
                 .program_header_offset()
                 .checked_add(u64::from(index) * u64::from(self.header.program_header_entry_size()))
-                .ok_or_else(|| {
-                    program_header_error(index, ProgramHeaderField::FileRange, 0)
-                        .at_stage(LoadStage::Inspect)
-                })?;
-            self.reader
-                .read_exact_at(offset, &mut raw[..entry_size])
-                .map_err(|error| error.at_stage(LoadStage::Inspect))?;
+                .ok_or_else(|| program_header_error(index, ProgramHeaderField::FileRange, 0))?;
+            self.reader.read_exact_at(offset, &mut raw[..entry_size])?;
             let program_header = ProgramHeaderInfo::decode(
                 &raw[..entry_size],
                 self.request.profile().class(),
                 self.request.profile().endian(),
-            )
-            .map_err(|e| e.at_stage(LoadStage::Inspect))?;
-
-            match program_header.r#type() {
-                PT_LOAD => {
-                    if program_header.file_size() > program_header.memory_size() {
-                        return Err(program_header_error(
+            )?;
+            let kind = program_header.r#type();
+            self.request.profile().check_program_header(index, kind)?;
+            // The other fields in PT_NULL entries have no defined meaning.
+            if kind == PT_NULL {
+                continue;
+            }
+            let singleton = match kind {
+                PT_DYNAMIC => Some((0b000001, ProgramHeaderField::DuplicateDynamic)),
+                PT_PHDR => Some((0b000010, ProgramHeaderField::DuplicatePhdr)),
+                PT_GNU_RELRO => Some((0b000100, ProgramHeaderField::DuplicateRelro)),
+                PT_GNU_STACK => Some((0b001000, ProgramHeaderField::DuplicateStack)),
+                PT_INTERP => Some((0b010000, ProgramHeaderField::DuplicateInterpreter)),
+                PT_TLS => Some((0b100000, ProgramHeaderField::DuplicateTls)),
+                _ => None,
+            };
+            if let Some((bit, field)) = singleton {
+                if seen_singletons & bit != 0 {
+                    return Err(program_header_error(index, field, u64::from(kind)));
+                }
+                seen_singletons |= bit;
+            }
+            if matches!(kind, PT_LOAD | PT_DYNAMIC | PT_TLS)
+                && program_header.file_size() > program_header.memory_size()
+            {
+                return Err(program_header_error(
+                    index,
+                    ProgramHeaderField::FileRange,
+                    program_header.file_size(),
+                ));
+            }
+            let file_range =
+                FileRange::new(program_header.file_offset(), program_header.file_size());
+            file_range.validate(self.file_len)?;
+            program_header
+                .vaddr()
+                .checked_add(program_header.memory_size())
+                .ok_or_else(|| {
+                    LoadError::new(
+                        LoadErrorKind::IntegerOverflow,
+                        ErrorContext::ProgramHeader {
                             index,
-                            ProgramHeaderField::FileRange,
-                            program_header.file_size(),
-                        )
-                        .at_stage(LoadStage::Inspect));
-                    }
+                            field: ProgramHeaderField::VirtualRange,
+                            value: program_header.vaddr(),
+                        },
+                    )
+                })?;
+            let vaddr = TargetAddress::new(program_header.vaddr());
+            match kind {
+                PT_LOAD => {
                     let permissions = permissions_from_flags(program_header.flags());
                     if !supports_segment_permissions(permissions) {
                         return Err(LoadError::new(
@@ -151,187 +187,42 @@ impl<R: ElfReader> AdmittedImage<R> {
                                 field: ProgramHeaderField::Permissions,
                                 value: u64::from(permissions.bits()),
                             },
-                        )
-                        .at_stage(LoadStage::Inspect));
+                        ));
                     }
-                    let file_range =
-                        FileRange::new(program_header.file_offset(), program_header.file_size());
-                    file_range
-                        .validate(self.file_len)
-                        .map_err(|e| e.at_stage(LoadStage::Inspect))?;
-                    TargetRange::new(program_header.vaddr(), program_header.memory_size())
-                        .end()
-                        .map_err(|e| e.at_stage(LoadStage::Inspect))?;
                     load_segments.push(LoadSegmentInfo::new(
                         index,
                         file_range,
-                        program_header.vaddr(),
+                        vaddr,
                         program_header.memory_size(),
                         program_header.align(),
                         permissions,
                     ));
                 }
                 PT_DYNAMIC => {
-                    if dynamic.is_some() {
-                        return Err(program_header_error(
-                            index,
-                            ProgramHeaderField::DuplicateDynamic,
-                            program_header.r#type().into(),
-                        )
-                        .at_stage(LoadStage::Inspect));
-                    }
-                    let file_range =
-                        FileRange::new(program_header.file_offset(), program_header.file_size());
-                    file_range
-                        .validate(self.file_len)
-                        .map_err(|e| e.at_stage(LoadStage::Inspect))?;
-                    TargetRange::new(program_header.vaddr(), program_header.memory_size())
-                        .end()
-                        .map_err(|e| e.at_stage(LoadStage::Inspect))?;
                     dynamic = Some(DynamicSegmentInfo::new(
                         file_range,
-                        program_header.vaddr(),
+                        vaddr,
                         program_header.memory_size(),
-                    ))
+                    ));
                 }
                 PT_GNU_RELRO => {
-                    if relro.is_some() {
-                        return Err(program_header_error(
-                            index,
-                            ProgramHeaderField::DuplicateRelro,
-                            program_header.r#type().into(),
-                        )
-                        .at_stage(LoadStage::Inspect));
-                    }
-                    let target_range =
-                        TargetRange::new(program_header.vaddr(), program_header.memory_size());
-                    target_range
-                        .end()
-                        .map_err(|error| error.at_stage(LoadStage::Inspect))?;
-                    relro = Some(target_range);
+                    relro = Some(TargetRange::new(vaddr, program_header.memory_size()));
                 }
                 PT_GNU_STACK => {
-                    if stack != StackKind::NotDeclared {
-                        return Err(program_header_error(
-                            index,
-                            ProgramHeaderField::DuplicateStack,
-                            program_header.r#type().into(),
-                        )
-                        .at_stage(LoadStage::Inspect));
-                    }
-                    if program_header.flags() & PF_X != 0 {
-                        stack = StackKind::Executable;
+                    self.request
+                        .profile()
+                        .check_stack_flags(index, program_header.flags())?;
+                    stack = if program_header.flags() & PF_X != 0 {
+                        StackKind::Executable
                     } else {
-                        stack = StackKind::NonExecutable
-                    }
+                        StackKind::NonExecutable
+                    };
                 }
-                PT_INTERP => {
-                    if interpreter.is_some() {
-                        return Err(program_header_error(
-                            index,
-                            ProgramHeaderField::DuplicateInterpreter,
-                            program_header.r#type().into(),
-                        )
-                        .at_stage(LoadStage::Inspect));
-                    }
-                    let file_range =
-                        FileRange::new(program_header.file_offset(), program_header.file_size());
-                    file_range
-                        .validate(self.file_len)
-                        .map_err(|e| e.at_stage(LoadStage::Inspect))?;
-                    interpreter = Some(file_range);
-                }
-                PT_TLS => {
-                    if tls.is_some() {
-                        return Err(program_header_error(
-                            index,
-                            ProgramHeaderField::DuplicateTls,
-                            program_header.r#type().into(),
-                        )
-                        .at_stage(LoadStage::Inspect));
-                    }
-                    if program_header.file_size() > program_header.memory_size() {
-                        return Err(program_header_error(
-                            index,
-                            ProgramHeaderField::FileRange,
-                            program_header.file_size(),
-                        )
-                        .at_stage(LoadStage::Inspect));
-                    }
-                    let file_range =
-                        FileRange::new(program_header.file_offset(), program_header.file_size());
-                    file_range
-                        .validate(self.file_len)
-                        .map_err(|e| e.at_stage(LoadStage::Inspect))?;
-                    let target_range =
-                        TargetRange::new(program_header.vaddr(), program_header.memory_size());
-                    target_range
-                        .end()
-                        .map_err(|e| e.at_stage(LoadStage::Inspect))?;
-                    tls = Some(target_range)
-                }
-                PT_PHDR => {
-                    if phdr_vaddr.is_some() {
-                        return Err(program_header_error(
-                            index,
-                            ProgramHeaderField::DuplicatePhdr,
-                            program_header.r#type().into(),
-                        )
-                        .at_stage(LoadStage::Inspect));
-                    }
-                    phdr_vaddr = Some(program_header.vaddr());
-                }
-                PT_GNU_EH_FRAME => {}
-                // Notes are structurally harmless metadata. The runtime loader
-                // does not currently interpret their contents.
-                PT_NOTE => {}
-                PT_ARM_EXIDX if self.header.machine() == ElfMachine::Arm => {}
-                PT_RISCV_ATTRIBUTES if self.header.machine() == ElfMachine::Riscv => {}
-                t => {
-                    return Err(LoadError::new(
-                        LoadErrorKind::UnsupportedByProfile,
-                        ErrorContext::ProgramHeader {
-                            index,
-                            field: ProgramHeaderField::UnknownField,
-                            value: t.into(),
-                        },
-                    )
-                    .at_stage(LoadStage::Inspect));
-                }
+                PT_PHDR => phdr_vaddr = Some(vaddr),
+                // Other accepted headers remain metadata; admission does not
+                // provide interpreter, TLS or processor-specific runtime support.
+                _ => {}
             }
-        }
-        if stack == StackKind::Executable {
-            return Err(LoadError::new(
-                LoadErrorKind::UnsupportedByProfile,
-                ErrorContext::ProgramHeader {
-                    index: 0,
-                    field: ProgramHeaderField::ExecutableStack,
-                    value: 0,
-                },
-            )
-            .at_stage(LoadStage::Inspect));
-        }
-        if interpreter.is_some() {
-            return Err(LoadError::new(
-                LoadErrorKind::UnsupportedByProfile,
-                ErrorContext::ProgramHeader {
-                    index: 0,
-                    field: ProgramHeaderField::UnsupportedInterpreter,
-                    value: 0,
-                },
-            )
-            .at_stage(LoadStage::Inspect));
-        }
-        if tls.is_some() {
-            return Err(LoadError::new(
-                LoadErrorKind::UnsupportedByProfile,
-                ErrorContext::ProgramHeader {
-                    index: 0,
-                    field: ProgramHeaderField::UnsupportedTls,
-                    value: 0,
-                },
-            )
-            .at_stage(LoadStage::Inspect));
         }
 
         // The dynamic feature summary must be decided here, before
@@ -349,8 +240,7 @@ impl<R: ElfReader> AdmittedImage<R> {
                 self.header.class(),
                 self.header.endian(),
                 self.request.limits(),
-            )
-            .map_err(|error| error.at_stage(LoadStage::Inspect))?,
+            )?,
             None => DynamicFeatureSummary::empty(),
         };
 
@@ -362,8 +252,7 @@ impl<R: ElfReader> AdmittedImage<R> {
                     field: crate::error::HeaderField::Entry,
                     value: 0,
                 },
-            )
-            .at_stage(LoadStage::Inspect));
+            ));
         }
         if role == ArtifactRole::SharedObject {
             if self.header.r#type() != ElfType::Dyn || summary.is_pie() {
@@ -373,11 +262,10 @@ impl<R: ElfReader> AdmittedImage<R> {
                         field: crate::error::HeaderField::Type,
                         value: u64::from(self.header.r#type()),
                     },
-                )
-                .at_stage(LoadStage::Inspect));
+                ));
             }
             if dynamic.is_none() {
-                return Err(missing_dynamic_error().at_stage(LoadStage::Inspect));
+                return Err(missing_dynamic_error());
             }
         }
 
@@ -390,8 +278,7 @@ impl<R: ElfReader> AdmittedImage<R> {
                 * u64::from(self.header.program_header_count());
             let phdr_file_range =
                 FileRange::new(self.header.program_header_offset(), phdr_file_len);
-            phdr_vaddr = infer_program_header_vaddr(phdr_file_range, &load_segments)
-                .map_err(|error| error.at_stage(LoadStage::Inspect))?;
+            phdr_vaddr = infer_program_header_vaddr(phdr_file_range, &load_segments)?;
         }
 
         let phdr_geometry = ProgramHeaderGeometry::new(

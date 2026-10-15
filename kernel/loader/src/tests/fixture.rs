@@ -86,6 +86,31 @@ pub struct ElfFixtureBuilder {
     is64: bool,
 }
 
+#[derive(Clone, Copy)]
+pub struct ProgramHeaderFixture {
+    pub kind: u32,
+    pub flags: u32,
+    pub offset: u64,
+    pub vaddr: u64,
+    pub filesz: u64,
+    pub memsz: u64,
+    pub align: u64,
+}
+
+impl ProgramHeaderFixture {
+    pub const fn load() -> Self {
+        Self {
+            kind: 1,
+            flags: 5,
+            offset: 0,
+            vaddr: 0x1000,
+            filesz: 4,
+            memsz: 0x100,
+            align: 4,
+        }
+    }
+}
+
 impl ElfFixtureBuilder {
     pub fn elf64(e_machine: u16, e_type: u16) -> Self {
         let mut bytes = alloc::vec![0; elf64::header::SIZEOF_EHDR];
@@ -135,6 +160,55 @@ impl ElfFixtureBuilder {
     pub fn with_flags(mut self, flags: u32) -> Self {
         let offset = if self.is64 { 48 } else { 36 };
         write_u32(&mut self.bytes, offset, flags);
+        self
+    }
+
+    /// Append a program header without padding the segment's file range.
+    /// Tests can describe both valid and deliberately truncated segments.
+    pub fn with_program_header(mut self, header: ProgramHeaderFixture) -> Self {
+        let is64 = self.is64;
+        let count_offset = if is64 { 56 } else { 44 };
+        let count = self.ph_count;
+        let offset = if is64 {
+            elf64::header::SIZEOF_EHDR + usize::from(count) * elf64::program_header::SIZEOF_PHDR
+        } else {
+            elf32::header::SIZEOF_EHDR + usize::from(count) * elf32::program_header::SIZEOF_PHDR
+        };
+        if is64 {
+            self.bytes
+                .resize(offset + elf64::program_header::SIZEOF_PHDR, 0);
+            write_u32(&mut self.bytes, offset, header.kind);
+            write_u32(&mut self.bytes, offset + 4, header.flags);
+            for (field, value) in [
+                (8, header.offset),
+                (16, header.vaddr),
+                (32, header.filesz),
+                (40, header.memsz),
+                (48, header.align),
+            ] {
+                write_u64(&mut self.bytes, offset + field, value);
+            }
+        } else {
+            self.bytes
+                .resize(offset + elf32::program_header::SIZEOF_PHDR, 0);
+            write_u32(&mut self.bytes, offset, header.kind);
+            for (field, value) in [
+                (4, header.offset),
+                (8, header.vaddr),
+                (16, header.filesz),
+                (20, header.memsz),
+                (28, header.align),
+            ] {
+                write_u32(
+                    &mut self.bytes,
+                    offset + field,
+                    u32::try_from(value).unwrap(),
+                );
+            }
+            write_u32(&mut self.bytes, offset + 24, header.flags);
+        }
+        self.ph_count = count.checked_add(1).unwrap();
+        write_u16(&mut self.bytes, count_offset, self.ph_count);
         self
     }
 

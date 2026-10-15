@@ -29,7 +29,7 @@ pub(crate) fn oom() -> LoadError {
     LoadError::new(LoadErrorKind::OutOfMemory, ErrorContext::None)
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum LoadStage {
     Beginning,
     Admit,
@@ -48,7 +48,7 @@ pub enum LoadStage {
     LinkSeal,
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum LoadErrorKind {
     BadElf,
     UnsupportedByProfile,
@@ -66,19 +66,21 @@ pub enum LoadErrorKind {
     NotAllocated,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Eq, PartialEq)]
 pub enum HeaderField {
     Magic,
     Class,
     Endian,
     Version,
     OsAbi,
+    AbiVersion,
     Type,
     Machine,
     Flags,
     Entry,
     HeaderSize,
     ProgramHeaderSize,
+    ProgramHeaderCount,
     ProgramHeaderTable,
 }
 
