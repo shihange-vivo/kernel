@@ -30,7 +30,7 @@ use super::fixture::{ElfFixtureBuilder, ProgramHeaderFixture, SliceElfReader};
 use crate::{
     error::{ErrorContext, HeaderField, LimitKind, LoadErrorKind, LoadStage, ProgramHeaderField},
     image::ImageLoader,
-    memory::MemoryPermissions,
+    memory::{address::TargetAddress, MemoryPermissions},
     profile::{
         ElfClass, ElfData, ElfMachine, LoadLimits, LoadProfile, LoadRequest, ProgramHeaderPolicy,
     },
@@ -725,7 +725,7 @@ fn custom_program_header_policies_preserve_structural_checks() {
     let bytes = fixture(profile, ET_DYN)
         .with_program_header(ProgramHeaderFixture {
             kind: PT_TLS,
-            vaddr: u64::MAX,
+            vaddr: TargetAddress::new(u64::MAX),
             memsz: 1,
             filesz: 0,
             ..ProgramHeaderFixture::load()
@@ -843,7 +843,7 @@ fn inspection_ignores_undefined_null_header_fields() {
         .with_program_header(ProgramHeaderFixture {
             kind: PT_NULL,
             offset: u64::MAX,
-            vaddr: u64::MAX,
+            vaddr: TargetAddress::new(u64::MAX),
             filesz: u64::MAX,
             memsz: u64::MAX,
             ..ProgramHeaderFixture::load()
