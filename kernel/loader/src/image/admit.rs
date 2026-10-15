@@ -162,20 +162,19 @@ impl<R: ElfReader> AdmittedImage<R> {
             let file_range =
                 FileRange::new(program_header.file_offset(), program_header.file_size());
             file_range.validate(self.file_len)?;
-            program_header
-                .vaddr()
+            let vaddr = program_header.vaddr();
+            vaddr
                 .checked_add(program_header.memory_size())
-                .ok_or_else(|| {
+                .map_err(|error| {
                     LoadError::new(
-                        LoadErrorKind::IntegerOverflow,
+                        error.kind(),
                         ErrorContext::ProgramHeader {
                             index,
                             field: ProgramHeaderField::VirtualRange,
-                            value: program_header.vaddr(),
+                            value: vaddr.get(),
                         },
                     )
                 })?;
-            let vaddr = TargetAddress::new(program_header.vaddr());
             match kind {
                 PT_LOAD => {
                     let permissions = permissions_from_flags(program_header.flags());

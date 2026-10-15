@@ -31,10 +31,10 @@ use crate::{
 };
 
 use crate::memory::{
-    AllocationId, AllocationLease, AllocationOffset, AllocationOwnership, AllocationRequest,
-    ImageAllocation, ImageMemory, ImageProtectionMemory, MemoryMapper, MemoryPermissions,
-    MemoryRegion, MutationProgress, Placement, PreparedProtectionPlan, ProtectionCapabilities,
-    ProtectionLevel,
+    address::TargetAddress, AllocationId, AllocationLease, AllocationOffset, AllocationOwnership,
+    AllocationRequest, ImageAllocation, ImageMemory, ImageProtectionMemory, MemoryMapper,
+    MemoryPermissions, MemoryRegion, MutationProgress, Placement, PreparedProtectionPlan,
+    ProtectionCapabilities, ProtectionLevel,
 };
 
 // Use one native linking configuration across pipeline tests so each backend
@@ -91,7 +91,7 @@ pub struct ProgramHeaderFixture {
     pub kind: u32,
     pub flags: u32,
     pub offset: u64,
-    pub vaddr: u64,
+    pub vaddr: TargetAddress,
     pub filesz: u64,
     pub memsz: u64,
     pub align: u64,
@@ -103,7 +103,7 @@ impl ProgramHeaderFixture {
             kind: 1,
             flags: 5,
             offset: 0,
-            vaddr: 0x1000,
+            vaddr: TargetAddress::new(0x1000),
             filesz: 4,
             memsz: 0x100,
             align: 4,
@@ -181,7 +181,7 @@ impl ElfFixtureBuilder {
             write_u32(&mut self.bytes, offset + 4, header.flags);
             for (field, value) in [
                 (8, header.offset),
-                (16, header.vaddr),
+                (16, header.vaddr.get()),
                 (32, header.filesz),
                 (40, header.memsz),
                 (48, header.align),
@@ -194,7 +194,7 @@ impl ElfFixtureBuilder {
             write_u32(&mut self.bytes, offset, header.kind);
             for (field, value) in [
                 (4, header.offset),
-                (8, header.vaddr),
+                (8, header.vaddr.get()),
                 (16, header.filesz),
                 (20, header.memsz),
                 (28, header.align),
