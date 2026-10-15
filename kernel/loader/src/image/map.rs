@@ -191,7 +191,8 @@ impl<M: ImageMemory> MappedImage<M> {
         let dynamic = self.dynamic.as_ref().unwrap();
         let entry_size = dynamic_entry_size(self.request.profile().class());
 
-        if dynamic.file_range().is_empty() || dynamic.file_range().len() % entry_size != 0 {
+        if dynamic.file_range().is_empty() || !dynamic.file_range().len().is_multiple_of(entry_size)
+        {
             return Err(dynamic_error(DT_NULL, dynamic.file_range().len()));
         }
         if dynamic.file_range().len() > dynamic.memory_size() {

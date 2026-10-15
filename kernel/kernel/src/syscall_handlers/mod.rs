@@ -12,6 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use blueos_infra::no_let_underscore::IgnoreResult;
+
 extern crate alloc;
 
 #[cfg(kernel_async)]
@@ -430,7 +432,7 @@ create_thread(spawn_args_ptr: *const SpawnArgs) -> c_long {
                     cleanup(cleanup_arg);
                 }
                 if let Some(group) = membership.upgrade() {
-                    let _ = group.remove_member(handle);
+                    group.remove_member(handle).ignore_result();
                 }
             })));
             Some(group)
@@ -471,7 +473,7 @@ create_thread(spawn_args_ptr: *const SpawnArgs) -> c_long {
     if ok.is_err() {
         #[cfg(all(enable_vfs, dynamic_loader))]
         if let Some(group) = joined_group {
-            let _ = group.remove_member(handle);
+            group.remove_member(handle).ignore_result();
         }
         let _ = GlobalQueueVisitor::remove(&mut t);
         return -1;

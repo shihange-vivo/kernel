@@ -34,6 +34,8 @@
 //! Ordinary `Thread::set_cleanup` callbacks keep their synchronous retirement
 //! behavior even when the dynamic application runtime is enabled.
 
+use blueos_infra::no_let_underscore::IgnoreResult;
+
 use crate::{
     sync::{atomic_wake, spinlock::SpinLock},
     thread::Entry,
@@ -84,7 +86,7 @@ pub fn wait_address() -> &'static AtomicUsize {
 /// Producers running in the context-switch path use [`defer`] instead.
 pub fn notify() {
     GENERATION.fetch_add(1, Ordering::Release);
-    let _ = atomic_wake(&GENERATION, usize::MAX);
+    atomic_wake(&GENERATION, usize::MAX).ignore_result();
 }
 
 /// Post `entry` for the reaper to run.

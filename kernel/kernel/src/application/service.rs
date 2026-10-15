@@ -31,6 +31,8 @@
 //! install moves the group to draining with a skipped fini so the deferred
 //! reaper releases the installed product.
 
+use blueos_infra::no_let_underscore::IgnoreResult;
+
 use alloc::{boxed::Box, sync::Arc, vec::Vec};
 use core::sync::atomic::{AtomicUsize, Ordering};
 use spin::Once;
@@ -93,14 +95,14 @@ impl<T> LinkHandoff<T> {
         // Publish the outcome before waking, so a caller that observes
         // completion is guaranteed to observe the value.
         self.completed.store(1, Ordering::Release);
-        let _ = crate::sync::atomic_wake(&self.completed, usize::MAX);
+        crate::sync::atomic_wake(&self.completed, usize::MAX).ignore_result();
     }
 
     fn wait(&self) -> T {
         while self.completed.load(Ordering::Acquire) == 0 {
             // Re-check completion after a spurious return. The worker marks
             // completion exactly once and never resets it.
-            let _ = crate::sync::atomic_wait(&self.completed, 0, Tick::MAX);
+            crate::sync::atomic_wait(&self.completed, 0, Tick::MAX).ignore_result();
         }
         self.outcome
             .irqsave_lock()
@@ -364,8 +366,8 @@ impl ApplicationService {
             // The product is installed but the main thread could not join:
             // move the group to draining with a skipped fini so the deferred
             // reaper releases the installed resources (abnormal path).
-            let _ = group.begin_exit();
-            let _ = group.skip_fini();
+            group.begin_exit().ignore_result();
+            group.skip_fini().ignore_result();
             return Err(ApplicationLaunchError::PrepareFailed);
         }
         let main_id = thread::Thread::id(&main);
@@ -373,15 +375,15 @@ impl ApplicationService {
         main.lock()
             .set_deferred_cleanup(Entry::Closure(Box::new(move || {
                 if let Some(group) = membership.upgrade() {
-                    let _ = group.remove_member(main_id);
+                    group.remove_member(main_id).ignore_result();
                 }
             })));
         let queued = scheduler::queue_ready_thread(thread::IDLE, main.clone());
         if queued.is_err() {
-            let _ = group.remove_member(main_id);
+            group.remove_member(main_id).ignore_result();
             let _ = GlobalQueueVisitor::remove(&mut main);
-            let _ = group.begin_exit();
-            let _ = group.skip_fini();
+            group.begin_exit().ignore_result();
+            group.skip_fini().ignore_result();
             return Err(ApplicationLaunchError::PrepareFailed);
         }
         Ok(())

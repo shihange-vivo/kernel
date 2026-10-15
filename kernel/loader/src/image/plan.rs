@@ -161,7 +161,7 @@ fn validate_allocation(
     class: ElfClass,
 ) -> LoadResult<()> {
     let base = allocation.base();
-    let aligned = base.get() % request.align() == 0;
+    let aligned = base.get().is_multiple_of(request.align());
     let end = base.checked_add(allocation.len());
     let target_width_valid = end.as_ref().is_ok_and(|end| match class {
         ElfClass::Elf32 => end.get() <= u64::from(u32::MAX),

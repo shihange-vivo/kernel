@@ -333,7 +333,7 @@ where
 
     // target alignment.
     let width = target_word.width();
-    if record.offset().get() % width.bytes() != 0 {
+    if !record.offset().get().is_multiple_of(width.bytes()) {
         return Err(relocation_error(record, LoadErrorKind::InvalidAlignment));
     }
 

@@ -160,9 +160,7 @@ pub fn resolve_dependency_paths(
                 ResolveBase::RequesterDirectory(dir) => dir,
                 ResolveBase::CurrentWorkingDirectory(dir) => dir,
             };
-            if let Some(path) = join_path(base_dir, request)
-                && path.starts_with('/')
-            {
+            if let Some(path) = join_path(base_dir, request).filter(|path| path.starts_with('/')) {
                 candidates.push(path);
             }
         }

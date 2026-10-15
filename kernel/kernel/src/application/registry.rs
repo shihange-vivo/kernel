@@ -47,6 +47,8 @@
 //! instance is safe to unload. The registry itself is a plain `Arc<Mutex<_>>`
 //! handle; every slow VFS, link, init and fini step runs outside its short lock.
 
+use blueos_infra::no_let_underscore::IgnoreResult;
+
 use alloc::{sync::Arc, vec::Vec};
 use core::sync::atomic::{AtomicUsize, Ordering};
 
@@ -156,6 +158,7 @@ pub struct SystemCandidateBacking {
 /// [`SystemDsoRegistry::fail_initialization_batch`] when the application dies
 /// first. Dropping it armed fails the batch: no descriptor is ever published
 /// and the backings move to `Failed` for the quiescence worker.
+#[must_use = "finish or fail the initialization batch; dropping it armed fails it"]
 pub struct SystemInitBatch {
     inner: Arc<Mutex<RegistryInner>>,
     members: Vec<BatchMember>,
@@ -217,7 +220,7 @@ impl SystemBatchWait {
             if current != self.observed {
                 break;
             }
-            let _ = atomic_wait(&self.signal, current, Tick::MAX);
+            atomic_wait(&self.signal, current, Tick::MAX).ignore_result();
         }
     }
 }
@@ -904,6 +907,7 @@ impl Default for SystemDsoRegistry {
 ///
 /// Exactly one is minted per generation. It must be advanced with
 /// [`SystemDsoRegistry::publish_relocated`]; dropping it armed cancels the load.
+#[must_use = "publish the relocated image or drop the permit to cancel its load"]
 pub struct LoadPermit {
     inner: Arc<Mutex<RegistryInner>>,
     slot: usize,
@@ -946,6 +950,7 @@ impl Drop for LoadPermit {
 /// It must be advanced with [`SystemDsoRegistry::publish_relocated_batch`].
 /// Dropping it armed cancels back to `Vacant` — still safe, because no
 /// constructor has run.
+#[must_use = "publish the initialization batch or drop the permit to cancel"]
 pub struct RelocatedPermit {
     inner: Arc<Mutex<RegistryInner>>,
     slot: usize,
@@ -989,6 +994,7 @@ impl Drop for RelocatedPermit {
 /// failures: they have no installed group receipt/reaper, so the last imported
 /// lease must not leave the provider permanently stuck in an in-flight state.
 /// Unloading remains a reaper decision made with quiescence evidence
+#[must_use = "keep the lease while using the system DSO"]
 pub struct SystemDsoLease {
     inner: Arc<Mutex<RegistryInner>>,
     slot: usize,
@@ -1027,7 +1033,7 @@ fn registry_oom() -> LoadError {
 /// Bump the registry-wide resolution epoch and wake every batch waiter.
 fn wake_waiters(resolution: &AtomicUsize) {
     resolution.fetch_add(1, Ordering::Release);
-    let _ = atomic_wake(resolution, usize::MAX);
+    atomic_wake(resolution, usize::MAX).ignore_result();
 }
 
 fn ensure_slot(slots: &mut Vec<Slot>, key: SystemLibraryKey) -> usize {

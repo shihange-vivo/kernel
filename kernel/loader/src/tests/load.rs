@@ -54,6 +54,7 @@ impl ElfReader for Reader {
         SliceElfReader::new(&self.0).read_exact_at(offset, dst)
     }
 }
+#[must_use = "keep the publication receipt while using its allocated images"]
 struct Receipt {
     memory: SharedMemory,
     leases: Vec<AllocationLease>,

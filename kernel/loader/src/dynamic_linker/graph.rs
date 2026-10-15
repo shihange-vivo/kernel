@@ -225,16 +225,19 @@ impl DependencyGraph {
         let provider = if let Some(existing) = self.find_identity(&artifact) {
             // Same snapshot: reuse, but a re-declared, conflicting SONAME is
             // still malformed rather than silently ignored.
-            if let (Some(declared), Some(new_soname)) = (
-                self.node(existing).and_then(|node| node.soname()),
-                soname.as_ref(),
-            ) && declared != new_soname
+            if self
+                .node(existing)
+                .and_then(|node| node.soname())
+                .zip(soname.as_ref())
+                .is_some_and(|(declared, new_soname)| declared != new_soname)
             {
                 return Err(dependency_error(LoadErrorKind::BadElf, requester, needed));
             }
             existing
-        } else if let Some(new_soname) = soname.as_ref()
-            && let Some(existing) = self.find_soname(new_soname)
+        } else if soname
+            .as_ref()
+            .and_then(|new_soname| self.find_soname(new_soname))
+            .is_some()
         {
             // A SONAME already claimed by a different identity is a conflict.
             return Err(dependency_error(

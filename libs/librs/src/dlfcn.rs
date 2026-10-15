@@ -16,6 +16,8 @@
 //! relocation path. Init/fini run in this calling application thread, including
 //! recursive dlopen/dlclose, before the kernel completes the operation token.
 
+use blueos_infra::no_let_underscore::IgnoreResult;
+
 use blueos_header::{
     dlfcn::{BlueOsDlPlan, DL_PLAN_ABI_VERSION},
     syscalls::NR::{DlClose, DlExit, DlFinish, DlOpen, DlSym},
@@ -66,7 +68,7 @@ fn fail(function: &str, errno: i32) {
     let mut error = ERROR.borrow_mut();
     error.len = 0;
     error.pending = true;
-    let _ = write!(error, "{function}: {description} (errno {errno})");
+    write!(error, "{function}: {description} (errno {errno})").ignore_result();
 }
 
 unsafe fn string_len(ptr: *const c_char) -> Result<usize, i32> {
@@ -209,6 +211,6 @@ pub extern "C" fn dlerror() -> *mut c_char {
 pub(crate) fn close_at_exit() {
     let mut plan = BlueOsDlPlan::empty();
     if bk_syscall!(DlExit, &mut plan as *mut BlueOsDlPlan) as isize >= 0 {
-        let _ = finish_plans(&mut plan);
+        finish_plans(&mut plan).ignore_result();
     }
 }
