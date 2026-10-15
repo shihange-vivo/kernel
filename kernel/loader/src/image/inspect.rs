@@ -36,6 +36,7 @@ pub(crate) enum StackKind {
     Executable,
 }
 
+#[must_use = "consume the inspected image with plan() to validate its memory layout"]
 pub(crate) struct InspectedImage<R: ElfReader> {
     reader: R,
     request: LoadRequest,

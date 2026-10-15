@@ -35,7 +35,7 @@ mod symbol;
 
 pub(crate) use decode::{absorb_into_session, RelocationAddend, RelocationRecord};
 pub(crate) use features::DynamicFeatureSummary;
-pub(crate) use image_loader::{read_u16, read_u32, read_u64, ImageLoader};
+pub(crate) use image_loader::ImageLoader;
 pub(crate) use inspect::StackKind;
 pub(crate) use map::LoadedRegion;
 pub(crate) use scan::ScannedArtifact;
