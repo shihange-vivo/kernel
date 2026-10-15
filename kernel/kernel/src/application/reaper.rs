@@ -27,6 +27,8 @@
 //! `Unloading` through fini and backing release. Dropping one group's outgoing
 //! leases can make another group quiescent, hence the bounded retry loop.
 
+use blueos_infra::no_let_underscore::IgnoreResult;
+
 use alloc::{boxed::Box, sync::Arc, vec::Vec};
 
 use super::adapters::system_paths::SystemLibraryKey;
@@ -124,11 +126,12 @@ impl ApplicationReaper {
             // A bounded wait: member exits and lifecycle transitions are plain
             // shared state with no wake plumbing into this thread, so the poll
             // bound is what makes the reaper eventually observe them.
-            let _ = crate::sync::atomic_wait(
+            crate::sync::atomic_wait(
                 deferred::wait_address(),
                 generation,
                 crate::time::Tick::from_millis(REAPER_POLL_MILLIS),
-            );
+            )
+            .ignore_result();
         }
     }
 
@@ -157,8 +160,8 @@ impl ApplicationReaper {
             // contains(handle) becomes false.
             drop(group);
             if let Some(handle) = handle {
-                let _ = manager.finish(handle);
-                let _ = manager.release(handle);
+                manager.finish(handle).ignore_result();
+                manager.release(handle).ignore_result();
             }
         }
         // Registrations made during callbacks remain queued for the next pass;
@@ -199,8 +202,8 @@ impl ApplicationReaper {
                 }
                 // Main thread died without ApplicationBeginExit: abnormal
                 // drain, destructors are skipped with a recorded reason
-                let _ = group.begin_exit();
-                let _ = group.skip_fini();
+                group.begin_exit().ignore_result();
+                group.skip_fini().ignore_result();
             }
             GroupState::Draining => {
                 if !group.is_empty() {
@@ -209,7 +212,7 @@ impl ApplicationReaper {
                 if !group.fini_resolved() {
                     // Coordinator died between BeginExit and FinishExit:
                     // skip the destructor plan and fall through.
-                    let _ = group.skip_fini();
+                    group.skip_fini().ignore_result();
                 }
             }
         }

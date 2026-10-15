@@ -18,7 +18,7 @@
 #![cfg_attr(test, test_runner(loader_test_runner))]
 #![cfg_attr(test, reexport_test_harness_main = "loader_test_main")]
 #![feature(c_size_t)]
-#![feature(let_chains)]
+#![cfg_attr(compatible_old_toolchain, feature(unsigned_is_multiple_of))]
 
 //! ELF loading and dynamic linking with kernel-owned platform backends.
 //!
@@ -66,6 +66,9 @@ pub use loading::{
 };
 
 #[cfg(test)]
+use blueos_infra::no_let_underscore::IgnoreResult;
+
+#[cfg(test)]
 extern crate rsrt;
 
 #[cfg(test)]
@@ -100,7 +103,7 @@ fn run_loader_tests_on_own_stack() {
         librs::pthread::register_my_posix_tcb();
         loader_test_main();
         worker_done.store(1, Ordering::Release);
-        let _ = blueos::sync::atomic_wake(&worker_done, usize::MAX);
+        blueos::sync::atomic_wake(&worker_done, usize::MAX).ignore_result();
     });
     assert!(
         worker.is_some(),
@@ -108,7 +111,7 @@ fn run_loader_tests_on_own_stack() {
     );
 
     while done.load(Ordering::Acquire) == 0 {
-        let _ = blueos::sync::atomic_wait(&done, 0, blueos::time::Tick::MAX);
+        blueos::sync::atomic_wait(&done, 0, blueos::time::Tick::MAX).ignore_result();
     }
 }
 

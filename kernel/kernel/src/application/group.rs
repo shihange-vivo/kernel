@@ -23,6 +23,8 @@
 //! register deferred retirement cleanups, so neither [`crate::thread::Thread`]
 //! nor the scheduler depends on application types.
 
+use blueos_infra::no_let_underscore::IgnoreResult;
+
 use crate::sync::SpinLock;
 use alloc::{
     sync::{Arc, Weak},
@@ -284,7 +286,7 @@ impl ThreadGroup {
             if count <= 1 {
                 return Ok(());
             }
-            let _ = crate::sync::atomic_wait(&epoch, epoch_value, crate::time::Tick::MAX);
+            crate::sync::atomic_wait(&epoch, epoch_value, crate::time::Tick::MAX).ignore_result();
         }
     }
 
@@ -466,5 +468,5 @@ impl ThreadGroup {
 /// the group lock so an immediate reschedule never runs with interrupts masked.
 fn bump_members_epoch(epoch: &Arc<AtomicUsize>) {
     epoch.fetch_add(1, Ordering::Release);
-    let _ = crate::sync::atomic_wake(epoch, usize::MAX);
+    crate::sync::atomic_wake(epoch, usize::MAX).ignore_result();
 }

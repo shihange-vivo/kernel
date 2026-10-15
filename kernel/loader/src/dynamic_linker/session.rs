@@ -442,7 +442,7 @@ impl<'a, M: ImageProtectionMemory + ?Sized, A: ArchRelocator> RelocatedSession<'
         cache
             .synchronize(prepared_cache)
             .map_err(|error| error.at_stage(LoadStage::LinkSeal))?;
-        for (image, prepared) in self.state.images.iter().zip(prepared_seals.into_iter()) {
+        for (image, prepared) in self.state.images.iter().zip(prepared_seals) {
             let allocation = image.allocation.allocation();
             let mut protection_records = prepared.into_ranges();
             self.rollback

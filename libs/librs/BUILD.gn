@@ -77,6 +77,7 @@ if (dynamic_loader) {
     deps = [
       "//external/vendor/spin-0.9.8:spin",
       "//kernel/header:blueos_header",
+      "//kernel/infra:blueos_infra",
       "//kernel/scal:blueos_scal_swi",
       "//libs/libc",
     ]

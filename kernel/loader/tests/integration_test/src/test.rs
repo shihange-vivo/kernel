@@ -12,6 +12,8 @@
 #![feature(thread_local)]
 #![feature(c_variadic)]
 
+use blueos_infra::no_let_underscore::IgnoreResult;
+
 extern crate alloc;
 extern crate rsrt;
 use alloc::{rc::Rc, sync::Arc, vec::Vec};
@@ -186,7 +188,7 @@ fn run_suite_on_own_stack() {
         pthread::register_my_posix_tcb();
         loader_test_main();
         worker_done.fetch_add(1, Ordering::Release);
-        let _ = atomic_wake(&worker_done, usize::MAX);
+        atomic_wake(&worker_done, usize::MAX).ignore_result();
     });
 
     if spawned.is_none() {
@@ -198,7 +200,7 @@ fn run_suite_on_own_stack() {
     while done.load(Ordering::Acquire) == 0 {
         // A spurious return only re-reads the flag; the worker bumps it exactly
         // once and never resets it.
-        let _ = atomic_wait(&done, 0, Tick::MAX);
+        atomic_wait(&done, 0, Tick::MAX).ignore_result();
     }
 }
 

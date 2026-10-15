@@ -100,7 +100,7 @@ pub(crate) fn validate_dynamic_features<R: ElfReader>(
         ElfClass::Elf64 => 16,
     };
     let file_range = dynamic.file_range();
-    if file_range.is_empty() || file_range.len() % entry_size != 0 {
+    if file_range.is_empty() || !file_range.len().is_multiple_of(entry_size) {
         return Err(dynamic_error(DT_NULL, file_range.len()));
     }
     if file_range.len() > dynamic.memory_size() {

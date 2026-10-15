@@ -23,6 +23,8 @@
 //! Two-phase operation tokens are thread-owned, checked in nesting order, and
 //! keep every function array/backing pinned until DlFinish.
 
+use blueos_infra::no_let_underscore::IgnoreResult;
+
 use alloc::{boxed::Box, string::String, sync::Arc, vec::Vec};
 use core::sync::atomic::{AtomicUsize, Ordering};
 
@@ -67,6 +69,7 @@ pub(crate) struct ExistingImage {
     batch: usize,
 }
 
+#[must_use = "dropping a dynamic load batch releases its image receipt"]
 struct Batch {
     id: usize,
     objects: Vec<Object>,
@@ -135,6 +138,7 @@ pub struct RuntimeNamespace {
     state: SpinLock<State>,
 }
 
+#[must_use = "keep the namespace gate until the operation is handed off or complete"]
 struct Gate<'a> {
     runtime: &'a RuntimeNamespace,
     armed: bool,
@@ -154,6 +158,7 @@ impl Drop for Gate<'_> {
     }
 }
 
+#[must_use = "install the prepared load or drop it to release its resources"]
 pub(crate) struct PreparedLoad {
     batch: Batch,
     init: Box<[usize]>,
@@ -204,7 +209,7 @@ impl RuntimeNamespace {
                     armed: true,
                 };
             }
-            let _ = crate::sync::atomic_wait(&self.owner, owner, Tick::MAX);
+            crate::sync::atomic_wait(&self.owner, owner, Tick::MAX).ignore_result();
         }
     }
 
@@ -223,7 +228,7 @@ impl RuntimeNamespace {
         }
         drop(state);
         if last {
-            let _ = crate::sync::atomic_wake(&self.owner, usize::MAX);
+            crate::sync::atomic_wake(&self.owner, usize::MAX).ignore_result();
         }
     }
 

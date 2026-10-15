@@ -399,7 +399,7 @@ mod exec_plan {
 
         let sink = Rc::new(RefCell::new(None));
         let recording = RecordingMemory::new(Rc::clone(&sink));
-        let _ = planned.allocate(recording).expect("allocate");
+        drop(planned.allocate(recording).expect("allocate"));
 
         let recorded = RecordingMemory::recorded(&sink).expect("request was recorded");
         match recorded.placement() {

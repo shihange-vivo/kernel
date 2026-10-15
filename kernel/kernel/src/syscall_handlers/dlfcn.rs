@@ -106,7 +106,7 @@ mod enabled {
 }
 
 fn valid_plan(ptr: *mut BlueOsDlPlan) -> bool {
-    if ptr.is_null() || ptr as usize % core::mem::align_of::<BlueOsDlPlan>() != 0 {
+    if ptr.is_null() || !(ptr as usize).is_multiple_of(core::mem::align_of::<BlueOsDlPlan>()) {
         return false;
     }
     let plan = unsafe { &*ptr };
@@ -142,7 +142,7 @@ pub fn exit(plan: *mut BlueOsDlPlan) -> c_long {
     plan_result(plan, enabled::exit)
 }
 pub fn symbol(handle: usize, name: *const u8, len: usize, result: *mut usize) -> c_long {
-    if result.is_null() || result as usize % core::mem::align_of::<usize>() != 0 {
+    if result.is_null() || !(result as usize).is_multiple_of(core::mem::align_of::<usize>()) {
         return -(libc::EINVAL as c_long);
     }
     match enabled::symbol(handle, name, len) {

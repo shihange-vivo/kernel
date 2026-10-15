@@ -25,6 +25,7 @@ use blueos_loader::{
 
 /// Owns backing and counted registry references until installation or reaping.
 /// Dropping an uninstalled receipt releases its allocations as well.
+#[must_use = "install the receipt or drop it to release its image allocations"]
 pub struct KernelLinkReceipt {
     private_allocations: Vec<AllocationLease>,
     system_allocations: Vec<AllocationLease>,

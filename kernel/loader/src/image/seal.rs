@@ -350,10 +350,10 @@ impl PreparedProtectionPlan {
             let applied_range =
                 TargetRange::new(applied_start, applied_end.checked_sub(applied_start)?);
 
-            if let Some(previous) = ranges.last()
-                && previous.applied_range().overlaps(applied_range)
-                && previous.permissions() != requested.permissions()
-            {
+            if ranges.last().is_some_and(|previous| {
+                previous.applied_range().overlaps(applied_range)
+                    && previous.permissions() != requested.permissions()
+            }) {
                 return Err(seal_range_error(
                     applied_range,
                     LoadErrorKind::PermissionConflict,
