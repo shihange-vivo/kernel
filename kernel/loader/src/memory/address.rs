@@ -19,7 +19,6 @@ use crate::{
     LoadError, LoadResult,
 };
 
-#[non_exhaustive]
 #[derive(PartialEq, PartialOrd, Clone, Copy, Debug, Eq, Ord)]
 pub struct TargetAddress(u64);
 
