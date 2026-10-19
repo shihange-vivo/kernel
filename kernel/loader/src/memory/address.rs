@@ -50,10 +50,9 @@ impl TargetAddress {
         self.0.checked_sub(other.0).ok_or_else(|| {
             LoadError::new(
                 LoadErrorKind::IntegerOverflow,
-                ErrorContext::TargetRange {
+                ErrorContext::TargetBounds {
                     start: other,
-                    len: self.0,
-                    align: 0,
+                    end: self,
                 },
             )
         })
