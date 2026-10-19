@@ -483,6 +483,45 @@ fn load_shared_root_without_an_entry() {
 }
 
 #[test]
+fn load_segment_permission_policy_is_honored_through_sealing_and_publication() {
+    use goblin::elf::program_header::{PF_R, PF_W, PF_X};
+
+    let wx = MemoryPermissions::WRITE.bitor(MemoryPermissions::EXECUTE);
+    for (flags, permissions) in [
+        (PF_W | PF_X, wx),
+        (PF_R | PF_W | PF_X, wx.bitor(MemoryPermissions::READ)),
+    ] {
+        for allowed in [false, true] {
+            let (mut bytes, base) = super::linker::native_fixture();
+            let flags_offset = if bytes[4] == 1 { 52 + 24 } else { 64 + 4 };
+            bytes[flags_offset..flags_offset + 4].copy_from_slice(&flags.to_le_bytes());
+            let profile = base.with_segment_permission_policy(
+                base.segment_permission_policy()
+                    .with_permissions(permissions, allowed),
+            );
+            let mut backend = Backend::new(alloc::vec![("root", bytes)]);
+            let result = load(
+                LoadRequest::executable("root", profile, SessionLimits::DEFAULT),
+                &mut backend,
+            );
+            if allowed {
+                let loaded = result.expect("configured permissions must survive sealing");
+                assert!(loaded.entry().is_some());
+                assert_eq!(backend.commits, 1);
+                assert_eq!(backend.memory.allocations.get(), 1);
+                drop(loaded.into_receipt());
+                assert_eq!(backend.memory.releases.get(), 1);
+            } else {
+                let error = result.err().expect("default policy rejects W+X");
+                assert_eq!(error.kind(), LoadErrorKind::PermissionConflict);
+                assert_eq!(backend.commits, 0);
+                assert_eq!(backend.memory.allocations.get(), 0);
+            }
+        }
+    }
+}
+
+#[test]
 fn load_marked_pie_requires_an_executable_entry() {
     let (_, profile) = super::linker::native_fixture();
     let mut bytes = native_dso_with_flags(&[], goblin::elf::dynamic::DF_1_PIE);

@@ -29,6 +29,7 @@ mod admission;
 mod fixture;
 mod linker;
 mod load;
+mod permissions;
 mod runtime;
 
 use blueos_test_macro::test;

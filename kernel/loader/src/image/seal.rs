@@ -22,7 +22,7 @@ use crate::{
         address::{TargetAddress, TargetRange},
         AllocationOffset, ImageAllocation, ImageProtectionMemory, MemoryPermissions,
     },
-    profile::ElfClass,
+    profile::{ElfClass, LoadProfile, SegmentPermissionPolicy},
     LoadError, LoadResult,
 };
 
@@ -95,7 +95,7 @@ impl SealPlan {
     pub(crate) fn build(
         allocation: &ImageAllocation,
         load_bias: TargetAddress,
-        class: ElfClass,
+        profile: &LoadProfile,
         load_segments: &[LoadSegmentInfo],
         regions: &[LoadedRegion],
         relro: Option<TargetRange>,
@@ -115,7 +115,7 @@ impl SealPlan {
         if load_segments.len() != regions.len() {
             return Err(protection_backend_error(allocation));
         }
-        validate_relocation_targets(class, load_segments, relocations)?;
+        validate_relocation_targets(profile.class(), load_segments, relocations)?;
         validate_relro(load_segments, relro)?;
 
         let capacity = regions
@@ -128,7 +128,13 @@ impl SealPlan {
 
         let mut allocation_cursor = 0_u64;
         for (segment, region) in load_segments.iter().zip(regions.iter()) {
-            validate_region(allocation, load_bias, segment, region)?;
+            validate_region(
+                allocation,
+                load_bias,
+                segment,
+                region,
+                profile.segment_permission_policy(),
+            )?;
             if region.runtime_range().is_empty() {
                 continue;
             }
@@ -387,6 +393,7 @@ fn validate_region(
     load_bias: TargetAddress,
     segment: &LoadSegmentInfo,
     region: &LoadedRegion,
+    permission_policy: SegmentPermissionPolicy,
 ) -> LoadResult<()> {
     let expected_vaddr = TargetRange::new(segment.vaddr(), segment.memory_size());
     let expected_runtime = TargetRange::new(
@@ -401,9 +408,7 @@ fn validate_region(
         return Err(protection_backend_error(allocation));
     }
     region.runtime_range().end()?;
-    if segment.permissions().contains(MemoryPermissions::WRITE)
-        && segment.permissions().contains(MemoryPermissions::EXECUTE)
-    {
+    if !permission_policy.accepts(segment.permissions()) {
         return Err(seal_range_error(
             region.runtime_range(),
             LoadErrorKind::PermissionConflict,
