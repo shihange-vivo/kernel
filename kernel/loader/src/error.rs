@@ -146,6 +146,11 @@ pub enum ErrorContext {
         len: u64,
         align: u64,
     },
+    /// Bounds used to calculate the distance between target addresses.
+    TargetBounds {
+        start: TargetAddress,
+        end: TargetAddress,
+    },
     ProgramHeader {
         index: u16,
         field: ProgramHeaderField,

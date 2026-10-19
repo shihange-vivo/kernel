@@ -24,6 +24,7 @@ use goblin::elf::{
 
 use crate::tests::fixture::ElfFixtureBuilder;
 
+mod address;
 mod admission;
 mod fixture;
 mod linker;
