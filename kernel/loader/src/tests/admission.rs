@@ -17,8 +17,8 @@ use blueos_test_macro::test;
 use core::cell::Cell;
 use goblin::elf::{
     header::{
-        EI_ABIVERSION, EI_CLASS, EI_DATA, EI_OSABI, EI_VERSION, ELFDATA2MSB, EM_AARCH64, EM_ARM,
-        EM_RISCV, ET_DYN, ET_EXEC, ET_REL,
+        EI_ABIVERSION, EI_CLASS, EI_DATA, EI_OSABI, EI_VERSION, ELFDATA2MSB, ELFOSABI_FREEBSD,
+        ELFOSABI_GNU, ELFOSABI_NONE, EM_AARCH64, EM_ARM, EM_RISCV, ET_DYN, ET_EXEC, ET_REL,
     },
     program_header::{
         PF_R, PF_W, PF_X, PT_ARM_EXIDX, PT_DYNAMIC, PT_GNU_RELRO, PT_GNU_STACK, PT_INTERP, PT_LOAD,
@@ -139,6 +139,32 @@ fn admission_accepts_dyn_and_exec_for_all_profiles() {
 }
 
 #[test]
+fn admission_accepts_gnu_osabi_for_all_profiles() {
+    for profile in PROFILES {
+        for elf_type in [ET_DYN, ET_EXEC] {
+            let mut bytes = fixture(profile, elf_type).build();
+            bytes[EI_OSABI] = ELFOSABI_GNU;
+            assert!(loader(&bytes, profile).admit().unwrap().inspect().is_ok());
+        }
+    }
+}
+
+#[test]
+fn admission_rejects_nonzero_abi_version_for_accepted_osabis() {
+    for osabi in [ELFOSABI_NONE, ELFOSABI_GNU] {
+        let mut bytes = fixture(LoadProfile::riscv64(), ET_DYN).build();
+        bytes[EI_OSABI] = osabi;
+        bytes[EI_ABIVERSION] = 1;
+        assert_header_error(
+            &bytes,
+            LoadProfile::riscv64(),
+            LoadErrorKind::UnsupportedByProfile,
+            HeaderField::AbiVersion,
+        );
+    }
+}
+
+#[test]
 fn admission_reports_invalid_ident_fields() {
     for (offset, value, kind, field) in [
         (0, 0, LoadErrorKind::BadElf, HeaderField::Magic),
@@ -147,7 +173,7 @@ fn admission_reports_invalid_ident_fields() {
         (EI_VERSION, 0, LoadErrorKind::BadElf, HeaderField::Version),
         (
             EI_OSABI,
-            3,
+            ELFOSABI_FREEBSD,
             LoadErrorKind::UnsupportedByProfile,
             HeaderField::OsAbi,
         ),

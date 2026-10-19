@@ -14,7 +14,8 @@
 
 use goblin::elf::header::{
     EI_ABIVERSION, EI_CLASS, EI_DATA, EI_OSABI, EI_VERSION, ELFCLASS32, ELFCLASS64, ELFDATA2LSB,
-    ELFDATA2MSB, ELFMAG, ELFOSABI_NONE, EM_AARCH64, EM_ARM, EM_RISCV, ET_DYN, ET_EXEC, EV_CURRENT,
+    ELFDATA2MSB, ELFMAG, ELFOSABI_GNU, ELFOSABI_NONE, EM_AARCH64, EM_ARM, EM_RISCV, ET_DYN,
+    ET_EXEC, EV_CURRENT,
 };
 
 use crate::{
@@ -92,7 +93,11 @@ fn validate_ident(ident: &[u8; ELF_IDENT_SIZE]) -> LoadResult<(ElfClass, ElfData
             u64::from(ident[EI_VERSION]),
         ));
     }
-    if ident[EI_OSABI] != ELFOSABI_NONE {
+    // Rust's retained sections (e.g. #[used] constructor tables) can mark an
+    // object as GNU OSABI, which the linker may propagate to the final ELF.
+    // This label alone does not require a GNU runtime; unsupported dynamic
+    // tags, symbol kinds and relocations are checked by their own decoders.
+    if !matches!(ident[EI_OSABI], ELFOSABI_NONE | ELFOSABI_GNU) {
         return Err(unsupported_header(
             HeaderField::OsAbi,
             u64::from(ident[EI_OSABI]),
