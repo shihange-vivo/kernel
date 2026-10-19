@@ -32,8 +32,8 @@ use goblin::elf::{
         ET_EXEC,
     },
     program_header::{
-        PF_X, PT_ARM_EXIDX, PT_DYNAMIC, PT_GNU_EH_FRAME, PT_GNU_RELRO, PT_GNU_STACK, PT_INTERP,
-        PT_LOAD, PT_NOTE, PT_NULL, PT_PHDR, PT_TLS,
+        PF_R, PF_W, PF_X, PT_ARM_EXIDX, PT_DYNAMIC, PT_GNU_EH_FRAME, PT_GNU_RELRO, PT_GNU_STACK,
+        PT_INTERP, PT_LOAD, PT_NOTE, PT_NULL, PT_PHDR, PT_TLS,
     },
 };
 
@@ -227,6 +227,62 @@ impl ProgramHeaderPolicy {
     }
 }
 
+/// Caller-defined admission for exact PT_LOAD permission combinations.
+///
+/// Admission preserves the ELF's requested R/W/X permissions. The memory
+/// backend must still validate and provide the required mapping capabilities.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct SegmentPermissionPolicy {
+    // Eight bits cover all R/W/X combinations, indexed by permissions.bits().
+    allowed_combinations: u8,
+}
+
+impl SegmentPermissionPolicy {
+    /// Accept R, RX and RW segments by default.
+    pub const DEFAULT: Self = Self::new(&[
+        MemoryPermissions::READ,
+        MemoryPermissions::READ.bitor(MemoryPermissions::EXECUTE),
+        MemoryPermissions::READ.bitor(MemoryPermissions::WRITE),
+    ]);
+
+    /// Replace the whitelist; an empty slice rejects every combination.
+    /// The slice is consumed into a bit set and need not have a static lifetime.
+    pub const fn new(allowed: &[MemoryPermissions]) -> Self {
+        let mut policy = Self {
+            allowed_combinations: 0,
+        };
+        let mut index = 0;
+        while index < allowed.len() {
+            policy = policy.with_permissions(allowed[index], true);
+            index += 1;
+        }
+        policy
+    }
+
+    /// Allow or deny one exact combination, retaining all other settings.
+    #[inline]
+    pub const fn with_permissions(mut self, permissions: MemoryPermissions, allowed: bool) -> Self {
+        let bit = 1u8 << permissions.bits();
+        if allowed {
+            self.allowed_combinations |= bit;
+        } else {
+            self.allowed_combinations &= !bit;
+        }
+        self
+    }
+
+    #[inline]
+    pub const fn accepts(self, permissions: MemoryPermissions) -> bool {
+        self.allowed_combinations & (1u8 << permissions.bits()) != 0
+    }
+}
+
+impl Default for SegmentPermissionPolicy {
+    fn default() -> Self {
+        Self::DEFAULT
+    }
+}
+
 /// How a machine encodes its entry point and the span a load must reserve
 /// there so that at least one whole instruction lies inside an executable
 /// segment.
@@ -304,6 +360,7 @@ pub struct LoadProfile {
     header_flags: HeaderFlagsPolicy,
     entry_mode: EntryMode,
     program_headers: ProgramHeaderPolicy,
+    segment_permissions: SegmentPermissionPolicy,
 }
 
 impl LoadProfile {
@@ -333,6 +390,7 @@ impl LoadProfile {
                 },
                 false,
             ),
+            segment_permissions: SegmentPermissionPolicy::DEFAULT,
         }
     }
 
@@ -449,6 +507,18 @@ impl LoadProfile {
         self
     }
 
+    #[inline]
+    pub const fn segment_permission_policy(&self) -> SegmentPermissionPolicy {
+        self.segment_permissions
+    }
+
+    /// Replace PT_LOAD permission admission while retaining other profile settings.
+    #[inline]
+    pub const fn with_segment_permission_policy(mut self, policy: SegmentPermissionPolicy) -> Self {
+        self.segment_permissions = policy;
+        self
+    }
+
     /// Set additional accepted types while retaining the base whitelist and stack policy.
     /// Calling this again replaces the extension list; an empty list clears it.
     pub const fn set_additional_program_headers(&mut self, types: &'static [u32]) {
@@ -476,6 +546,32 @@ impl LoadProfile {
                 index,
                 field,
                 value: u64::from(kind),
+            },
+        ))
+    }
+
+    pub(crate) fn check_segment_permissions(
+        &self,
+        index: u16,
+        flags: u32,
+    ) -> LoadResult<MemoryPermissions> {
+        let permissions = permissions_from_flags(flags);
+        if self.segment_permissions.accepts(permissions) {
+            return Ok(permissions);
+        }
+        let kind = if permissions.contains(MemoryPermissions::WRITE)
+            && permissions.contains(MemoryPermissions::EXECUTE)
+        {
+            LoadErrorKind::PermissionConflict
+        } else {
+            LoadErrorKind::UnsupportedByProfile
+        };
+        Err(LoadError::new(
+            kind,
+            ErrorContext::ProgramHeader {
+                index,
+                field: ProgramHeaderField::Permissions,
+                value: u64::from(flags),
             },
         ))
     }
@@ -837,12 +933,18 @@ fn check_u32_limit(resource: LimitKind, actual: u32, maximum: u32) -> LoadResult
     ))
 }
 
-/// Supported PT_LOAD permissions. W+X is also rejected as a structural
-/// invariant during inspection and planning.
-pub(crate) fn supports_segment_permissions(permissions: MemoryPermissions) -> bool {
-    permissions == MemoryPermissions::READ
-        || permissions == MemoryPermissions::READ.bitor(MemoryPermissions::EXECUTE)
-        || permissions == MemoryPermissions::READ.bitor(MemoryPermissions::WRITE)
+fn permissions_from_flags(flags: u32) -> MemoryPermissions {
+    let mut permissions = MemoryPermissions::NONE;
+    for (flag, permission) in [
+        (PF_R, MemoryPermissions::READ),
+        (PF_W, MemoryPermissions::WRITE),
+        (PF_X, MemoryPermissions::EXECUTE),
+    ] {
+        if flags & flag != 0 {
+            permissions = permissions.bitor(permission);
+        }
+    }
+    permissions
 }
 
 /// ELF dynamic semantics implemented by the unified loader.

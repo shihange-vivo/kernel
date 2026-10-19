@@ -17,8 +17,7 @@ use crate::image::{ArtifactRole, ProgramHeaderGeometry};
 use alloc::vec::Vec;
 use goblin::{
     elf::program_header::{
-        PF_R, PF_W, PF_X, PT_DYNAMIC, PT_GNU_RELRO, PT_GNU_STACK, PT_INTERP, PT_LOAD, PT_NULL,
-        PT_PHDR, PT_TLS,
+        PF_X, PT_DYNAMIC, PT_GNU_RELRO, PT_GNU_STACK, PT_INTERP, PT_LOAD, PT_NULL, PT_PHDR, PT_TLS,
     },
     elf64,
 };
@@ -31,11 +30,8 @@ use crate::{
         inspect::{InspectedImage, StackKind},
         DynamicFeatureSummary,
     },
-    memory::{
-        address::{FileRange, TargetAddress, TargetRange},
-        MemoryPermissions,
-    },
-    profile::{supports_segment_permissions, ElfType, LoadRequest},
+    memory::address::{FileRange, TargetAddress, TargetRange},
+    profile::{ElfType, LoadRequest},
     reader::ElfReader,
     LoadError, LoadResult,
 };
@@ -177,17 +173,10 @@ impl<R: ElfReader> AdmittedImage<R> {
                 })?;
             match kind {
                 PT_LOAD => {
-                    let permissions = permissions_from_flags(program_header.flags());
-                    if !supports_segment_permissions(permissions) {
-                        return Err(LoadError::new(
-                            LoadErrorKind::UnsupportedByProfile,
-                            ErrorContext::ProgramHeader {
-                                index,
-                                field: ProgramHeaderField::Permissions,
-                                value: u64::from(permissions.bits()),
-                            },
-                        ));
-                    }
+                    let permissions = self
+                        .request
+                        .profile()
+                        .check_segment_permissions(index, program_header.flags())?;
                     load_segments.push(LoadSegmentInfo::new(
                         index,
                         file_range,
@@ -321,20 +310,6 @@ fn infer_program_header_vaddr(
     Ok(None)
 }
 
-fn permissions_from_flags(flags: u32) -> MemoryPermissions {
-    let mut permissions = MemoryPermissions::NONE;
-    if flags & PF_R != 0 {
-        permissions = permissions.bitor(MemoryPermissions::READ);
-    }
-    if flags & PF_W != 0 {
-        permissions = permissions.bitor(MemoryPermissions::WRITE);
-    }
-    if flags & PF_X != 0 {
-        permissions = permissions.bitor(MemoryPermissions::EXECUTE);
-    }
-    permissions
-}
-
 pub(crate) fn program_header_error(index: u16, field: ProgramHeaderField, value: u64) -> LoadError {
     LoadError::new(
         LoadErrorKind::BadElf,
@@ -349,6 +324,7 @@ pub(crate) fn program_header_error(index: u16, field: ProgramHeaderField, value:
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::memory::MemoryPermissions;
 
     use blueos_test_macro::test;
 

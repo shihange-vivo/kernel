@@ -24,7 +24,7 @@ use crate::{
         address::{TargetAddress, TargetRange},
         MemoryPermissions,
     },
-    profile::{supports_segment_permissions, EntryMode, LoadRequest},
+    profile::{EntryMode, LoadRequest},
     reader::ElfReader,
     LoadError, LoadResult,
 };
@@ -105,6 +105,7 @@ impl<R: ElfReader> InspectedImage<R> {
 
     pub fn plan(mut self) -> LoadResult<PlannedImage<R>> {
         let mut r = 0;
+        // The profile admitted the segment permissions during inspection.
         for segment in self.load_segments.iter() {
             if segment.memory_size() == 0 {
                 continue;
@@ -121,30 +122,6 @@ impl<R: ElfReader> InspectedImage<R> {
                     segment.index(),
                     ProgramHeaderField::Align,
                     align,
-                )
-                .at_stage(LoadStage::Plan));
-            }
-            if segment.permissions().contains(MemoryPermissions::WRITE)
-                && segment.permissions().contains(MemoryPermissions::EXECUTE)
-            {
-                return Err(LoadError::new(
-                    LoadErrorKind::PermissionConflict,
-                    ErrorContext::ProgramHeader {
-                        index: segment.index(),
-                        field: ProgramHeaderField::VirtualRange,
-                        value: segment.vaddr().get(),
-                    },
-                )
-                .at_stage(LoadStage::Plan));
-            }
-            if !supports_segment_permissions(segment.permissions()) {
-                return Err(LoadError::new(
-                    LoadErrorKind::UnsupportedByProfile,
-                    ErrorContext::ProgramHeader {
-                        index: segment.index(),
-                        field: ProgramHeaderField::Permissions,
-                        value: u64::from(segment.permissions().bits()),
-                    },
                 )
                 .at_stage(LoadStage::Plan));
             }

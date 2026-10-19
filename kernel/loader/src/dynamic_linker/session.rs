@@ -405,7 +405,7 @@ impl<'a, M: ImageProtectionMemory + ?Sized, A: ArchRelocator> RelocatedSession<'
             let seal_plan = SealPlan::build(
                 &allocation,
                 runtime.load_bias(),
-                self.profile.class(),
+                &self.profile,
                 runtime.load_segments(),
                 runtime.regions(),
                 runtime.relro(),
