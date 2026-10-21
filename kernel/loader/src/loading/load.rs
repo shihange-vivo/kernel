@@ -12,40 +12,33 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Load requests and orchestration of discovery, linking, publication and installation.
-
-use crate::image::ArtifactRole;
-
-use alloc::vec::Vec;
-
-use super::{materialize::load_images, planning::LoadPlan, publication::BackendPublisher};
-
+//! Complete load preparation and publication through separate host capabilities.
+use super::{materialize::load_images, planning::LoadPlan, publication::CapturePublisher};
 use crate::{
     dynamic_linker::prepare_link,
     error::{invalid, oom, ErrorContext, LoadErrorKind},
+    image::ArtifactRole,
+    memory::{CodeCache, ImageProtectionMemory},
     profile::{LoadProfile, SessionLimits},
-    trace::{emit, trace_product, LoadEvent, LoadPhase},
-    ImageHandle, LoadError, LoadResult, LoadedImage, LoaderBackend,
+    trace::{emit, trace_product, LoadEvent, LoadObserver, LoadPhase},
+    ArtifactResolver, ImageCandidate, ImageHandle, ImagePin, ImageRepository, LoadError,
+    LoadPublisher, LoadReservation, LoadResult, LoadedImage, NamespaceSnapshot, PreparedLoad,
+    PublicationManifest,
 };
+use alloc::vec::Vec;
 
-/// Load inputs with an explicit purpose. ELF contents determine placement and
-/// dependencies; a shared object is never inferred from its entry or ownership.
-pub struct LoadRequest<S> {
+#[must_use = "submit the request or release its namespace pins"]
+pub struct LoadRequest<S, P: ImagePin = super::repository::LocalPin> {
     pub(crate) source: S,
     pub(crate) profile: LoadProfile,
     pub(crate) limits: SessionLimits,
     pub(crate) role: ArtifactRole,
-    pub(crate) existing: Vec<ImageHandle>,
-    pub(crate) global: Vec<ImageHandle>,
+    pub(crate) namespace: NamespaceSnapshot<P>,
 }
-
-impl<S> LoadRequest<S> {
-    /// Load a fresh executable (ET_EXEC or PIE) and validate its runtime entry.
+impl<S, P: ImagePin> LoadRequest<S, P> {
     pub fn executable(source: S, profile: LoadProfile, limits: SessionLimits) -> Self {
         Self::for_role(source, profile, limits, ArtifactRole::ExecutableRoot)
     }
-    /// Load or reuse an ET_DYN shared object. ET_EXEC and DF_1_PIE are rejected,
-    /// and a nonzero entry does not turn the object into an executable launch.
     pub fn shared_object(source: S, profile: LoadProfile, limits: SessionLimits) -> Self {
         Self::for_role(source, profile, limits, ArtifactRole::SharedObject)
     }
@@ -60,217 +53,357 @@ impl<S> LoadRequest<S> {
             profile,
             limits,
             role,
-            existing: Vec::new(),
-            global: Vec::new(),
+            namespace: NamespaceSnapshot::empty(),
         }
     }
-    /// Supply pinned existing images and the ordered global symbol prefix.
-    /// Keep them pinned through installation; `retained_images` identifies
-    /// which previous owners the new result still needs.
-    pub fn with_namespace(mut self, existing: Vec<ImageHandle>, global: Vec<ImageHandle>) -> Self {
-        self.existing = existing;
-        self.global = global;
+    pub fn with_namespace(mut self, namespace: NamespaceSnapshot<P>) -> Self {
+        self.namespace = namespace;
         self
     }
 }
 
-/// Load, link and publish the full dependency closure through platform services.
-///
-/// Scanning, dependency graphs, symbol scopes and retention calculations stay
-/// inside the loader. Every new allocation is rolled back on pre-commit failure;
-/// a completion failure returns the receipt to the backend for release.
-pub fn load<B: LoaderBackend>(
-    request: LoadRequest<B::Source>,
-    backend: &mut B,
-) -> LoadResult<LoadedImage<B::Receipt>> {
+/// Disjoint host capabilities. Memory moves into preparation and its final owner;
+/// the remaining services are borrowed only for this operation.
+pub struct LoadServices<'a, S, R, M, C, O> {
+    pub sources: &'a mut S,
+    pub images: &'a mut R,
+    pub memory: M,
+    pub cache: &'a mut C,
+    pub observer: &'a mut O,
+}
+
+/// Discover, map, relocate and seal a closure without publishing or executing it.
+/// The returned guard exposes a complete manifest and rolls back when dropped.
+pub fn prepare_load<S, R, M, C, O>(
+    request: LoadRequest<S::Source, R::Pin>,
+    services: LoadServices<'_, S, R, M, C, O>,
+) -> LoadResult<PreparedLoad<M, R::Pin, R::Reservation>>
+where
+    S: ArtifactResolver,
+    R: ImageRepository,
+    M: ImageProtectionMemory,
+    C: CodeCache,
+    O: LoadObserver,
+{
+    let LoadServices {
+        sources,
+        images,
+        memory,
+        cache,
+        observer,
+    } = services;
     emit(
-        backend,
+        observer,
         LoadEvent::Started {
-            path: backend.identity(&request.source),
+            path: sources.info(&request.source).key().identity(),
             executable: request.role == ArtifactRole::ExecutableRoot,
         },
     );
-    let result = load_inner(request, backend);
-    match &result {
-        Ok(_) => emit(backend, LoadEvent::Completed),
-        Err(error) => {
-            backend.cancel_load();
-            emit(backend, LoadEvent::Failed { error });
-        }
+    let result = prepare_inner(
+        request,
+        LoadServices {
+            sources,
+            images,
+            memory,
+            cache,
+            observer: &mut *observer,
+        },
+    );
+    if let Err(error) = &result {
+        emit(observer, LoadEvent::Failed { error });
     }
     result
 }
 
-fn load_inner<B: LoaderBackend>(
-    request: LoadRequest<B::Source>,
-    backend: &mut B,
-) -> LoadResult<LoadedImage<B::Receipt>> {
-    for image in request.existing.iter().chain(&request.global) {
-        if image.descriptor.snapshot().profile() != request.profile {
-            return Err(LoadError::new(
-                LoadErrorKind::UnsupportedByProfile,
-                ErrorContext::None,
-            ));
+/// Convenience entry combining preparation and ownership publication.
+/// Completion means the owner adopted resources; constructors remain host-controlled.
+pub fn load<S, R, M, C, O, U>(
+    request: LoadRequest<S::Source, R::Pin>,
+    services: LoadServices<'_, S, R, M, C, O>,
+    publisher: &mut U,
+) -> LoadResult<LoadedImage<U::Owner>>
+where
+    S: ArtifactResolver,
+    R: ImageRepository,
+    M: ImageProtectionMemory,
+    C: CodeCache,
+    O: LoadObserver,
+    U: LoadPublisher<M, R::Pin, R::Reservation>,
+{
+    let LoadServices {
+        sources,
+        images,
+        memory,
+        cache,
+        observer,
+    } = services;
+    let prepared = prepare_load(
+        request,
+        LoadServices {
+            sources,
+            images,
+            memory,
+            cache,
+            observer: &mut *observer,
+        },
+    )?;
+    phase(observer, LoadPhase::Publish, false);
+    let result = prepared.publish(publisher);
+    match &result {
+        Ok(_) => {
+            phase(observer, LoadPhase::Publish, true);
+            emit(observer, LoadEvent::Completed);
         }
+        Err(error) => emit(observer, LoadEvent::Failed { error }),
     }
-    let (mut plan, ready) = loop {
+    result
+}
+fn phase<O: LoadObserver + ?Sized>(observer: &mut O, phase: LoadPhase, completed: bool) {
+    emit(observer, LoadEvent::Phase { phase, completed });
+}
+fn prepare_inner<S, R, M, C, O>(
+    request: LoadRequest<S::Source, R::Pin>,
+    services: LoadServices<'_, S, R, M, C, O>,
+) -> LoadResult<PreparedLoad<M, R::Pin, R::Reservation>>
+where
+    S: ArtifactResolver,
+    R: ImageRepository,
+    M: ImageProtectionMemory,
+    C: CodeCache,
+    O: LoadObserver,
+{
+    let LoadServices {
+        sources,
+        images: repository,
+        mut memory,
+        cache,
+        observer,
+    } = services;
+    let domain = memory.execution_domain();
+    if cache.execution_domain() != domain {
+        return Err(invalid());
+    }
+    for image in request.namespace.images() {
+        validate_provider(image, request.profile, domain)?;
+    }
+    let mut pins = Vec::new();
+    let (mut plan, reservation) = loop {
+        phase(observer, LoadPhase::Discover, false);
+        let plan = LoadPlan::build(&request, sources, repository, &mut pins, observer)?;
+        for image in plan.snapshots() {
+            validate_provider(image, request.profile, domain)?;
+        }
         emit(
-            backend,
-            LoadEvent::Phase {
-                phase: LoadPhase::Discover,
-                completed: false,
-            },
-        );
-        let plan = LoadPlan::build(&request, backend)?;
-        emit(
-            backend,
+            observer,
             LoadEvent::Closure {
                 images: plan.images.len(),
                 dependencies: plan.edges.len(),
             },
         );
-        emit(
-            backend,
-            LoadEvent::Phase {
-                phase: LoadPhase::Discover,
-                completed: true,
-            },
-        );
-        let sources = plan
-            .images
-            .iter()
-            .map(|image| image.source.clone())
-            .collect::<Vec<_>>();
-        emit(
-            backend,
-            LoadEvent::Phase {
-                phase: LoadPhase::Acquire,
-                completed: false,
-            },
-        );
-        let ready = backend.acquire(&sources, &request.existing)?;
-        emit(
-            backend,
-            LoadEvent::Phase {
-                phase: LoadPhase::Acquire,
-                completed: true,
-            },
-        );
-        for image in &ready {
-            if image.descriptor.snapshot().profile() != request.profile {
-                return Err(LoadError::new(
-                    LoadErrorKind::UnsupportedByProfile,
-                    ErrorContext::None,
-                ));
+        phase(observer, LoadPhase::Discover, true);
+        let mut candidates = Vec::new();
+        candidates
+            .try_reserve_exact(plan.images.len())
+            .map_err(|_| oom())?;
+        for image in &plan.images {
+            if image.snapshot.is_none() {
+                candidates.push(ImageCandidate {
+                    key: image.info.key().clone(),
+                    artifact: image.artifact,
+                    managed: image.shared,
+                });
             }
-            if !plan.contains(image.identity())
-                || (request.role == ArtifactRole::ExecutableRoot
-                    && image.identity() == plan.images[0].identity.as_bytes())
+        }
+        phase(observer, LoadPhase::Acquire, false);
+        let reservation = repository.acquire(&candidates)?;
+        phase(observer, LoadPhase::Acquire, true);
+        // Every candidate is either imported or reserved exactly once; the host
+        // cannot substitute an unrelated key or alias two mapping identities.
+        for candidate in &candidates {
+            let imports = reservation
+                .imported()
+                .iter()
+                .filter(|p| p.image().key() == &candidate.key)
+                .count();
+            let slots = reservation
+                .reserved()
+                .iter()
+                .filter(|s| s.key == candidate.key)
+                .count();
+            if imports + slots != 1 {
+                return Err(invalid());
+            }
+        }
+        for (index, pin) in reservation.imported().iter().enumerate() {
+            let image = pin.image();
+            if !candidates
+                .iter()
+                .any(|c| &c.key == image.key() && c.managed == image.is_shared())
+                || reservation.imported()[..index]
+                    .iter()
+                    .any(|p| p.image().instance_id() == image.instance_id())
             {
                 return Err(invalid());
             }
         }
-        if ready.iter().all(|image| plan.matches_snapshot(image)) {
-            break (plan, ready);
+        let mut matches = true;
+        for pin in reservation.imported() {
+            let image = pin.image();
+            validate_provider(image, request.profile, domain)?;
+            if !plan.images.iter().any(|p| p.info.key() == image.key()) {
+                return Err(invalid());
+            }
+            matches &= plan.matches_snapshot(image);
         }
-        // A concurrent publisher may win after a vacant source was scanned.
-        // Release this whole reservation before planning its frozen closure;
-        // never enlarge a batch while holding partial load permits.
-        backend.cancel_load();
-        emit(backend, LoadEvent::Retry);
+        if matches {
+            break (plan, reservation);
+        }
+        drop(reservation);
+        pins.clear();
+        emit(observer, LoadEvent::Retry);
     };
-    let mut providers = request.existing;
-    providers
-        .try_reserve(plan.images.len() + ready.len())
-        .map_err(|_| oom())?;
-    for image in plan.snapshots().cloned().chain(ready) {
-        if !providers
-            .iter()
-            .any(|provider| provider.identity() == image.identity())
-        {
-            providers.push(image);
+    for image in &mut plan.images {
+        if image.snapshot.is_none() {
+            if let Some(pin) = reservation
+                .imported()
+                .iter()
+                .find(|p| p.image().key() == image.info.key())
+            {
+                image.instance = Some(pin.image().instance_id());
+            } else {
+                let selected = reservation
+                    .reserved()
+                    .iter()
+                    .find(|r| &r.key == image.info.key())
+                    .ok_or_else(invalid)?;
+                image.instance = Some(selected.instance);
+            }
         }
     }
-    let mut memory = backend.memory();
-    emit(
-        backend,
-        LoadEvent::Phase {
-            phase: LoadPhase::Map,
-            completed: false,
-        },
-    );
+    // The acquired batch cannot introduce duplicate or unrequested identities.
+    for (i, slot) in reservation.reserved().iter().enumerate() {
+        if !plan
+            .images
+            .iter()
+            .any(|p| p.info.key() == &slot.key && p.snapshot.is_none())
+            || reservation.reserved()[..i]
+                .iter()
+                .any(|old| old.key == slot.key || old.instance == slot.instance)
+        {
+            return Err(invalid());
+        }
+    }
+    for (index, image) in plan.images.iter().enumerate() {
+        if plan.images[..index]
+            .iter()
+            .any(|old| old.instance == image.instance)
+        {
+            return Err(invalid());
+        }
+    }
+    // One session cannot silently merge two generations or namespace keys behind
+    // the same ELF graph identity, including providers supplied only through globals.
+    for planned in &plan.images {
+        for pin in request
+            .namespace
+            .pins
+            .iter()
+            .chain(pins.iter())
+            .chain(reservation.imported().iter())
+        {
+            let image = pin.image();
+            if planned.identity.as_bytes() == image.identity()
+                && (planned.info.key() != image.key()
+                    || planned.instance != Some(image.instance_id()))
+            {
+                return Err(invalid());
+            }
+        }
+    }
+    let mut providers = Vec::new();
+    providers
+        .try_reserve_exact(request.namespace.pins.len() + pins.len() + reservation.imported().len())
+        .map_err(|_| oom())?;
+    for pin in request
+        .namespace
+        .pins
+        .iter()
+        .chain(pins.iter())
+        .chain(reservation.imported().iter())
+    {
+        if !providers
+            .iter()
+            .any(|p: &ImageHandle| p.instance_id() == pin.image().instance_id())
+        {
+            providers.push(pin.image().clone());
+        }
+    }
+    let globals = request.namespace.globals()?;
+    phase(observer, LoadPhase::Map, false);
     let images = load_images(
         &mut plan,
         &providers,
-        &request.global,
+        &globals,
         request.profile,
         request.limits,
         &mut memory,
-        |event| emit(backend, event),
+        |e| emit(observer, e),
     )?;
-    emit(
-        backend,
-        LoadEvent::Phase {
-            phase: LoadPhase::Map,
-            completed: true,
-        },
-    );
-    emit(
-        backend,
-        LoadEvent::Phase {
-            phase: LoadPhase::Link,
-            completed: false,
-        },
-    );
-    let prepared = prepare_link(images)?;
-    emit(
-        backend,
-        LoadEvent::Phase {
-            phase: LoadPhase::Link,
-            completed: true,
-        },
-    );
-    let mut publisher = BackendPublisher::new(backend, &plan);
-    emit(
-        publisher.backend,
-        LoadEvent::Phase {
-            phase: LoadPhase::Publish,
-            completed: false,
-        },
-    );
-    let product = prepared.publish(&mut publisher)?;
-    emit(
-        publisher.backend,
-        LoadEvent::Phase {
-            phase: LoadPhase::Publish,
-            completed: true,
-        },
-    );
-    let mut facts = publisher
-        .facts
-        .take()
-        .expect("publication prepared result metadata");
-    facts.entry = (plan.images[0].scanned.role == crate::image::ArtifactRole::ExecutableRoot)
-        .then(|| product.entry());
-    trace_product(publisher.backend, &product);
-    let mut loaded = LoadedImage::new(product.into_publication(), facts);
-    emit(
-        publisher.backend,
-        LoadEvent::Phase {
-            phase: LoadPhase::Install,
-            completed: false,
-        },
-    );
-    if let Err(error) = publisher.backend.complete_load(&mut loaded) {
-        publisher.backend.abort_publication(loaded.into_receipt());
-        return Err(error);
+    phase(observer, LoadPhase::Map, true);
+    phase(observer, LoadPhase::Link, false);
+    let sealed = prepare_link(images, cache)?;
+    phase(observer, LoadPhase::Link, true);
+    let mut capture = CapturePublisher::new(&plan);
+    let mut product = sealed.publish(&mut capture)?;
+    let entry = (request.role == ArtifactRole::ExecutableRoot).then(|| product.entry());
+    // No fallible work occurs between disarming the internal log and arming this owning rollback guard.
+    let mut prepared = PreparedLoad {
+        memory: Some(memory),
+        allocations: Vec::new(),
+        pins,
+        reservation: Some(reservation),
+        manifest: None,
+    };
+    prepared.allocations = product.take_publication();
+    trace_product(observer, &product);
+    let mut facts = capture.facts.take().expect("capture prepared facts");
+    facts.entry = entry;
+    let mut allocations = Vec::new();
+    allocations
+        .try_reserve_exact(prepared.allocations.len())
+        .map_err(|_| oom())?;
+    for (image, lease) in &prepared.allocations {
+        allocations.push((image.clone(), *lease.allocation()));
     }
-    emit(
-        publisher.backend,
-        LoadEvent::Phase {
-            phase: LoadPhase::Install,
-            completed: true,
-        },
-    );
-    Ok(loaded)
+    prepared
+        .pins
+        .try_reserve(request.namespace.pins.len())
+        .map_err(|_| oom())?;
+    for pin in request.namespace.pins {
+        if facts
+            .retained
+            .iter()
+            .any(|i| i.instance_id() == pin.image().instance_id())
+        {
+            prepared.pins.push(pin);
+        }
+    }
+    prepared.manifest = Some(PublicationManifest {
+        image: LoadedImage::new((), facts),
+        allocations,
+    });
+    Ok(prepared)
+}
+fn validate_provider(
+    image: &ImageHandle,
+    profile: LoadProfile,
+    domain: crate::ExecutionDomainId,
+) -> LoadResult<()> {
+    if image.descriptor.snapshot().profile() != profile || image.execution_domain() != domain {
+        return Err(LoadError::new(
+            LoadErrorKind::UnsupportedByProfile,
+            ErrorContext::None,
+        ));
+    }
+    Ok(())
 }

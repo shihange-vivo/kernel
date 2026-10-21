@@ -430,4 +430,11 @@ impl<Receipt> LinkProduct<Receipt> {
     pub fn into_publication(self) -> Receipt {
         self.publication
     }
+
+    pub(crate) fn take_publication(&mut self) -> Receipt
+    where
+        Receipt: Default,
+    {
+        core::mem::take(&mut self.publication)
+    }
 }

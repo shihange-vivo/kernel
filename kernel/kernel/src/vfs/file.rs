@@ -257,6 +257,14 @@ impl File {
         self.dcache.fs_info()
     }
 
+    /// Return an atomic, immutable snapshot without changing the shared file offset.
+    pub fn snapshot(&self, max_len: usize) -> Result<alloc::vec::Vec<u8>, Error> {
+        if !self.access_mode().is_readable() {
+            return Err(code::EACCES);
+        }
+        self.dcache.inode().snapshot(max_len)
+    }
+
     /// Length of the underlying file, in bytes.
     pub fn file_len(&self) -> Result<u64, Error> {
         Ok(self.dcache.size() as u64)

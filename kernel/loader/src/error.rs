@@ -102,6 +102,7 @@ pub enum LimitKind {
     DependencyEdgeCount,
     DependencyDepth,
     TotalImageBytes,
+    TotalInputBytes,
     TotalRuntimeMetadataBytes,
     TotalRelocations,
     SymbolLookups,

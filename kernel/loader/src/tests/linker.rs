@@ -15,7 +15,6 @@
 use crate::image::ArtifactRole;
 
 use alloc::vec::Vec;
-
 use blueos_test_macro::test;
 
 use crate::{
@@ -43,7 +42,7 @@ fn prepare<'m>(
     profile: LoadProfile,
     memory: &'m mut SharedMemory,
 ) -> LoadResult<
-    crate::dynamic_linker::SealedSession<'m, SharedMemory, crate::relocation::NativeRelocator>,
+    crate::dynamic_linker::SealedSession<'m, SharedMemory, crate::relocation::ProfileRelocator>,
 > {
     let mut plan = crate::tests::fixture::single_plan(
         bytes,
@@ -60,7 +59,7 @@ fn prepare<'m>(
         memory,
         |_| {},
     )?;
-    prepare_link(images)
+    prepare_link(images, &mut crate::memory::CoherentCodeCache)
 }
 
 #[derive(Default)]

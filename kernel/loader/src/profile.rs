@@ -654,6 +654,10 @@ impl LoadLimits {
         }
     }
 
+    pub const fn max_file_len(&self) -> u64 {
+        self.max_file_len
+    }
+
     pub fn check_file_len(&self, actual: u64) -> LoadResult<()> {
         check_limit(LimitKind::FileLength, actual, self.max_file_len)
     }
@@ -801,6 +805,7 @@ pub struct SessionLimits {
     max_dependency_edges: u32,
     max_dependency_depth: u16,
     max_total_image_bytes: u64,
+    max_total_input_bytes: u64,
     max_total_runtime_metadata_bytes: u64,
     max_total_relocations: u64,
     max_symbol_lookups: u64,
@@ -841,6 +846,7 @@ impl SessionLimits {
             max_dependency_edges,
             max_dependency_depth,
             max_total_image_bytes,
+            max_total_input_bytes: max_total_image_bytes,
             max_total_runtime_metadata_bytes,
             max_total_relocations,
             max_symbol_lookups,
@@ -871,6 +877,19 @@ impl SessionLimits {
             LimitKind::DependencyDepth,
             u32::from(actual),
             u32::from(self.max_dependency_depth),
+        )
+    }
+
+    /// Bound retained immutable inputs independently of mapped image bytes.
+    pub const fn with_total_input_bytes(mut self, maximum: u64) -> Self {
+        self.max_total_input_bytes = maximum;
+        self
+    }
+    pub fn check_total_input_bytes(&self, actual: u64) -> LoadResult<()> {
+        check_limit(
+            LimitKind::TotalInputBytes,
+            actual,
+            self.max_total_input_bytes,
         )
     }
 

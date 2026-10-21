@@ -15,6 +15,7 @@
 //! Platform adapters that bind the loader's neutral contracts to the kernel's
 //! VFS, memory and cache services.
 
+pub mod code_cache;
 pub mod flat_memory;
 pub mod resolver;
 pub mod system_paths;

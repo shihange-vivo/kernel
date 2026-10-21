@@ -200,7 +200,7 @@ impl<M: ImageMemory> MappedImage<M> {
         }
         let offset = self.locate_file_backed_dynamic(dynamic)?;
         self.transaction
-            .image_span(offset, dynamic.file_range().len())?;
+            .validate_range(offset, dynamic.file_range().len())?;
 
         let limits = self.request.limits();
         let entry_count = dynamic.file_range().len() / entry_size;
@@ -278,7 +278,7 @@ impl<M: ImageMemory> MappedImage<M> {
         let table_vaddr = TargetAddress::new(address);
         if byte_len != 0 {
             let offset = self.locate_vaddr_at(table_vaddr, byte_len)?;
-            self.transaction.image_span(offset, byte_len)?;
+            self.transaction.validate_range(offset, byte_len)?;
             let mut raw = [0; 24];
             for index in 0..count {
                 let entry_offset = offset.checked_add(index * entry_size)?;
@@ -601,7 +601,7 @@ impl<M: ImageMemory> MappedImage<M> {
             return Ok(Vec::new());
         }
         let offset = self.locate_vaddr_at(TargetAddress::new(vaddr), len)?;
-        self.transaction.image_span(offset, len)?;
+        self.transaction.validate_range(offset, len)?;
         let len_usize = usize::try_from(len).map_err(|_| dynamic_error(tag, len))?;
         let mut buffer = Vec::new();
         buffer.try_reserve_exact(len_usize).map_err(|_| {

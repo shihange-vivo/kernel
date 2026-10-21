@@ -25,7 +25,6 @@ use crate::{
     tests::fixture::{native_fixture_builder, SharedMemory, SliceElfReader, NATIVE_PROFILE},
 };
 use alloc::{sync::Arc, vec::Vec};
-
 use blueos_test_macro::test;
 
 fn identity(name: &[u8]) -> ArtifactIdentity {
@@ -73,7 +72,16 @@ fn descriptor(name: &[u8], table: SymbolTable) -> Arc<PublishedImageDescriptor> 
             TargetAddress::new(0),
             ProgramHeaderRuntimeInfo::from_headers(0, 0, None, TargetAddress::new(0)).unwrap(),
             table,
-            PublishedLoadSnapshot::new(NATIVE_PROFILE, ArtifactRole::SharedObject, Vec::new()),
+            PublishedLoadSnapshot::new(
+                NATIVE_PROFILE,
+                ArtifactRole::SharedObject,
+                Vec::new(),
+                crate::dynamic_linker::PublicationIdentity::fresh(
+                    b"runtime",
+                    crate::ExecutionDomainId::FLAT,
+                )
+                .unwrap(),
+            ),
         )
         .unwrap(),
     )
@@ -84,7 +92,7 @@ fn load_single<'m>(
     role: ArtifactRole,
     memory: &'m mut SharedMemory,
 ) -> crate::LoadResult<
-    crate::dynamic_linker::LoadedSession<'m, SharedMemory, crate::relocation::NativeRelocator>,
+    crate::dynamic_linker::LoadedSession<'m, SharedMemory, crate::relocation::ProfileRelocator>,
 > {
     let mut plan =
         crate::tests::fixture::single_plan(bytes, role, NATIVE_PROFILE, SessionLimits::DEFAULT)?;
@@ -106,12 +114,15 @@ fn import_single<'m>(
     limits: SessionLimits,
     memory: &'m mut SharedMemory,
 ) -> crate::LoadResult<
-    crate::dynamic_linker::LoadedSession<'m, SharedMemory, crate::relocation::NativeRelocator>,
+    crate::dynamic_linker::LoadedSession<'m, SharedMemory, crate::relocation::ProfileRelocator>,
 > {
     let handle = crate::ImageHandle::new(provider.clone(), false);
     let mut plan = crate::loading::planning::LoadPlan {
         images: alloc::vec![crate::loading::planning::PlannedImage {
-            source: (),
+            source: Some(()),
+            info: crate::ArtifactInfo::new(provider.snapshot().key.clone(), false),
+            artifact: provider.snapshot().artifact,
+            instance: Some(provider.snapshot().instance),
             identity: provider.identity().try_clone()?,
             shared: false,
             reader: None::<SliceElfReader<'static>>,

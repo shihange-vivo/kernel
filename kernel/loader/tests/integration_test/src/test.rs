@@ -218,13 +218,18 @@ mod test_elf_loader {
             PreparedProtectionPlan, ProtectionCapabilities, ProtectionLevel,
         },
         profile::{LoadProfile, SessionLimits},
-        CommittedAllocations, ImageHandle, LoadRequest, LoadedImage, LoaderBackend, Publication,
+        ArtifactId, ArtifactInfo, ArtifactResolver, ImageKey, LoadRequest, LoadResources,
+        LoadServices, LoadedImage, LocalPin, LocalRepository, LocalReservation, OpenedArtifact,
+        RetainResources,
     };
 
     #[derive(Clone)]
     struct Memory(Rc<RefCell<MemoryMapper>>);
 
     impl ImageMemory for Memory {
+        fn execution_domain(&self) -> loader::ExecutionDomainId {
+            loader::ExecutionDomainId::FLAT
+        }
         fn allocate_image(&mut self, request: AllocationRequest) -> LoadResult<AllocationLease> {
             self.0.borrow_mut().allocate_image(request)
         }
@@ -234,13 +239,13 @@ mod test_elf_loader {
         fn release_committed(&mut self, lease: AllocationLease) {
             self.0.borrow_mut().release_committed(lease);
         }
-        fn image_span(
+        fn validate_range(
             &self,
             allocation: &ImageAllocation,
             offset: AllocationOffset,
             len: u64,
-        ) -> LoadResult<*mut u8> {
-            self.0.borrow().image_span(allocation, offset, len)
+        ) -> LoadResult<()> {
+            self.0.borrow().validate_range(allocation, offset, len)
         }
         fn read(
             &self,
@@ -292,76 +297,21 @@ mod test_elf_loader {
                 .validate_protection_aliases(allocation, plan)
         }
     }
-    struct Receipt {
-        memory: Memory,
-        leases: Vec<AllocationLease>,
-    }
-    impl Drop for Receipt {
-        fn drop(&mut self) {
-            for lease in self.leases.drain(..) {
-                self.memory.release_committed(lease);
-            }
-        }
-    }
-    struct Backend<'a> {
+    type Receipt = LoadResources<Memory, LocalPin, LocalReservation>;
+    struct Sources<'a> {
         reader: SemihostingElfReader<'a>,
-        memory: Memory,
     }
-    impl<'a> LoaderBackend for Backend<'a> {
-        type Source = ();
+    impl<'a> ArtifactResolver for Sources<'a> {
+        type Source = ArtifactInfo;
         type Reader = SemihostingElfReader<'a>;
-        type Memory = Memory;
-        type PreparedPublication = Vec<AllocationLease>;
-        type Receipt = Receipt;
-        fn identity<'b>(&self, _: &'b ()) -> &'b [u8] {
-            b"test-elf"
+        fn info<'b>(&self, source: &'b ArtifactInfo) -> &'b ArtifactInfo {
+            source
         }
-        fn is_shared(&self, _: &()) -> bool {
-            false
-        }
-        fn open(&mut self, _: &()) -> LoadResult<Self::Reader> {
-            Ok(self.reader)
-        }
-        fn snapshot(&mut self, _: &()) -> LoadResult<Option<ImageHandle>> {
-            Ok(None)
-        }
-        fn resolve(&mut self, _: &(), _: &[u8]) -> LoadResult<()> {
+        fn resolve(&mut self, _: &ArtifactInfo, _: &[u8]) -> LoadResult<ArtifactInfo> {
             Err(io_error())
         }
-        fn resolve_snapshot(&mut self, _: &blueos_loader::ImageDependency) -> LoadResult<()> {
-            Err(io_error())
-        }
-        fn acquire(&mut self, _: &[()], _: &[ImageHandle]) -> LoadResult<Vec<ImageHandle>> {
-            Ok(Vec::new())
-        }
-        fn memory(&mut self) -> Memory {
-            self.memory.clone()
-        }
-        fn prepare_publication(
-            &mut self,
-            publication: &Publication,
-        ) -> LoadResult<Vec<AllocationLease>> {
-            let mut leases = Vec::new();
-            leases
-                .try_reserve_exact(publication.private_images())
-                .map_err(|_| io_error())?;
-            Ok(leases)
-        }
-        unsafe fn commit_publication(
-            &mut self,
-            mut leases: Vec<AllocationLease>,
-            allocations: CommittedAllocations,
-        ) -> Receipt {
-            for (_, lease) in allocations.into_images() {
-                leases.push(lease);
-            }
-            Receipt {
-                memory: self.memory.clone(),
-                leases,
-            }
-        }
-        fn abort_publication(&mut self, receipt: Receipt) {
-            drop(receipt);
+        fn open(&mut self, _: &ArtifactInfo) -> LoadResult<OpenedArtifact<Self::Reader>> {
+            Ok(OpenedArtifact::new(self.reader, ArtifactId::fresh()?))
         }
     }
     fn profile() -> LoadProfile {
@@ -390,13 +340,21 @@ mod test_elf_loader {
         reader: SemihostingElfReader<'_>,
         mapper: MemoryMapper,
     ) -> LoadResult<LoadedImage<Receipt>> {
-        let mut backend = Backend {
-            reader,
-            memory: Memory(Rc::new(RefCell::new(mapper))),
-        };
+        let mut sources = Sources { reader };
+        let source = ArtifactInfo::new(ImageKey::new(0, b"test-elf")?, false);
+        let mut cache = blueos::application::adapters::code_cache::ArchitectureCodeCache::new(
+            loader::memory::CacheRequirements::CURRENT_EXECUTION_CONTEXT,
+        );
         loader::load(
-            LoadRequest::executable((), profile(), SessionLimits::DEFAULT),
-            &mut backend,
+            LoadRequest::executable(source, profile(), SessionLimits::DEFAULT),
+            LoadServices {
+                sources: &mut sources,
+                images: &mut LocalRepository,
+                memory: Memory(Rc::new(RefCell::new(mapper))),
+                cache: &mut cache,
+                observer: &mut (),
+            },
+            &mut RetainResources,
         )
     }
 

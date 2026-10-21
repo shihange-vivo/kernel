@@ -12,24 +12,24 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Dependency discovery before mapping: source lookup, snapshot reuse and a
-//! root-first load plan. Materialization follows its indexed edges directly.
-
-use crate::image::{ArtifactRole, DependencyName};
-
+//! Discover the complete dependency closure before reserving new instances.
 use crate::{
     dynamic_linker::ArtifactIdentity,
     error::{invalid, oom, overflow, ErrorContext, LoadErrorKind},
-    image::ScannedArtifact,
-    trace::{emit, LoadEvent},
-    ImageHandle, LoadRequest, LoadResult, LoaderBackend,
+    image::{ArtifactRole, DependencyName, ScannedArtifact},
+    trace::{emit, LoadEvent, LoadObserver},
+    ArtifactId, ArtifactInfo, ArtifactResolver, ImageHandle, ImageInstanceId, ImagePin,
+    ImageRepository, LoadRequest, LoadResult,
 };
 use alloc::vec::Vec;
 
 pub(crate) struct PlannedImage<S, R> {
-    pub(crate) source: S,
+    pub(crate) source: Option<S>,
     pub(crate) identity: ArtifactIdentity,
+    pub(crate) info: ArtifactInfo,
     pub(crate) shared: bool,
+    pub(crate) instance: Option<ImageInstanceId>,
+    pub(crate) artifact: ArtifactId,
     pub(crate) reader: Option<R>,
     pub(crate) snapshot: Option<ImageHandle>,
     pub(crate) scanned: ScannedArtifact,
@@ -43,85 +43,88 @@ pub(crate) struct LoadPlan<S, R> {
     pub(crate) images: Vec<PlannedImage<S, R>>,
     pub(crate) edges: Vec<PlannedEdge>,
 }
-
 impl<S, R> LoadPlan<S, R> {
     pub(crate) fn snapshots(&self) -> impl Iterator<Item = &ImageHandle> {
-        self.images
-            .iter()
-            .filter_map(|image| image.snapshot.as_ref())
+        self.images.iter().filter_map(|i| i.snapshot.as_ref())
     }
     pub(crate) fn matches_snapshot(&self, image: &ImageHandle) -> bool {
-        let Some(index) = self
-            .images
-            .iter()
-            .position(|planned| planned.identity.as_bytes() == image.identity())
-        else {
+        let Some(index) = self.images.iter().position(|p| p.info.key() == image.key()) else {
             return false;
         };
-        let planned = &self.images[index];
-        planned.shared == image.is_shared()
-            && planned.scanned.role == image.descriptor.snapshot().role()
-            && planned.scanned.declared_soname.as_ref() == image.descriptor.soname()
-            && planned.scanned.needed.len() == image.dependencies().len()
+        let p = &self.images[index];
+        p.shared == image.is_shared()
+            && p.scanned.role == image.descriptor.snapshot().role()
+            && p.scanned.declared_soname.as_ref() == image.descriptor.soname()
+            && p.scanned.needed.len() == image.dependencies().len()
             && image
                 .dependencies()
                 .iter()
                 .enumerate()
-                .all(|(needed_index, dependency)| {
-                    planned.scanned.needed[needed_index].as_bytes() == dependency.name()
-                        && self.edges.iter().any(|edge| {
-                            edge.requester == index
-                                && edge.needed_index as usize == needed_index
-                                && self.images[edge.provider].identity.as_bytes()
-                                    == dependency.identity()
-                                && self.images[edge.provider].shared == dependency.is_shared()
+                .all(|(needed_index, d)| {
+                    p.scanned.needed[needed_index].as_bytes() == d.name()
+                        && self.edges.iter().any(|e| {
+                            e.requester == index
+                                && e.needed_index as usize == needed_index
+                                && self.images[e.provider].instance == Some(d.instance_id())
                         })
                 })
-    }
-    pub(crate) fn contains(&self, identity: &[u8]) -> bool {
-        self.images
-            .iter()
-            .any(|image| image.identity.as_bytes() == identity)
     }
     pub(crate) fn metadata_bytes(&self) -> LoadResult<u64> {
         let mut bytes = core::mem::size_of::<Self>() as u64
             + (self.images.capacity() * core::mem::size_of::<PlannedImage<S, R>>()) as u64
             + (self.edges.capacity() * core::mem::size_of::<PlannedEdge>()) as u64;
-        for image in &self.images {
-            let names = image
+        for i in &self.images {
+            let names = i
                 .scanned
                 .needed
                 .iter()
-                .map(|name| name.as_bytes().len() as u64)
+                .map(|n| n.as_bytes().len() as u64)
                 .sum::<u64>();
-            let metadata = image.identity.metadata_bytes()
-                + (image.scanned.needed.capacity() * core::mem::size_of::<DependencyName>()) as u64
-                + image
-                    .scanned
-                    .declared_soname
-                    .as_ref()
-                    .map_or(0, |name| name.as_bytes().len() as u64)
-                + names;
-            bytes = bytes.checked_add(metadata).ok_or_else(overflow)?;
+            bytes = bytes
+                .checked_add(
+                    i.identity.metadata_bytes()
+                        + names
+                        + (i.scanned.needed.capacity() * core::mem::size_of::<DependencyName>())
+                            as u64
+                        + i.scanned
+                            .declared_soname
+                            .as_ref()
+                            .map_or(0, |n| n.as_bytes().len() as u64)
+                        + i.info.key().identity().len() as u64,
+                )
+                .ok_or_else(overflow)?;
         }
         Ok(bytes)
     }
 }
 
-impl<S: Clone, R> LoadPlan<S, R> {
-    pub(crate) fn build<B: LoaderBackend<Source = S, Reader = R>>(
-        request: &LoadRequest<S>,
-        backend: &mut B,
-    ) -> LoadResult<Self> {
-        if request.role == ArtifactRole::ExecutableRoot && backend.is_shared(&request.source) {
+impl<S: Clone, R: crate::reader::ElfReader> LoadPlan<S, R> {
+    pub(crate) fn build<A, I, O>(
+        request: &LoadRequest<S, I::Pin>,
+        sources: &mut A,
+        repository: &mut I,
+        pins: &mut Vec<I::Pin>,
+        observer: &mut O,
+    ) -> LoadResult<Self>
+    where
+        A: ArtifactResolver<Source = S, Reader = R>,
+        I: ImageRepository,
+        O: LoadObserver + ?Sized,
+    {
+        if request.role == ArtifactRole::ExecutableRoot
+            && sources.info(&request.source).is_managed()
+        {
             return Err(unsupported());
         }
-        let root = scan(
-            backend,
+        request.limits.check_image_count(1)?;
+        let root = scan_source(
             request.source.clone(),
             request.role,
-            false,
             request,
+            sources,
+            repository,
+            pins,
+            observer,
         )?;
         let mut plan = Self {
             images: Vec::new(),
@@ -132,11 +135,24 @@ impl<S: Clone, R> LoadPlan<S, R> {
         let mut queue = Vec::new();
         queue.try_reserve(1).map_err(|_| oom())?;
         queue.push((0, 1u16));
+        let mut input_bytes = plan.images[0]
+            .reader
+            .as_ref()
+            .map(crate::reader::ElfReader::len)
+            .transpose()?
+            .unwrap_or(0);
+        request.limits.check_total_input_bytes(input_bytes)?;
         let mut cursor = 0;
         while cursor < queue.len() {
             let (requester, depth) = queue[cursor];
             cursor += 1;
-            let needed = plan.images[requester].scanned.needed.clone();
+            let mut needed = Vec::new();
+            needed
+                .try_reserve_exact(plan.images[requester].scanned.needed.len())
+                .map_err(|_| oom())?;
+            for name in &plan.images[requester].scanned.needed {
+                needed.push(name.try_clone()?);
+            }
             for (needed_index, name) in needed.into_iter().enumerate() {
                 request
                     .limits
@@ -147,49 +163,108 @@ impl<S: Clone, R> LoadPlan<S, R> {
                 let frozen = plan.images[requester]
                     .snapshot
                     .as_ref()
-                    .map(|image| &image.dependencies()[needed_index]);
-                let source = if let Some(dependency) = frozen {
-                    let source = backend.resolve_snapshot(dependency)?;
-                    if backend.identity(&source) != dependency.identity()
-                        || backend.is_shared(&source) != dependency.is_shared()
+                    .map(|i| &i.dependencies()[needed_index]);
+                let reuse_required = frozen.is_some();
+                let image = if let Some(dependency) = frozen {
+                    let id = dependency.instance_id();
+                    let snapshot = if let Some(p) = request
+                        .namespace
+                        .pins
+                        .iter()
+                        .chain(pins.iter())
+                        .find(|p| p.image().instance_id() == id)
+                    {
+                        p.image().clone()
+                    } else {
+                        let pin = repository.pin_exact(&id)?;
+                        if pin.image().instance_id() != id {
+                            return Err(invalid());
+                        }
+                        let snapshot = pin.image().clone();
+                        pins.try_reserve(1).map_err(|_| oom())?;
+                        pins.push(pin);
+                        snapshot
+                    };
+                    if snapshot.identity() != dependency.identity()
+                        || snapshot.is_shared() != dependency.is_shared()
                     {
                         return Err(invalid());
                     }
-                    source
+                    scan_snapshot(None, snapshot, request, observer)?
                 } else {
-                    backend.resolve(&plan.images[requester].source, name.as_bytes())?
-                };
-                let reuse_required = frozen.is_some();
-                let identity = backend.identity(&source);
-                let shared = backend.is_shared(&source);
-                let provider = if let Some(index) = plan.images.iter().position(|image| {
-                    image.identity.as_bytes() == identity && image.shared == shared
-                }) {
-                    if plan.images[index].scanned.role != ArtifactRole::SharedObject {
-                        return Err(unsupported());
+                    let source = plan.images[requester].source.as_ref().ok_or_else(invalid)?;
+                    let selected = sources.resolve(source, name.as_bytes())?;
+                    let info = sources.info(&selected);
+                    if let Some(index) = plan.images.iter().position(|i| i.info.key() == info.key())
+                    {
+                        let provider = index;
+                        if plan.images[provider].scanned.role != ArtifactRole::SharedObject {
+                            return Err(unsupported());
+                        }
+                        plan.edges.try_reserve(1).map_err(|_| oom())?;
+                        plan.edges.push(PlannedEdge {
+                            requester,
+                            provider,
+                            needed_index: u16::try_from(needed_index).map_err(|_| overflow())?,
+                        });
+                        emit(
+                            observer,
+                            LoadEvent::Dependency {
+                                requester: plan.images[requester].identity.as_bytes(),
+                                name: name.as_bytes(),
+                                provider: plan.images[provider].identity.as_bytes(),
+                                frozen: false,
+                            },
+                        );
+                        continue;
                     }
-                    if reuse_required && plan.images[index].snapshot.is_none() {
+                    scan_source(
+                        selected,
+                        ArtifactRole::SharedObject,
+                        request,
+                        sources,
+                        repository,
+                        pins,
+                        observer,
+                    )?
+                };
+                let provider = if let Some(index) = plan
+                    .images
+                    .iter()
+                    .position(|i| i.info.key() == image.info.key())
+                {
+                    if plan.images[index].scanned.role != ArtifactRole::SharedObject
+                        || (reuse_required && plan.images[index].instance != image.instance)
+                    {
                         return Err(invalid());
                     }
                     index
                 } else {
+                    // The internal ELF graph uses byte identities. Reject ambiguous keys rather than merging namespaces.
+                    if plan.images.iter().any(|i| i.identity == image.identity) {
+                        return Err(invalid());
+                    }
                     request
                         .limits
                         .check_image_count((plan.images.len() + 1) as u32)?;
-                    let depth = depth.checked_add(1).ok_or_else(invalid)?;
-                    request.limits.check_dependency_depth(depth)?;
-                    let image = scan(
-                        backend,
-                        source,
-                        ArtifactRole::SharedObject,
-                        reuse_required,
-                        request,
-                    )?;
+                    let next = depth.checked_add(1).ok_or_else(overflow)?;
+                    request.limits.check_dependency_depth(next)?;
                     plan.images.try_reserve(1).map_err(|_| oom())?;
                     queue.try_reserve(1).map_err(|_| oom())?;
+                    input_bytes = input_bytes
+                        .checked_add(
+                            image
+                                .reader
+                                .as_ref()
+                                .map(crate::reader::ElfReader::len)
+                                .transpose()?
+                                .unwrap_or(0),
+                        )
+                        .ok_or_else(overflow)?;
+                    request.limits.check_total_input_bytes(input_bytes)?;
                     let index = plan.images.len();
                     plan.images.push(image);
-                    queue.push((index, depth));
+                    queue.push((index, next));
                     index
                 };
                 plan.edges.try_reserve(1).map_err(|_| oom())?;
@@ -199,7 +274,7 @@ impl<S: Clone, R> LoadPlan<S, R> {
                     needed_index: u16::try_from(needed_index).map_err(|_| overflow())?,
                 });
                 emit(
-                    backend,
+                    observer,
                     LoadEvent::Dependency {
                         requester: plan.images[requester].identity.as_bytes(),
                         name: name.as_bytes(),
@@ -216,82 +291,54 @@ impl<S: Clone, R> LoadPlan<S, R> {
         Ok(plan)
     }
 }
-
-fn scan<B: LoaderBackend>(
-    backend: &mut B,
-    source: B::Source,
+fn scan_source<A: ArtifactResolver, I: ImageRepository, O: LoadObserver + ?Sized>(
+    source: A::Source,
     role: ArtifactRole,
-    reuse_required: bool,
-    request: &LoadRequest<B::Source>,
-) -> LoadResult<PlannedImage<B::Source, B::Reader>> {
-    let identity = ArtifactIdentity::from_bytes(backend.identity(&source))?;
-    let shared = backend.is_shared(&source);
+    request: &LoadRequest<A::Source, I::Pin>,
+    sources: &mut A,
+    repository: &mut I,
+    pins: &mut Vec<I::Pin>,
+    observer: &mut O,
+) -> LoadResult<PlannedImage<A::Source, A::Reader>> {
+    let info = sources.info(&source).clone();
     if role == ArtifactRole::SharedObject {
-        let snapshot = match request
-            .existing
+        let snapshot = if let Some(p) = request
+            .namespace
+            .pins
             .iter()
-            .find(|image| image.identity() == identity.as_bytes())
+            .chain(pins.iter())
+            .find(|p| p.image().key() == info.key())
         {
-            Some(image) => Some(image.clone()),
-            None => backend.snapshot(&source)?,
-        };
-        if let Some(snapshot) = snapshot {
-            let published = snapshot.descriptor.snapshot();
-            if snapshot.identity() != identity.as_bytes() || snapshot.is_shared() != shared {
+            Some(p.image().clone())
+        } else if let Some(pin) = repository.snapshot(info.key())? {
+            if pin.image().key() != info.key() {
                 return Err(invalid());
             }
-            if published.profile() != request.profile || published.role() != role {
-                return Err(unsupported());
+            let image = pin.image().clone();
+            pins.try_reserve(1).map_err(|_| oom())?;
+            pins.push(pin);
+            Some(image)
+        } else {
+            None
+        };
+        if let Some(snapshot) = snapshot {
+            if snapshot.is_shared() != info.is_managed() {
+                return Err(invalid());
             }
-            let mut needed = Vec::new();
-            needed
-                .try_reserve_exact(snapshot.dependencies().len())
-                .map_err(|_| oom())?;
-            for dependency in snapshot.dependencies() {
-                request
-                    .limits
-                    .check_dependency_name_len(dependency.name().len() as u32)?;
-                needed.push(dependency.needed().try_clone()?);
-            }
-            let scanned = ScannedArtifact {
-                role,
-                declared_soname: snapshot
-                    .descriptor
-                    .soname()
-                    .map(DependencyName::try_clone)
-                    .transpose()?,
-                needed,
-            };
-            emit(
-                backend,
-                LoadEvent::Inspected {
-                    path: identity.as_bytes(),
-                    system: shared,
-                    snapshot: true,
-                },
-            );
-            return Ok(PlannedImage {
-                source,
-                identity,
-                shared,
-                reader: None,
-                snapshot: Some(snapshot),
-                scanned,
-            });
-        }
-        if reuse_required {
-            return Err(invalid());
+            return scan_snapshot(Some(source), snapshot, request, observer);
         }
     }
-    let reader = backend.open(&source)?;
+    let opened = sources.open(&source)?;
     let scanned = crate::image::scan::scan_root_or_dependency(
-        &reader,
+        opened.reader(),
         request.profile,
         role,
         *request.limits.per_image(),
     )?;
+    let identity = ArtifactIdentity::from_bytes(info.key().identity())?;
+    let shared = info.is_managed();
     emit(
-        backend,
+        observer,
         LoadEvent::Inspected {
             path: identity.as_bytes(),
             system: shared,
@@ -299,15 +346,68 @@ fn scan<B: LoaderBackend>(
         },
     );
     Ok(PlannedImage {
-        source,
+        source: Some(source),
         identity,
+        info,
         shared,
-        reader: Some(reader),
+        instance: None,
+        artifact: opened.artifact,
+        reader: Some(opened.reader),
         snapshot: None,
         scanned,
     })
 }
-
+fn scan_snapshot<S, R, P: ImagePin, O: LoadObserver + ?Sized>(
+    source: Option<S>,
+    snapshot: ImageHandle,
+    request: &LoadRequest<S, P>,
+    observer: &mut O,
+) -> LoadResult<PlannedImage<S, R>> {
+    let published = snapshot.descriptor.snapshot();
+    if published.profile() != request.profile || published.role() != ArtifactRole::SharedObject {
+        return Err(unsupported());
+    }
+    let mut needed = Vec::new();
+    needed
+        .try_reserve_exact(snapshot.dependencies().len())
+        .map_err(|_| oom())?;
+    for d in snapshot.dependencies() {
+        request
+            .limits
+            .check_dependency_name_len(d.name().len() as u32)?;
+        needed.push(d.needed().try_clone()?);
+    }
+    let scanned = ScannedArtifact {
+        role: ArtifactRole::SharedObject,
+        declared_soname: snapshot
+            .descriptor
+            .soname()
+            .map(DependencyName::try_clone)
+            .transpose()?,
+        needed,
+    };
+    let identity = ArtifactIdentity::from_bytes(snapshot.identity())?;
+    let shared = snapshot.is_shared();
+    emit(
+        observer,
+        LoadEvent::Inspected {
+            path: identity.as_bytes(),
+            system: shared,
+            snapshot: true,
+        },
+    );
+    Ok(PlannedImage {
+        source,
+        identity,
+        info: ArtifactInfo::new(snapshot.key().clone(), shared),
+        shared,
+        instance: Some(snapshot.instance_id()),
+        artifact: snapshot.artifact_id(),
+        reader: None,
+        snapshot: Some(snapshot),
+        scanned,
+    })
+}
 fn unsupported() -> crate::LoadError {
     crate::LoadError::new(LoadErrorKind::UnsupportedByProfile, ErrorContext::None)
 }

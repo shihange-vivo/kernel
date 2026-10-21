@@ -39,7 +39,8 @@ pub(crate) use publish::{
 };
 pub use published::ImageDependency;
 pub(crate) use published::{
-    ImportedImageDescriptor, PublishedImageDescriptor, PublishedLoadSnapshot, PublishedRegion,
+    ImportedImageDescriptor, PublicationIdentity, PublishedImageDescriptor, PublishedLoadSnapshot,
+    PublishedRegion,
 };
 pub(crate) use scope::{RelocationBinding, ResolvedSymbol, ScopeSet, SymbolRegionKind};
 pub(crate) use session::{

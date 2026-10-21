@@ -30,6 +30,7 @@ use alloc::{
     collections::BTreeMap,
     string::String,
     sync::{Arc, Weak},
+    vec::Vec,
 };
 use blueos_infra::no_let_underscore::IgnoreResult;
 use core::{
@@ -516,6 +517,33 @@ impl InnerNode {
 }
 
 impl InodeOps for FatInode {
+    fn snapshot(&self, max_len: usize) -> Result<Vec<u8>, Error> {
+        let mut inner = self.inner.write();
+        let (file, _filesystem_guard) = inner
+            .as_file_mut()
+            .ok_or(code::ENOTSUP)?
+            .internal_file
+            .get_mut();
+        let file = file.as_mut().ok_or(code::EIO)?;
+        let len = usize::try_from(file.size().ok_or(code::EIO)?).map_err(|_| code::EOVERFLOW)?;
+        if len > max_len {
+            return Err(code::EFBIG);
+        }
+        let mut bytes = Vec::new();
+        bytes.try_reserve_exact(len).map_err(|_| code::ENOMEM)?;
+        bytes.resize(len, 0);
+        file.seek(SeekFrom::Start(0))?;
+        let mut at = 0;
+        while at < len {
+            let n = file.read(&mut bytes[at..])?;
+            if n == 0 {
+                return Err(code::ENODATA);
+            }
+            at += n;
+        }
+        Ok(bytes)
+    }
+
     fn create(
         &self,
         name: &str,

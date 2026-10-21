@@ -14,27 +14,39 @@
 
 //! Optional observations of a complete load. Events describe facts, independently
 //! of a logger, output device or test framework. Borrowed data is valid only for
-//! the synchronous [`crate::LoaderBackend::trace`] call.
+//! the synchronous [`LoadObserver::observe`] call.
 
 use crate::{
     dynamic_linker::{ImageId, LinkProduct},
-    LoadError, LoaderBackend,
+    LoadError,
 };
 use core::fmt;
 
-pub(crate) fn emit<B: LoaderBackend>(backend: &B, event: LoadEvent<'_>) {
-    if backend.trace_enabled() {
-        backend.trace(event);
+/// Optional synchronous observations; callbacks cannot mutate load ownership or reenter.
+pub trait LoadObserver {
+    fn enabled(&self) -> bool {
+        false
+    }
+    fn observe(&mut self, _event: LoadEvent<'_>) {}
+}
+impl LoadObserver for () {}
+
+pub(crate) fn emit<B: LoadObserver + ?Sized>(backend: &mut B, event: LoadEvent<'_>) {
+    if backend.enabled() {
+        backend.observe(event);
     }
 }
 
-pub(crate) fn trace_product<B: LoaderBackend>(backend: &B, product: &LinkProduct<B::Receipt>) {
-    if !backend.trace_enabled() {
+pub(crate) fn trace_product<B: LoadObserver + ?Sized, R>(
+    backend: &mut B,
+    product: &LinkProduct<R>,
+) {
+    if !backend.enabled() {
         return;
     }
     let plans = product.lifecycle_plans();
     for (index, entry) in plans.startup().iter().enumerate() {
-        backend.trace(LoadEvent::LifecyclePlan {
+        backend.observe(LoadEvent::LifecyclePlan {
             kind: LifecycleKind::Startup,
             index,
             owner: entry.owner().get(),
@@ -42,7 +54,7 @@ pub(crate) fn trace_product<B: LoaderBackend>(backend: &B, product: &LinkProduct
         });
     }
     for (index, entry) in plans.group_fini().iter().enumerate() {
-        backend.trace(LoadEvent::LifecyclePlan {
+        backend.observe(LoadEvent::LifecyclePlan {
             kind: LifecycleKind::GroupFini,
             index,
             owner: entry.owner().get(),
@@ -51,7 +63,7 @@ pub(crate) fn trace_product<B: LoaderBackend>(backend: &B, product: &LinkProduct
     }
     for plan in plans.system_fini() {
         for (index, entry) in plan.plan().iter().enumerate() {
-            backend.trace(LoadEvent::LifecyclePlan {
+            backend.observe(LoadEvent::LifecyclePlan {
                 kind: LifecycleKind::SystemFini,
                 index,
                 owner: entry.owner().get(),
@@ -60,20 +72,20 @@ pub(crate) fn trace_product<B: LoaderBackend>(backend: &B, product: &LinkProduct
         }
     }
     for edge in product.context().graph_edges() {
-        backend.trace(LoadEvent::ProviderEdge {
+        backend.observe(LoadEvent::ProviderEdge {
             requester: edge.requester().get(),
             provider: edge.provider().get(),
         });
     }
     for entry in product.link_map() {
-        backend.trace(LoadEvent::Image {
+        backend.observe(LoadEvent::Image {
             owner: entry.owner().get(),
             soname: entry.soname().map(|name| name.as_bytes()),
             bias: entry.load_bias().get(),
         });
     }
     for (group, members) in plans.sccs().iter().enumerate() {
-        backend.trace(LoadEvent::Component {
+        backend.observe(LoadEvent::Component {
             group,
             members: ImageIds::new(members),
         });
@@ -82,7 +94,7 @@ pub(crate) fn trace_product<B: LoaderBackend>(backend: &B, product: &LinkProduct
         if binding.name().is_empty() {
             continue;
         }
-        backend.trace(LoadEvent::SymbolBinding {
+        backend.observe(LoadEvent::SymbolBinding {
             requester: binding.requester().get(),
             name: binding.name(),
             provider: binding.provider().map(|id| id.get()),
@@ -99,8 +111,6 @@ pub enum LoadPhase {
     /// Freeze scopes, relocate, synchronize caches and seal permissions.
     Link,
     Publish,
-    /// The backend installs the published receipt; constructors run later.
-    Install,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

@@ -12,22 +12,16 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Link already mapped images: freeze symbol scopes, relocate, synchronize
-//! code caches and seal final memory protections.
-
+//! Freeze scopes, relocate and publish instruction bytes through the host adapter.
 use crate::{
     dynamic_linker::{LoadedSession, SealedSession},
-    memory::{
-        cache::{ArchitectureCodeCache, CacheRequirements},
-        ImageProtectionMemory,
-    },
-    relocation::NativeRelocator,
+    memory::{CodeCache, ImageProtectionMemory},
+    relocation::ProfileRelocator,
     LoadResult,
 };
-
-pub(crate) fn prepare_link<M: ImageProtectionMemory + ?Sized>(
-    images: LoadedSession<'_, M, NativeRelocator>,
-) -> LoadResult<SealedSession<'_, M, NativeRelocator>> {
-    let mut cache = ArchitectureCodeCache::new(CacheRequirements::CURRENT_EXECUTION_CONTEXT);
-    images.freeze_scopes()?.relocate()?.seal(&mut cache)
+pub(crate) fn prepare_link<'a, M: ImageProtectionMemory + ?Sized, C: CodeCache + ?Sized>(
+    images: LoadedSession<'a, M, ProfileRelocator>,
+    cache: &mut C,
+) -> LoadResult<SealedSession<'a, M, ProfileRelocator>> {
+    images.freeze_scopes()?.relocate()?.seal(cache)
 }

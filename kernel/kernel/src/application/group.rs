@@ -133,6 +133,7 @@ struct GroupInner {
 /// A per-application thread group. `Clone` yields another handle onto the same
 /// resources and membership state.
 #[derive(Clone)]
+#[must_use = "the group owns application resources and lifecycle state"]
 pub struct ThreadGroup {
     inner: Arc<SpinLock<GroupInner>>,
 }
@@ -176,6 +177,10 @@ impl ThreadGroup {
         }
     }
 
+    pub(crate) fn namespace_scope(&self) -> u64 {
+        Arc::as_ptr(&self.inner) as usize as u64
+    }
+
     /// The group's current state.
     pub fn state(&self) -> GroupState {
         self.inner.irqsave_lock().state
@@ -215,8 +220,8 @@ impl ThreadGroup {
     /// the group from `New` to `Linked`.
     ///
     /// This is the infallible second half of the two-phase install: the
-    /// `KernelLinkPublisher::prepare` check already proved the group was
-    /// unlinked, and this move only swaps the fully-built product into place.
+    /// The loader has already returned a complete owning product. This method
+    /// validates the execution group's state and installs its prepared resources.
     /// A reader therefore observes either the old `New` state or a complete
     /// product, never a half-written link map.
     pub fn install_resources(

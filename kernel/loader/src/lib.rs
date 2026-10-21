@@ -20,11 +20,12 @@
 #![feature(c_size_t)]
 #![cfg_attr(compatible_old_toolchain, feature(unsigned_is_multiple_of))]
 
-//! ELF loading and dynamic linking with kernel-owned platform backends.
+//! ELF loading and dynamic linking with host-supplied platform capabilities.
 //!
-//! Call [`load`] with a [`LoadRequest`] and a [`LoaderBackend`]. The loader
-//! discovers dependencies, links and publishes the complete image closure;
-//! the backend supplies file policy, memory and resource ownership.
+//! Call [`load`] with a [`LoadRequest`], independent [`LoadServices`] and a
+//! [`LoadPublisher`]. Use [`prepare_load`] to inspect the complete immutable
+//! manifest before publication. Dropping preparation rolls back allocations
+//! and reservation permits; the returned owner retains the published resources.
 //! Select [`LoadRequest::executable`] for a fresh launch or
 //! [`LoadRequest::shared_object`] for a runtime library load. Ready images
 //! reuse published dependency snapshots without reopening their ELF files.
@@ -54,15 +55,20 @@ pub mod trace;
 // Loading and linking implementation details.
 mod dynamic_linker;
 mod elf;
+mod identity;
 mod image;
 mod loading;
+pub use identity::{ArtifactId, ExecutionDomainId, ImageInstanceId, ImageKey};
 mod relocation;
 
 // Frequently used entry points and types.
 pub use error::{LoadError, LoadResult};
 pub use loading::{
-    load, CommittedAllocations, ImageDependency, ImageHandle, LoadRequest, LoadedImage,
-    LoaderBackend, Publication,
+    load, prepare_load, ArtifactInfo, ArtifactResolver, ImageCandidate, ImageDependency,
+    ImageHandle, ImagePin, ImageRepository, LifecycleEntry, LoadPublisher, LoadRequest,
+    LoadReservation, LoadResources, LoadServices, LoadedImage, LocalPin, LocalRepository,
+    LocalReservation, NamespaceSnapshot, OpenedArtifact, PreparedLoad, PublicationManifest,
+    ReservedImage, RetainResources,
 };
 
 #[cfg(test)]

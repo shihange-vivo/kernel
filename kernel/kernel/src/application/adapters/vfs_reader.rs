@@ -12,66 +12,60 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! `ElfReader` adapter over an opened VFS file.
-//!
-//! [`VfsElfReader`] binds the loader's neutral [`ElfReader`] contract to a
-//! concrete [`File`]. Positional reads leave the shared file offset untouched.
-
+//! Immutable regular-file input captured atomically by its filesystem.
 use crate::{
     error::{code, Error},
     vfs::File,
 };
+use alloc::vec::Vec;
 use blueos_loader::{
     error::{ErrorContext, LoadErrorKind},
     reader::ElfReader,
     LoadError, LoadResult,
 };
 
-/// A read-only ELF reader over an opened VFS file.
-///
-/// The reader holds the `File` by value and leaves `File.offset` untouched, so
-/// two readers can interleave reads of the same inode without interference.
 pub struct VfsElfReader {
-    file: File,
+    bytes: Vec<u8>,
 }
-
 impl VfsElfReader {
-    /// Wrap an opened file for loader reads.
-    pub fn new(file: File) -> Self {
-        Self { file }
+    pub fn new(file: File) -> LoadResult<Self> {
+        // This is the per-artifact input limit of the kernel's fixed load profile.
+        let bytes = file
+            .snapshot(64 * 1024 * 1024)
+            .map_err(|e| map_error(e, 0, 0, 0))?;
+        Ok(Self { bytes })
     }
 }
-
 impl ElfReader for VfsElfReader {
     fn len(&self) -> LoadResult<u64> {
-        self.file
-            .file_len()
-            .map_err(|error| map_error(error, 0, 0, 0))
+        Ok(self.bytes.len() as u64)
     }
-
     fn read_exact_at(&self, offset: u64, dst: &mut [u8]) -> LoadResult<()> {
-        let len = u64::try_from(dst.len())
-            .map_err(|_| LoadError::new(LoadErrorKind::IntegerOverflow, ErrorContext::None))?;
-        let file_len = self.len()?;
-        self.file
-            .read_exact_at(offset, dst)
-            .map_err(|error| map_error(error, offset, len, file_len))
+        let len = dst.len() as u64;
+        let at = usize::try_from(offset)
+            .map_err(|_| map_error(code::EOVERFLOW, offset, len, self.bytes.len() as u64))?;
+        let end = at
+            .checked_add(dst.len())
+            .ok_or_else(|| map_error(code::EOVERFLOW, offset, len, self.bytes.len() as u64))?;
+        let source = self
+            .bytes
+            .get(at..end)
+            .ok_or_else(|| map_error(code::ENODATA, offset, len, self.bytes.len() as u64))?;
+        dst.copy_from_slice(source);
+        Ok(())
     }
 }
-
-/// Classify a kernel VFS error into a stable loader error: a short
-/// read at EOF maps to `OutOfBounds`, an offset overflow to
-/// `IntegerOverflow`, a device I/O failure to `Io`, and anything else to
-/// `Backend`.
 fn map_error(error: Error, offset: u64, len: u64, file_len: u64) -> LoadError {
-    let kind = if error == code::EIO {
-        LoadErrorKind::Io
+    let kind = if error == code::ENOMEM {
+        LoadErrorKind::OutOfMemory
     } else if error == code::EOVERFLOW {
         LoadErrorKind::IntegerOverflow
     } else if error == code::ENODATA {
         LoadErrorKind::OutOfBounds
+    } else if error == code::EFBIG {
+        LoadErrorKind::ResourceLimit
     } else {
-        LoadErrorKind::Backend
+        LoadErrorKind::Io
     };
     LoadError::new(
         kind,

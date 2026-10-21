@@ -13,7 +13,7 @@
 // limitations under the License.
 
 //! Dynamic application loading: platform adapters that bind the loader's
-//! contracts (`LoaderBackend`, `ElfReader`, `ImageMemory`) to
+//! contracts (`ArtifactResolver`, `ImageRepository`, `ImageMemory`) to
 //! the kernel's VFS, memory and cache services.
 //!
 //! A launch freezes an [`namespace::ApplicationNamespace`] and calls the
@@ -59,6 +59,7 @@ pub mod namespace;
 pub mod publication;
 pub mod reaper;
 pub mod registry;
+pub(crate) mod repository;
 pub mod runtime;
 /// Boot-time installation of the system image into the root tmpfs. Present
 /// only when the board asks for it; the loader backend below is independent

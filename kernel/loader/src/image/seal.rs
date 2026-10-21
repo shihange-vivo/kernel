@@ -295,7 +295,7 @@ impl PreparedProtectionPlan {
         let prepared = Self::build(allocation, logical, memory.protection_capabilities())?;
         memory.validate_protection_aliases(allocation, &prepared)?;
         for range in prepared.ranges() {
-            memory.image_span(
+            memory.validate_range(
                 allocation,
                 range.allocation_offset(),
                 range.applied_range().len(),

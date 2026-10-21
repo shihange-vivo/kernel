@@ -143,6 +143,12 @@ impl fmt::Debug for InodeAttr {
 }
 
 pub trait InodeOps: Any + Sync + Send {
+    /// Capture one immutable regular-file version under the filesystem's write exclusion.
+    /// Implementations must hold the same lock as writes/truncation for the entire copy.
+    fn snapshot(&self, _max_len: usize) -> Result<alloc::vec::Vec<u8>, Error> {
+        Err(code::ENOTSUP)
+    }
+
     fn read_at(&self, offset: usize, buf: &mut [u8], nonblock: bool) -> Result<usize, Error> {
         warn!("read_at is not implemented");
         Err(code::EINVAL)

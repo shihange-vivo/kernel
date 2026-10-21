@@ -53,15 +53,25 @@ pub struct ImageDependency {
     name: DependencyName,
     identity: ArtifactIdentity,
     shared: bool,
+    instance: crate::ImageInstanceId,
 }
 
 impl ImageDependency {
-    pub(crate) fn new(name: DependencyName, identity: ArtifactIdentity, shared: bool) -> Self {
+    pub(crate) fn new(
+        name: DependencyName,
+        identity: ArtifactIdentity,
+        shared: bool,
+        instance: crate::ImageInstanceId,
+    ) -> Self {
         Self {
             name,
             identity,
             shared,
+            instance,
         }
+    }
+    pub const fn instance_id(&self) -> crate::ImageInstanceId {
+        self.instance
     }
     pub fn name(&self) -> &[u8] {
         self.name.as_bytes()
@@ -77,8 +87,30 @@ impl ImageDependency {
     }
 }
 
+#[derive(Clone, Debug)]
+pub(crate) struct PublicationIdentity {
+    pub(crate) instance: crate::ImageInstanceId,
+    pub(crate) artifact: crate::ArtifactId,
+    pub(crate) key: crate::ImageKey,
+    pub(crate) domain: crate::ExecutionDomainId,
+}
+impl PublicationIdentity {
+    pub(crate) fn fresh(identity: &[u8], domain: crate::ExecutionDomainId) -> LoadResult<Self> {
+        Ok(Self {
+            instance: crate::ImageInstanceId::fresh()?,
+            artifact: crate::ArtifactId::fresh()?,
+            key: crate::ImageKey::new(0, identity)?,
+            domain,
+        })
+    }
+}
+
 #[derive(Debug)]
 pub(crate) struct PublishedLoadSnapshot {
+    pub(crate) instance: crate::ImageInstanceId,
+    pub(crate) artifact: crate::ArtifactId,
+    pub(crate) key: crate::ImageKey,
+    pub(crate) domain: crate::ExecutionDomainId,
     profile: LoadProfile,
     role: ArtifactRole,
     dependencies: Vec<ImageDependency>,
@@ -89,8 +121,13 @@ impl PublishedLoadSnapshot {
         profile: LoadProfile,
         role: ArtifactRole,
         dependencies: Vec<ImageDependency>,
+        identity: PublicationIdentity,
     ) -> Self {
         Self {
+            instance: identity.instance,
+            artifact: identity.artifact,
+            key: identity.key,
+            domain: identity.domain,
             profile,
             role,
             dependencies,
@@ -107,6 +144,7 @@ impl PublishedLoadSnapshot {
     }
     pub(crate) fn metadata_bytes(&self) -> u64 {
         core::mem::size_of::<Self>() as u64
+            + self.key.identity().len() as u64
             + (self.dependencies.capacity() * core::mem::size_of::<ImageDependency>()) as u64
             + self
                 .dependencies
