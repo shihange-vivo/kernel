@@ -144,6 +144,9 @@ impl ApplicationReaper {
         for allocation in self.registry.drain_failed_backings() {
             memory.release_committed(allocation);
         }
+        // Pins dropped by failed/background link workers may be the final users;
+        // their Drop only releases references, so this worker performs deferred fini.
+        self.resolve_quiescence();
         // Detach one pass under the short queue lock. Reaping runs application
         // destructors, which may launch/register another group on this reaper.
         let mut pending = core::mem::take(&mut *self.pending.lock());
@@ -263,27 +266,18 @@ impl ApplicationReaper {
     /// Release a runtime link after the application's destructor plan finished.
     /// No group, loader or registry lock may be held while this runs.
     pub(crate) fn release_receipt(&self, receipt: KernelLinkReceipt) -> ReapReport {
-        let (private, failed_system, system_leases) = receipt.into_parts();
+        let (private_images, imported_dsos) = receipt.counts();
+        drop(receipt);
+        self.resolve_quiescence();
+        ReapReport {
+            private_images,
+            imported_dsos,
+        }
+    }
 
-        // `FlatImageMemory` is a handle onto a shared service; `release_committed`
-        // needs `&mut self`, so release through a per-call clone like the loader's
-        // link session does (`let mut memory = self.memory.clone()`).
+    fn resolve_quiescence(&self) {
         let mut memory = self.memory.clone();
-        let private_images = private.len();
-        for lease in private {
-            memory.release_committed(lease);
-        }
-        for lease in failed_system {
-            memory.release_committed(lease);
-        }
-
-        let imported_dsos = system_leases.len();
-        let mut quiescence: Vec<SystemLibraryKey> = Vec::new();
-        for lease in system_leases {
-            let key = lease.key().clone();
-            quiescence.push(key);
-            drop(lease);
-        }
+        let mut quiescence = self.registry.quiescent_keys();
 
         loop {
             let mut made_progress = false;
@@ -365,11 +359,6 @@ impl ApplicationReaper {
             if quiescence.is_empty() || !made_progress {
                 break;
             }
-        }
-
-        ReapReport {
-            private_images,
-            imported_dsos,
         }
     }
 }

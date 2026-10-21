@@ -26,13 +26,15 @@ use crate::{
 use alloc::sync::Arc;
 use blueos_loader::{
     error::{ErrorContext, LoadErrorKind},
-    ImageDependency, ImageHandle, LoadError, LoadResult,
+    ArtifactId, ArtifactInfo, ArtifactResolver, ImageHandle, ImageKey, LoadError, LoadResult,
+    OpenedArtifact,
 };
 
 #[derive(Clone)]
 pub(crate) struct KernelSource {
     path: Arc<str>,
     shared: bool,
+    info: ArtifactInfo,
 }
 
 impl KernelSource {
@@ -47,26 +49,38 @@ impl KernelSource {
 pub(crate) struct NamespaceSourceResolver<'a> {
     namespace: &'a ApplicationNamespace,
     catalog: &'static SystemLibraryPaths,
+    scope: u64,
+    existing: alloc::vec::Vec<ImageHandle>,
 }
 
 impl<'a> NamespaceSourceResolver<'a> {
     pub(crate) fn new(
         namespace: &'a ApplicationNamespace,
         catalog: &'static SystemLibraryPaths,
+        scope: u64,
+        existing: alloc::vec::Vec<ImageHandle>,
     ) -> Self {
-        Self { namespace, catalog }
-    }
-    /// Select resource ownership independently of the caller's loading purpose.
-    pub(crate) fn root(&self, path: &str, private: bool) -> KernelSource {
-        KernelSource {
-            path: Arc::from(path),
-            shared: !private && self.catalog.resolve_path(path).is_some(),
+        Self {
+            namespace,
+            catalog,
+            scope,
+            existing,
         }
     }
+    /// Select resource ownership independently of the caller's loading purpose.
+    pub(crate) fn root(&self, path: &str, private: bool) -> LoadResult<KernelSource> {
+        let shared = !private && self.catalog.resolve_path(path).is_some();
+        Ok(KernelSource {
+            path: Arc::from(path),
+            shared,
+            info: ArtifactInfo::new(
+                ImageKey::new(if shared { 0 } else { self.scope }, path.as_bytes())?,
+                shared,
+            ),
+        })
+    }
     pub(crate) fn open(&self, source: &KernelSource) -> LoadResult<VfsElfReader> {
-        open_path(source.path(), libc::O_RDONLY, 0)
-            .map(VfsElfReader::new)
-            .map_err(|_| backend_error())
+        VfsElfReader::new(open_path(source.path(), libc::O_RDONLY, 0).map_err(|_| backend_error())?)
     }
     pub(crate) fn resolve(
         &self,
@@ -83,7 +97,7 @@ impl<'a> NamespaceSourceResolver<'a> {
                     .catalog
                     .resolve_name(name)
                     .ok_or_else(|| unresolved(name))?;
-                return Ok(self.root(entry.path, false));
+                return self.root(entry.path, false);
             }
             let private = resolve_dependency_paths(
                 self.namespace,
@@ -95,20 +109,17 @@ impl<'a> NamespaceSourceResolver<'a> {
                 .iter()
                 .any(|image| image.identity() == path.as_bytes() && !image.is_shared())
             {
-                return Ok(KernelSource {
-                    path: Arc::from(path.as_str()),
-                    shared: false,
-                });
+                return self.root(path, true);
             }
             // Only absence allows catalog fallback. A corrupt or inaccessible
             // private file remains selected and fails in the loader.
             if matches!(open_path(path, libc::O_RDONLY, 0), Err(error) if error == code::ENOENT || error == code::ENOTDIR)
             {
                 if let Some(entry) = self.catalog.resolve_name(name) {
-                    return Ok(self.root(entry.path, false));
+                    return self.root(entry.path, false);
                 }
             }
-            return Ok(self.root(path, false));
+            return self.root(path, false);
         }
         let paths = resolve_dependency_paths(
             self.namespace,
@@ -119,21 +130,24 @@ impl<'a> NamespaceSourceResolver<'a> {
         if requester.shared() && self.catalog.resolve_path(path).is_none() {
             return Err(unresolved(name));
         }
-        Ok(self.root(path, false))
+        self.root(path, false)
     }
+}
 
-    pub(crate) fn source_from_snapshot(
-        &self,
-        dependency: &ImageDependency,
-    ) -> LoadResult<KernelSource> {
-        let path = core::str::from_utf8(dependency.identity()).map_err(|_| backend_error())?;
-        if dependency.is_shared() && self.catalog.resolve_path(path).is_none() {
-            return Err(backend_error());
-        }
-        Ok(KernelSource {
-            path: Arc::from(path),
-            shared: dependency.is_shared(),
-        })
+impl ArtifactResolver for NamespaceSourceResolver<'_> {
+    type Source = KernelSource;
+    type Reader = VfsElfReader;
+    fn info<'b>(&self, source: &'b KernelSource) -> &'b ArtifactInfo {
+        &source.info
+    }
+    fn resolve(&mut self, requester: &KernelSource, name: &[u8]) -> LoadResult<KernelSource> {
+        NamespaceSourceResolver::resolve(self, requester, name, &self.existing)
+    }
+    fn open(&mut self, source: &KernelSource) -> LoadResult<OpenedArtifact<VfsElfReader>> {
+        Ok(OpenedArtifact::new(
+            NamespaceSourceResolver::open(self, source)?,
+            ArtifactId::fresh()?,
+        ))
     }
 }
 

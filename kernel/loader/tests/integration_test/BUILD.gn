@@ -16,6 +16,8 @@ import("//build/boards/${board}.gni")
 import("//build/templates/build_template.gni")
 import("//build/toolchain/blueos.gni")
 
+assert(dynamic_loader, "Loader integration tests require dynamic_loader=true.")
+
 build_rust("loader_integration_test") {
   testonly = true
   crate_type = "bin"

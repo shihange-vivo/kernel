@@ -12,40 +12,11 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! System DSO registry: permit, lease and generation state machine.
-//!
-//! One [`SystemDsoRegistry`] tracks every mapped system DSO instance by its
-//! canonical system path. It answers the single question a resolver needs:
-//! for a requested system dependency, is there already a Ready instance to
-//! *import*, or must some link *load* it as a candidate?
-//!
-//! The state machine is driven by unique, non-`Clone` tokens:
-//!
-//! * [`LoadPermit`] — the sole publication authority for one generation, handed
-//!   out exactly once while a slot is `Loading`. Dropping it before
-//!   [`SystemDsoRegistry::publish_relocated`] cancels the load (back to
-//!   `Vacant`).
-//! * [`RelocatedPermit`] — the authority handed back by `publish_relocated`
-//!   once the link's relocation/seal stage completed. Dropping it before
-//!   [`SystemDsoRegistry::publish_relocated_batch`] also cancels, because
-//!   nothing has run a constructor yet.
-//! * [`SystemDsoLease`] — one counted reference to a Ready instance. Acquiring
-//!   it on the Ready fast path only increments a counter; it never re-maps,
-//!   re-relocates or re-runs init. Its `Drop` only decrements
-//!   the counter. A reaper explicitly resolves a zero-user instance through
-//!   [`SystemDsoRegistry::resolve_quiescence`]; an ordinary failed-link drop
-//!   safely leaves a reusable zero-user `Ready` instance instead of stranding
-//!   it in an in-flight state with no worker.
-//! * [`SystemBatchWait`] — a waiter's ticket for an in-flight closure. A
-//!   planner-acquired batch never partially mutates the registry, so concurrent
-//!   sessions cannot form an ABBA wait cycle.
-//!
-//! A system candidate's unique
-//! [`AllocationLease`](blueos_loader::memory::AllocationLease) moves from the publisher
-//! receipt into the registry when the candidate enters `Initializing`. The
-//! registry retains it through `Ready` and hands it to the reaper only when the
-//! instance is safe to unload. The registry itself is a plain `Arc<Mutex<_>>`
-//! handle; every slow VFS, link, init and fini step runs outside its short lock.
+//! Shared-instance registry. A load permit exclusively owns a Loading generation.
+//! Publication is preflighted while permits remain armed, then all slots move to
+//! Initializing atomically without failure. Only the execution runtime's explicit
+//! init-completion signal publishes Ready instances. Leases retain provider SCCs;
+//! Drop releases references and the reaper alone executes application destructors.
 
 use blueos_infra::no_let_underscore::IgnoreResult;
 
@@ -75,6 +46,7 @@ pub enum QuiescenceResolution {
 }
 
 /// One member handed to the quiescence worker for destruction.
+#[must_use]
 pub struct SystemUnloadBacking {
     pub key: SystemLibraryKey,
     pub allocation: AllocationLease,
@@ -89,6 +61,7 @@ pub struct SystemUnloadBacking {
 /// Its slots remain `Unloading`, so no new link can observe a partially
 /// destroyed group. The worker takes the backings, performs fini/release in
 /// ordinary thread context, then calls [`SystemDsoRegistry::finish_unload`].
+#[must_use]
 pub struct SystemUnloadBatch {
     inner: Arc<Mutex<RegistryInner>>,
     members: Vec<BatchMember>,
@@ -120,6 +93,7 @@ pub enum SystemSnapshotOutcome {
 }
 
 /// The atomically acquired system closure a resolver consumes edge-by-edge.
+#[must_use]
 pub struct PreparedSystemBatch {
     /// First-load candidates: the canonical path key and publication permit.
     pub loads: Vec<(SystemLibraryKey, LoadPermit)>,
@@ -132,6 +106,7 @@ pub struct PreparedSystemBatch {
 /// The first-loading application moves these into the registry at batch
 /// publication: the instance — not the application receipt — owns the unique
 /// allocation, the descriptor and the fini plan from then on.
+#[must_use]
 pub struct SystemCandidateBacking {
     pub descriptor: ImageHandle,
     pub fini_plan: Vec<usize>,
@@ -150,8 +125,15 @@ pub struct SystemCandidateBacking {
     pub keep_cached: bool,
 }
 
+/// Validated storage for an atomic Loading-to-Initializing publication.
+#[must_use = "commit this preparation with its still-owned load permits"]
+pub(crate) struct SystemPublication {
+    members: Vec<BatchMember>,
+    failure_backings: Vec<AllocationLease>,
+}
+
 /// Publication authority for a batch of `Initializing` slots, minted by
-/// [`SystemDsoRegistry::publish_relocated_batch`].
+/// the kernel publisher's infallible batch commit.
 ///
 /// It must be advanced with [`SystemDsoRegistry::finish_initialization_batch`]
 /// once the application reports `ApplicationInitComplete`, or failed through
@@ -234,7 +216,6 @@ impl SystemBatchWait {
 enum InstanceState {
     Vacant,
     Loading,
-    Relocated,
     /// The batch publication was accepted: the backing, descriptor and fini
     /// plan are registry-owned while the application's constructors run. No
     /// waiter may observe a descriptor here — they stay `Pending` until the
@@ -350,6 +331,34 @@ impl SystemDsoRegistry {
         }
     }
 
+    /// Pin a generation directly; frozen dependencies never resolve a pathname again.
+    pub(crate) fn pin_exact(
+        &self,
+        id: blueos_loader::ImageInstanceId,
+    ) -> LoadResult<(SystemDsoLease, ImageHandle)> {
+        let mut inner = self.inner.lock();
+        for (index, slot) in inner.slots.iter_mut().enumerate() {
+            if let InstanceState::Ready {
+                leases, descriptor, ..
+            } = &mut slot.state
+            {
+                if descriptor.instance_id() == id {
+                    *leases = leases.checked_add(1).ok_or_else(stale_error)?;
+                    return Ok((
+                        SystemDsoLease {
+                            inner: Arc::clone(&self.inner),
+                            slot: index,
+                            generation: slot.generation,
+                            key: slot.key.clone(),
+                        },
+                        descriptor.clone(),
+                    ));
+                }
+            }
+        }
+        Err(stale_error())
+    }
+
     /// Atomically acquire the whole declared system closure.
     ///
     /// Every slot must be re-acquirable — `Vacant` or `Ready` — in which case
@@ -359,36 +368,53 @@ impl SystemDsoRegistry {
     /// an ABBA cycle. Any in-flight slot leaves the entire set untouched and
     /// returns a [`SystemBatchWait`] ticket; the caller waits outside the lock
     /// and retries the whole batch.
-    pub fn acquire_batch(&self, keys: &[SystemLibraryKey]) -> AcquireBatchOutcome {
-        let mut inner = self.inner.lock();
-        // Deterministic canonical-path byte order, de-duplicated.
-        let mut ordered: Vec<SystemLibraryKey> = keys.to_vec();
+    pub fn acquire_batch(&self, keys: &[SystemLibraryKey]) -> LoadResult<AcquireBatchOutcome> {
+        let mut ordered = Vec::new();
+        ordered
+            .try_reserve_exact(keys.len())
+            .map_err(|_| registry_oom())?;
+        ordered.extend_from_slice(keys);
         ordered.sort();
         ordered.dedup();
+        let mut loads = Vec::new();
+        let mut imports = Vec::new();
+        loads
+            .try_reserve_exact(ordered.len())
+            .map_err(|_| registry_oom())?;
+        imports
+            .try_reserve_exact(ordered.len())
+            .map_err(|_| registry_oom())?;
+        let mut inner = self.inner.lock();
+        inner
+            .slots
+            .try_reserve(ordered.len())
+            .map_err(|_| registry_oom())?;
         for key in &ordered {
-            let index = ensure_slot(&mut inner.slots, key.clone());
-            match inner.slots[index].state {
-                InstanceState::Vacant | InstanceState::Ready { .. } => {}
-                InstanceState::Loading
-                | InstanceState::Relocated
-                | InstanceState::Initializing { .. }
-                | InstanceState::Unloading
-                | InstanceState::Failed { .. } => {
-                    return AcquireBatchOutcome::Pending(SystemBatchWait {
+            let Some(slot) = inner.slots.iter().find(|slot| &slot.key == key) else {
+                continue;
+            };
+            match &slot.state {
+                InstanceState::Vacant => {
+                    slot.generation.checked_add(1).ok_or_else(stale_error)?;
+                }
+                InstanceState::Ready { leases, .. } => {
+                    leases.checked_add(1).ok_or_else(stale_error)?;
+                }
+                _ => {
+                    return Ok(AcquireBatchOutcome::Pending(SystemBatchWait {
                         observed: inner.resolution.load(Ordering::Acquire),
                         signal: Arc::clone(&inner.resolution),
-                    });
+                    }))
                 }
             }
         }
-        let mut loads = Vec::new();
-        let mut imports = Vec::new();
+        // All capacities and every counter transition were checked before mutating a slot.
         for key in ordered {
             let index = ensure_slot(&mut inner.slots, key.clone());
             let slot = &mut inner.slots[index];
             match &mut slot.state {
                 InstanceState::Vacant => {
-                    slot.generation = slot.generation.wrapping_add(1);
+                    slot.generation += 1;
                     slot.state = InstanceState::Loading;
                     loads.push((
                         key,
@@ -403,7 +429,7 @@ impl SystemDsoRegistry {
                 InstanceState::Ready {
                     leases, descriptor, ..
                 } => {
-                    *leases = leases.saturating_add(1);
+                    *leases += 1;
                     imports.push((
                         key,
                         SystemDsoLease {
@@ -415,67 +441,39 @@ impl SystemDsoRegistry {
                         descriptor.clone(),
                     ));
                 }
-                _ => unreachable!("batch pre-check passed"),
+                _ => unreachable!("whole batch validated before mutation"),
             }
         }
-        AcquireBatchOutcome::Acquired(PreparedSystemBatch { loads, imports })
+        Ok(AcquireBatchOutcome::Acquired(PreparedSystemBatch {
+            loads,
+            imports,
+        }))
     }
 
-    /// Advance a `Loading` slot to `Relocated` once the candidate image's
-    /// relocation and seal stage completed. All capacity/identity/
-    /// publication storage is reserved before this call; generation checks
-    /// below validate the permit before moving the slot to the next state.
-    pub fn publish_relocated(&self, permit: LoadPermit) -> LoadResult<RelocatedPermit> {
-        let (inner, slot, generation) = permit.consume();
-        {
-            let mut guard = inner.lock();
-            let instance = guard.slots.get_mut(slot).ok_or_else(stale_error)?;
-            if instance.generation != generation {
+    pub(crate) fn prepare_publication(
+        &self,
+        permits: &[(SystemLibraryKey, LoadPermit)],
+    ) -> LoadResult<SystemPublication> {
+        let mut members = Vec::new();
+        let mut failure_backings = Vec::new();
+        members
+            .try_reserve_exact(permits.len())
+            .map_err(|_| registry_oom())?;
+        failure_backings
+            .try_reserve_exact(permits.len())
+            .map_err(|_| registry_oom())?;
+        let guard = self.inner.lock();
+        for (key, permit) in permits {
+            if !permit.armed
+                || !Arc::ptr_eq(&self.inner, &permit.inner)
+                || members.iter().any(|m: &BatchMember| m.slot == permit.slot)
+            {
                 return Err(stale_error());
             }
-            match instance.state {
-                InstanceState::Loading => instance.state = InstanceState::Relocated,
-                _ => return Err(stale_error()),
-            }
-        }
-        Ok(RelocatedPermit {
-            inner,
-            slot,
-            generation,
-            armed: true,
-        })
-    }
-
-    /// Publish a whole batch of relocated system candidates in one lock hold
-    /// Each slot moves `Relocated → Initializing` and the
-    /// registry becomes the owner of its backing allocation, descriptor and
-    /// fini plan. Waiters stay `Pending` — nothing here publishes a
-    /// descriptor. The returned [`SystemInitBatch`] must be advanced with
-    /// [`SystemDsoRegistry::finish_initialization_batch`] once the
-    /// application reports `ApplicationInitComplete`, or failed through
-    /// [`SystemDsoRegistry::fail_initialization_batch`] when the application
-    /// dies first.
-    pub fn publish_relocated_batch(
-        &self,
-        permits: Vec<RelocatedPermit>,
-        backings: &mut Vec<SystemCandidateBacking>,
-    ) -> LoadResult<SystemInitBatch> {
-        if permits.len() != backings.len() {
-            return Err(stale_error());
-        }
-        let mut members = Vec::new();
-        members
-            .try_reserve(permits.len())
-            .map_err(|_| registry_oom())?;
-        let mut failure_backings = Vec::new();
-        failure_backings
-            .try_reserve(permits.len())
-            .map_err(|_| registry_oom())?;
-        for permit in &permits {
-            if !Arc::ptr_eq(&self.inner, &permit.inner)
-                || members
-                    .iter()
-                    .any(|member: &BatchMember| member.slot == permit.slot)
+            let slot = guard.slots.get(permit.slot).ok_or_else(stale_error)?;
+            if &slot.key != key
+                || slot.generation != permit.generation
+                || !matches!(slot.state, InstanceState::Loading)
             {
                 return Err(stale_error());
             }
@@ -484,24 +482,24 @@ impl SystemDsoRegistry {
                 generation: permit.generation,
             });
         }
+        Ok(SystemPublication {
+            members,
+            failure_backings,
+        })
+    }
 
+    /// All slots remain exclusively owned by the permits between prepare and commit.
+    /// No allocation, validation failure or application code occurs here.
+    pub(crate) fn commit_publication(
+        &self,
+        prepared: SystemPublication,
+        permits: Vec<(SystemLibraryKey, LoadPermit)>,
+        backings: Vec<SystemCandidateBacking>,
+    ) -> SystemInitBatch {
         let mut guard = self.inner.lock();
-        for member in &members {
-            let instance = guard.slots.get(member.slot).ok_or_else(stale_error)?;
-            if instance.generation != member.generation
-                || !matches!(instance.state, InstanceState::Relocated)
-            {
-                return Err(stale_error());
-            }
-        }
-
-        // Every fallible check completed above. Mutate the whole batch while
-        // holding one registry lock, so no observer can see a partial
-        // Relocated-to-Initializing transition.
-        for (permit, backing) in permits.into_iter().zip(backings.drain(..)) {
+        for ((_, permit), backing) in permits.into_iter().zip(backings) {
             let (_, slot, _) = permit.consume();
-            let instance = &mut guard.slots[slot];
-            instance.state = InstanceState::Initializing {
+            guard.slots[slot].state = InstanceState::Initializing {
                 descriptor: backing.descriptor,
                 fini_plan: backing.fini_plan,
                 allocation: backing.allocation,
@@ -512,13 +510,23 @@ impl SystemDsoRegistry {
             };
         }
         drop(guard);
-
-        Ok(SystemInitBatch {
+        SystemInitBatch {
             inner: Arc::clone(&self.inner),
-            members,
-            failure_backings,
+            members: prepared.members,
+            failure_backings: prepared.failure_backings,
             armed: true,
-        })
+        }
+    }
+
+    /// Only Ready instances with no pins are candidates for deferred quiescence.
+    pub(crate) fn quiescent_keys(&self) -> Vec<SystemLibraryKey> {
+        let guard = self.inner.lock();
+        guard
+            .slots
+            .iter()
+            .filter(|s| matches!(s.state, InstanceState::Ready { leases: 0, .. }))
+            .map(|s| s.key.clone())
+            .collect()
     }
 
     /// Complete a published initialization batch: every slot moves
@@ -905,8 +913,8 @@ impl Default for SystemDsoRegistry {
 
 /// The unique publication authority for a `Loading` slot.
 ///
-/// Exactly one is minted per generation. It must be advanced with
-/// [`SystemDsoRegistry::publish_relocated`]; dropping it armed cancels the load.
+/// Exactly one is minted per generation. The publisher consumes it after
+/// successful preflight; dropping it armed cancels the load.
 #[must_use = "publish the relocated image or drop the permit to cancel its load"]
 pub struct LoadPermit {
     inner: Arc<Mutex<RegistryInner>>,
@@ -939,48 +947,6 @@ impl Drop for LoadPermit {
             }
             slot.state = InstanceState::Vacant;
             // Cancelling back to `Vacant` makes the slot re-acquirable.
-            wake_waiters(&resolution);
-        }
-    }
-}
-
-/// The publication authority for a `Relocated` slot, returned by
-/// [`SystemDsoRegistry::publish_relocated`].
-///
-/// It must be advanced with [`SystemDsoRegistry::publish_relocated_batch`].
-/// Dropping it armed cancels back to `Vacant` — still safe, because no
-/// constructor has run.
-#[must_use = "publish the initialization batch or drop the permit to cancel"]
-pub struct RelocatedPermit {
-    inner: Arc<Mutex<RegistryInner>>,
-    slot: usize,
-    generation: u32,
-    armed: bool,
-}
-
-impl RelocatedPermit {
-    fn consume(mut self) -> (Arc<Mutex<RegistryInner>>, usize, u32) {
-        self.armed = false;
-        (Arc::clone(&self.inner), self.slot, self.generation)
-    }
-}
-
-impl Drop for RelocatedPermit {
-    fn drop(&mut self) {
-        if !self.armed {
-            return;
-        }
-        {
-            let mut guard = self.inner.lock();
-            let resolution = Arc::clone(&guard.resolution);
-            let Some(slot) = guard.slots.get_mut(self.slot) else {
-                return;
-            };
-            if slot.generation != self.generation || !matches!(slot.state, InstanceState::Relocated)
-            {
-                return;
-            }
-            slot.state = InstanceState::Vacant;
             wake_waiters(&resolution);
         }
     }
@@ -1050,4 +1016,81 @@ fn ensure_slot(slots: &mut Vec<Slot>, key: SystemLibraryKey) -> usize {
 
 fn stale_error() -> LoadError {
     LoadError::new(LoadErrorKind::Backend, ErrorContext::None)
+}
+
+#[cfg(test)]
+mod publication_tests {
+    use super::*;
+    use blueos_test_macro::test;
+    fn key(name: &[u8]) -> SystemLibraryKey {
+        SystemLibraryKey::from_bytes(name).unwrap()
+    }
+    fn acquire(registry: &SystemDsoRegistry, keys: &[SystemLibraryKey]) -> PreparedSystemBatch {
+        match registry.acquire_batch(keys).unwrap() {
+            AcquireBatchOutcome::Acquired(batch) => batch,
+            _ => panic!("unexpected pending closure"),
+        }
+    }
+    #[test]
+    fn closure_wait_never_holds_a_partial_reservation() {
+        let registry = SystemDsoRegistry::new();
+        let x = key(b"x");
+        let y = key(b"y");
+        let first = acquire(&registry, core::slice::from_ref(&x));
+        assert!(matches!(
+            registry.acquire_batch(&[x.clone(), y.clone()]).unwrap(),
+            AcquireBatchOutcome::Pending(_)
+        ));
+        assert!(matches!(
+            registry.snapshot(y.clone()).unwrap(),
+            SystemSnapshotOutcome::Vacant
+        ));
+        drop(first);
+        let second = acquire(&registry, &[x.clone(), y.clone()]);
+        assert_eq!(second.loads.len(), 2);
+        drop(second);
+        assert!(matches!(
+            registry.snapshot(x).unwrap(),
+            SystemSnapshotOutcome::Vacant
+        ));
+        assert!(matches!(
+            registry.snapshot(y).unwrap(),
+            SystemSnapshotOutcome::Vacant
+        ));
+    }
+    #[test]
+    fn publication_preflight_preserves_raii_cancellation_authority() {
+        let registry = SystemDsoRegistry::new();
+        let other = SystemDsoRegistry::new();
+        let x = key(b"x");
+        let batch = acquire(&registry, core::slice::from_ref(&x));
+        assert!(other.prepare_publication(&batch.loads).is_err());
+        let prepared = registry.prepare_publication(&batch.loads).unwrap();
+        drop(prepared);
+        assert!(matches!(
+            registry.snapshot(x.clone()).unwrap(),
+            SystemSnapshotOutcome::Pending(_)
+        ));
+        drop(batch);
+        assert!(matches!(
+            registry.snapshot(x).unwrap(),
+            SystemSnapshotOutcome::Vacant
+        ));
+    }
+    #[test]
+    fn generation_overflow_rejects_the_whole_batch_before_mutation() {
+        let registry = SystemDsoRegistry::new();
+        let x = key(b"x");
+        let y = key(b"y");
+        {
+            let mut inner = registry.inner.lock();
+            let index = ensure_slot(&mut inner.slots, x.clone());
+            inner.slots[index].generation = u32::MAX;
+        }
+        assert!(registry.acquire_batch(&[x, y.clone()]).is_err());
+        assert!(matches!(
+            registry.snapshot(y).unwrap(),
+            SystemSnapshotOutcome::Vacant
+        ));
+    }
 }

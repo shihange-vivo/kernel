@@ -37,17 +37,6 @@ use crate::memory::{
     ProtectionCapabilities, ProtectionLevel,
 };
 
-// Use one native linking configuration across pipeline tests so each backend
-// and relocator does not instantiate another copy of the complete loader.
-#[cfg(target_arch = "aarch64")]
-pub(super) use crate::relocation::AArch64Relocator as NativeRelocator;
-#[cfg(target_arch = "arm")]
-pub(super) use crate::relocation::ArmRelocator as NativeRelocator;
-#[cfg(target_arch = "riscv32")]
-pub(super) use crate::relocation::Riscv32Relocator as NativeRelocator;
-#[cfg(target_arch = "riscv64")]
-pub(super) use crate::relocation::Riscv64Relocator as NativeRelocator;
-
 pub(super) const NATIVE_PROFILE: LoadProfile = {
     #[cfg(target_arch = "arm")]
     {
@@ -484,7 +473,10 @@ pub(super) fn single_plan(
         crate::image::scan::scan_root_or_dependency(&reader, profile, role, *limits.per_image())?;
     Ok(crate::loading::planning::LoadPlan {
         images: alloc::vec![crate::loading::planning::PlannedImage {
-            source: (),
+            source: Some(()),
+            info: crate::ArtifactInfo::new(crate::ImageKey::new(0, b"native-root")?, false),
+            artifact: crate::ArtifactId::fresh()?,
+            instance: Some(crate::ImageInstanceId::fresh()?),
             identity: crate::dynamic_linker::ArtifactIdentity::from_bytes(b"native-root")?,
             shared: false,
             reader: Some(reader),
@@ -497,6 +489,7 @@ pub(super) fn single_plan(
 
 /// Shared real-memory backend for load, link and runtime pipeline tests.
 #[derive(Clone)]
+#[must_use = "shared test memory keeps image backing alive"]
 pub(super) struct SharedMemory {
     pub(super) mappers: Rc<RefCell<Vec<(ImageAllocation, MemoryMapper)>>>,
     pub(super) regions: Option<&'static [MemoryRegion]>,
@@ -517,6 +510,9 @@ impl SharedMemory {
 }
 
 impl ImageMemory for SharedMemory {
+    fn execution_domain(&self) -> crate::ExecutionDomainId {
+        crate::ExecutionDomainId::FLAT
+    }
     fn allocate_image(&mut self, request: AllocationRequest) -> LoadResult<AllocationLease> {
         assert!(self.acquired.get(), "reserve closure before mapping");
         let mut mapper = MemoryMapper::new(self.regions);
@@ -544,19 +540,19 @@ impl ImageMemory for SharedMemory {
             .unwrap();
         mappers.swap_remove(index).1.release_committed(lease);
     }
-    fn image_span(
+    fn validate_range(
         &self,
         allocation: &ImageAllocation,
         offset: AllocationOffset,
         len: u64,
-    ) -> LoadResult<*mut u8> {
+    ) -> LoadResult<()> {
         self.mappers
             .borrow()
             .iter()
             .find(|(key, _)| key == allocation)
             .unwrap()
             .1
-            .image_span(allocation, offset, len)
+            .validate_range(allocation, offset, len)
     }
     fn read(
         &self,
@@ -670,6 +666,9 @@ impl RecordingMemory {
 }
 
 impl ImageMemory for RecordingMemory {
+    fn execution_domain(&self) -> crate::ExecutionDomainId {
+        crate::ExecutionDomainId::FLAT
+    }
     fn allocate_image(&mut self, request: AllocationRequest) -> crate::LoadResult<AllocationLease> {
         let (base, ownership) = match request.placement() {
             Placement::Fixed(range) => (range.start(), AllocationOwnership::BorrowedFixed),
@@ -695,14 +694,14 @@ impl ImageMemory for RecordingMemory {
 
     fn release_committed(&mut self, _allocation: AllocationLease) {}
 
-    fn image_span(
+    fn validate_range(
         &self,
         allocation: &ImageAllocation,
         _offset: crate::memory::AllocationOffset,
         _len: u64,
-    ) -> crate::LoadResult<*mut u8> {
+    ) -> crate::LoadResult<()> {
         self.validate_allocation(allocation)?;
-        Ok(core::ptr::null_mut())
+        Ok(())
     }
 
     fn write(

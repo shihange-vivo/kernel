@@ -357,6 +357,20 @@ fn rename_tmpfs_locked(
 }
 
 impl InodeOps for TmpInode {
+    fn snapshot(&self, max_len: usize) -> Result<Vec<u8>, Error> {
+        let inner = self.inner.read();
+        let data = inner.as_file().ok_or(code::ENOTSUP)?;
+        if data.len() > max_len {
+            return Err(code::EFBIG);
+        }
+        let mut bytes = Vec::new();
+        bytes
+            .try_reserve_exact(data.len())
+            .map_err(|_| code::ENOMEM)?;
+        bytes.extend_from_slice(data);
+        Ok(bytes)
+    }
+
     fn create(
         &self,
         name: &str,
@@ -808,5 +822,68 @@ impl InodeOps for TmpInode {
 impl Drop for TmpInode {
     fn drop(&mut self) {
         trace!("Drop {:?}", self);
+    }
+}
+
+#[cfg(test)]
+mod snapshot_tests {
+    use super::*;
+    use blueos_infra::no_let_underscore::IgnoreResult;
+    use blueos_test_macro::test;
+
+    #[test]
+    fn snapshots_are_immutable_and_bounded() {
+        let fs = TmpFileSystem::new();
+        let file = fs
+            .root_inode()
+            .create(
+                "elf",
+                InodeFileType::Regular,
+                InodeMode::from_bits_truncate(0o600),
+            )
+            .unwrap();
+        file.write_at(0, b"old version", false).unwrap();
+        let old = file.snapshot(11).unwrap();
+        assert_eq!(file.snapshot(10).unwrap_err(), code::EFBIG);
+        file.write_at(0, b"new version", false).unwrap();
+        file.resize(3).unwrap();
+        assert_eq!(old, b"old version");
+        assert_eq!(file.snapshot(11).unwrap(), b"new");
+        assert_eq!(fs.root_inode().snapshot(11).unwrap_err(), code::ENOTSUP);
+    }
+
+    #[test]
+    fn snapshots_do_not_mix_concurrent_file_versions() {
+        let fs = TmpFileSystem::new();
+        let file = fs
+            .root_inode()
+            .create(
+                "elf",
+                InodeFileType::Regular,
+                InodeMode::from_bits_truncate(0o600),
+            )
+            .unwrap();
+        file.write_at(0, &alloc::vec![1;4096], false).unwrap();
+        let done = Arc::new(AtomicUsize::new(0));
+        let worker_done = done.clone();
+        let writer = file.clone();
+        let worker = crate::thread::spawn(move || {
+            for version in 1..=32u8 {
+                writer
+                    .write_at(0, &alloc::vec![version;4096], false)
+                    .unwrap();
+            }
+            worker_done.store(1, Ordering::Release);
+            crate::sync::atomic_wake(&worker_done, usize::MAX).ignore_result();
+        });
+        assert!(worker.is_some());
+        for _ in 0..32 {
+            let bytes = file.snapshot(4096).unwrap();
+            assert_eq!(bytes.len(), 4096);
+            assert!(bytes.iter().all(|b| *b == bytes[0]));
+        }
+        while done.load(Ordering::Acquire) == 0 {
+            crate::sync::atomic_wait(&done, 0, crate::time::Tick::MAX).ignore_result();
+        }
     }
 }

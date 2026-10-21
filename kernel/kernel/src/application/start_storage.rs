@@ -43,9 +43,11 @@ use crate::application::publication::KernelLinkReceipt;
 pub enum StartStorageError {
     OutOfMemory,
     MissingEntry,
+    InvalidAddress,
 }
 
 /// Owned, pinned application start storage.
+#[must_use = "keep the startup buffers alive through application exit"]
 pub struct ApplicationStartStorage {
     _argv_bytes: Box<[u8]>,
     _envp_bytes: Box<[u8]>,
@@ -223,12 +225,19 @@ fn nul_terminated(bytes: &[u8]) -> Result<Box<[u8]>, StartStorageError> {
 
 /// Flatten an init/fini plan into a boxed array of runtime function addresses
 /// (Thumb bit preserved on ARM).
-fn build_plan_targets(plan: &[usize]) -> Result<Box<[usize]>, StartStorageError> {
+pub(crate) fn build_plan_targets(
+    plan: &[blueos_loader::LifecycleEntry],
+) -> Result<Box<[usize]>, StartStorageError> {
     let mut targets = Vec::new();
     targets
         .try_reserve_exact(plan.len())
         .map_err(|_| StartStorageError::OutOfMemory)?;
-    targets.extend_from_slice(plan);
+    for address in plan {
+        targets.push(
+            usize::try_from(address.function().get())
+                .map_err(|_| StartStorageError::InvalidAddress)?,
+        );
+    }
     Ok(targets.into_boxed_slice())
 }
 
@@ -248,12 +257,12 @@ fn build_auxv(
     // `usize` after the canonical range check.
     auxv.push(BlueOsAuxvEntry {
         key: auxv::AT_ENTRY,
-        value: entry.get() as usize,
+        value: usize::try_from(entry.get()).map_err(|_| StartStorageError::InvalidAddress)?,
     });
     if let Some(phdr) = program_headers.0 {
         auxv.push(BlueOsAuxvEntry {
             key: auxv::AT_PHDR,
-            value: phdr.get() as usize,
+            value: usize::try_from(phdr.get()).map_err(|_| StartStorageError::InvalidAddress)?,
         });
     }
     auxv.push(BlueOsAuxvEntry {
@@ -266,7 +275,7 @@ fn build_auxv(
     });
     auxv.push(BlueOsAuxvEntry {
         key: auxv::AT_PAGESZ,
-        value: page_granule as usize,
+        value: usize::try_from(page_granule).map_err(|_| StartStorageError::InvalidAddress)?,
     });
     auxv.push(BlueOsAuxvEntry {
         key: auxv::AT_EXECFN,

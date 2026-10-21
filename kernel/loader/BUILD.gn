@@ -17,7 +17,8 @@ import("//build/templates/build_template.gni")
 import("//build/toolchain/blueos.gni")
 
 # Keep the full unit-test image on QEMU boards with room for the loader's
-# fixtures and debug code. Physical boards retain the integration tests.
+# fixtures and debug code. Loader integration tests and shared CI checks
+# require dynamic_loader.
 _loader_unittest_boards = [
   "qemu_mps2_an385",
   "qemu_mps3_an547",
@@ -30,9 +31,14 @@ _loader_unittest_enabled =
 
 group("check_loader") {
   testonly = true
-  deps = [ "tests:run_loader_integration_test" ]
-  if (_loader_unittest_enabled) {
-    deps += [ ":run_loader_unittest" ]
+  deps = []
+
+  # Shared board CI invokes this group even on static configurations.
+  if (dynamic_loader) {
+    deps = [ "tests:run_loader_integration_test" ]
+    if (_loader_unittest_enabled) {
+      deps += [ ":run_loader_unittest" ]
+    }
   }
 }
 
@@ -121,11 +127,14 @@ if (_loader_unittest_enabled) {
 
 group("check_loader_by_clippy") {
   testonly = true
-  deps = [
-    ":blueos_loader_clippy",
-    "tests/integration_test:loader_integration_test_clippy",
-  ]
-  if (_loader_unittest_enabled) {
-    deps += [ ":loader_unittest_clippy" ]
+  deps = []
+  if (dynamic_loader) {
+    deps = [
+      ":blueos_loader_clippy",
+      "tests/integration_test:loader_integration_test_clippy",
+    ]
+    if (_loader_unittest_enabled) {
+      deps += [ ":loader_unittest_clippy" ]
+    }
   }
 }

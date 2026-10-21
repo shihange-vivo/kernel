@@ -22,6 +22,7 @@ pub mod code {
     pub const FALSE: super::Error = super::Error(0);
     pub const ERROR: super::Error = super::Error(-255);
     pub const ETIMEDOUT: super::Error = super::Error(-libc::ETIMEDOUT);
+    pub const EFBIG: super::Error = super::Error(-libc::EFBIG);
     pub const ENOSPC: super::Error = super::Error(-libc::ENOSPC);
     pub const ENODATA: super::Error = super::Error(-libc::ENODATA);
     pub const ENOMEM: super::Error = super::Error(-libc::ENOMEM);

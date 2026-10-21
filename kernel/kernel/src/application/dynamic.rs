@@ -54,17 +54,21 @@ fn token() -> Result<usize> {
         .map_err(|_| libc::EOVERFLOW)
 }
 
+#[must_use = "namespace objects retain mapped providers"]
 struct Object {
     handle: usize,
     descriptor: ImageHandle,
+    pin: super::repository::KernelImagePin,
     global: bool,
     opens: usize,
     // Root-first BFS closure for dlsym(handle), independent of global scope.
     lookup: Vec<ImageHandle>,
 }
 
+#[must_use = "the link worker needs owned namespace pins"]
 pub(crate) struct ExistingImage {
     descriptor: ImageHandle,
+    pin: super::repository::KernelImagePin,
     global: bool,
     batch: usize,
 }
@@ -175,6 +179,7 @@ impl RuntimeNamespace {
             base.push(Object {
                 handle: token()?,
                 descriptor: image.clone(),
+                pin: product.receipt().pin(image).map_err(|_| libc::ENOEXEC)?,
                 global: true,
                 opens: 0,
                 lookup: product.lookup_scope(image).to_vec(),
@@ -568,6 +573,7 @@ impl State {
             )
             .map(|(object, batch)| ExistingImage {
                 descriptor: object.descriptor.clone(),
+                pin: object.pin.clone(),
                 global: object.global,
                 batch,
             })
@@ -660,12 +666,9 @@ pub(crate) fn prepare_load(
     let globals = existing
         .iter()
         .filter(|image| image.global)
-        .map(|image| image.descriptor.clone())
+        .map(|image| image.descriptor.instance_id())
         .collect();
-    let imports = existing
-        .iter()
-        .map(|image| image.descriptor.clone())
-        .collect();
+    let imports = existing.iter().map(|image| image.pin.clone()).collect();
     let (product, system) = service
         .runtime_loader()
         .link_shared(namespace, path, group, imports, globals)
@@ -676,15 +679,18 @@ pub(crate) fn prepare_load(
             && product
                 .retained_images()
                 .iter()
-                .any(|provider| provider.identity() == image.descriptor.identity())
+                .any(|provider| provider.instance_id() == image.descriptor.instance_id())
             && !dependencies.contains(&image.batch)
         {
             dependencies.push(image.batch);
         }
     }
-    let init = product.startup().to_vec().into_boxed_slice();
-    let fini = product.fini().to_vec().into_boxed_slice();
-    let rollback_fini = product.rollback_fini().to_vec().into_boxed_slice();
+    let init =
+        super::start_storage::build_plan_targets(product.startup()).map_err(|_| libc::ENOEXEC)?;
+    let fini =
+        super::start_storage::build_plan_targets(product.fini()).map_err(|_| libc::ENOEXEC)?;
+    let rollback_fini = super::start_storage::build_plan_targets(product.rollback_fini())
+        .map_err(|_| libc::ENOEXEC)?;
     let mut objects = Vec::new();
     for image in product.images() {
         if existing
@@ -696,6 +702,7 @@ pub(crate) fn prepare_load(
         objects.push(Object {
             handle: token()?,
             descriptor: image.clone(),
+            pin: product.receipt().pin(image).map_err(|_| libc::ENOEXEC)?,
             global: false,
             opens: 0,
             lookup: product.lookup_scope(image).to_vec(),

@@ -325,11 +325,15 @@ impl ApplicationService {
             .collect();
 
         let root_path = namespace.root_path();
-        let product = self
+        let mut product = self
             .loader
             .link(namespace, group)
             .map_err(|error| prepare_failed("link application", &error))?;
 
+        let pending = product.receipt_mut().take_pending();
+        group
+            .install_pending_system_batch(pending)
+            .map_err(|_| ApplicationLaunchError::PrepareFailed)?;
         let granule = self.loader.memory().protection_capabilities().granule();
         let storage = ApplicationStartStorage::build(
             root_path.as_bytes(),
@@ -346,7 +350,8 @@ impl ApplicationService {
         let entry = product
             .entry()
             .ok_or(ApplicationLaunchError::PrepareFailed)?
-            .get() as usize;
+            .get();
+        let entry = usize::try_from(entry).map_err(|_| ApplicationLaunchError::PrepareFailed)?;
         let runtime = super::dynamic::RuntimeNamespace::new(namespace.clone(), &product)
             .map_err(|_| ApplicationLaunchError::PrepareFailed)?;
         group.install_runtime(runtime);

@@ -19,7 +19,11 @@
 //! This module defines the public memory API and the internal transaction log.
 
 pub(crate) mod address;
-pub(crate) mod cache;
+pub mod cache;
+pub use cache::{
+    CacheMaintenance, CacheRequirements, CacheSync, CodeCache, CoherentCodeCache, ExecutionScope,
+    PreparedCacheSync,
+};
 mod mapper;
 
 use alloc::vec::Vec;
@@ -251,6 +255,9 @@ impl AllocationOffset {
 /// descriptor that does not match it; multi-image backends key allocations by
 /// `AllocationId` and may serve many at once.
 pub trait ImageMemory {
+    /// Execution address space served by this memory handle.
+    fn execution_domain(&self) -> crate::ExecutionDomainId;
+
     /// Allocate or borrow exactly the logical range requested by the loader.
     /// Returning `Err` must leave no allocation behind. On success the
     /// backend returns the unique allocation lease; the loader transfers it
@@ -266,15 +273,13 @@ pub trait ImageMemory {
     /// lifetime. Borrowed-fixed contents are not restored or poisoned.
     fn release_committed(&mut self, allocation: AllocationLease);
 
-    /// Return a host pointer covering `allocation[offset..offset+len]`.
-    /// The descriptor must name an allocation this backend currently
-    /// tracks; otherwise an error is returned.
-    fn image_span(
+    /// Validate access without requiring a host-accessible target pointer.
+    fn validate_range(
         &self,
         allocation: &ImageAllocation,
         offset: AllocationOffset,
         len: u64,
-    ) -> LoadResult<*mut u8>;
+    ) -> LoadResult<()>;
 
     fn write(
         &mut self,
@@ -530,11 +535,8 @@ impl<M: ImageMemory> ImageLoadTransaction<M> {
         self.memory.zero(&allocation, offset, len)
     }
 
-    /// Owner-bound wrapper around `ImageMemory::image_span`. The returned
-    /// pointer borrows the backend; it must not escape the caller.
-    pub(crate) fn image_span(&self, offset: AllocationOffset, len: u64) -> LoadResult<*mut u8> {
-        let allocation = *self.allocation();
-        self.memory.image_span(&allocation, offset, len)
+    pub(crate) fn validate_range(&self, offset: AllocationOffset, len: u64) -> LoadResult<()> {
+        self.memory.validate_range(self.allocation(), offset, len)
     }
 }
 
@@ -581,13 +583,16 @@ impl<M: ImageMemory + ?Sized> ImageMemory for &mut M {
         (**self).release_committed(allocation)
     }
 
-    fn image_span(
+    fn execution_domain(&self) -> crate::ExecutionDomainId {
+        (**self).execution_domain()
+    }
+    fn validate_range(
         &self,
         allocation: &ImageAllocation,
         offset: AllocationOffset,
         len: u64,
-    ) -> LoadResult<*mut u8> {
-        (**self).image_span(allocation, offset, len)
+    ) -> LoadResult<()> {
+        (**self).validate_range(allocation, offset, len)
     }
 
     fn write(

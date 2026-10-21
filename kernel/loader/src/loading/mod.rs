@@ -15,20 +15,27 @@
 //! Complete-load orchestration and the host-facing API.
 //!
 //! Read `load` first: it connects dependency planning, atomic host acquisition,
-//! image mapping, linking, publication and backend installation. `backend` defines
-//! host services; `planning` resolves sources and reusable snapshots;
+//! image mapping, linking and publication. `source` and `repository` define
+//! independent host capabilities; `planning` resolves sources and pinned snapshots;
 //! `materialize` maps its indexed plan without rediscovering dependencies;
 //! `publication` transfers allocations; `loaded` assembles result metadata.
 //! ELF loading and linking algorithms live in `image` and `dynamic_linker`.
 
-mod backend;
 mod load;
 mod loaded;
 pub(crate) mod materialize;
 pub(crate) mod planning;
 mod publication;
+mod repository;
+mod source;
 
-pub use backend::LoaderBackend;
-pub use load::{load, LoadRequest};
-pub use loaded::{ImageDependency, ImageHandle, LoadedImage};
-pub use publication::{CommittedAllocations, Publication};
+pub use load::{load, prepare_load, LoadRequest, LoadServices};
+pub use loaded::{ImageDependency, ImageHandle, LifecycleEntry, LoadedImage};
+pub use publication::{
+    LoadPublisher, LoadResources, PreparedLoad, PublicationManifest, RetainResources,
+};
+pub use repository::{
+    ImageCandidate, ImagePin, ImageRepository, LoadReservation, LocalPin, LocalRepository,
+    LocalReservation, NamespaceSnapshot, ReservedImage,
+};
+pub use source::{ArtifactInfo, ArtifactResolver, OpenedArtifact};

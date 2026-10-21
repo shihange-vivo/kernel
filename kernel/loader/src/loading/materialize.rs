@@ -33,7 +33,7 @@ use crate::{
     memory::{AllocationRollbackGuard, AllocationRollbackLog, ImageMemory},
     profile::{LoadProfile, SessionLimits},
     reader::ElfReader,
-    relocation::{ArchRelocator, NativeRelocator},
+    relocation::{ArchRelocator, ProfileRelocator},
     trace::LoadEvent,
     ImageHandle, LoadError, LoadResult,
 };
@@ -46,9 +46,9 @@ pub(crate) fn load_images<'m, S, R: ElfReader, M: ImageMemory + ?Sized>(
     limits: SessionLimits,
     memory: &'m mut M,
     mut observe: impl FnMut(LoadEvent<'_>),
-) -> LoadResult<LoadedSession<'m, M, NativeRelocator>> {
-    if NativeRelocator.machine() != profile.machine() || NativeRelocator.class() != profile.class()
-    {
+) -> LoadResult<LoadedSession<'m, M, ProfileRelocator>> {
+    let arch = ProfileRelocator::new(profile)?;
+    if arch.machine() != profile.machine() || arch.class() != profile.class() {
         return Err(
             LoadError::new(LoadErrorKind::UnsupportedByProfile, ErrorContext::None)
                 .at_stage(LoadStage::Beginning),
@@ -63,7 +63,7 @@ pub(crate) fn load_images<'m, S, R: ElfReader, M: ImageMemory + ?Sized>(
         limits,
         usage: SessionUsage::default(),
         profile,
-        arch: NativeRelocator,
+        arch,
         state: LoadedState {
             images: Vec::new(),
             imported: Vec::new(),
@@ -77,7 +77,7 @@ pub(crate) fn load_images<'m, S, R: ElfReader, M: ImageMemory + ?Sized>(
     let root = plan.images.first_mut().ok_or_else(invalid)?;
     let provider = providers
         .iter()
-        .find(|image| image.identity() == root.identity.as_bytes());
+        .find(|image| Some(image.instance_id()) == root.instance && image.key() == root.info.key());
     ids[0] = Some(
         load_image(&mut session, root, provider, None, &mut observe)
             .map_err(|error| error.at_stage(LoadStage::Beginning))?,
@@ -117,9 +117,9 @@ pub(crate) fn load_images<'m, S, R: ElfReader, M: ImageMemory + ?Sized>(
             });
             id
         } else {
-            let provider = providers
-                .iter()
-                .find(|provider| provider.identity() == image.identity.as_bytes());
+            let provider = providers.iter().find(|provider| {
+                Some(provider.instance_id()) == image.instance && provider.key() == image.info.key()
+            });
             load_image(
                 &mut session,
                 image,
@@ -138,7 +138,7 @@ pub(crate) fn load_images<'m, S, R: ElfReader, M: ImageMemory + ?Sized>(
 }
 
 fn insert_node<S, R, M: ImageMemory + ?Sized>(
-    session: &mut LoadedSession<'_, M, NativeRelocator>,
+    session: &mut LoadedSession<'_, M, ProfileRelocator>,
     image: &PlannedImage<S, R>,
     ownership: ImageOwnership,
     soname: Option<DependencyName>,
@@ -154,7 +154,7 @@ fn insert_node<S, R, M: ImageMemory + ?Sized>(
 }
 
 fn load_image<S, R: ElfReader, M: ImageMemory + ?Sized>(
-    session: &mut LoadedSession<'_, M, NativeRelocator>,
+    session: &mut LoadedSession<'_, M, ProfileRelocator>,
     image: &mut PlannedImage<S, R>,
     provider: Option<&ImageHandle>,
     parent: Option<(ImageId, &DependencyName, u16)>,
@@ -233,6 +233,12 @@ fn load_image<S, R: ElfReader, M: ImageMemory + ?Sized>(
     session.state.images.push(SessionImage {
         image_id: id,
         role: image.scanned.role,
+        publication: Some(crate::dynamic_linker::PublicationIdentity {
+            key: image.info.key().clone(),
+            instance: image.instance.ok_or_else(invalid)?,
+            artifact: image.artifact,
+            domain: session.rollback.memory.execution_domain(),
+        }),
         allocation,
         state: runtime,
     });
@@ -240,7 +246,7 @@ fn load_image<S, R: ElfReader, M: ImageMemory + ?Sized>(
 }
 
 fn import_global<M: ImageMemory + ?Sized>(
-    session: &mut LoadedSession<'_, M, NativeRelocator>,
+    session: &mut LoadedSession<'_, M, ProfileRelocator>,
     image: &ImageHandle,
 ) -> LoadResult<ImageId> {
     let (descriptor, ownership) = image.imported().into_parts();

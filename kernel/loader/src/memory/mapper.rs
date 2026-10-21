@@ -82,6 +82,7 @@ impl MemoryRegion {
 
 /// A memory backend for one image, with optional authorized fixed regions.
 #[derive(Debug)]
+#[must_use = "keep the memory backing alive while image allocations exist"]
 pub struct MemoryMapper {
     mem: Storage,
     regions: &'static [MemoryRegion],
@@ -216,7 +217,67 @@ impl MemoryMapper {
     }
 }
 
+impl MemoryMapper {
+    fn image_span(
+        &self,
+        allocation: &ImageAllocation,
+        offset: AllocationOffset,
+        len: u64,
+    ) -> LoadResult<*mut u8> {
+        self.expect_active_allocation(allocation, offset, len)?;
+        let end = offset
+            .value()
+            .checked_add(len)
+            .filter(|end| *end <= allocation.len())
+            .ok_or_else(|| memory_access_error(*allocation, offset, len))?;
+        let offset_usize = usize::try_from(offset.value())
+            .map_err(|_| memory_access_error(*allocation, offset, len))?;
+        let end =
+            usize::try_from(end).map_err(|_| memory_access_error(*allocation, offset, len))?;
+        match allocation.ownership() {
+            AllocationOwnership::Owned => {
+                let base = self.mem.base();
+                if base.is_null() || self.mem.size() < end {
+                    return Err(memory_access_error(*allocation, offset, len));
+                };
+                Ok(unsafe { base.add(offset_usize) })
+            }
+            // Fixed images already validated their span against the static
+            // regions at allocation time; the offset bounds check above keeps
+            // accesses inside the recorded allocation.
+            AllocationOwnership::BorrowedFixed => {
+                let base = usize::try_from(allocation.base().get())
+                    .map_err(|_| memory_access_error(*allocation, offset, len))?;
+                let address = base
+                    .checked_add(offset_usize)
+                    .ok_or_else(|| memory_access_error(*allocation, offset, len))?;
+                Ok(address as *mut u8)
+            }
+        }
+    }
+}
+
 impl ImageMemory for MemoryMapper {
+    fn execution_domain(&self) -> crate::ExecutionDomainId {
+        crate::ExecutionDomainId::FLAT
+    }
+    fn read(
+        &self,
+        allocation: &ImageAllocation,
+        offset: AllocationOffset,
+        dst: &mut [u8],
+    ) -> LoadResult<()> {
+        let len = u64::try_from(dst.len())
+            .map_err(|_| memory_access_error(*allocation, offset, u64::MAX))?;
+        let source = self.image_span(allocation, offset, len)?;
+        if !dst.is_empty() {
+            unsafe {
+                core::ptr::copy_nonoverlapping(source, dst.as_mut_ptr(), dst.len());
+            }
+        }
+        Ok(())
+    }
+
     fn allocate_image(&mut self, request: AllocationRequest) -> LoadResult<AllocationLease> {
         if self.poisoned.is_some() || self.allocation.is_some() {
             return Err(allocation_error(&request));
@@ -293,59 +354,13 @@ impl ImageMemory for MemoryMapper {
         self.release_lease(allocation, false);
     }
 
-    fn image_span(
+    fn validate_range(
         &self,
         allocation: &ImageAllocation,
         offset: AllocationOffset,
         len: u64,
-    ) -> LoadResult<*mut u8> {
-        self.expect_active_allocation(allocation, offset, len)?;
-        let end = offset
-            .value()
-            .checked_add(len)
-            .filter(|end| *end <= allocation.len())
-            .ok_or_else(|| memory_access_error(*allocation, offset, len))?;
-        let offset_usize = usize::try_from(offset.value())
-            .map_err(|_| memory_access_error(*allocation, offset, len))?;
-        let end =
-            usize::try_from(end).map_err(|_| memory_access_error(*allocation, offset, len))?;
-        match allocation.ownership() {
-            AllocationOwnership::Owned => {
-                let base = self.mem.base();
-                if base.is_null() || self.mem.size() < end {
-                    return Err(memory_access_error(*allocation, offset, len));
-                };
-                Ok(unsafe { base.add(offset_usize) })
-            }
-            // Fixed images already validated their span against the static
-            // regions at allocation time; the offset bounds check above keeps
-            // accesses inside the recorded allocation.
-            AllocationOwnership::BorrowedFixed => {
-                let base = usize::try_from(allocation.base().get())
-                    .map_err(|_| memory_access_error(*allocation, offset, len))?;
-                let address = base
-                    .checked_add(offset_usize)
-                    .ok_or_else(|| memory_access_error(*allocation, offset, len))?;
-                Ok(address as *mut u8)
-            }
-        }
-    }
-
-    fn read(
-        &self,
-        allocation: &ImageAllocation,
-        offset: AllocationOffset,
-        dst: &mut [u8],
     ) -> LoadResult<()> {
-        let len = u64::try_from(dst.len())
-            .map_err(|_| memory_access_error(*allocation, offset, u64::MAX))?;
-        let source = self.image_span(allocation, offset, len)?;
-        if !dst.is_empty() {
-            unsafe {
-                core::ptr::copy_nonoverlapping(source, dst.as_mut_ptr(), dst.len());
-            }
-        }
-        Ok(())
+        self.image_span(allocation, offset, len).map(|_| ())
     }
 
     fn write(

@@ -43,6 +43,21 @@ impl ImageHandle {
         Self { descriptor, shared }
     }
 
+    pub fn profile(&self) -> crate::profile::LoadProfile {
+        self.descriptor.snapshot().profile()
+    }
+    pub fn key(&self) -> &crate::ImageKey {
+        &self.descriptor.snapshot().key
+    }
+    pub fn instance_id(&self) -> crate::ImageInstanceId {
+        self.descriptor.snapshot().instance
+    }
+    pub fn artifact_id(&self) -> crate::ArtifactId {
+        self.descriptor.snapshot().artifact
+    }
+    pub fn execution_domain(&self) -> crate::ExecutionDomainId {
+        self.descriptor.snapshot().domain
+    }
     pub fn identity(&self) -> &[u8] {
         self.descriptor.identity().as_bytes()
     }
@@ -66,22 +81,37 @@ impl ImageHandle {
     }
 }
 
+/// A validated constructor/destructor target tied to its exact mapped owner.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct LifecycleEntry {
+    owner: crate::ImageInstanceId,
+    function: TargetAddress,
+}
+impl LifecycleEntry {
+    pub const fn owner(&self) -> crate::ImageInstanceId {
+        self.owner
+    }
+    pub const fn function(&self) -> TargetAddress {
+        self.function
+    }
+}
+
 struct ImageFacts {
     handle: ImageHandle,
     newly_loaded: bool,
     lookup: Vec<ImageHandle>,
     component: Vec<ImageHandle>,
     dependencies: Vec<ImageHandle>,
-    fini: Vec<usize>,
+    fini: Vec<LifecycleEntry>,
 }
 
 pub(crate) struct LoadFacts {
     pub(crate) entry: Option<TargetAddress>,
     images: Vec<ImageFacts>,
-    retained: Vec<ImageHandle>,
-    startup: Vec<usize>,
-    fini: Vec<usize>,
-    rollback_fini: Vec<usize>,
+    pub(crate) retained: Vec<ImageHandle>,
+    startup: Vec<LifecycleEntry>,
+    fini: Vec<LifecycleEntry>,
+    rollback_fini: Vec<LifecycleEntry>,
 }
 
 impl LoadFacts {
@@ -91,23 +121,23 @@ impl LoadFacts {
             + self.images.capacity() * core::mem::size_of::<ImageFacts>()
             + self.retained.capacity() * handle_bytes
             + (self.startup.capacity() + self.fini.capacity() + self.rollback_fini.capacity())
-                * core::mem::size_of::<usize>();
+                * core::mem::size_of::<LifecycleEntry>();
         for image in &self.images {
             bytes += (image.lookup.capacity()
                 + image.component.capacity()
                 + image.dependencies.capacity())
                 * handle_bytes;
-            bytes += image.fini.capacity() * core::mem::size_of::<usize>();
+            bytes += image.fini.capacity() * core::mem::size_of::<LifecycleEntry>();
         }
         bytes as u64
     }
 }
 
-/// A complete load with kernel-owned resource lifetime and opaque image metadata.
+/// A complete load with host-owned resource lifetime and opaque image metadata.
 #[must_use = "the publication receipt must be installed or released"]
 pub struct LoadedImage<Receipt> {
-    receipt: Receipt,
-    facts: LoadFacts,
+    pub(crate) receipt: Receipt,
+    pub(crate) facts: LoadFacts,
 }
 
 impl<Receipt> LoadedImage<Receipt> {
@@ -119,6 +149,9 @@ impl<Receipt> LoadedImage<Receipt> {
     pub fn entry(&self) -> Option<TargetAddress> {
         self.facts.entry
     }
+    pub fn is_executable(&self) -> bool {
+        self.facts.entry.is_some()
+    }
     /// The complete requested closure in root-first breadth-first order.
     pub fn images(&self) -> impl Iterator<Item = &ImageHandle> {
         self.facts.images.iter().map(|image| &image.handle)
@@ -128,13 +161,13 @@ impl<Receipt> LoadedImage<Receipt> {
     pub fn retained_images(&self) -> &[ImageHandle] {
         &self.facts.retained
     }
-    pub fn startup(&self) -> &[usize] {
+    pub fn startup(&self) -> &[LifecycleEntry] {
         &self.facts.startup
     }
-    pub fn fini(&self) -> &[usize] {
+    pub fn fini(&self) -> &[LifecycleEntry] {
         &self.facts.fini
     }
-    pub fn rollback_fini(&self) -> &[usize] {
+    pub fn rollback_fini(&self) -> &[LifecycleEntry] {
         &self.facts.rollback_fini
     }
     pub fn is_new(&self, image: &ImageHandle) -> bool {
@@ -164,7 +197,7 @@ impl<Receipt> LoadedImage<Receipt> {
             .unwrap_or(&[])
     }
     /// Validated destructors owned by a newly loaded shared instance.
-    pub fn image_fini(&self, image: &ImageHandle) -> &[usize] {
+    pub fn image_fini(&self, image: &ImageHandle) -> &[LifecycleEntry] {
         self.image_facts(image)
             .map(|facts| facts.fini.as_slice())
             .unwrap_or(&[])
@@ -178,6 +211,9 @@ impl<Receipt> LoadedImage<Receipt> {
             headers.count(),
         )
     }
+    pub fn receipt(&self) -> &Receipt {
+        &self.receipt
+    }
     pub fn receipt_mut(&mut self) -> &mut Receipt {
         &mut self.receipt
     }
@@ -188,7 +224,7 @@ impl<Receipt> LoadedImage<Receipt> {
         self.facts
             .images
             .iter()
-            .find(|facts| facts.handle.identity() == image.identity())
+            .find(|facts| facts.handle.instance_id() == image.instance_id())
     }
 }
 
@@ -327,7 +363,7 @@ pub(crate) fn build_facts<S, R>(
             .iter()
             .find(|plan| plan.owner() == image.owner())
         {
-            copy_targets(&mut fini, plan.plan().iter())?;
+            copy_targets(&mut fini, context, plan.plan().iter())?;
         }
         let newly_loaded = matches!(
             image.ownership(),
@@ -364,26 +400,34 @@ pub(crate) fn build_facts<S, R>(
             }
         }
     }
-    copy_targets(&mut facts.startup, plans.startup().iter())?;
-    copy_targets(&mut facts.fini, plans.group_fini().iter())?;
+    copy_targets(&mut facts.startup, context, plans.startup().iter())?;
+    copy_targets(&mut facts.fini, context, plans.group_fini().iter())?;
     facts
         .rollback_fini
         .try_reserve_exact(facts.fini.len())
         .map_err(|_| oom())?;
     facts.rollback_fini.extend_from_slice(&facts.fini);
     for plan in plans.system_fini() {
-        copy_targets(&mut facts.rollback_fini, plan.plan().iter())?;
+        copy_targets(&mut facts.rollback_fini, context, plan.plan().iter())?;
     }
     Ok(facts)
 }
 
 fn copy_targets<'a>(
-    out: &mut Vec<usize>,
+    out: &mut Vec<LifecycleEntry>,
+    context: &LinkContext,
     entries: impl Iterator<Item = &'a crate::dynamic_linker::LifecycleEntry>,
 ) -> LoadResult<()> {
     for entry in entries {
         out.try_reserve(1).map_err(|_| oom())?;
-        out.push(entry.function().get() as usize);
+        let owner = context
+            .images()
+            .get(entry.owner().get() as usize)
+            .ok_or_else(invalid)?;
+        out.push(LifecycleEntry {
+            owner: owner.descriptor().snapshot().instance,
+            function: entry.function(),
+        });
     }
     Ok(())
 }

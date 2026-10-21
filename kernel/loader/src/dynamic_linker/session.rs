@@ -36,8 +36,9 @@ use crate::{
     error::{ErrorContext, LoadErrorKind, LoadStage},
     image::{PreparedProtectionPlan, ProtectionBatch, SealPlan},
     memory::{
-        address::TargetAddress, cache::ArchitectureCodeCache, AllocationRollbackGuard, ImageMemory,
-        ImageProtectionMemory, SessionAllocation,
+        address::TargetAddress,
+        cache::{CacheRequirements, CodeCache},
+        AllocationRollbackGuard, ImageMemory, ImageProtectionMemory, SessionAllocation,
     },
     profile::{LoadProfile, SessionLimits},
     relocation::ArchRelocator,
@@ -115,6 +116,7 @@ impl SessionUsage {
 pub(crate) struct SessionImage {
     pub(crate) image_id: ImageId,
     pub(crate) role: ArtifactRole,
+    pub(crate) publication: Option<crate::dynamic_linker::PublicationIdentity>,
     pub(crate) allocation: SessionAllocation,
     pub(crate) state: RuntimeImageState,
 }
@@ -367,9 +369,9 @@ impl<'a, M: ImageProtectionMemory + ?Sized, A: ArchRelocator> RelocatedSession<'
     /// Every logical seal plan, backend protection plan and executable range
     /// is prepared before the first cache/protection mutation. Publication is
     /// available only on the returned [`SealedSession`].
-    pub(crate) fn seal(
+    pub(crate) fn seal<C: CodeCache + ?Sized>(
         mut self,
-        cache: &mut ArchitectureCodeCache,
+        cache: &mut C,
     ) -> LoadResult<SealedSession<'a, M, A>> {
         let image_count = self.state.images.len();
         let total_executable_ranges =
@@ -432,9 +434,10 @@ impl<'a, M: ImageProtectionMemory + ?Sized, A: ArchRelocator> RelocatedSession<'
             prepared_seals.push(prepared);
         }
 
-        let requirements = cache.requirements();
+        let required_scope = cache.required_scope();
+        let requirements = CacheRequirements::new(required_scope);
         let prepared_cache = cache
-            .prepare(&executable_ranges)
+            .prepare(&executable_ranges, required_scope)
             .map_err(|error| error.at_stage(LoadStage::LinkSeal))?;
         requirements
             .validate_prepared(&executable_ranges, &prepared_cache)
@@ -593,6 +596,43 @@ impl<M: ImageMemory + ?Sized, A: ArchRelocator> SealedSession<'_, M, A> {
         slots.try_reserve_exact(total).map_err(|_| publish_oom())?;
         slots.resize_with(total, || None);
 
+        let mut identities = Vec::new();
+        identities
+            .try_reserve_exact(total)
+            .map_err(|_| publish_oom())?;
+        identities.resize_with(total, || None);
+        let mut images = images;
+        for image in &mut images {
+            let identity = match image.publication.take() {
+                Some(identity) => identity,
+                None => {
+                    let node = graph.node(image.image_id).ok_or_else(publish_invalid)?;
+                    crate::dynamic_linker::PublicationIdentity::fresh(
+                        node.artifact().as_bytes(),
+                        rollback.memory.execution_domain(),
+                    )?
+                }
+            };
+            identities[image.image_id.get() as usize] = Some(identity);
+        }
+        for image in &imported {
+            let snapshot = image.descriptor.snapshot();
+            identities[image.image_id.get() as usize] =
+                Some(crate::dynamic_linker::PublicationIdentity {
+                    instance: snapshot.instance,
+                    artifact: snapshot.artifact,
+                    key: snapshot.key.clone(),
+                    domain: snapshot.domain,
+                });
+        }
+        let mut instances = Vec::new();
+        instances
+            .try_reserve_exact(total)
+            .map_err(|_| publish_oom())?;
+        for identity in &identities {
+            instances.push(identity.as_ref().ok_or_else(publish_invalid)?.instance);
+        }
+
         let mut snapshot_bytes = 0u64;
         for image in images {
             let node = graph.node(image.image_id).ok_or_else(publish_invalid)?;
@@ -617,9 +657,17 @@ impl<M: ImageMemory + ?Sized, A: ArchRelocator> SealedSession<'_, M, A> {
                         provider.ownership(),
                         ImageOwnership::SystemCandidate | ImageOwnership::ExternalReady
                     ),
+                    instances[edge.provider().get() as usize],
                 ));
             }
-            let snapshot = PublishedLoadSnapshot::new(profile, image.role, dependencies);
+            let snapshot = PublishedLoadSnapshot::new(
+                profile,
+                image.role,
+                dependencies,
+                identities[image.image_id.get() as usize]
+                    .take()
+                    .ok_or_else(publish_invalid)?,
+            );
             snapshot_bytes = snapshot_bytes
                 .checked_add(snapshot.metadata_bytes())
                 .ok_or_else(session_overflow)?;

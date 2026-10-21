@@ -12,34 +12,26 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Kernel services for the loader's complete-load interface.
-//! File policy, backing ownership and registry state stay in the kernel;
-//! dependency graphs, binding decisions and lifecycle plans stay in the loader.
-
-use crate::application::{
+//! Assemble independent loader capabilities. Runtime installation belongs to the caller.
+use super::{
     adapters::{
-        flat_memory::FlatImageMemory,
-        resolver::{KernelSource, NamespaceSourceResolver},
-        system_paths::{SystemLibraryKey, SystemLibraryPaths},
-        vfs_reader::VfsElfReader,
+        code_cache::ArchitectureCodeCache, flat_memory::FlatImageMemory,
+        resolver::NamespaceSourceResolver, system_paths::SystemLibraryPaths,
     },
-    group::{GroupState, ThreadGroup},
+    group::ThreadGroup,
     namespace::ApplicationNamespace,
-    publication::{KernelLinkPreparedBatch, KernelLinkPublisher, KernelLinkReceipt},
-    registry::{
-        AcquireBatchOutcome, LoadPermit, PreparedSystemBatch, SystemCandidateBacking,
-        SystemDsoLease, SystemDsoRegistry, SystemInitBatch, SystemSnapshotOutcome,
-    },
+    publication::{KernelLinkPublisher, KernelLinkReceipt},
+    registry::{SystemDsoRegistry, SystemInitBatch},
+    repository::{KernelImagePin, KernelImageRepository},
     trace,
 };
 use alloc::vec::Vec;
 use blueos_loader::{
     error::{ErrorContext, LoadErrorKind},
     load,
-    memory::ImageMemory,
+    memory::CacheRequirements,
     profile::SessionLimits,
-    CommittedAllocations, ImageDependency, ImageHandle, LoadError, LoadRequest, LoadResult,
-    LoadedImage, LoaderBackend, Publication,
+    ImagePin, LoadError, LoadRequest, LoadResult, LoadServices, LoadedImage, NamespaceSnapshot,
 };
 
 pub struct ApplicationLoader {
@@ -47,7 +39,6 @@ pub struct ApplicationLoader {
     registry: SystemDsoRegistry,
     memory: FlatImageMemory,
 }
-
 impl ApplicationLoader {
     pub fn new(
         catalog: &'static SystemLibraryPaths,
@@ -69,17 +60,18 @@ impl ApplicationLoader {
     pub fn memory(&self) -> &FlatImageMemory {
         &self.memory
     }
-
     pub fn link(
         &self,
         namespace: &ApplicationNamespace,
         group: &ThreadGroup,
     ) -> LoadResult<LoadedImage<KernelLinkReceipt>> {
-        let mut backend = KernelLoaderBackend::new(self, namespace, group, false, Vec::new());
-        let source = backend.files.root(namespace.root_path(), true);
-        load(
-            LoadRequest::executable(source, namespace.profile(), SessionLimits::DEFAULT),
-            &mut backend,
+        self.link_inner(
+            namespace,
+            namespace.root_path(),
+            group,
+            false,
+            Vec::new(),
+            Vec::new(),
         )
     }
     pub(crate) fn link_shared(
@@ -87,318 +79,120 @@ impl ApplicationLoader {
         namespace: &ApplicationNamespace,
         path: &str,
         group: &ThreadGroup,
-        existing: Vec<ImageHandle>,
-        global: Vec<ImageHandle>,
+        existing: Vec<KernelImagePin>,
+        global: Vec<blueos_loader::ImageInstanceId>,
     ) -> LoadResult<(LoadedImage<KernelLinkReceipt>, SystemInitBatch)> {
-        let mut backend = KernelLoaderBackend::new(self, namespace, group, true, existing.clone());
-        let source = backend.files.root(path, false);
-        let request =
-            LoadRequest::shared_object(source, namespace.profile(), SessionLimits::DEFAULT)
-                .with_namespace(existing, global);
-        let product = load(request, &mut backend)?;
-        Ok((
-            product,
-            backend
-                .batch
-                .take()
-                .expect("completed runtime load installs its batch"),
-        ))
+        let mut product = self.link_inner(namespace, path, group, true, existing, global)?;
+        let batch = product.receipt_mut().take_pending();
+        Ok((product, batch))
     }
-}
-
-struct KernelLoaderBackend<'a> {
-    loader: &'a ApplicationLoader,
-    files: NamespaceSourceResolver<'a>,
-    group: ThreadGroup,
-    publisher: KernelLinkPublisher,
-    permits: Vec<(SystemLibraryKey, LoadPermit)>,
-    leases: Vec<SystemDsoLease>,
-    namespace_images: Vec<ImageHandle>,
-    snapshots: Vec<ImageHandle>,
-    batch: Option<SystemInitBatch>,
-    runtime: bool,
-    trace_id: usize,
-}
-
-impl<'a> KernelLoaderBackend<'a> {
-    fn new(
-        loader: &'a ApplicationLoader,
-        namespace: &'a ApplicationNamespace,
+    fn link_inner(
+        &self,
+        namespace: &ApplicationNamespace,
+        path: &str,
         group: &ThreadGroup,
-        runtime: bool,
-        namespace_images: Vec<ImageHandle>,
-    ) -> Self {
-        Self {
-            loader,
-            files: NamespaceSourceResolver::new(namespace, loader.catalog),
-            group: group.clone(),
-            publisher: KernelLinkPublisher::new(loader.memory.clone()),
-            permits: Vec::new(),
-            leases: Vec::new(),
-            namespace_images,
-            snapshots: Vec::new(),
-            batch: None,
-            runtime,
-            trace_id: trace::new_load_id(),
-        }
-    }
-
-    fn hand_off(
-        &mut self,
-        product: &mut LoadedImage<KernelLinkReceipt>,
-    ) -> LoadResult<SystemInitBatch> {
-        let images = product.receipt_mut().system_images().to_vec();
-        if self.permits.len() != images.len() {
-            return Err(loader_error());
-        }
-        // Prepare every fallible metadata copy before taking allocation ownership.
-        let mut metadata = Vec::new();
-        metadata
-            .try_reserve_exact(images.len())
-            .map_err(|_| loader_oom())?;
-        let mut relocated = Vec::new();
-        relocated
-            .try_reserve_exact(images.len())
-            .map_err(|_| loader_oom())?;
-        let mut backings = Vec::new();
-        backings
-            .try_reserve_exact(images.len())
-            .map_err(|_| loader_oom())?;
-        for image in &images {
-            let key = SystemLibraryKey::from_bytes(image.identity())?;
-            let keep_cached = self
-                .loader
-                .catalog
-                .resolve_key(&key)
-                .ok_or_else(loader_error)?
-                .keep_cached;
-            let scc_members = image_keys(product.shared_component(image))?;
-            if scc_members.is_empty() {
-                return Err(loader_error());
-            }
-            let mut dependency_keys = image_keys(product.shared_dependencies(image))?;
-            dependency_keys.sort();
-            dependency_keys.dedup();
-            let mut dependencies = Vec::new();
-            dependencies
-                .try_reserve_exact(dependency_keys.len())
-                .map_err(|_| loader_oom())?;
-            let mut fini = Vec::new();
-            fini.try_reserve_exact(product.image_fini(image).len())
-                .map_err(|_| loader_oom())?;
-            fini.extend_from_slice(product.image_fini(image));
-            metadata.push((
-                fini,
-                dependency_keys,
-                dependencies,
-                scc_members,
-                keep_cached,
-            ));
-            let index = self
-                .permits
-                .iter()
-                .position(|(candidate, _)| candidate == &key)
-                .ok_or_else(loader_error)?;
-            let (_, permit) = self.permits.swap_remove(index);
-            relocated.push(self.loader.registry.publish_relocated(permit)?);
-        }
-        let (images, allocations) = product.receipt_mut().take_system_backings();
-        for (
-            (descriptor, allocation),
-            (fini_plan, dependency_keys, dependencies, scc_members, keep_cached),
-        ) in images.into_iter().zip(allocations).zip(metadata)
+        shared: bool,
+        existing: Vec<KernelImagePin>,
+        global: Vec<blueos_loader::ImageInstanceId>,
+    ) -> LoadResult<LoadedImage<KernelLinkReceipt>> {
+        // The core can link foreign profiles into non-native memory. This host
+        // launches native threads, so retain the former native-only ABI gate here.
+        let profile = namespace.profile();
+        let native = super::board_dynamic_profile();
+        if profile.machine() != native.machine()
+            || profile.class() != native.class()
+            || profile.endian() != native.endian()
+            || profile.header_flags() != native.header_flags()
+            || profile.entry_mode() != native.entry_mode()
         {
-            backings.push(SystemCandidateBacking {
-                descriptor,
-                allocation,
-                fini_plan,
-                dependency_keys,
-                dependencies,
-                scc_members,
-                keep_cached,
-            });
+            return Err(LoadError::new(
+                LoadErrorKind::UnsupportedByProfile,
+                ErrorContext::None,
+            ));
         }
-        let result = self
-            .loader
-            .registry
-            .publish_relocated_batch(relocated, &mut backings);
-        // Failed publication leaves ownership with us; successful publication drains it.
-        if result.is_err() {
-            let mut memory = self.loader.memory.clone();
-            for backing in backings {
-                memory.release_committed(backing.allocation);
-            }
-        }
-        result
+        let mut files = NamespaceSourceResolver::new(
+            namespace,
+            self.catalog,
+            group.namespace_scope(),
+            existing.iter().map(|p| p.image().clone()).collect(),
+        );
+        let source = files.root(path, !shared)?;
+        let mut repository = KernelImageRepository::new(
+            self.registry.clone(),
+            existing.clone(),
+            self.memory.clone(),
+        );
+        let request = if shared {
+            LoadRequest::shared_object(source, namespace.profile(), SessionLimits::DEFAULT)
+        } else {
+            LoadRequest::executable(source, namespace.profile(), SessionLimits::DEFAULT)
+        };
+        let request = request.with_namespace(NamespaceSnapshot::new(existing, global)?);
+        let mut cache = ArchitectureCodeCache::new(CacheRequirements::CURRENT_EXECUTION_CONTEXT);
+        let mut observer = KernelLoadObserver {
+            group: group.clone(),
+            id: trace::new_load_id(),
+        };
+        let mut publisher =
+            KernelLinkPublisher::new(self.memory.clone(), self.registry.clone(), self.catalog);
+        load(
+            request,
+            LoadServices {
+                sources: &mut files,
+                images: &mut repository,
+                memory: self.memory.clone(),
+                cache: &mut cache,
+                observer: &mut observer,
+            },
+            &mut publisher,
+        )
     }
 }
-
-impl LoaderBackend for KernelLoaderBackend<'_> {
-    type Source = KernelSource;
-    type Reader = VfsElfReader;
-    type Memory = FlatImageMemory;
-    type PreparedPublication = KernelLinkPreparedBatch;
-    type Receipt = KernelLinkReceipt;
-
-    fn identity<'a>(&self, source: &'a KernelSource) -> &'a [u8] {
-        source.path().as_bytes()
+struct KernelLoadObserver {
+    group: ThreadGroup,
+    id: usize,
+}
+impl blueos_loader::trace::LoadObserver for KernelLoadObserver {
+    fn enabled(&self) -> bool {
+        self.id != 0
     }
-    fn is_shared(&self, source: &KernelSource) -> bool {
-        source.shared()
-    }
-    fn open(&mut self, source: &KernelSource) -> LoadResult<VfsElfReader> {
-        self.files.open(source)
-    }
-    fn snapshot(&mut self, source: &KernelSource) -> LoadResult<Option<ImageHandle>> {
-        if let Some(image) = self
-            .snapshots
-            .iter()
-            .chain(&self.namespace_images)
-            .find(|image| image.identity() == source.path().as_bytes())
-        {
-            return Ok(Some(image.clone()));
-        }
-        if !source.shared() {
-            return Ok(None);
-        }
-        self.snapshots.try_reserve(1).map_err(|_| loader_oom())?;
-        self.leases.try_reserve(1).map_err(|_| loader_oom())?;
-        loop {
-            match self
-                .loader
-                .registry
-                .snapshot(SystemLibraryKey::from_bytes(source.path().as_bytes())?)?
-            {
-                SystemSnapshotOutcome::Vacant => return Ok(None),
-                SystemSnapshotOutcome::Pending(wait) => wait.wait(),
-                SystemSnapshotOutcome::Ready(lease, image) => {
-                    self.leases.push(lease);
-                    self.snapshots.push(image.clone());
-                    return Ok(Some(image));
-                }
-            }
-        }
-    }
-    fn resolve(&mut self, requester: &KernelSource, name: &[u8]) -> LoadResult<KernelSource> {
-        self.files.resolve(requester, name, &self.namespace_images)
-    }
-    fn resolve_snapshot(&mut self, dependency: &ImageDependency) -> LoadResult<KernelSource> {
-        self.files.source_from_snapshot(dependency)
-    }
-    fn acquire(
-        &mut self,
-        sources: &[KernelSource],
-        existing: &[ImageHandle],
-    ) -> LoadResult<Vec<ImageHandle>> {
-        let mut keys = Vec::new();
-        keys.try_reserve_exact(sources.len())
-            .map_err(|_| loader_oom())?;
-        for source in sources {
-            // Constructors may dlopen while their startup batch is Initializing.
-            // Reuse its pinned handles instead of waiting for our own completion.
-            if source.shared()
-                && !existing
-                    .iter()
-                    .any(|image| image.identity() == source.path().as_bytes())
-                && !self
-                    .snapshots
-                    .iter()
-                    .any(|image| image.identity() == source.path().as_bytes())
-            {
-                keys.push(SystemLibraryKey::from_bytes(source.path().as_bytes())?);
-            }
-        }
-        keys.sort();
-        keys.dedup();
-        let PreparedSystemBatch { loads, imports } = loop {
-            match self.loader.registry.acquire_batch(&keys) {
-                AcquireBatchOutcome::Acquired(batch) => break batch,
-                AcquireBatchOutcome::Pending(wait) => wait.wait(),
-            }
-        };
-        self.permits = loads;
-        let mut handles = Vec::new();
-        handles
-            .try_reserve_exact(imports.len())
-            .map_err(|_| loader_oom())?;
-        self.leases
-            .try_reserve_exact(imports.len())
-            .map_err(|_| loader_oom())?;
-        for (_, lease, image) in imports {
-            self.leases.push(lease);
-            handles.push(image);
-        }
-        Ok(handles)
-    }
-    fn memory(&mut self) -> FlatImageMemory {
-        self.loader.memory.clone()
-    }
-    fn prepare_publication(
-        &mut self,
-        publication: &Publication,
-    ) -> LoadResult<KernelLinkPreparedBatch> {
-        if !self.runtime
-            && (self.group.state() != GroupState::New
-                || publication.imported_shared_images() != self.leases.len())
-        {
-            return Err(loader_error());
-        }
-        self.publisher
-            .import_leases(core::mem::take(&mut self.leases));
-        self.publisher.prepare(publication)
-    }
-    unsafe fn commit_publication(
-        &mut self,
-        prepared: KernelLinkPreparedBatch,
-        allocations: CommittedAllocations,
-    ) -> KernelLinkReceipt {
-        self.publisher.commit(prepared, allocations)
-    }
-    fn complete_load(&mut self, image: &mut LoadedImage<KernelLinkReceipt>) -> LoadResult<()> {
-        let batch = self.hand_off(image)?;
-        if self.runtime {
-            self.batch = Some(batch);
-        } else {
-            self.group
-                .install_pending_system_batch(batch)
-                .map_err(|_| loader_error())?;
-        }
-        Ok(())
-    }
-    fn abort_publication(&mut self, receipt: KernelLinkReceipt) {
-        drop(receipt);
-    }
-    fn cancel_load(&mut self) {
-        self.permits.clear();
-        self.leases.clear();
-        self.snapshots.clear();
-        self.publisher.cancel();
-    }
-    fn trace_enabled(&self) -> bool {
-        self.trace_id != 0
-    }
-    fn trace(&self, event: blueos_loader::trace::LoadEvent<'_>) {
+    fn observe(&mut self, event: blueos_loader::trace::LoadEvent<'_>) {
         trace::emit(trace::Event::Load {
             application: self.group.handle(),
-            operation: self.trace_id,
+            operation: self.id,
             event,
         });
     }
 }
-
-fn image_keys(images: &[ImageHandle]) -> LoadResult<Vec<SystemLibraryKey>> {
-    let mut keys = Vec::new();
-    keys.try_reserve_exact(images.len())
-        .map_err(|_| loader_oom())?;
-    for image in images {
-        keys.push(SystemLibraryKey::from_bytes(image.identity())?);
-    }
-    Ok(keys)
-}
-
-fn loader_error() -> LoadError {
+pub(crate) fn loader_error() -> LoadError {
     LoadError::new(LoadErrorKind::Backend, ErrorContext::None)
 }
-fn loader_oom() -> LoadError {
+pub(crate) fn loader_oom() -> LoadError {
     LoadError::new(LoadErrorKind::OutOfMemory, ErrorContext::None)
+}
+
+#[cfg(test)]
+mod native_profile_tests {
+    use super::*;
+    use blueos_test_macro::test;
+    #[test]
+    fn native_host_rejects_foreign_profiles_before_opening_files() {
+        static CATALOG: SystemLibraryPaths = SystemLibraryPaths::new(&[]);
+        let registry = SystemDsoRegistry::new();
+        let group = ThreadGroup::new(&registry);
+        let loader = ApplicationLoader::new(&CATALOG, registry, FlatImageMemory::new());
+        let profile = if super::super::board_dynamic_profile().machine()
+            == blueos_loader::profile::ElfMachine::Aarch64
+        {
+            blueos_loader::profile::LoadProfile::riscv64()
+        } else {
+            blueos_loader::profile::LoadProfile::aarch64()
+        };
+        let namespace =
+            ApplicationNamespace::from_launch_path("/does-not-exist", "/", profile).unwrap();
+        assert_eq!(
+            loader.link(&namespace, &group).err().unwrap().kind(),
+            LoadErrorKind::UnsupportedByProfile
+        );
+    }
 }

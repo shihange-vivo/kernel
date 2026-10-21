@@ -22,7 +22,7 @@
 //! dependency is a shared system DSO (the normalized catalog path is the
 //! registry key). Neither operation depends on the ELF carrying `DT_SONAME`.
 
-use alloc::vec::Vec;
+use alloc::{sync::Arc, vec::Vec};
 use blueos_loader::{
     error::{ErrorContext, LoadErrorKind},
     LoadError, LoadResult,
@@ -30,7 +30,7 @@ use blueos_loader::{
 
 /// Kernel registry identity: a canonical catalog path, independent of ELF metadata.
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
-pub struct SystemLibraryKey(Vec<u8>);
+pub struct SystemLibraryKey(Arc<Vec<u8>>);
 
 impl SystemLibraryKey {
     pub fn from_bytes(path: &[u8]) -> LoadResult<Self> {
@@ -42,7 +42,7 @@ impl SystemLibraryKey {
             .try_reserve_exact(path.len())
             .map_err(|_| LoadError::new(LoadErrorKind::OutOfMemory, ErrorContext::None))?;
         bytes.extend_from_slice(path);
-        Ok(Self(bytes))
+        Ok(Self(Arc::new(bytes)))
     }
     pub fn as_bytes(&self) -> &[u8] {
         &self.0

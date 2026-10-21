@@ -24,14 +24,48 @@ pub(crate) use aarch64::AArch64Relocator;
 pub(crate) use arm::ArmRelocator;
 pub(crate) use riscv::{Riscv32Relocator, Riscv64Relocator};
 
-#[cfg(target_arch = "aarch64")]
-pub(crate) use aarch64::AArch64Relocator as NativeRelocator;
-#[cfg(target_arch = "arm")]
-pub(crate) use arm::ArmRelocator as NativeRelocator;
-#[cfg(target_arch = "riscv32")]
-pub(crate) use riscv::Riscv32Relocator as NativeRelocator;
-#[cfg(target_arch = "riscv64")]
-pub(crate) use riscv::Riscv64Relocator as NativeRelocator;
+/// Architecture selected by the requested ELF profile, independent of the host CPU.
+#[derive(Clone, Copy)]
+pub(crate) enum ProfileRelocator {
+    Arm,
+    Aarch64,
+    Riscv32,
+    Riscv64,
+}
+impl ProfileRelocator {
+    pub(crate) fn new(profile: crate::profile::LoadProfile) -> LoadResult<Self> {
+        use crate::profile::{ElfClass, ElfMachine};
+        match (profile.machine(), profile.class()) {
+            (ElfMachine::Arm, ElfClass::Elf32) => Ok(Self::Arm),
+            (ElfMachine::Aarch64, ElfClass::Elf64) => Ok(Self::Aarch64),
+            (ElfMachine::Riscv, ElfClass::Elf32) => Ok(Self::Riscv32),
+            (ElfMachine::Riscv, ElfClass::Elf64) => Ok(Self::Riscv64),
+            _ => Err(crate::error::invalid()),
+        }
+    }
+    fn engine(&self) -> &dyn ArchRelocator {
+        match self {
+            Self::Arm => &ArmRelocator,
+            Self::Aarch64 => &AArch64Relocator,
+            Self::Riscv32 => &Riscv32Relocator,
+            Self::Riscv64 => &Riscv64Relocator,
+        }
+    }
+}
+impl ArchRelocator for ProfileRelocator {
+    fn machine(&self) -> ElfMachine {
+        self.engine().machine()
+    }
+    fn class(&self) -> ElfClass {
+        self.engine().class()
+    }
+    fn addend_encoding(&self) -> AddendEncoding {
+        self.engine().addend_encoding()
+    }
+    fn classify_relocation(&self, raw: u32) -> Option<RelocationKind> {
+        self.engine().classify_relocation(raw)
+    }
+}
 
 use crate::{
     error::{ErrorContext, LoadErrorKind},

@@ -14,15 +14,16 @@
 
 use crate::{
     error::{ErrorContext, LoadErrorKind},
-    load,
     loading::planning::LoadPlan,
     memory::{AllocationLease, AllocationOffset, ImageMemory, MemoryPermissions, MemoryRegion},
     profile::{LoadLimits, LoadProfile, SessionLimits},
     reader::ElfReader,
     tests::fixture::{SharedMemory, SliceElfReader},
     trace::{LoadEvent, LoadPhase},
-    CommittedAllocations, ImageDependency, ImageHandle, LoadError, LoadRequest, LoadResult,
-    LoadedImage, LoaderBackend, Publication,
+    ArtifactId, ArtifactInfo, ArtifactResolver, ImageCandidate, ImageHandle, ImageInstanceId,
+    ImageKey, ImagePin, ImageRepository, LoadError, LoadPublisher, LoadReservation, LoadResources,
+    LoadResult, LoadServices, LoadedImage, NamespaceSnapshot, OpenedArtifact, PreparedLoad,
+    PublicationManifest, ReservedImage,
 };
 use alloc::{rc::Rc, vec::Vec};
 use blueos_test_macro::test;
@@ -54,28 +55,64 @@ impl ElfReader for Reader {
         SliceElfReader::new(&self.0).read_exact_at(offset, dst)
     }
 }
-#[must_use = "keep the publication receipt while using its allocated images"]
+type LoadRequest<S> = crate::LoadRequest<S, Pin>;
+#[must_use]
 struct Receipt {
+    inner: Rc<ReceiptInner>,
+}
+impl core::ops::Deref for Receipt {
+    type Target = ReceiptInner;
+    fn deref(&self) -> &ReceiptInner {
+        &self.inner
+    }
+}
+#[must_use]
+struct ReceiptInner {
     memory: SharedMemory,
     leases: Vec<AllocationLease>,
+    _pins: Vec<Pin>,
+    _imports: Vec<Pin>,
 }
-impl Drop for Receipt {
+impl Drop for ReceiptInner {
     fn drop(&mut self) {
         for lease in self.leases.drain(..) {
             self.memory.release_committed(lease);
         }
     }
 }
+impl Receipt {
+    fn pin(&self, image: &ImageHandle) -> Pin {
+        Pin {
+            image: image.clone(),
+            _owner: self.inner.clone(),
+        }
+    }
+}
+#[must_use]
+#[derive(Clone)]
+struct Pin {
+    image: ImageHandle,
+    _owner: Rc<ReceiptInner>,
+}
+// SAFETY: the shared receipt owns the backing and the transitive provider pins.
+unsafe impl ImagePin for Pin {
+    fn image(&self) -> &ImageHandle {
+        &self.image
+    }
+}
+fn namespace(pins: Vec<Pin>, global: Vec<ImageHandle>) -> NamespaceSnapshot<Pin> {
+    NamespaceSnapshot::new(pins, global.iter().map(ImageHandle::instance_id).collect()).unwrap()
+}
 struct Backend {
     files: Vec<(&'static str, Rc<[u8]>)>,
     sources: Vec<&'static str>,
-    ready: Vec<ImageHandle>,
-    ready_after_acquire: Vec<ImageHandle>,
+    ready: Vec<Pin>,
+    ready_after_acquire: Vec<Pin>,
     opens: Vec<&'static str>,
     memory: SharedMemory,
     reject_acquire: bool,
+    malformed_reservation: u8,
     reject_publish: bool,
-    reject_complete: bool,
     shared: bool,
     commits: usize,
     aborts: usize,
@@ -96,8 +133,8 @@ impl Backend {
                 .collect(),
             memory: SharedMemory::new(false),
             reject_acquire: false,
+            malformed_reservation: 0,
             reject_publish: false,
-            reject_complete: false,
             shared: false,
             commits: 0,
             aborts: 0,
@@ -110,126 +147,174 @@ impl Backend {
 fn failure() -> LoadError {
     LoadError::new(LoadErrorKind::Backend, ErrorContext::None)
 }
-impl LoaderBackend for Backend {
-    type Source = &'static str;
+#[derive(Clone)]
+struct Source {
+    name: &'static str,
+    info: ArtifactInfo,
+}
+#[derive(Clone)]
+struct Host<'a>(Rc<RefCell<&'a mut Backend>>);
+impl ArtifactResolver for Host<'_> {
+    type Source = Source;
     type Reader = Reader;
-    type Memory = SharedMemory;
-    type PreparedPublication = Vec<AllocationLease>;
-    type Receipt = Receipt;
-    fn identity<'a>(&self, source: &'a Self::Source) -> &'a [u8] {
-        source.as_bytes()
+    fn info<'b>(&self, source: &'b Source) -> &'b ArtifactInfo {
+        &source.info
     }
-    fn is_shared(&self, _: &Self::Source) -> bool {
-        self.shared
-    }
-    fn open(&mut self, source: &Self::Source) -> LoadResult<Reader> {
-        self.opens.push(*source);
-        self.files
+    fn resolve(&mut self, _: &Source, name: &[u8]) -> LoadResult<Source> {
+        let b = self.0.borrow();
+        let name = b
+            .sources
             .iter()
-            .find(|(name, _)| name == source)
-            .map(|(_, bytes)| Reader(bytes.clone()))
-            .ok_or_else(failure)
+            .find(|s| s.as_bytes() == name)
+            .copied()
+            .ok_or_else(failure)?;
+        Ok(Source {
+            name,
+            info: ArtifactInfo::new(ImageKey::new(0, name.as_bytes())?, b.shared),
+        })
     }
-    fn snapshot(&mut self, source: &Self::Source) -> LoadResult<Option<ImageHandle>> {
+    fn open(&mut self, source: &Source) -> LoadResult<OpenedArtifact<Reader>> {
+        let mut b = self.0.borrow_mut();
+        b.opens.push(source.name);
+        let bytes = b
+            .files
+            .iter()
+            .find(|(name, _)| *name == source.name)
+            .map(|(_, bytes)| bytes.clone())
+            .ok_or_else(failure)?;
+        Ok(OpenedArtifact::new(Reader(bytes), ArtifactId::fresh()?))
+    }
+}
+#[must_use]
+struct Reservation<'a> {
+    host: Host<'a>,
+    reserved: Vec<ReservedImage>,
+    imported: Vec<Pin>,
+    armed: bool,
+}
+impl LoadReservation for Reservation<'_> {
+    type Pin = Pin;
+    fn reserved(&self) -> &[ReservedImage] {
+        &self.reserved
+    }
+    fn imported(&self) -> &[Pin] {
+        &self.imported
+    }
+}
+impl Drop for Reservation<'_> {
+    fn drop(&mut self) {
+        if self.armed {
+            self.host.0.borrow_mut().cancels += 1;
+        }
+    }
+}
+impl<'a> ImageRepository for Host<'a> {
+    type Pin = Pin;
+    type Reservation = Reservation<'a>;
+    fn snapshot(&mut self, key: &ImageKey) -> LoadResult<Option<Pin>> {
         Ok(self
+            .0
+            .borrow()
             .ready
             .iter()
-            .find(|image| image.identity() == source.as_bytes())
+            .find(|p| p.image.key() == key)
             .cloned())
     }
-    fn resolve(&mut self, _: &Self::Source, name: &[u8]) -> LoadResult<Self::Source> {
-        self.sources
-            .iter()
-            .find(|source| source.as_bytes() == name)
-            .copied()
-            .ok_or_else(failure)
-    }
-    fn resolve_snapshot(&mut self, dependency: &ImageDependency) -> LoadResult<Self::Source> {
-        self.sources
-            .iter()
-            .find(|source| source.as_bytes() == dependency.identity())
-            .copied()
-            .ok_or_else(failure)
-    }
-    fn acquire(
-        &mut self,
-        sources: &[Self::Source],
-        existing: &[ImageHandle],
-    ) -> LoadResult<Vec<ImageHandle>> {
-        assert!(sources.iter().all(|source| self.sources.contains(source)));
-        if self.reject_acquire {
-            return Err(failure());
-        }
-        self.memory.acquired.set(true);
-        self.ready.append(&mut self.ready_after_acquire);
-        Ok(self
+    fn pin_exact(&mut self, id: &ImageInstanceId) -> LoadResult<Pin> {
+        self.0
+            .borrow()
             .ready
             .iter()
-            .filter(|image| {
-                sources
-                    .iter()
-                    .any(|source| source.as_bytes() == image.identity())
-                    && !existing
-                        .iter()
-                        .any(|previous| previous.identity() == image.identity())
-            })
+            .find(|p| p.image.instance_id() == *id)
             .cloned()
-            .collect())
+            .ok_or_else(failure)
     }
-    fn memory(&mut self) -> SharedMemory {
-        self.memory.clone()
-    }
-    fn prepare_publication(
-        &mut self,
-        publication: &Publication,
-    ) -> LoadResult<Vec<AllocationLease>> {
-        if self.reject_publish {
+    fn acquire(&mut self, candidates: &[ImageCandidate]) -> LoadResult<Self::Reservation> {
+        let mut b = self.0.borrow_mut();
+        if b.reject_acquire {
             return Err(failure());
         }
-        if self.shared {
-            assert_eq!(publication.private_images(), 0);
-        } else {
-            assert_eq!(publication.shared_images(), 0);
+        b.memory.acquired.set(true);
+        let arriving = core::mem::take(&mut b.ready_after_acquire);
+        b.ready.extend(arriving);
+        let imported: Vec<_> = b
+            .ready
+            .iter()
+            .filter(|p| candidates.iter().any(|c| &c.key == p.image.key()))
+            .cloned()
+            .collect();
+        let mut reserved = Vec::new();
+        for c in candidates {
+            if !imported.iter().any(|p| p.image.key() == &c.key) {
+                reserved.push(ReservedImage {
+                    key: c.key.clone(),
+                    instance: ImageInstanceId::fresh()?,
+                });
+            }
+        }
+        match b.malformed_reservation {
+            1 => reserved.push(reserved[0].clone()),
+            2 => reserved.clear(),
+            3 => reserved[0].key = ImageKey::new(0, b"unrequested")?,
+            4 => reserved[1].instance = reserved[0].instance,
+            _ => {}
+        }
+        Ok(Reservation {
+            host: self.clone(),
+            reserved,
+            imported,
+            armed: true,
+        })
+    }
+}
+impl<'a> LoadPublisher<SharedMemory, Pin, Reservation<'a>> for Host<'a> {
+    type Prepared = Receipt;
+    type Owner = Receipt;
+    fn prepare(
+        &mut self,
+        publication: &PublicationManifest,
+        _: &Reservation<'a>,
+    ) -> LoadResult<Self::Prepared> {
+        let b = self.0.borrow();
+        if b.reject_publish {
+            return Err(failure());
         }
         let mut leases = Vec::new();
         leases
-            .try_reserve_exact(publication.private_images() + publication.shared_images())
+            .try_reserve_exact(publication.allocations().len())
             .map_err(|_| failure())?;
-        Ok(leases)
+        Ok(Receipt {
+            inner: Rc::new(ReceiptInner {
+                memory: b.memory.clone(),
+                leases,
+                _pins: Vec::new(),
+                _imports: Vec::new(),
+            }),
+        })
     }
-    unsafe fn commit_publication(
+    unsafe fn commit(
         &mut self,
-        mut leases: Vec<AllocationLease>,
-        allocations: CommittedAllocations,
+        mut prepared: Self::Prepared,
+        resources: LoadResources<SharedMemory, Pin, Reservation<'a>>,
     ) -> Receipt {
-        self.commits += 1;
-        for (_, lease) in allocations.into_images() {
-            leases.push(lease);
+        let (_, allocations, pins, mut reservation) = unsafe { resources.into_parts() };
+        let owner = Rc::get_mut(&mut prepared.inner).expect("unpublished owner");
+        for (_, lease) in allocations {
+            owner.leases.push(lease);
         }
-        Receipt {
-            memory: self.memory.clone(),
-            leases,
-        }
+        owner._pins = pins;
+        owner._imports = core::mem::take(&mut reservation.imported);
+        reservation.armed = false;
+        self.0.borrow_mut().commits += 1;
+        prepared
     }
-    fn complete_load(&mut self, image: &mut LoadedImage<Receipt>) -> LoadResult<()> {
-        assert!(image.images().count() >= 1 && image.images().count() <= self.sources.len());
-        if self.reject_complete {
-            Err(failure())
-        } else {
-            Ok(())
-        }
+}
+impl crate::trace::LoadObserver for Host<'_> {
+    fn enabled(&self) -> bool {
+        self.0.borrow().tracing
     }
-    fn abort_publication(&mut self, receipt: Receipt) {
-        self.aborts += 1;
-        drop(receipt);
-    }
-    fn cancel_load(&mut self) {
-        self.cancels += 1;
-    }
-    fn trace_enabled(&self) -> bool {
-        self.tracing
-    }
-    fn trace(&self, event: LoadEvent<'_>) {
+    fn observe(&mut self, event: LoadEvent<'_>) {
+        let b = self.0.borrow();
         let observation = match event {
             LoadEvent::Started { .. } => Observation::Started,
             LoadEvent::Phase { phase, completed } => Observation::Phase(phase, completed),
@@ -240,21 +325,78 @@ impl LoaderBackend for Backend {
                 ..
             } => Observation::Dependency(requester.to_vec(), provider.to_vec()),
             LoadEvent::ImageReused { path, .. } => Observation::Reused(path.to_vec()),
-            LoadEvent::Retry => Observation::Retry(self.cancels),
+            LoadEvent::Retry => Observation::Retry(b.cancels),
             LoadEvent::Completed => Observation::Completed,
             LoadEvent::Failed { .. } => Observation::Failed {
-                cancels: self.cancels,
-                releases: self.memory.releases.get(),
-                backings: self.memory.mappers.borrow().len(),
+                cancels: b.cancels,
+                releases: b.memory.releases.get(),
+                backings: b.memory.mappers.borrow().len(),
             },
             _ => return,
         };
-        self.observations.borrow_mut().push(observation);
+        b.observations.borrow_mut().push(observation);
     }
+}
+fn request(request: LoadRequest<&'static str>, shared: bool) -> crate::LoadRequest<Source, Pin> {
+    crate::LoadRequest {
+        source: Source {
+            name: request.source,
+            info: ArtifactInfo::new(ImageKey::new(0, request.source.as_bytes()).unwrap(), shared),
+        },
+        profile: request.profile,
+        limits: request.limits,
+        role: request.role,
+        namespace: request.namespace,
+    }
+}
+fn load(
+    input: LoadRequest<&'static str>,
+    backend: &mut Backend,
+) -> LoadResult<LoadedImage<Receipt>> {
+    let input = request(input, backend.shared);
+    let memory = backend.memory.clone();
+    let mut host = Host(Rc::new(RefCell::new(backend)));
+    crate::load(
+        input,
+        LoadServices {
+            sources: &mut host.clone(),
+            images: &mut host.clone(),
+            memory,
+            cache: &mut crate::memory::CoherentCodeCache,
+            observer: &mut host.clone(),
+        },
+        &mut host,
+    )
+}
+fn plan(
+    input: &LoadRequest<&'static str>,
+    backend: &mut Backend,
+) -> LoadResult<LoadPlan<Source, Reader>> {
+    let input = request(
+        LoadRequest {
+            source: input.source,
+            profile: input.profile,
+            limits: input.limits,
+            role: input.role,
+            namespace: NamespaceSnapshot::new(
+                input.namespace.pins.clone(),
+                input.namespace.global.clone(),
+            )?,
+        },
+        backend.shared,
+    );
+    let mut host = Host(Rc::new(RefCell::new(backend)));
+    LoadPlan::build(
+        &input,
+        &mut host.clone(),
+        &mut host.clone(),
+        &mut Vec::new(),
+        &mut host,
+    )
 }
 
 #[test]
-fn load_observations_are_opt_in_and_complete_after_installation() {
+fn load_observations_are_opt_in_and_complete_after_ownership_transfer() {
     for tracing in [false, true] {
         let (bytes, profile) = super::linker::native_fixture();
         let mut backend = Backend::new(alloc::vec![("root", bytes)]);
@@ -289,8 +431,6 @@ fn load_observations_are_opt_in_and_complete_after_installation() {
                         (LoadPhase::Link, true),
                         (LoadPhase::Publish, false),
                         (LoadPhase::Publish, true),
-                        (LoadPhase::Install, false),
-                        (LoadPhase::Install, true),
                     ]
             );
         } else {
@@ -305,12 +445,11 @@ fn load_observations_are_opt_in_and_complete_after_installation() {
 
 #[test]
 fn load_failure_is_observed_after_rollback_without_a_completion() {
-    for reject_complete in [false, true] {
+    for _ in 0..1 {
         let (bytes, profile) = super::linker::native_fixture();
         let mut backend = Backend::new(alloc::vec![("root", bytes)]);
         backend.tracing = true;
-        backend.reject_complete = reject_complete;
-        backend.reject_publish = !reject_complete;
+        backend.reject_publish = true;
         assert!(load(
             LoadRequest::executable("root", profile, SessionLimits::DEFAULT),
             &mut backend,
@@ -324,7 +463,7 @@ fn load_failure_is_observed_after_rollback_without_a_completion() {
                     cancels: 1,
                     // Uncommitted storage rolls back through RAII; this fixture
                     // counts only explicit release_committed calls.
-                    releases: usize::from(reject_complete),
+                    releases: 0,
                     backings: 0,
                 })
         );
@@ -345,9 +484,11 @@ fn load_observes_snapshot_reuse_without_reopening_the_provider() {
     backend.shared = true;
     backend.tracing = true;
     backend.sources.push("C");
-    backend
-        .ready
-        .push(loaded_provider.images().next().unwrap().clone());
+    backend.ready.push(
+        loaded_provider
+            .receipt()
+            .pin(loaded_provider.images().next().unwrap()),
+    );
     let loaded = load(
         LoadRequest::shared_object("root", profile, SessionLimits::DEFAULT),
         &mut backend,
@@ -439,7 +580,7 @@ fn load_shared_purpose_rejects_executable_roots_before_acquire() {
             assert!(matches!(error.kind(), LoadErrorKind::UnsupportedByProfile));
             assert!(!backend.memory.acquired.get());
             assert_eq!(backend.memory.allocations.get(), 0);
-            assert_eq!(backend.cancels, 1);
+            assert_eq!(backend.cancels, 0);
         }
     }
 }
@@ -617,20 +758,32 @@ fn load_rejects_executable_dependencies_before_mapping() {
     assert_eq!(backend.memory.allocations.get(), 0);
 }
 #[test]
-fn load_completion_failure_releases_committed_receipt_once() {
+fn dropping_prepared_load_rolls_back_without_commit() {
     let (bytes, profile) = super::linker::native_fixture();
     let mut backend = Backend::new(alloc::vec![("root", bytes)]);
-    backend.reject_complete = true;
-    assert!(load(
+    let input = request(
         LoadRequest::executable("root", profile, SessionLimits::DEFAULT),
-        &mut backend
-    )
-    .is_err());
-    assert_eq!(
-        (backend.commits, backend.aborts, backend.cancels),
-        (1, 1, 1)
+        false,
     );
-    assert_eq!(backend.memory.releases.get(), 1);
+    let memory = backend.memory.clone();
+    let host = Host(Rc::new(RefCell::new(&mut backend)));
+    let prepared = crate::prepare_load(
+        input,
+        LoadServices {
+            sources: &mut host.clone(),
+            images: &mut host.clone(),
+            memory,
+            cache: &mut crate::memory::CoherentCodeCache,
+            observer: &mut host.clone(),
+        },
+    )
+    .unwrap();
+    assert_eq!(prepared.manifest().allocations().len(), 1);
+    drop(prepared);
+    drop(host);
+    assert!(backend.memory.mappers.borrow().is_empty());
+    assert_eq!(backend.commits, 0);
+    assert_eq!(backend.cancels, 1);
 }
 #[test]
 fn load_publication_failure_aborts_before_commit() {
@@ -665,7 +818,7 @@ fn load_acquire_failure_maps_no_images() {
     )
     .is_err());
     assert_eq!(backend.memory.allocations.get(), 0);
-    assert_eq!(backend.cancels, 1);
+    assert_eq!(backend.cancels, 0);
 }
 
 // Reusing a provider must preserve dependencies beneath it without mapping
@@ -685,7 +838,10 @@ fn load_reused_provider_preserves_transitive_closure() {
     let c_handle = c.images().next().unwrap().clone();
     let mut b_backend = Backend::new(alloc::vec![("B", b_bytes.clone()), ("C", c_bytes.clone())]);
     let b_request = LoadRequest::shared_object("B", profile, SessionLimits::DEFAULT)
-        .with_namespace(alloc::vec![c_handle.clone()], Vec::new());
+        .with_namespace(namespace(
+            alloc::vec![c.receipt().pin(&c_handle)],
+            Vec::new(),
+        ));
     let b = load(b_request, &mut b_backend).expect("load B with existing C");
     let b_handle = b.images().next().unwrap().clone();
     assert_eq!(b_handle.dependencies().len(), 1);
@@ -703,7 +859,10 @@ fn load_reused_provider_preserves_transitive_closure() {
             backend.files.push(("B", Rc::from(bytes)));
         }
         let request = LoadRequest::executable("root", profile, SessionLimits::DEFAULT)
-            .with_namespace(alloc::vec![b_handle.clone(), c_handle.clone()], Vec::new());
+            .with_namespace(namespace(
+                alloc::vec![b.receipt().pin(&b_handle), c.receipt().pin(&c_handle)],
+                Vec::new(),
+            ));
         let loaded =
             load(request, &mut backend).expect("reuse original B -> C despite filesystem changes");
         let root = loaded.images().next().unwrap();
@@ -739,7 +898,10 @@ fn load_ready_cycle_uses_snapshots_without_elf_files() {
     .unwrap();
     let mut backend = Backend::new(alloc::vec![("root", Vec::new()), ("child", Vec::new())]);
     backend.shared = true;
-    backend.ready = original.images().cloned().collect();
+    backend.ready = original
+        .images()
+        .map(|i| original.receipt().pin(i))
+        .collect();
     backend.files.clear();
     let reused = load(
         LoadRequest::shared_object("root", profile, SessionLimits::DEFAULT),
@@ -772,7 +934,7 @@ fn load_snapshot_requires_its_original_loaded_dependency() {
     let mut backend = Backend::new(alloc::vec![("B", native_dso(&[])), ("C", native_dso(&[]))]);
     backend
         .ready
-        .push(original.images().next().unwrap().clone());
+        .push(original.receipt().pin(original.images().next().unwrap()));
     assert!(load(
         LoadRequest::shared_object("B", profile, SessionLimits::DEFAULT),
         &mut backend
@@ -803,7 +965,10 @@ fn load_snapshot_rejects_incompatible_profile_and_executable_role() {
         },
     ] {
         let mut backend = Backend::new(alloc::vec![("root", Vec::new())]);
-        backend.ready = executable.images().cloned().collect();
+        backend.ready = executable
+            .images()
+            .map(|i| executable.receipt().pin(i))
+            .collect();
         let error = load(
             LoadRequest::shared_object("root", requested_profile, SessionLimits::DEFAULT),
             &mut backend,
@@ -836,7 +1001,10 @@ fn load_concurrent_ready_provider_replans_its_frozen_closure() {
         ("C", Vec::new())
     ]);
     backend.shared = true;
-    backend.ready_after_acquire = original.images().cloned().collect();
+    backend.ready_after_acquire = original
+        .images()
+        .map(|i| original.receipt().pin(i))
+        .collect();
     backend.tracing = true;
     backend.files.retain(|(source, _)| *source != "C");
     let loaded = load(
@@ -863,6 +1031,101 @@ fn load_concurrent_ready_provider_replans_its_frozen_closure() {
         .observations
         .borrow()
         .contains(&Observation::Retry(1)));
+}
+
+#[test]
+fn a_retained_namespace_pin_outlives_the_original_owner() {
+    let (_, profile) = super::linker::native_fixture();
+    let mut owner = Backend::new(alloc::vec![("C", native_dso(&[]))]);
+    let c = load(
+        LoadRequest::shared_object("C", profile, SessionLimits::DEFAULT),
+        &mut owner,
+    )
+    .unwrap();
+    let handle = c.images().next().unwrap().clone();
+    let pin = c.receipt().pin(&handle);
+    drop(c);
+    assert_eq!(owner.memory.releases.get(), 0);
+    let mut consumer = Backend::new(alloc::vec![("root", native_dso(&["C"]))]);
+    consumer.sources.push("C");
+    let image = load(
+        LoadRequest::executable("root", profile, SessionLimits::DEFAULT)
+            .with_namespace(namespace(alloc::vec![pin], Vec::new())),
+        &mut consumer,
+    )
+    .unwrap();
+    assert_eq!(owner.memory.releases.get(), 0);
+    assert_eq!(
+        image.retained_images()[0].instance_id(),
+        handle.instance_id()
+    );
+    drop(image);
+    assert_eq!(owner.memory.releases.get(), 1);
+}
+
+#[test]
+fn frozen_dependencies_reject_a_replacement_generation_at_the_same_key() {
+    let (_, profile) = super::linker::native_fixture();
+    let mut first = Backend::new(alloc::vec![("C", native_dso(&[]))]);
+    let c = load(
+        LoadRequest::shared_object("C", profile, SessionLimits::DEFAULT),
+        &mut first,
+    )
+    .unwrap();
+    let mut b_backend = Backend::new(alloc::vec![("B", native_dso(&["C"]))]);
+    b_backend.sources.push("C");
+    let b = load(
+        LoadRequest::shared_object("B", profile, SessionLimits::DEFAULT).with_namespace(namespace(
+            alloc::vec![c.receipt().pin(c.images().next().unwrap())],
+            Vec::new(),
+        )),
+        &mut b_backend,
+    )
+    .unwrap();
+    let mut replacement = Backend::new(alloc::vec![("C", native_dso(&[]))]);
+    let new_c = load(
+        LoadRequest::shared_object("C", profile, SessionLimits::DEFAULT),
+        &mut replacement,
+    )
+    .unwrap();
+    assert_ne!(
+        c.images().next().unwrap().instance_id(),
+        new_c.images().next().unwrap().instance_id()
+    );
+    let mut root = Backend::new(alloc::vec![("root", native_dso(&["B"]))]);
+    root.sources.push("B");
+    root.ready.push(c.receipt().pin(c.images().next().unwrap()));
+    let request =
+        LoadRequest::executable("root", profile, SessionLimits::DEFAULT).with_namespace(namespace(
+            alloc::vec![
+                b.receipt().pin(b.images().next().unwrap()),
+                new_c.receipt().pin(new_c.images().next().unwrap())
+            ],
+            Vec::new(),
+        ));
+    assert!(load(request, &mut root).is_err());
+    assert_eq!(root.memory.allocations.get(), 0);
+    assert_eq!(root.opens, ["root"]);
+}
+
+#[test]
+fn invalid_repository_batches_reject_before_mapping_and_cancel_once() {
+    let (_, profile) = super::linker::native_fixture();
+    for malformed in 1..=4 {
+        let mut backend = Backend::new(alloc::vec![
+            ("root", native_dso(&["child"])),
+            ("child", native_dso(&[]))
+        ]);
+        backend.malformed_reservation = malformed;
+        assert!(load(
+            LoadRequest::executable("root", profile, SessionLimits::DEFAULT),
+            &mut backend
+        )
+        .is_err());
+        assert_eq!(backend.cancels, 1);
+        assert_eq!(backend.memory.allocations.get(), 0);
+        assert_eq!(backend.commits, 0);
+    }
 }
 
 fn native_dso(needed: &[&str]) -> Vec<u8> {
@@ -1045,8 +1308,10 @@ fn shared_image_retains_an_actual_global_provider_without_dt_needed() {
     backend.shared = true;
     let mut image = load(
         LoadRequest::shared_object("root", profile, SessionLimits::DEFAULT).with_namespace(
-            alloc::vec![provider_handle.clone()],
-            alloc::vec![provider_handle],
+            namespace(
+                alloc::vec![provider.receipt().pin(&provider_handle)],
+                alloc::vec![provider_handle],
+            ),
         ),
         &mut backend,
     )
@@ -1133,12 +1398,11 @@ fn planning_closes_diamond_and_cycle_in_bfs_order() {
         ("right", dso_elf(&["leaf"], None)),
         ("leaf", dso_elf(&["left"], None)),
     ]);
-    let plan =
-        LoadPlan::build(&plan_request(SessionLimits::DEFAULT), &mut backend).expect("closed plan");
+    let plan = plan(&plan_request(SessionLimits::DEFAULT), &mut backend).expect("closed plan");
     assert_eq!(
         plan.images
             .iter()
-            .map(|image| image.source)
+            .map(|image| image.source.as_ref().unwrap().name)
             .collect::<Vec<_>>(),
         ["root", "left", "right", "leaf"]
     );
@@ -1167,7 +1431,7 @@ fn planning_enforces_image_and_depth_limits_before_mapping() {
             256,
             256,
         );
-        let error = LoadPlan::build(&plan_request(limits), &mut backend)
+        let error = plan(&plan_request(limits), &mut backend)
             .err()
             .expect("bounded plan");
         assert!(matches!(error.kind(), LoadErrorKind::ResourceLimit));
@@ -1186,12 +1450,12 @@ fn mapping_rejects_changed_dependency_names_order_and_count() {
             ("D", native_dso(&[])),
         ]);
         let request = LoadRequest::shared_object("root", profile, SessionLimits::DEFAULT);
-        let mut plan = LoadPlan::build(&request, &mut backend).unwrap();
+        let mut plan = plan(&request, &mut backend).unwrap();
         // Model a file changing between scanning and mapping. No newly declared
         // dependency may escape the closure that was acquired from the scan.
         plan.images[0].reader = Some(Reader(Rc::from(native_dso(changed))));
-        backend.acquire(&["root", "B", "C"], &[]).unwrap();
-        let mut memory = backend.memory();
+        backend.memory.acquired.set(true);
+        let mut memory = backend.memory.clone();
         let error = crate::loading::materialize::load_images(
             &mut plan,
             &[],
@@ -1215,7 +1479,7 @@ fn load_request_discovers_declared_dependencies() {
         ("root", dso_elf(&["left"], None)),
         ("left", dso_elf(&[], None)),
     ]);
-    let plan = LoadPlan::build(&plan_request(SessionLimits::DEFAULT), &mut backend)
+    let plan = plan(&plan_request(SessionLimits::DEFAULT), &mut backend)
         .expect("dependencies are inferred from DT_NEEDED");
     assert_eq!(plan.images.len(), 2);
     assert_eq!(plan.edges.len(), 1);

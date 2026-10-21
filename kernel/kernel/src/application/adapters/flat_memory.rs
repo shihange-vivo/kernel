@@ -53,7 +53,7 @@ struct FlatAllocationEntry {
 /// created service. `next_counter` is the low bits, monotonic within a service.
 struct FlatMemoryService {
     nonce: u64,
-    entries: Vec<FlatAllocationEntry>,
+    entries: Vec<Arc<FlatAllocationEntry>>,
     next_counter: u64,
 }
 
@@ -80,6 +80,7 @@ impl FlatMemoryService {
         self.entries
             .iter()
             .find(|entry| entry.allocation == *allocation)
+            .map(Arc::as_ref)
     }
 
     fn entry_index(&self, allocation: &ImageAllocation) -> Option<usize> {
@@ -90,6 +91,7 @@ impl FlatMemoryService {
 }
 
 /// A cloneable handle onto the shared-flat memory service.
+#[must_use = "keep the allocation service alive while image resources exist"]
 pub struct FlatImageMemory {
     service: Arc<Mutex<FlatMemoryService>>,
 }
@@ -108,6 +110,22 @@ impl FlatImageMemory {
     }
 }
 
+#[must_use = "keep the pin while a descriptor may access its backing"]
+#[derive(Clone)]
+pub(crate) struct FlatBackingPin(Arc<FlatAllocationEntry>);
+
+impl FlatImageMemory {
+    pub(crate) fn pin(&self, allocation: &ImageAllocation) -> LoadResult<FlatBackingPin> {
+        let service = self.service.lock();
+        let entry = service
+            .entries
+            .iter()
+            .find(|entry| entry.allocation == *allocation)
+            .ok_or_else(|| not_allocated_error(*allocation))?;
+        Ok(FlatBackingPin(entry.clone()))
+    }
+}
+
 impl Default for FlatImageMemory {
     fn default() -> Self {
         Self::new()
@@ -122,7 +140,38 @@ impl Clone for FlatImageMemory {
     }
 }
 
+impl FlatImageMemory {
+    fn image_span(
+        &self,
+        allocation: &ImageAllocation,
+        offset: AllocationOffset,
+        len: u64,
+    ) -> LoadResult<*mut u8> {
+        let service = self.service.lock();
+        let entry = service
+            .entry(allocation)
+            .ok_or_else(|| not_allocated_error(*allocation))?;
+        let end = offset
+            .value()
+            .checked_add(len)
+            .filter(|end| *end <= allocation.len())
+            .ok_or_else(|| memory_access_error(*allocation, offset, len))?;
+        let offset_usize = usize::try_from(offset.value())
+            .map_err(|_| memory_access_error(*allocation, offset, len))?;
+        let end_usize =
+            usize::try_from(end).map_err(|_| memory_access_error(*allocation, offset, len))?;
+        let base = entry.storage.base();
+        if base.is_null() || entry.storage.size() < end_usize {
+            return Err(memory_access_error(*allocation, offset, len));
+        }
+        Ok(unsafe { base.add(offset_usize) })
+    }
+}
+
 impl ImageMemory for FlatImageMemory {
+    fn execution_domain(&self) -> blueos_loader::ExecutionDomainId {
+        blueos_loader::ExecutionDomainId::FLAT
+    }
     fn allocate_image(&mut self, request: AllocationRequest) -> LoadResult<AllocationLease> {
         // Dynamic images are movable ET_DYN objects loaded from the
         // shared heap. A fixed placement cannot be honoured against this heap
@@ -171,10 +220,10 @@ impl ImageMemory for FlatImageMemory {
             request.align(),
             AllocationOwnership::Owned,
         );
-        service.entries.push(FlatAllocationEntry {
+        service.entries.push(Arc::new(FlatAllocationEntry {
             storage,
             allocation,
-        });
+        }));
         // SAFETY: the backend just recorded `allocation` in the shared table
         // and mints no other lease for it; the caller receives the sole
         // authority to abort, commit, or release this allocation.
@@ -197,30 +246,13 @@ impl ImageMemory for FlatImageMemory {
         }
     }
 
-    fn image_span(
+    fn validate_range(
         &self,
         allocation: &ImageAllocation,
         offset: AllocationOffset,
         len: u64,
-    ) -> LoadResult<*mut u8> {
-        let service = self.service.lock();
-        let entry = service
-            .entry(allocation)
-            .ok_or_else(|| not_allocated_error(*allocation))?;
-        let end = offset
-            .value()
-            .checked_add(len)
-            .filter(|end| *end <= allocation.len())
-            .ok_or_else(|| memory_access_error(*allocation, offset, len))?;
-        let offset_usize = usize::try_from(offset.value())
-            .map_err(|_| memory_access_error(*allocation, offset, len))?;
-        let end_usize =
-            usize::try_from(end).map_err(|_| memory_access_error(*allocation, offset, len))?;
-        let base = entry.storage.base();
-        if base.is_null() || entry.storage.size() < end_usize {
-            return Err(memory_access_error(*allocation, offset, len));
-        }
-        Ok(unsafe { base.add(offset_usize) })
+    ) -> LoadResult<()> {
+        self.image_span(allocation, offset, len).map(|_| ())
     }
 
     fn write(
@@ -359,4 +391,31 @@ fn protection_backend_error(allocation: &ImageAllocation) -> LoadError {
             align: allocation.align(),
         },
     )
+}
+
+#[cfg(test)]
+mod pin_tests {
+    use super::*;
+    use blueos_test_macro::test;
+    #[test]
+    fn physical_pin_keeps_bytes_alive_after_unique_lease_release() {
+        let mut memory = FlatImageMemory::new();
+        let lease = memory
+            .allocate_image(AllocationRequest::new(Placement::Anywhere, 32, 8))
+            .unwrap();
+        let allocation = *lease.allocation();
+        memory
+            .write(&allocation, AllocationOffset::new(0), b"pinned")
+            .unwrap();
+        let pin = memory.pin(&allocation).unwrap();
+        let retained = pin.clone();
+        memory.release_committed(lease);
+        assert!(memory.service.lock().entries.is_empty());
+        drop(pin);
+        assert_eq!(&retained.0.storage.as_slice()[..6], b"pinned");
+        assert!(memory
+            .validate_range(&allocation, AllocationOffset::new(0), 6)
+            .is_err());
+        drop(retained);
+    }
 }
