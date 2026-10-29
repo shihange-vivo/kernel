@@ -447,22 +447,17 @@ create_thread(spawn_args_ptr: *const SpawnArgs) -> c_long {
     if let Some(cleanup) = spawn_args.cleanup {
         t.lock().set_cleanup(Entry::Posix(cleanup, spawn_args.arg));
     };
-    // Link the new thread to the caller's process so that it shares the
-    // caller's per-process fd table (stdin/stdout/stderr and any open files).
-    // Without this, `current_process()` resolves to `None` on the new thread
-    // and every VFS syscall returns `-EBADF` — i.e. the thread has no I/O.
-    // `add_thread` takes the thread by value, so clone the `Arc` here; the
-    // original `t` is still queued below.
-    match crate::process::current_process() {
-        Some(proc) => {
-            if !proc.add_thread(t.clone()) {
-                log::warn!(
-                    "create_thread: new thread not linked to process"
-                );
+    // Inherit an existing process's descriptors; a direct RTOS caller keeps
+    // its shared system table and needs no process association.
+    let process = crate::process::current_process();
+    if let Some(process) = &process {
+        if !process.add_thread(t.clone()) {
+            #[cfg(all(enable_vfs, dynamic_loader))]
+            if let Some(group) = joined_group {
+                group.remove_member(handle).ignore_result();
             }
-        }
-        None => {
-            log::warn!("create_thread: caller has no process; new thread will have no fd table");
+            let _ = GlobalQueueVisitor::remove(&mut t);
+            return -1;
         }
     }
     if let Some(f) = spawn_args.spawn_hook { f(handle, spawn_args_ptr as *mut _); }
@@ -474,6 +469,9 @@ create_thread(spawn_args_ptr: *const SpawnArgs) -> c_long {
         #[cfg(all(enable_vfs, dynamic_loader))]
         if let Some(group) = joined_group {
             group.remove_member(handle).ignore_result();
+        }
+        if let Some(process) = process {
+            process.remove_thread(&mut t);
         }
         let _ = GlobalQueueVisitor::remove(&mut t);
         return -1;

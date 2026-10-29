@@ -21,6 +21,15 @@ use crate::{
 use alloc::{sync::Arc, vec, vec::Vec};
 use core::ffi::c_int;
 use log::warn;
+use spin::Once;
+
+// Direct RTOS threads share a system descriptor table without acquiring
+// process membership. Process-owned threads use their process's own table.
+static SYSTEM_FD_MANAGER: Once<crate::sync::SpinLock<FdManager>> = Once::new();
+
+pub(crate) fn system_fd_manager() -> &'static crate::sync::SpinLock<FdManager> {
+    SYSTEM_FD_MANAGER.call_once(|| crate::sync::SpinLock::new(FdManager::new()))
+}
 
 /// Standard file descriptors
 pub const STDIN_FILENO: c_int = 0;

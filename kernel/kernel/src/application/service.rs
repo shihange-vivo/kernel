@@ -223,6 +223,9 @@ impl ApplicationService {
     /// `argv`/`envp` are the owned, already-validated strings the launch
     /// syscall copied in; the returned handle stays `Loading` until the
     /// application reports `ApplicationInitComplete`.
+    /// The main thread inherits an existing caller process, or remains a
+    /// direct RTOS thread when the caller has none. Its application group
+    /// independently owns loaded images and coordinates exit.
     pub fn spawn(
         &self,
         path: &str,
@@ -289,10 +292,13 @@ impl ApplicationService {
         argv: Vec<Vec<u8>>,
         envp: Vec<Vec<u8>>,
     ) -> Result<(), ApplicationLaunchError> {
+        // Capture the launcher's fd-table context before entering the plain
+        // kernel link worker, which has no process membership of its own.
+        let process = crate::process::current_process();
         let handoff = Arc::new(LinkHandoff::new());
         let worker = handoff.clone();
         thread::spawn_with_stack(LINK_STACK_SIZE, move || {
-            let result = self.prepare(&group, &namespace, &argv, &envp);
+            let result = self.prepare(&group, &namespace, &argv, &envp, process.as_ref());
             worker.complete(result);
         })
         .ok_or(ApplicationLaunchError::PrepareFailed)?;
@@ -308,6 +314,7 @@ impl ApplicationService {
         namespace: &ApplicationNamespace,
         argv: &[Vec<u8>],
         envp: &[Vec<u8>],
+        process: Option<&Arc<crate::process::Process>>,
     ) -> Result<(), ApplicationLaunchError> {
         let argv_views: Vec<BlueOsStringView> = argv
             .iter()
@@ -366,7 +373,21 @@ impl ApplicationService {
         let mut main = Builder::new(Entry::Raw(entry, start_info as *mut core::ffi::c_void))
             .set_stack(stack)
             .build();
+        // An optional process supplies private descriptors; direct RTOS
+        // threads keep the shared system table. Install any process and the
+        // application group before the new thread can execute its entry.
+        if let Some(process) = process {
+            if !process.add_thread(main.clone()) {
+                let _ = GlobalQueueVisitor::remove(&mut main);
+                group.begin_exit().ignore_result();
+                group.skip_fini().ignore_result();
+                return Err(ApplicationLaunchError::PrepareFailed);
+            }
+        }
         if group.add_member(main.clone()).is_err() {
+            if let Some(process) = process {
+                process.remove_thread(&mut main);
+            }
             let _ = GlobalQueueVisitor::remove(&mut main);
             // The product is installed but the main thread could not join:
             // move the group to draining with a skipped fini so the deferred
@@ -386,6 +407,9 @@ impl ApplicationService {
         let queued = scheduler::queue_ready_thread(thread::IDLE, main.clone());
         if queued.is_err() {
             group.remove_member(main_id).ignore_result();
+            if let Some(process) = process {
+                process.remove_thread(&mut main);
+            }
             let _ = GlobalQueueVisitor::remove(&mut main);
             group.begin_exit().ignore_result();
             group.skip_fini().ignore_result();
