@@ -49,6 +49,53 @@ use libc::{
 };
 use semihosting::println;
 
+#[test]
+fn test_unbound_threads_share_system_descriptors() {
+    let caller_process = blueos::process::current_process().map(|process| process.pid());
+    let descriptor = alloc::sync::Arc::new(AtomicUsize::new(0));
+    let produced = descriptor.clone();
+    let writer = blueos::thread::spawn(move || {
+        assert!(blueos::process::current_process().is_none());
+        let fd = open(
+            c"/rtos-shared-fd".as_ptr(),
+            O_CREAT | O_RDWR | O_TRUNC,
+            0o644,
+        );
+        assert!(fd >= 3);
+        assert_eq!(write(fd, b"rtos".as_ptr(), 4), 4);
+        assert_eq!(lseek(fd, 0, SEEK_SET), 0);
+        assert!(blueos::process::current_process().is_none());
+        produced.store(fd as usize, Ordering::Release);
+        blueos::sync::wake(&produced);
+    })
+    .expect("spawn direct RTOS writer");
+    while descriptor.load(Ordering::Acquire) == 0 {
+        futex::atomic_wait(&descriptor, 0, Tick::MAX).ignore_result();
+    }
+    let fd = descriptor.load(Ordering::Acquire) as c_int;
+    let done = alloc::sync::Arc::new(AtomicUsize::new(0));
+    let completed = done.clone();
+    let reader = blueos::thread::spawn(move || {
+        assert!(blueos::process::current_process().is_none());
+        let mut bytes = [0u8; 4];
+        assert_eq!(read(fd, bytes.as_mut_ptr(), bytes.len()), 4);
+        assert_eq!(&bytes, b"rtos");
+        assert_eq!(close(fd), 0);
+        assert!(blueos::process::current_process().is_none());
+        completed.store(1, Ordering::Release);
+        blueos::sync::wake(&completed);
+    })
+    .expect("spawn direct RTOS reader");
+    blueos::sync::wait_until(1, &done);
+    assert_eq!(
+        blueos::process::current_process().map(|process| process.pid()),
+        caller_process
+    );
+    assert_eq!(unlink(c"/rtos-shared-fd".as_ptr()), 0);
+    drop(reader);
+    drop(writer);
+}
+
 // In esp32c3/esp32c6, we use usb-serial as the console output,
 // which does not support on qemu yet, so we skip this test on them for now.
 // See https://github.com/espressif/esp-toolchain-docs/blob/main/qemu/README.md

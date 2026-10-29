@@ -78,9 +78,11 @@ pub fn vfs_init() -> Result<(), Error> {
     debug!("Mounted devfs at '/dev'");
     devfs::init()?;
 
-    // Stdio (fds 0/1/2 on the root process's fd table) is now initialized in
-    // the boot path after the root process is created, since it requires the
-    // per-process `Process::fd_manager` rather than a global singleton.
+    // Direct RTOS threads keep their shared I/O context. Processes initialize
+    // their own standard descriptors when they are created.
+    fd_manager::system_fd_manager()
+        .irqsave_lock()
+        .init_stdio()?;
 
     #[cfg(fatfs)]
     {

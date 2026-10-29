@@ -4,7 +4,7 @@
 // CHECK-SUCC: hello dynamic app
 // CHECK-SUCC: argv0=/apps/hello/app.elf
 // CHECK-SUCC: argv0=app.elf
-// COUNT: auxv: AT_PHDR ok == 2
+// COUNT: auxv: AT_PHDR ok == 3
 // CHECK-SUCC: APP_LAUNCHED handle=.* path=/apps/hello/app.elf
 // CHECK-SUCC: APP_INIT_COMPLETE handle=.*
 // CHECK-SUCC: APP_REAP handle=.* private_images=1 imported_dsos=1
@@ -100,6 +100,24 @@ fn dynamic_app_vertical() {
         first.generation, second.generation,
         "generation must bump on relaunch"
     );
+}
+
+#[test]
+fn dynamic_app_from_direct_rtos_thread() {
+    let done = alloc::sync::Arc::new(AtomicUsize::new(0));
+    let completed = done.clone();
+    let worker = blueos::thread::spawn(move || {
+        assert!(blueos::process::current_process().is_none());
+        // The RTOS caller needs no Process object to launch an application;
+        // its I/O uses the shared system descriptors throughout the launch.
+        launch_and_wait(runtime::init(), "/apps/hello/app.elf", false);
+        assert!(blueos::process::current_process().is_none());
+        completed.store(1, Ordering::Release);
+        blueos::sync::wake(&completed);
+    })
+    .expect("spawn RTOS launch caller");
+    blueos::sync::wait_until(1, &done);
+    drop(worker);
 }
 
 #[no_mangle]
