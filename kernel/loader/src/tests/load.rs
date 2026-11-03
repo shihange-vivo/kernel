@@ -13,7 +13,7 @@
 // limitations under the License.
 
 use crate::{
-    error::{ErrorContext, LoadErrorKind},
+    error::{ErrorContext, LimitKind, LoadErrorKind},
     loading::planning::LoadPlan,
     memory::{AllocationLease, AllocationOffset, ImageMemory, MemoryPermissions, MemoryRegion},
     profile::{LoadLimits, LoadProfile, SessionLimits},
@@ -858,7 +858,7 @@ fn load_reused_provider_preserves_transitive_closure() {
         if let Some(bytes) = replacement {
             backend.files.push(("B", Rc::from(bytes)));
         }
-        let request = LoadRequest::executable("root", profile, SessionLimits::DEFAULT)
+        let request = LoadRequest::executable("root", profile, planning_limits(64, 2))
             .with_namespace(namespace(
                 alloc::vec![b.receipt().pin(&b_handle), c.receipt().pin(&c_handle)],
                 Vec::new(),
@@ -1390,6 +1390,75 @@ fn shared_binding_cycle_is_structural_and_preserves_reverse_lifecycle_order() {
 fn plan_request(limits: SessionLimits) -> LoadRequest<&'static str> {
     LoadRequest::shared_object("root", LoadProfile::arm_thumb_soft_float(), limits)
 }
+
+fn planning_limits(images: u32, depth: u16) -> SessionLimits {
+    SessionLimits::new(
+        LoadLimits::DEFAULT,
+        images,
+        1024,
+        depth,
+        u64::MAX,
+        u64::MAX,
+        u64::MAX,
+        u64::MAX,
+        256,
+        256,
+    )
+}
+
+#[test]
+fn load_accepts_exact_dependency_depth_limits() {
+    let (_, profile) = super::linker::native_fixture();
+    for depth in 0..=2u16 {
+        let files = match depth {
+            0 => alloc::vec![("root", native_dso(&[]))],
+            1 => alloc::vec![("root", native_dso(&["left"])), ("left", native_dso(&[])),],
+            _ => alloc::vec![
+                ("root", native_dso(&["left"])),
+                ("left", native_dso(&["leaf"])),
+                ("leaf", native_dso(&[])),
+            ],
+        };
+        let mut backend = Backend::new(files);
+        let image = load(
+            LoadRequest::shared_object("root", profile, planning_limits(64, depth)),
+            &mut backend,
+        )
+        .expect("closure ends exactly at the depth limit");
+        let count = usize::from(depth.saturating_add(1));
+        assert_eq!(image.images().count(), count);
+        assert_eq!(backend.commits, 1);
+        drop(image.into_receipt());
+        assert_eq!(backend.memory.releases.get(), count);
+    }
+}
+
+#[test]
+fn planning_rejects_the_first_dependency_beyond_the_depth_limit() {
+    for depth in 0..=1u16 {
+        let mut backend = Backend::new(alloc::vec![
+            ("root", dso_elf(&["left"], None)),
+            ("left", dso_elf(&["leaf"], None)),
+            ("leaf", dso_elf(&[], None)),
+        ]);
+        let error = plan(&plan_request(planning_limits(64, depth)), &mut backend)
+            .err()
+            .expect("next dependency exceeds the depth limit");
+        assert_eq!(error.kind(), LoadErrorKind::ResourceLimit);
+        assert!(matches!(
+            error.context(),
+            ErrorContext::Limit {
+                resource: LimitKind::DependencyDepth,
+                actual,
+                maximum,
+            } if *actual == u64::from(depth.saturating_add(1))
+                && *maximum == u64::from(depth)
+        ));
+        assert_eq!(backend.memory.allocations.get(), 0);
+        assert!(!backend.memory.acquired.get());
+    }
+}
+
 #[test]
 fn planning_closes_diamond_and_cycle_in_bfs_order() {
     let mut backend = Backend::new(alloc::vec![
@@ -1398,7 +1467,8 @@ fn planning_closes_diamond_and_cycle_in_bfs_order() {
         ("right", dso_elf(&["leaf"], None)),
         ("leaf", dso_elf(&["left"], None)),
     ]);
-    let plan = plan(&plan_request(SessionLimits::DEFAULT), &mut backend).expect("closed plan");
+    let plan = plan(&plan_request(planning_limits(64, 2)), &mut backend)
+        .expect("diamond and cycle fit at depth two");
     assert_eq!(
         plan.images
             .iter()
@@ -1418,23 +1488,30 @@ fn planning_enforces_image_and_depth_limits_before_mapping() {
         ("left", dso_elf(&["leaf"], None)),
         ("leaf", dso_elf(&[], None))
     ]);
-    for (images, depth) in [(2, 32), (64, 2)] {
-        let limits = SessionLimits::new(
-            LoadLimits::DEFAULT,
-            images,
-            1024,
-            depth,
-            u64::MAX,
-            u64::MAX,
-            u64::MAX,
-            u64::MAX,
-            256,
-            256,
-        );
+    for (images, depth) in [(2, 32), (64, 1)] {
+        let limits = planning_limits(images, depth);
         let error = plan(&plan_request(limits), &mut backend)
             .err()
             .expect("bounded plan");
         assert!(matches!(error.kind(), LoadErrorKind::ResourceLimit));
+        assert!(matches!(
+            (images, error.context()),
+            (
+                2,
+                ErrorContext::Limit {
+                    resource: LimitKind::ImageCount,
+                    actual: 3,
+                    maximum: 2,
+                }
+            ) | (
+                64,
+                ErrorContext::Limit {
+                    resource: LimitKind::DependencyDepth,
+                    actual: 2,
+                    maximum: 1,
+                }
+            )
+        ));
     }
     assert_eq!(backend.memory.allocations.get(), 0);
 }

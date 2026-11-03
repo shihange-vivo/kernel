@@ -876,6 +876,7 @@ impl SessionLimits {
         )
     }
 
+    /// The root is depth 0; each newly discovered dependency adds one level.
     pub fn check_dependency_depth(&self, actual: u16) -> LoadResult<()> {
         check_u32_limit(
             LimitKind::DependencyDepth,
