@@ -44,7 +44,7 @@ __attribute__((destructor)) void finalizePrivate() {
   printf("clang-cxx: private fini state=%d\n", kPrivateState);
 }
 
-} // namespace
+}  // namespace
 
 extern "C" int clangCxxPrivateValue(int input) {
   return PrivateValue(kPrivateState).add(input);
