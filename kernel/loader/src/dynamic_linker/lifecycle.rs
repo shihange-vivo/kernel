@@ -222,7 +222,8 @@ pub(crate) fn build<M: ImageMemory + ?Sized>(
         thumb: profile.entry_mode().is_thumb(),
         min_instruction: u64::from(profile.entry_mode().minimum_instruction_size()),
     };
-    let ordered = ordered_images(graph)?;
+    // Reuse the same groups for traversal and the frozen SCC snapshot.
+    let sccs = graph.dependency_order()?;
 
     let mut init = Vec::new();
 
@@ -243,7 +244,7 @@ pub(crate) fn build<M: ImageMemory + ?Sized>(
         }
     }
 
-    for &image_id in &ordered {
+    for &image_id in sccs.iter().flatten() {
         // An imported Ready image contributes no constructor (it was already
         // initialized by the link that first published it), so its
         // image id has no lifecycle entry here and is skipped.
@@ -262,7 +263,7 @@ pub(crate) fn build<M: ImageMemory + ?Sized>(
     }
 
     let mut fini = Vec::new();
-    for &image_id in ordered.iter().rev() {
+    for &image_id in sccs.iter().flatten().rev() {
         let Some(image) = image_for(images, image_id) else {
             continue;
         };
@@ -318,30 +319,12 @@ pub(crate) fn build<M: ImageMemory + ?Sized>(
         .map(|(owner, entries)| ImageFiniPlan::new(owner, FiniPlan(entries)))
         .collect::<Vec<_>>();
 
-    // The frozen SCC snapshot: the exact groups and in-group order the
-    // plans above were generated from.
-    let sccs = graph.dependency_order()?;
-
     Ok(LifecyclePlans {
         startup: InitPlan(init),
         group_fini: FiniPlan(group_fini),
         system_fini,
         sccs,
     })
-}
-
-/// Flatten the SCC groups into one dependency-first image order.
-fn ordered_images(graph: &DependencyGraph) -> LoadResult<Vec<ImageId>> {
-    let groups = graph.dependency_order()?;
-    let total = groups.iter().map(|group| group.len()).sum();
-    let mut ordered = Vec::new();
-    ordered
-        .try_reserve_exact(total)
-        .map_err(|_| lifecycle_oom())?;
-    for group in groups.iter() {
-        ordered.extend_from_slice(group);
-    }
-    Ok(ordered)
 }
 
 /// Emit a direct `DT_INIT`/`DT_FINI` target. The stored value is a link-time
