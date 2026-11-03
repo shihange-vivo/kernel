@@ -104,13 +104,18 @@ impl<R: ElfReader> InspectedImage<R> {
     }
 
     pub fn plan(mut self) -> LoadResult<PlannedImage<R>> {
-        let mut r = 0;
+        // Empty segments contribute no memory, alignment or mapping region.
+        self.load_segments
+            .retain(|segment| segment.memory_size() != 0);
+        if self.load_segments.is_empty() {
+            return Err(
+                LoadError::new(LoadErrorKind::BadElf, ErrorContext::None).at_stage(LoadStage::Plan)
+            );
+        }
+
+        let mut segment_max_align = 1;
         // The profile admitted the segment permissions during inspection.
         for segment in self.load_segments.iter() {
-            if segment.memory_size() == 0 {
-                continue;
-            }
-            r += 1;
             let align = normalize_alignment(segment.align(), segment.index())
                 .map_err(|error| error.at_stage(LoadStage::Plan))?;
             self.request
@@ -125,11 +130,7 @@ impl<R: ElfReader> InspectedImage<R> {
                 )
                 .at_stage(LoadStage::Plan));
             }
-        }
-        if r == 0 {
-            return Err(
-                LoadError::new(LoadErrorKind::BadElf, ErrorContext::None).at_stage(LoadStage::Plan)
-            );
+            segment_max_align = core::cmp::max(segment_max_align, align);
         }
 
         self.load_segments
@@ -146,12 +147,6 @@ impl<R: ElfReader> InspectedImage<R> {
                 .at_stage(LoadStage::Plan));
             }
         }
-        let segment_max_align = self
-            .load_segments
-            .iter()
-            .map(|segment| segment.align())
-            .max()
-            .unwrap_or(1);
         let min_vaddr = self.load_segments[0].vaddr();
         let max_vaddr = self
             .load_segments
