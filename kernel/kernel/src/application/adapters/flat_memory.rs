@@ -24,7 +24,10 @@
 //! allocation it targets and is validated against the full descriptor.
 
 use alloc::{sync::Arc, vec::Vec};
-use core::alloc::Layout;
+use core::{
+    alloc::Layout,
+    sync::atomic::{AtomicU32, Ordering},
+};
 
 use blueos_infra::storage::Storage;
 use blueos_loader::{
@@ -38,6 +41,19 @@ use blueos_loader::{
 };
 use spin::Mutex;
 
+static LAST_SERVICE_NONCE: AtomicU32 = AtomicU32::new(0);
+
+/// Reserve a service namespace once, without reusing it after service drop.
+fn reserve_service_nonce(last: &AtomicU32) -> Option<u32> {
+    let previous = last
+        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |nonce| {
+            nonce.checked_add(1)
+        })
+        .ok()?;
+    // A successful update proves that this increment cannot overflow.
+    Some(previous + 1)
+}
+
 /// One live allocation: the stable, non-moving backing storage and the full
 /// descriptor it was minted with. `Storage` owns the heap block and frees it on
 /// drop, so removing an entry is exactly the release of that image's bytes.
@@ -48,32 +64,38 @@ struct FlatAllocationEntry {
 
 /// Shared allocation table plus the identity nonce and monotonic id counter.
 ///
-/// `nonce` is the service instance address, folded into the high bits of every
-/// [`AllocationId`] it mints so ids cannot collide with a second, independently
-/// created service. `next_counter` is the low bits, monotonic within a service.
+/// `nonce` occupies the high 32 bits of every [`AllocationId`]. It is reserved
+/// once per service and never reused, including after the service is dropped.
+/// `None` means the service namespace is exhausted and allocations must fail.
+/// `last_counter` occupies the low 32 bits and never wraps within a service.
+#[must_use = "keep the allocation table alive while image resources exist"]
 struct FlatMemoryService {
-    nonce: u64,
+    nonce: Option<u32>,
     entries: Vec<Arc<FlatAllocationEntry>>,
-    next_counter: u64,
+    last_counter: u32,
 }
 
 impl FlatMemoryService {
-    const fn new() -> Self {
+    fn new() -> Self {
         Self {
-            nonce: 0,
+            nonce: reserve_service_nonce(&LAST_SERVICE_NONCE),
             entries: Vec::new(),
-            next_counter: 1,
+            last_counter: 0,
         }
     }
 
-    /// Mint a globally unique allocation id: instance nonce in the high bits,
-    /// a per-service counter in the low bits.
+    /// Mint a unique allocation id from disjoint 32-bit fields. Exhausting
+    /// either field fails permanently instead of reissuing an earlier id.
     fn mint_id(&mut self) -> LoadResult<AllocationId> {
-        let counter = self.next_counter;
-        self.next_counter = counter
+        let nonce = self.nonce.ok_or_else(|| allocation_error_u64(0, 0))?;
+        let counter = self
+            .last_counter
             .checked_add(1)
             .ok_or_else(|| allocation_error_u64(0, 0))?;
-        Ok(AllocationId::new((self.nonce << 32) | counter))
+        self.last_counter = counter;
+        Ok(AllocationId::new(
+            (u64::from(nonce) << 32) | u64::from(counter),
+        ))
     }
 
     fn entry(&self, allocation: &ImageAllocation) -> Option<&FlatAllocationEntry> {
@@ -102,11 +124,11 @@ impl FlatImageMemory {
     /// The boot path creates exactly one service and keeps a handle alive for
     /// the lifetime of the system so it outlives every committed lease; the
     /// reaper obtains its own `Clone` to release those leases.
+    /// If service namespaces are exhausted, this handle rejects allocations.
     pub fn new() -> Self {
-        let service = Arc::new(Mutex::new(FlatMemoryService::new()));
-        let nonce = Arc::as_ptr(&service) as *const () as usize as u64;
-        service.lock().nonce = nonce;
-        Self { service }
+        Self {
+            service: Arc::new(Mutex::new(FlatMemoryService::new())),
+        }
     }
 }
 
@@ -391,6 +413,121 @@ fn protection_backend_error(allocation: &ImageAllocation) -> LoadError {
             align: allocation.align(),
         },
     )
+}
+
+#[cfg(test)]
+mod id_tests {
+    use super::*;
+    use blueos_test_macro::test;
+
+    #[test]
+    fn allocation_counter_stops_at_the_low_32_bit_boundary() {
+        let mut service = FlatMemoryService::new();
+        service.nonce = Some(8);
+        service.last_counter = u32::MAX - 1;
+        let last = service.mint_id().expect("last counter is still valid");
+        assert_eq!(last.value(), (8u64 << 32) | u64::from(u32::MAX));
+        for _ in 0..2 {
+            assert!(service.mint_id().is_err());
+            assert_eq!(service.last_counter, u32::MAX);
+        }
+    }
+
+    #[test]
+    fn counter_exhaustion_does_not_publish_an_allocation() {
+        let mut memory = FlatImageMemory::new();
+        let lease = memory
+            .allocate_image(AllocationRequest::new(Placement::Anywhere, 32, 8))
+            .unwrap();
+        let allocation = *lease.allocation();
+        memory
+            .write(&allocation, AllocationOffset::new(0), b"live")
+            .unwrap();
+        memory.service.lock().last_counter = u32::MAX - 1;
+        let last = memory
+            .allocate_image(AllocationRequest::new(Placement::Anywhere, 16, 8))
+            .unwrap();
+        memory.release_committed(last);
+
+        for _ in 0..2 {
+            assert!(memory
+                .allocate_image(AllocationRequest::new(Placement::Anywhere, 16, 8))
+                .is_err());
+            assert_eq!(memory.service.lock().entries.len(), 1);
+        }
+        let mut bytes = [0; 4];
+        memory
+            .read(&allocation, AllocationOffset::new(0), &mut bytes)
+            .unwrap();
+        assert_eq!(&bytes, b"live");
+        memory.release_committed(lease);
+        assert!(memory.service.lock().entries.is_empty());
+    }
+
+    #[test]
+    fn service_nonce_exhaustion_never_wraps() {
+        let last = AtomicU32::new(0);
+        assert_eq!(reserve_service_nonce(&last), Some(1));
+        assert_eq!(reserve_service_nonce(&last), Some(2));
+
+        let last = AtomicU32::new(u32::MAX - 1);
+        assert_eq!(reserve_service_nonce(&last), Some(u32::MAX));
+        for _ in 0..2 {
+            assert_eq!(reserve_service_nonce(&last), None);
+            assert_eq!(last.load(Ordering::Relaxed), u32::MAX);
+        }
+    }
+
+    #[test]
+    fn clones_share_a_counter_but_independent_services_have_distinct_nonces() {
+        let mut memory = FlatImageMemory::new();
+        let mut clone = memory.clone();
+        let mut independent = FlatImageMemory::new();
+        let request = AllocationRequest::new(Placement::Anywhere, 16, 8);
+        let first = memory.allocate_image(request).unwrap();
+        let second = clone.allocate_image(request).unwrap();
+        let other = independent.allocate_image(request).unwrap();
+        let first_id = first.allocation().id().value();
+        let second_id = second.allocation().id().value();
+        let other_id = other.allocation().id().value();
+        assert_eq!(first_id & u64::from(u32::MAX), 1);
+        assert_eq!(second_id & u64::from(u32::MAX), 2);
+        assert_eq!(other_id & u64::from(u32::MAX), 1);
+        assert_eq!(first_id >> 32, second_id >> 32);
+        assert_ne!(first_id >> 32, other_id >> 32);
+
+        clone.release_committed(first);
+        memory.release_committed(second);
+        independent.release_committed(other);
+        assert!(memory.service.lock().entries.is_empty());
+        assert!(independent.service.lock().entries.is_empty());
+    }
+
+    #[test]
+    fn service_namespace_is_not_reused_after_drop() {
+        let first_nonce = {
+            let memory = FlatImageMemory::new();
+            let nonce = memory.service.lock().nonce.expect("reserve namespace");
+            nonce
+        };
+        let memory = FlatImageMemory::new();
+        let next_nonce = memory.service.lock().nonce.expect("reserve namespace");
+        assert_ne!(first_nonce, next_nonce);
+    }
+
+    #[test]
+    fn exhausted_service_namespace_cannot_publish_allocations() {
+        let mut memory = FlatImageMemory::new();
+        memory.service.lock().nonce = None;
+        for _ in 0..2 {
+            assert!(memory
+                .allocate_image(AllocationRequest::new(Placement::Anywhere, 16, 8))
+                .is_err());
+            let service = memory.service.lock();
+            assert!(service.entries.is_empty());
+            assert_eq!(service.last_counter, 0);
+        }
+    }
 }
 
 #[cfg(test)]
