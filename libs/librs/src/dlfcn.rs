@@ -71,12 +71,22 @@ fn fail(function: &str, errno: i32) {
     write!(error, "{function}: {description} (errno {errno})").ignore_result();
 }
 
+/// Find a nonempty string's NUL within the loader's 256-byte name limit.
+///
+/// # Safety
+/// A non-null ptr must refer to initialized, immutable bytes in one allocation
+/// through the first NUL, or through all 257 inspected bytes if none is found.
+/// That allocation must remain live throughout this call. NULL is rejected.
+// SAFETY: the caller supplies the readable prefix; the loop stops at its NUL
+// and inspects at most offsets 0..=256 without retaining any borrowed pointer.
 unsafe fn string_len(ptr: *const c_char) -> Result<usize, i32> {
     if ptr.is_null() {
         return Err(libc::EINVAL);
     }
     for index in 0..=256 {
-        if *ptr.add(index) == 0 {
+        // SAFETY: ptr is non-null and no preceding byte was NUL. The caller's
+        // readable prefix therefore includes this initialized byte in bounds.
+        if unsafe { *ptr.add(index) } == 0 {
             return if index == 0 {
                 Err(libc::EINVAL)
             } else {
@@ -121,13 +131,23 @@ fn finish_plans(plan: &mut BlueOsDlPlan) -> Result<(), i32> {
     }
 }
 
+/// Open an object, or query the main image when filename is NULL.
+///
+/// # Safety
+/// A non-null filename must remain readable and immutable through its first
+/// NUL, or for 257 bytes when no NUL appears in that prefix, until this call
+/// returns. All inspected bytes must belong to the same live allocation.
+// SAFETY: the caller supplies filename's readable prefix. The kernel copies
+// its bounded bytes synchronously, and plan is an exclusive local output slot.
 #[no_mangle]
 #[linkage = "weak"]
 pub unsafe extern "C" fn dlopen(filename: *const c_char, flags: c_int) -> *mut c_void {
     let len = if filename.is_null() {
         0
     } else {
-        match string_len(filename) {
+        // SAFETY: filename is non-null and its caller-provided readable,
+        // immutable prefix satisfies string_len's bounded scan contract.
+        match unsafe { string_len(filename) } {
             Ok(len) => len,
             Err(errno) => {
                 fail("dlopen", errno);
@@ -155,10 +175,22 @@ pub unsafe extern "C" fn dlopen(filename: *const c_char, flags: c_int) -> *mut c
     handle as *mut c_void
 }
 
+/// Resolve a symbol in the handle's lookup scope.
+///
+/// # Safety
+/// A non-null symbol must satisfy the same readable, immutable string-prefix
+/// contract as dlopen's filename for this entire call. NULL is rejected.
+/// Before using the returned address, the caller must establish its data type
+/// or exact function ABI and signature, and keep its provider loaded throughout
+/// every access or invocation. handle is an opaque token, never dereferenced.
+// SAFETY: the caller supplies symbol's readable prefix. The kernel validates
+// the opaque handle and copies the name before returning an address value.
 #[no_mangle]
 #[linkage = "weak"]
 pub unsafe extern "C" fn dlsym(handle: *mut c_void, symbol: *const c_char) -> *mut c_void {
-    let len = match string_len(symbol) {
+    // SAFETY: the caller retains the immutable readable symbol prefix; NULL
+    // is explicitly accepted by string_len for its error-return path.
+    let len = match unsafe { string_len(symbol) } {
         Ok(len) => len,
         Err(errno) => {
             fail("dlsym", errno);

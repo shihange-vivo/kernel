@@ -100,25 +100,50 @@ impl ArchitectureCodeCache {
     }
 }
 
+/// Publish code writes to the current AArch64 execution context.
+///
+/// # Safety
+/// The caller must run where CTR_EL0 reads and cache maintenance are permitted.
+/// Every cache line intersecting runtime_range must remain mapped as normal
+/// memory throughout this call, with code writes complete before entry. The
+/// caller must separately synchronize execution on other cores when needed.
 #[cfg(target_arch = "aarch64")]
+// SAFETY: the caller pins the loader's mapped code and supplies the required
+// execution privilege; this helper only maintains the intersecting cache lines.
 unsafe fn synchronize_aarch64(runtime_range: TargetRange) -> LoadResult<()> {
     let mut ctr_el0: u64;
-    core::arch::asm!("mrs {value}, ctr_el0", value = out(reg) ctr_el0, options(nostack));
+    // SAFETY: the caller guarantees register access is permitted. The output
+    // operand is initialized by MRS, which does not access caller memory.
+    unsafe {
+        core::arch::asm!("mrs {value}, ctr_el0", value = out(reg) ctr_el0, options(nostack));
+    }
     let dcache_line = 4_u64 << ((ctr_el0 >> 16) & 0xf);
     let icache_line = 4_u64 << (ctr_el0 & 0xf);
     let end = runtime_range.end()?.get();
     let mut address = runtime_range.start().align_down(dcache_line)?.get();
     while address < end {
-        core::arch::asm!("dc cvau, {address}", address = in(reg) address, options(nostack));
+        // SAFETY: address names a cache line intersecting the caller-pinned
+        // range; privileged maintenance is permitted for this live mapping.
+        unsafe {
+            core::arch::asm!("dc cvau, {address}", address = in(reg) address, options(nostack));
+        }
         address = address.saturating_add(dcache_line);
     }
-    core::arch::asm!("dsb ish", options(nostack));
+    // SAFETY: this barrier completes the preceding clean operations without
+    // reading a pointer or modifying the stack.
+    unsafe { core::arch::asm!("dsb ish", options(nostack)) };
     address = runtime_range.start().align_down(icache_line)?.get();
     while address < end {
-        core::arch::asm!("ic ivau, {address}", address = in(reg) address, options(nostack));
+        // SAFETY: the same mapped cache lines remain pinned for instruction
+        // invalidation, and the caller permits these maintenance instructions.
+        unsafe {
+            core::arch::asm!("ic ivau, {address}", address = in(reg) address, options(nostack));
+        }
         address = address.saturating_add(icache_line);
     }
-    core::arch::asm!("dsb ish", "isb", options(nostack));
+    // SAFETY: these barriers complete instruction publication on this core;
+    // neither has a pointer operand or changes the stack.
+    unsafe { core::arch::asm!("dsb ish", "isb", options(nostack)) };
     Ok(())
 }
 
@@ -172,10 +197,14 @@ fn architecture_cache_capability() -> LoadResult<(ExecutionScope, CacheMaintenan
 ///
 /// # Safety
 ///
-/// The caller runs in privileged kernel context on ARMv8-M and supplies ranges
-/// already validated by the loader. The two MMIO addresses are architectural
-/// SCB registers, not application-controlled pointers.
+/// The caller must run in privileged ARMv8-M kernel context where the SCB
+/// maintenance registers below are accessible. Cache lines intersecting the
+/// loader-validated range must remain mapped, with code writes complete before
+/// entry. The platform must have the documented 32-byte lines or no cache;
+/// execution on other cores requires separate synchronization by the caller.
 #[cfg(all(target_arch = "arm", not(armv7m)))]
+// SAFETY: the caller retains the mapped range and establishes the platform
+// and privilege requirements; only the fixed SCB registers are dereferenced.
 unsafe fn synchronize_arm_v8m(runtime_range: TargetRange) -> LoadResult<()> {
     const CACHE_LINE_BYTES: u64 = 32;
     const SCB_ICIMVAU: *mut u32 = 0xE000_EF58 as *mut u32;
@@ -184,25 +213,35 @@ unsafe fn synchronize_arm_v8m(runtime_range: TargetRange) -> LoadResult<()> {
     let end = runtime_range.end()?.get();
     let mut address = runtime_range.start().align_down(CACHE_LINE_BYTES)?.get();
 
-    core::arch::asm!("dsb", options(nostack, preserves_flags));
+    // SAFETY: this privileged kernel barrier orders prior code writes and
+    // does not access a pointer or modify the stack.
+    unsafe { core::arch::asm!("dsb", options(nostack, preserves_flags)) };
     while address < end {
         let mva = u32::try_from(address).map_err(|_| cache_error(runtime_range))?;
-        core::ptr::write_volatile(SCB_DCCMVAU, mva);
+        // SAFETY: the caller permits aligned 32-bit SCB MMIO access. mva is
+        // the address of a cache line intersecting the retained code range.
+        unsafe { core::ptr::write_volatile(SCB_DCCMVAU, mva) };
         address = address
             .checked_add(CACHE_LINE_BYTES)
             .ok_or_else(|| cache_error(runtime_range))?;
     }
-    core::arch::asm!("dsb", options(nostack, preserves_flags));
+    // SAFETY: the barrier completes the preceding SCB clean requests without
+    // accessing caller memory or changing the stack.
+    unsafe { core::arch::asm!("dsb", options(nostack, preserves_flags)) };
 
     address = runtime_range.start().align_down(CACHE_LINE_BYTES)?.get();
     while address < end {
         let mva = u32::try_from(address).map_err(|_| cache_error(runtime_range))?;
-        core::ptr::write_volatile(SCB_ICIMVAU, mva);
+        // SAFETY: this fixed aligned SCB register is writable in the caller's
+        // privileged context; the encoded cache line remains mapped.
+        unsafe { core::ptr::write_volatile(SCB_ICIMVAU, mva) };
         address = address
             .checked_add(CACHE_LINE_BYTES)
             .ok_or_else(|| cache_error(runtime_range))?;
     }
-    core::arch::asm!("dsb", "isb", options(nostack, preserves_flags));
+    // SAFETY: these barriers complete instruction publication on the current
+    // core without pointer operands or stack modification.
+    unsafe { core::arch::asm!("dsb", "isb", options(nostack, preserves_flags)) };
     Ok(())
 }
 
