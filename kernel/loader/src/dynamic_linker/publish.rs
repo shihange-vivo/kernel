@@ -411,7 +411,6 @@ impl<Receipt> LinkProduct<Receipt> {
         &self.link_map
     }
 
-    #[inline]
     /// The relocation-binding diagnostic: the recorded scope
     /// decision per relocation — requester, symbol name and winning provider.
     #[inline]
