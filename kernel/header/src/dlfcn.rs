@@ -35,6 +35,27 @@ pub struct BlueOsDlPlan {
     pub error: i32,
 }
 
+#[cfg(target_pointer_width = "32")]
+assert_ffi_layout!(BlueOsDlPlan, 28, 4, {
+    abi_version: 0,
+    struct_size: 4,
+    handle: 8,
+    token: 12,
+    entries: 16,
+    count: 20,
+    error: 24,
+});
+#[cfg(target_pointer_width = "64")]
+assert_ffi_layout!(BlueOsDlPlan, 48, 8, {
+    abi_version: 0,
+    struct_size: 4,
+    handle: 8,
+    token: 16,
+    entries: 24,
+    count: 32,
+    error: 40,
+});
+
 impl BlueOsDlPlan {
     pub const fn empty() -> Self {
         Self {

@@ -14,6 +14,17 @@
 
 #![no_std]
 
+// Lock wire layouts to reviewed byte sizes, alignments and field offsets.
+// Callers supply literal ILP32/LP64 values rather than deriving the expected
+// layout from the same Rust type that the assertions inspect.
+macro_rules! assert_ffi_layout {
+    ($ty:ty, $size:literal, $align:literal, { $($field:ident: $offset:literal),+ $(,)? }) => {
+        const _: () = assert!(core::mem::size_of::<$ty>() == $size);
+        const _: () = assert!(core::mem::align_of::<$ty>() == $align);
+        $(const _: () = assert!(core::mem::offset_of!($ty, $field) == $offset);)+
+    };
+}
+
 pub mod application;
 
 pub mod dlfcn;
@@ -128,4 +139,23 @@ pub mod thread {
         pub arg: *mut core::ffi::c_void,
         pub cleanup: Option<extern "C" fn(*mut core::ffi::c_void)>,
     }
+
+    #[cfg(target_pointer_width = "32")]
+    assert_ffi_layout!(SpawnArgs, 24, 4, {
+        spawn_hook: 0,
+        stack_start: 4,
+        stack_size: 8,
+        entry: 12,
+        arg: 16,
+        cleanup: 20,
+    });
+    #[cfg(target_pointer_width = "64")]
+    assert_ffi_layout!(SpawnArgs, 48, 8, {
+        spawn_hook: 0,
+        stack_start: 8,
+        stack_size: 16,
+        entry: 24,
+        arg: 32,
+        cleanup: 40,
+    });
 }
