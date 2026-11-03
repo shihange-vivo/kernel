@@ -253,6 +253,8 @@ unsafe impl Sync for Process {}
 
 impl Process {
     pub fn new(pid: Pid, parent: Weak<Process>) -> Result<Arc<Self>, crate::error::Error> {
+        #[cfg(enable_vfs)]
+        let fd_manager = FdManager::with_stdio()?;
         let arc = Arc::new(Self {
             pid,
             topology: SpinLock::new(ProcessTopology {
@@ -263,15 +265,11 @@ impl Process {
             threads: SpinLock::new(ThreadList::new()),
 
             #[cfg(enable_vfs)]
-            fd_manager: SpinLock::new(FdManager::new()),
+            fd_manager: SpinLock::new(fd_manager),
         });
         // SAFETY: `arc` is the sole strong ref and is not yet observable by any
         // other thread, so this `&mut Process` aliases no live reference.
         let p = unsafe { Arc::as_ptr(&arc).cast_mut().as_mut().unwrap() };
-        #[cfg(enable_vfs)]
-        {
-            p.fd_manager.irqsave_lock().init_stdio()?;
-        }
         p.threads.irqsave_lock().init();
         Ok(arc)
     }

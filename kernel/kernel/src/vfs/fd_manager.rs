@@ -26,6 +26,7 @@ use spin::Once;
 // Direct RTOS threads share a system descriptor table without acquiring
 // process membership. Process-owned threads use their process's own table.
 static SYSTEM_FD_MANAGER: Once<crate::sync::SpinLock<FdManager>> = Once::new();
+static SYSTEM_STDIO_READY: Once<()> = Once::new();
 
 pub(crate) fn system_fd_manager() -> &'static crate::sync::SpinLock<FdManager> {
     SYSTEM_FD_MANAGER.call_once(|| crate::sync::SpinLock::new(FdManager::new()))
@@ -38,7 +39,46 @@ pub const STDERR_FILENO: c_int = 2;
 /// First available file descriptor
 pub const FIRST_FD: usize = 3;
 
+pub(crate) fn init_system_stdio() -> Result<(), Error> {
+    init_stdio_with(system_fd_manager(), &SYSTEM_STDIO_READY, open_console)
+}
+
+fn open_console(flags: c_int) -> Result<Arc<dyn FileOps>, Error> {
+    Ok(Arc::new(path::open_path("/dev/console", flags, 0o666)?))
+}
+
+fn prepare_stdio(
+    mut open: impl FnMut(c_int) -> Result<Arc<dyn FileOps>, Error>,
+) -> Result<[Arc<dyn FileOps>; FIRST_FD], Error> {
+    Ok([
+        open(libc::O_RDONLY)?,
+        open(libc::O_WRONLY)?,
+        open(libc::O_WRONLY)?,
+    ])
+}
+
+fn init_stdio_with(
+    table: &crate::sync::SpinLock<FdManager>,
+    initialized: &Once<()>,
+    open: impl FnMut(c_int) -> Result<Arc<dyn FileOps>, Error>,
+) -> Result<(), Error> {
+    initialized
+        .try_call_once(|| {
+            // Opening and partial-failure cleanup happen without the fd lock.
+            let files = prepare_stdio(open)?;
+            let replaced = {
+                let mut manager = table.irqsave_lock();
+                manager.install_stdio(files)
+            };
+            // Old file objects may release VFS resources on their last drop.
+            drop(replaced);
+            Ok(())
+        })
+        .map(|_| ())
+}
+
 /// File descriptor manager
+#[must_use = "keep the descriptor table alive while its files are in use"]
 pub struct FdManager {
     /// File descriptor table
     fds: Vec<Option<Arc<dyn FileOps>>>,
@@ -55,16 +95,25 @@ impl FdManager {
         }
     }
 
-    pub fn init_stdio(&mut self) -> Result<(), Error> {
-        let stdin = path::open_path("/dev/console", libc::O_RDONLY, 0o666)?;
-        let stdout = path::open_path("/dev/console", libc::O_WRONLY, 0o666)?;
-        let stderr = path::open_path("/dev/console", libc::O_WRONLY, 0o666)?;
+    /// Prepare a process's standard streams before publishing its fd table.
+    pub fn with_stdio() -> Result<Self, Error> {
+        let files = prepare_stdio(open_console)?;
+        let mut manager = Self::new();
+        drop(manager.install_stdio(files));
+        Ok(manager)
+    }
 
-        self.fds[STDIN_FILENO as usize] = Some(Arc::new(stdin));
-        self.fds[STDOUT_FILENO as usize] = Some(Arc::new(stdout));
-        self.fds[STDERR_FILENO as usize] = Some(Arc::new(stderr));
-
-        Ok(())
+    /// Only move handles while locked; the caller drops old handles unlocked.
+    #[must_use = "release replaced file handles after unlocking the fd table"]
+    fn install_stdio(
+        &mut self,
+        [stdin, stdout, stderr]: [Arc<dyn FileOps>; FIRST_FD],
+    ) -> [Option<Arc<dyn FileOps>>; FIRST_FD] {
+        [
+            self.fds[STDIN_FILENO as usize].replace(stdin),
+            self.fds[STDOUT_FILENO as usize].replace(stdout),
+            self.fds[STDERR_FILENO as usize].replace(stderr),
+        ]
     }
 
     /// Allocate new file descriptor
@@ -165,3 +214,6 @@ impl FdManager {
         self.next_fd = next_fd;
     }
 }
+
+#[cfg(test)]
+mod tests;
