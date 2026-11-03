@@ -217,9 +217,14 @@ fn read_dynstr_from_file<R: ElfReader>(
     // The straddling case — vaddr inside the segment but the string table
     // reaching past its file-backed extent into BSS — is malformed, exactly
     // as the mapped pipeline's `locate_file_backed_dynamic` treats it.
-    if file_range.offset() + file_range.len()
-        > segment.file_range().offset() + segment.file_range().len()
-    {
+    let file_end = file_range
+        .end()
+        .map_err(|error| error.at_stage(LoadStage::Discover))?;
+    let segment_end = segment
+        .file_range()
+        .end()
+        .map_err(|error| error.at_stage(LoadStage::Discover))?;
+    if file_end > segment_end {
         return Err(LoadError::new(
             LoadErrorKind::OutOfBounds,
             crate::error::ErrorContext::FileRange {
@@ -270,5 +275,58 @@ impl<R: ElfReader> ElfReader for ReadRef<'_, R> {
 
     fn read_exact_at(&self, offset: u64, dst: &mut [u8]) -> LoadResult<()> {
         self.inner.read_exact_at(offset, dst)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{memory::MemoryPermissions, tests::fixture::SliceElfReader};
+    use blueos_test_macro::test;
+
+    #[test]
+    fn dynstr_rejects_overflowing_file_bounds_during_discovery() {
+        let offset = u64::MAX - 3;
+        for (file_len, strsz, overflowing_len) in [(3, 4, 4), (4, 1, 4)] {
+            let segment = LoadSegmentInfo::new(
+                0,
+                FileRange::new(offset, file_len),
+                TargetAddress::new(0x1000),
+                0x100,
+                1,
+                MemoryPermissions::READ,
+            );
+            // A wrapped endpoint must fail before any string-table read.
+            let error = read_dynstr_from_file(&SliceElfReader::new(&[]), &[segment], 0x1000, strsz)
+                .unwrap_err();
+            assert_eq!(error.kind(), LoadErrorKind::IntegerOverflow);
+            assert_eq!(error.stage(), Some(LoadStage::Discover));
+            assert!(matches!(
+                error.context(),
+                crate::error::ErrorContext::FileRange { offset: actual, len, .. }
+                    if *actual == offset && *len == overflowing_len
+            ));
+        }
+    }
+
+    #[test]
+    fn dynstr_accepts_exact_file_end_and_rejects_bss() {
+        let segment = LoadSegmentInfo::new(
+            0,
+            FileRange::new(0, 4),
+            TargetAddress::new(0x1000),
+            8,
+            1,
+            MemoryPermissions::READ,
+        );
+        let segments = [segment];
+        let reader = SliceElfReader::new(b"abc\0");
+        assert_eq!(
+            read_dynstr_from_file(&reader, &segments, 0x1000, 4).unwrap(),
+            b"abc\0",
+        );
+        let error = read_dynstr_from_file(&reader, &segments, 0x1000, 5).unwrap_err();
+        assert_eq!(error.kind(), LoadErrorKind::OutOfBounds);
+        assert_eq!(error.stage(), Some(LoadStage::Discover));
     }
 }

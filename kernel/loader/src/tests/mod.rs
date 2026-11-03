@@ -27,7 +27,7 @@ use crate::tests::fixture::ElfFixtureBuilder;
 mod address;
 mod admission;
 mod contracts;
-mod fixture;
+pub(crate) mod fixture;
 mod linker;
 mod load;
 mod permissions;

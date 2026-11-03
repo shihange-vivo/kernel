@@ -289,22 +289,19 @@ fn session_image_metadata_bytes(
     identity: &ArtifactIdentity,
     soname: Option<&DependencyName>,
 ) -> LoadResult<u64> {
+    let segment_bytes = (runtime.load_segments().len() as u64)
+        .checked_mul(core::mem::size_of::<LoadSegmentInfo>() as u64)
+        .ok_or_else(overflow)?;
+    let region_bytes = (runtime.regions().len() as u64)
+        .checked_mul(core::mem::size_of::<LoadedRegion>() as u64)
+        .ok_or_else(overflow)?;
     runtime
         .metadata()
         .metadata_bytes()
         .checked_add(identity.metadata_bytes())
         .and_then(|bytes| bytes.checked_add(soname.map_or(0, |name| name.as_bytes().len() as u64)))
-        .and_then(|bytes| {
-            bytes.checked_add(
-                runtime.load_segments().len() as u64
-                    * core::mem::size_of::<LoadSegmentInfo>() as u64,
-            )
-        })
-        .and_then(|bytes| {
-            bytes.checked_add(
-                runtime.regions().len() as u64 * core::mem::size_of::<LoadedRegion>() as u64,
-            )
-        })
+        .and_then(|bytes| bytes.checked_add(segment_bytes))
+        .and_then(|bytes| bytes.checked_add(region_bytes))
         .ok_or_else(overflow)
 }
 
@@ -313,6 +310,9 @@ fn session_image_metadata_bytes(
 /// published regions. Charged against
 /// `SessionLimits::total_runtime_metadata_bytes` on import.
 fn imported_metadata_bytes(descriptor: &PublishedImageDescriptor) -> LoadResult<u64> {
+    let region_bytes = (descriptor.regions().len() as u64)
+        .checked_mul(core::mem::size_of::<PublishedRegion>() as u64)
+        .ok_or_else(overflow)?;
     descriptor
         .exports()
         .metadata_bytes()
@@ -325,10 +325,6 @@ fn imported_metadata_bytes(descriptor: &PublishedImageDescriptor) -> LoadResult<
                     .map_or(0, |name| name.as_bytes().len() as u64),
             )
         })
-        .and_then(|bytes| {
-            bytes.checked_add(
-                descriptor.regions().len() as u64 * core::mem::size_of::<PublishedRegion>() as u64,
-            )
-        })
+        .and_then(|bytes| bytes.checked_add(region_bytes))
         .ok_or_else(overflow)
 }

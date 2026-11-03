@@ -115,21 +115,51 @@ pub(crate) struct LoadFacts {
 }
 
 impl LoadFacts {
+    // Saturate the byte total so quota accounting never wraps to a smaller value.
     pub(crate) fn metadata_bytes(&self) -> u64 {
-        let handle_bytes = core::mem::size_of::<ImageHandle>();
-        let mut bytes = core::mem::size_of::<Self>()
-            + self.images.capacity() * core::mem::size_of::<ImageFacts>()
-            + self.retained.capacity() * handle_bytes
-            + (self.startup.capacity() + self.fini.capacity() + self.rollback_fini.capacity())
-                * core::mem::size_of::<LifecycleEntry>();
+        let mut bytes = [
+            (self.images.capacity(), core::mem::size_of::<ImageFacts>()),
+            (
+                self.retained.capacity(),
+                core::mem::size_of::<ImageHandle>(),
+            ),
+            (
+                self.startup.capacity(),
+                core::mem::size_of::<LifecycleEntry>(),
+            ),
+            (self.fini.capacity(), core::mem::size_of::<LifecycleEntry>()),
+            (
+                self.rollback_fini.capacity(),
+                core::mem::size_of::<LifecycleEntry>(),
+            ),
+        ]
+        .into_iter()
+        .fold(
+            core::mem::size_of::<Self>() as u64,
+            |bytes, (count, size)| bytes.saturating_add((count as u64).saturating_mul(size as u64)),
+        );
         for image in &self.images {
-            bytes += (image.lookup.capacity()
-                + image.component.capacity()
-                + image.dependencies.capacity())
-                * handle_bytes;
-            bytes += image.fini.capacity() * core::mem::size_of::<LifecycleEntry>();
+            bytes = [
+                (image.lookup.capacity(), core::mem::size_of::<ImageHandle>()),
+                (
+                    image.component.capacity(),
+                    core::mem::size_of::<ImageHandle>(),
+                ),
+                (
+                    image.dependencies.capacity(),
+                    core::mem::size_of::<ImageHandle>(),
+                ),
+                (
+                    image.fini.capacity(),
+                    core::mem::size_of::<LifecycleEntry>(),
+                ),
+            ]
+            .into_iter()
+            .fold(bytes, |bytes, (count, size)| {
+                bytes.saturating_add((count as u64).saturating_mul(size as u64))
+            });
         }
-        bytes as u64
+        bytes
     }
 }
 

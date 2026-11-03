@@ -23,7 +23,10 @@
 #![no_std]
 #![no_main]
 
-use core::ffi::{c_char, c_int};
+use core::{
+    ffi::{c_char, c_int},
+    fmt::{self, Write},
+};
 
 extern "C" {
     fn write(fd: c_int, buf: *const c_char, count: usize) -> isize;
@@ -44,6 +47,15 @@ fn put(fd: c_int, bytes: &[u8]) {
     }
 }
 
+struct Stdout;
+
+impl Write for Stdout {
+    fn write_str(&mut self, value: &str) -> fmt::Result {
+        put(1, value.as_bytes());
+        Ok(())
+    }
+}
+
 /// # Safety
 /// The runtime provides argc initialized argv entries and terminated strings
 /// pinned in application start storage for the duration of this call.
@@ -57,8 +69,7 @@ pub unsafe extern "C" fn main(
 
     // argc/argv round-trip: argv[0] is the application path from the kernel's
     // start storage.
-    let argc_bytes = &[b'0' + (argc as u8), b'\n'];
-    put(1, argc_bytes);
+    let _write_result = writeln!(Stdout, "{argc}");
     if argc > 0 && !argv.is_null() {
         // SAFETY: argv is the pinned C-style pointer array from the kernel
         // start storage, valid for the whole application lifetime.

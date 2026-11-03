@@ -539,16 +539,24 @@ impl SymbolTable {
 
     /// Total owned metadata bytes kept by this table: the `.dynstr` copy, the
     /// decoded symbol entries, and the retained hash tables. Charged against
-    /// `max_runtime_metadata_bytes` during.
+    /// `max_runtime_metadata_bytes`. Overflow saturates at `u64::MAX`.
     pub(crate) fn metadata_bytes(&self) -> u64 {
         let dynstr = self.dynstr.len() as u64;
-        let entries = self.entries.len() as u64 * core::mem::size_of::<SymbolEntry>() as u64;
+        let entries =
+            (self.entries.len() as u64).saturating_mul(core::mem::size_of::<SymbolEntry>() as u64);
         let sysv = self.sysv.as_ref().map_or(0, |table| {
-            (table.buckets.len() + table.chains.len()) as u64 * 4
+            (table.buckets.len() as u64)
+                .saturating_add(table.chains.len() as u64)
+                .saturating_mul(4)
         });
         let gnu = self.gnu.as_ref().map_or(0, |table| {
-            (table.bloom.len() as u64 * core::mem::size_of::<u64>() as u64)
-                + (table.buckets.len() + table.chains.len()) as u64 * 4
+            (table.bloom.len() as u64)
+                .saturating_mul(core::mem::size_of::<u64>() as u64)
+                .saturating_add(
+                    (table.buckets.len() as u64)
+                        .saturating_add(table.chains.len() as u64)
+                        .saturating_mul(4),
+                )
         });
         dynstr
             .checked_add(entries)

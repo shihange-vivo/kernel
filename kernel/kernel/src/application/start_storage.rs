@@ -200,7 +200,11 @@ fn build_strings(views: &[BlueOsStringView]) -> Result<OwnedStrings, StartStorag
     let bytes: Box<[u8]> = bytes.into_boxed_slice();
     let base = bytes.as_ptr();
     let mut ptrs = Vec::new();
-    ptrs.try_reserve_exact(views.len() + 1)
+    let ptr_count = views
+        .len()
+        .checked_add(1)
+        .ok_or(StartStorageError::OutOfMemory)?;
+    ptrs.try_reserve_exact(ptr_count)
         .map_err(|_| StartStorageError::OutOfMemory)?;
     for offset in offsets {
         // SAFETY: `base` points into the owned `bytes` heap slice, whose
@@ -214,9 +218,13 @@ fn build_strings(views: &[BlueOsStringView]) -> Result<OwnedStrings, StartStorag
 
 /// Copy a byte slice into a fresh NUL-terminated buffer.
 fn nul_terminated(bytes: &[u8]) -> Result<Box<[u8]>, StartStorageError> {
+    let len = bytes
+        .len()
+        .checked_add(1)
+        .ok_or(StartStorageError::OutOfMemory)?;
     let mut buffer = Vec::new();
     buffer
-        .try_reserve_exact(bytes.len() + 1)
+        .try_reserve_exact(len)
         .map_err(|_| StartStorageError::OutOfMemory)?;
     buffer.extend_from_slice(bytes);
     buffer.push(0);
@@ -292,4 +300,47 @@ fn build_auxv(
 
     let count = auxv.len();
     Ok((auxv.into_boxed_slice(), count))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use blueos_test_macro::test;
+
+    #[test]
+    fn start_strings_keep_empty_and_nonempty_terminators() {
+        let (bytes, ptrs) = build_strings(&[]).unwrap();
+        assert!(bytes.is_empty());
+        assert_eq!(ptrs.as_ref(), &[core::ptr::null()]);
+        let views = [
+            BlueOsStringView {
+                data: b"".as_ptr(),
+                len: 0,
+            },
+            BlueOsStringView {
+                data: b"app".as_ptr(),
+                len: 3,
+            },
+        ];
+        let (bytes, ptrs) = build_strings(&views).unwrap();
+        assert_eq!(bytes.as_ref(), b"\0app\0");
+        assert_eq!(ptrs.len(), 3);
+        assert_eq!(ptrs[0], bytes.as_ptr().cast());
+        assert_eq!(ptrs[1], bytes[1..].as_ptr().cast());
+        assert!(ptrs[2].is_null());
+        assert_eq!(nul_terminated(b"").unwrap().as_ref(), b"\0");
+        assert_eq!(nul_terminated(b"app").unwrap().as_ref(), b"app\0");
+    }
+
+    #[test]
+    fn start_strings_reject_size_overflow_before_reading_views() {
+        let views = [BlueOsStringView {
+            data: core::ptr::null(),
+            len: usize::MAX,
+        }];
+        assert_eq!(
+            build_strings(&views).unwrap_err(),
+            StartStorageError::OutOfMemory
+        );
+    }
 }
