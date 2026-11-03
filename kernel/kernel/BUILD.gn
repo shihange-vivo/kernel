@@ -297,7 +297,7 @@ if (boot_dynamic_seed) {
       "--file",
       "/apps/rust_std/app.elf," + rebase_path("${root_out_dir}/bin/rust_std"),
       "--file",
-      "/shell/app.elf," + rebase_path("${root_out_dir}/bin/shell"),
+      "/apps/shell/app.elf," + rebase_path("${root_out_dir}/bin/shell"),
       "--file",
       "/system/lib/libc.so.1," + rebase_path("${root_out_dir}/lib/liblibrs.so"),
       "--file",
