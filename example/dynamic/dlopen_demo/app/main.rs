@@ -39,6 +39,7 @@ extern "C" {
     fn pthread_join(tid: usize, result: *mut *mut c_void) -> c_int;
     fn usleep(microseconds: u32) -> c_int;
     fn dl_base_count() -> usize;
+    #[link_name = "dlopenCApiProbe"]
     fn dlopen_c_api_probe() -> c_int;
     fn open(path: *const c_char, flags: c_int, ...) -> c_int;
     fn read(fd: c_int, data: *mut u8, len: usize) -> isize;

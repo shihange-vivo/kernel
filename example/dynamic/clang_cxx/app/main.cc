@@ -13,7 +13,7 @@
 // limitations under the License.
 
 extern "C" int printf(const char *format, ...);
-extern "C" int clang_cxx_private_value(int input);
+extern "C" int clangCxxPrivateValue(int input);
 
 namespace {
 
@@ -30,7 +30,7 @@ private:
 } // namespace
 
 extern "C" int main(int argc, const char *const *argv, const char *const *) {
-  const Accumulator<int> accumulator(clang_cxx_private_value(5));
+  const Accumulator<int> accumulator(clangCxxPrivateValue(5));
   const int result = accumulator.add(7);
   const char *argument = argc > 1 ? argv[1] : "-";
   printf("clang-cxx: result=%d argc=%d argv1=%s\n", result, argc, argument);

@@ -31,22 +31,22 @@ extern size_t strlen(const char *string);
 extern void *memcpy(void *destination, const void *source, size_t count);
 extern int memcmp(const void *left, const void *right, size_t count);
 
-extern int clang_c_private_base(void);
-extern int clang_c_private_value(int input);
-extern float clang_c_private_float(float first, float second);
-extern double clang_c_private_double(double first, double second);
+extern int clangCPrivateBase(void);
+extern int clangCPrivateValue(int input);
+extern float clangCPrivateFloat(float first, float second);
+extern double clangCPrivateDouble(double first, double second);
 
 // A file-scope object in the root's own data segment, so the image has a
 // writable BSS word that only relocation + startup can have initialized.
 static int root_generation;
 
-__attribute__((constructor)) static void c_root_constructor(void) {
+__attribute__((constructor)) static void cRootConstructor(void) {
   root_generation = 1;
 }
 
 // Fill a heap block, read it back through a second view of it, and release it.
 // Returns 1 only if the bytes survived the round trip.
-static int heap_round_trip(void) {
+static int heapRoundTrip(void) {
   const size_t length = 64;
   char *buffer = malloc(length);
   if (buffer == NULL) {
@@ -65,15 +65,15 @@ static int heap_round_trip(void) {
 
 // Cross the PLT with floating-point arguments and return values. Compare the
 // result bits so the soft-float board needs no arithmetic runtime helpers.
-static int floating_point_round_trip(void) {
+static int floatingPointRoundTrip(void) {
   union {
     float value;
     uint32_t bits;
-  } single = {.value = clang_c_private_float(1.5f, 2.75f)};
+  } single = {.value = clangCPrivateFloat(1.5f, 2.75f)};
   union {
     double value;
     uint64_t bits;
-  } wide = {.value = clang_c_private_double(1.5, 6.25)};
+  } wide = {.value = clangCPrivateDouble(1.5, 6.25)};
   return single.bits == UINT32_C(0x40300000) &&
          wide.bits == UINT64_C(0x4019000000000000);
 }
@@ -83,15 +83,15 @@ int main(int argc, char *argv[], char *envp[]) {
 
   // The DSO's constructor ran before this one's body, so its state is already
   // visible through the exported accessor.
-  const int base = clang_c_private_base();
-  const int result = clang_c_private_value(5) + 7;
+  const int base = clangCPrivateBase();
+  const int result = clangCPrivateValue(5) + 7;
 
   const char *argument = argc > 1 ? argv[1] : "-";
   printf("clang-c: base=%d generation=%d\n", base, root_generation);
   printf("clang-c: result=%d argc=%d argv1=%s argv1len=%u\n", result, argc,
          argument, (unsigned)strlen(argument));
-  printf("clang-c: heap ok=%d\n", heap_round_trip());
-  const int float_ok = floating_point_round_trip();
+  printf("clang-c: heap ok=%d\n", heapRoundTrip());
+  const int float_ok = floatingPointRoundTrip();
   printf("clang-c: float abi ok=%d\n", float_ok);
 
   // 49 == (37 + 5) + 7 when the DSO constructor ran exactly once and the

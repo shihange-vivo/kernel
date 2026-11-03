@@ -23,7 +23,7 @@ extern char *dlerror(void);
 #define RTLD_LOCAL 0
 #define RTLD_DEFAULT ((void *)0)
 
-int dlopen_c_api_probe(void) {
+int dlopenCApiProbe(void) {
   void *handle = dlopen("libdl_provider.so.1", RTLD_NOW | RTLD_LOCAL);
   if (handle == RTLD_DEFAULT) {
     return 1;

@@ -28,17 +28,17 @@ private:
   int base_;
 };
 
-__attribute__((constructor)) void initialize_private() {
+__attribute__((constructor)) void initializePrivate() {
   private_state = 37;
   printf("clang-cxx: private ctor state=%d\n", private_state);
 }
 
-__attribute__((destructor)) void finalize_private() {
+__attribute__((destructor)) void finalizePrivate() {
   printf("clang-cxx: private fini state=%d\n", private_state);
 }
 
 } // namespace
 
-extern "C" int clang_cxx_private_value(int input) {
+extern "C" int clangCxxPrivateValue(int input) {
   return PrivateValue(private_state).add(input);
 }
