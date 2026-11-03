@@ -10,6 +10,9 @@
 // COUNT: rust-std: sum=56 len=8 == 1
 // COUNT: rust-std: joined=0,2,4,6,8,10,12,14 == 1
 // COUNT: rust-std: thread=ThreadId\( == 1
+// COUNT: rust-std: atexit=register == 1
+// COUNT: rust-std: atexit=nested == 1
+// COUNT: rust-std: atexit=last == 1
 
 #![no_main]
 #![no_std]
@@ -30,6 +33,8 @@
 //! It also covers the bootstrap seam the other fixtures do not: `std` brings
 //! its own `main` wrapper, while the entry is still
 //! `blueos_scrt1::_start -> __librs_start_main(main, info)`.
+//! Exit callbacks re-register through the shared libc and verify LIFO order
+//! before the application is reaped.
 
 extern crate alloc;
 extern crate rsrt;
