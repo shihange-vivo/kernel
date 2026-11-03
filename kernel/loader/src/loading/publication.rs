@@ -29,10 +29,11 @@ use crate::{
     ImageHandle, ImagePin, LoadReservation, LoadResult, LoadedImage,
 };
 use alloc::vec::Vec;
-use core::ops::Deref;
+use core::{mem::ManuallyDrop, ops::Deref};
 
 /// Complete immutable facts available before the host adopts allocations.
 pub struct PublicationManifest {
+    pub(crate) root: ImageHandle,
     pub(crate) image: LoadedImage<()>,
     pub(crate) allocations: Vec<(ImageHandle, ImageAllocation)>,
 }
@@ -44,13 +45,13 @@ impl Deref for PublicationManifest {
 }
 impl PublicationManifest {
     pub fn profile(&self) -> crate::profile::LoadProfile {
-        self.images().next().expect("root image").profile()
+        self.root.profile()
     }
     pub fn allocations(&self) -> &[(ImageHandle, ImageAllocation)] {
         &self.allocations
     }
     pub fn execution_domain(&self) -> crate::ExecutionDomainId {
-        self.images().next().expect("root image").execution_domain()
+        self.root.execution_domain()
     }
     pub fn private_images(&self) -> usize {
         self.allocations
@@ -83,28 +84,61 @@ pub trait LoadPublisher<M: ImageProtectionMemory, P: ImagePin, B: LoadReservatio
 
 #[must_use = "the publisher must adopt every allocation and retained provider"]
 pub struct LoadResources<M: ImageMemory, P: ImagePin, B: LoadReservation<Pin = P>> {
-    memory: Option<M>,
-    allocations: Vec<(ImageHandle, AllocationLease)>,
-    pins: Vec<P>,
-    reservation: Option<B>,
+    pub(crate) parts: ResourceParts<M, P, B>,
+    rollback: bool,
+}
+#[must_use = "resource parts carry unique allocation release authority"]
+pub(crate) struct ResourceParts<M: ImageMemory, P: ImagePin, B: LoadReservation<Pin = P>> {
+    pub(crate) memory: M,
+    pub(crate) allocations: Vec<(ImageHandle, AllocationLease)>,
+    pub(crate) pins: Vec<P>,
+    pub(crate) reservation: B,
 }
 impl<M: ImageMemory, P: ImagePin, B: LoadReservation<Pin = P>> LoadResources<M, P, B> {
+    pub(crate) fn prepared(
+        memory: M,
+        allocations: Vec<(ImageHandle, AllocationLease)>,
+        pins: Vec<P>,
+        reservation: B,
+    ) -> Self {
+        Self {
+            parts: ResourceParts {
+                memory,
+                allocations,
+                pins,
+                reservation,
+            },
+            rollback: true,
+        }
+    }
+
     /// # Safety
     /// The caller assumes all release authority, including the memory backing and provider pins.
-    pub unsafe fn into_parts(mut self) -> (M, Vec<(ImageHandle, AllocationLease)>, Vec<P>, B) {
+    // SAFETY: the caller adopts every owned field and its release authority;
+    // moving the complete parts value leaves no partially consumed state.
+    pub unsafe fn into_parts(self) -> (M, Vec<(ImageHandle, AllocationLease)>, Vec<P>, B) {
+        let this = ManuallyDrop::new(self);
+        // SAFETY: self is consumed and its destructor is disabled. parts is
+        // initialized, aligned and read exactly once; no source field is used
+        // or dropped again, so the returned fields are their unique owners.
+        let parts = unsafe { core::ptr::read(&this.parts) };
         (
-            self.memory.take().expect("resource memory"),
-            core::mem::take(&mut self.allocations),
-            core::mem::take(&mut self.pins),
-            self.reservation.take().expect("resource reservation"),
+            parts.memory,
+            parts.allocations,
+            parts.pins,
+            parts.reservation,
         )
     }
 }
 impl<M: ImageMemory, P: ImagePin, B: LoadReservation<Pin = P>> Drop for LoadResources<M, P, B> {
     fn drop(&mut self) {
-        if let Some(memory) = &mut self.memory {
-            while let Some((_, lease)) = self.allocations.pop() {
-                memory.release_committed(lease);
+        while let Some((_, lease)) = self.parts.allocations.pop() {
+            if self.rollback {
+                self.parts
+                    .memory
+                    .abort_image(lease, MutationProgress::ProtectionModified);
+            } else {
+                self.parts.memory.release_committed(lease);
             }
         }
     }
@@ -112,48 +146,28 @@ impl<M: ImageMemory, P: ImagePin, B: LoadReservation<Pin = P>> Drop for LoadReso
 
 #[must_use = "publish the prepared load or drop it to roll back"]
 pub struct PreparedLoad<M: ImageProtectionMemory, P: ImagePin, B: LoadReservation<Pin = P>> {
-    pub(crate) memory: Option<M>,
-    pub(crate) allocations: Vec<(ImageHandle, AllocationLease)>,
-    pub(crate) pins: Vec<P>,
-    pub(crate) reservation: Option<B>,
-    pub(crate) manifest: Option<PublicationManifest>,
+    pub(crate) resources: LoadResources<M, P, B>,
+    pub(crate) manifest: PublicationManifest,
 }
 impl<M: ImageProtectionMemory, P: ImagePin, B: LoadReservation<Pin = P>> PreparedLoad<M, P, B> {
     pub fn manifest(&self) -> &PublicationManifest {
-        self.manifest.as_ref().expect("prepared manifest")
+        &self.manifest
     }
     pub fn publish<U: LoadPublisher<M, P, B>>(
-        mut self,
+        self,
         publisher: &mut U,
     ) -> LoadResult<LoadedImage<U::Owner>> {
-        let token = publisher.prepare(
-            self.manifest(),
-            self.reservation.as_ref().expect("reservation"),
-        )?;
-        let manifest = self.manifest.take().expect("manifest");
-        let resources = LoadResources {
-            memory: self.memory.take(),
-            allocations: core::mem::take(&mut self.allocations),
-            pins: core::mem::take(&mut self.pins),
-            reservation: self.reservation.take(),
-        };
+        let token = publisher.prepare(&self.manifest, &self.resources.parts.reservation)?;
+        let Self {
+            mut resources,
+            manifest,
+        } = self;
+        resources.rollback = false;
         // SAFETY: the token and guarded resources were produced for the same complete manifest.
         let owner = unsafe { publisher.commit(token, resources) };
         Ok(LoadedImage::new(owner, manifest.image.facts))
     }
 }
-impl<M: ImageProtectionMemory, P: ImagePin, B: LoadReservation<Pin = P>> Drop
-    for PreparedLoad<M, P, B>
-{
-    fn drop(&mut self) {
-        if let Some(memory) = &mut self.memory {
-            while let Some((_, lease)) = self.allocations.pop() {
-                memory.abort_image(lease, MutationProgress::ProtectionModified);
-            }
-        }
-    }
-}
-
 /// Private-only host publisher retaining resources until the returned owner is dropped.
 pub struct RetainResources;
 impl<M: ImageProtectionMemory, P: ImagePin, B: LoadReservation<Pin = P>> LoadPublisher<M, P, B>
@@ -167,6 +181,8 @@ impl<M: ImageProtectionMemory, P: ImagePin, B: LoadReservation<Pin = P>> LoadPub
         }
         Ok(())
     }
+    // SAFETY: the matching prepare rejected shared allocations; returning the
+    // complete guard retains every lease and pin without allocation or failure.
     unsafe fn commit(&mut self, _: (), resources: Self::Owner) -> Self::Owner {
         resources
     }
@@ -190,15 +206,15 @@ impl<'a, S, R> CapturePublisher<'a, S, R> {
     }
 }
 impl<S, R> LinkPublisher for CapturePublisher<'_, S, R> {
-    type PreparedBatch = ();
-    type Receipt = Vec<(ImageHandle, AllocationLease)>;
+    type PreparedBatch = LoadFacts;
+    type Receipt = (LoadFacts, Vec<(ImageHandle, AllocationLease)>);
     fn prepare_metadata(
         &mut self,
         context: &LinkContext,
         plans: &LifecyclePlans,
         bindings: &[RelocationBinding],
     ) -> LoadResult<u64> {
-        self.facts = Some(build_facts(self.plan, context, plans, bindings)?);
+        let facts = build_facts(self.plan, context, plans, bindings)?;
         self.handles
             .try_reserve_exact(context.images().len())
             .map_err(|_| oom())?;
@@ -213,9 +229,7 @@ impl<S, R> LinkPublisher for CapturePublisher<'_, S, R> {
                 self.handles.push(handle(image));
             }
         }
-        self.facts
-            .as_ref()
-            .expect("facts")
+        let metadata_bytes = facts
             .metadata_bytes()
             .checked_add(self.plan.metadata_bytes()?)
             .and_then(|b| {
@@ -227,15 +241,23 @@ impl<S, R> LinkPublisher for CapturePublisher<'_, S, R> {
                         as u64,
                 )
             })
-            .ok_or_else(overflow)
+            .ok_or_else(overflow)?;
+        self.facts = Some(facts);
+        Ok(metadata_bytes)
     }
-    fn prepare_batch(&mut self, _: &PreparedLinkManifest) -> LoadResult<()> {
-        Ok(())
+    fn prepare_batch(&mut self, _: &PreparedLinkManifest) -> LoadResult<LoadFacts> {
+        self.facts.take().ok_or_else(crate::error::invalid)
     }
-    unsafe fn commit_batch(&mut self, _: (), product: CommittingLinkProduct) -> Self::Receipt {
+    // SAFETY: prepare_metadata reserved all sinks and prepare_batch transferred
+    // this session's complete facts. Commit only moves those facts and leases.
+    unsafe fn commit_batch(
+        &mut self,
+        facts: LoadFacts,
+        product: CommittingLinkProduct,
+    ) -> Self::Receipt {
         for pair in self.handles.drain(..).zip(product.into_leases()) {
             self.allocations.push(pair);
         }
-        core::mem::take(&mut self.allocations)
+        (facts, core::mem::take(&mut self.allocations))
     }
 }

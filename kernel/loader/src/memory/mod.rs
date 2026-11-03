@@ -498,11 +498,11 @@ impl<M: ImageMemory> ImageLoadTransaction<M> {
     }
 
     #[inline]
-    pub(crate) fn allocation(&self) -> &ImageAllocation {
+    pub(crate) fn allocation(&self) -> LoadResult<&ImageAllocation> {
         self.pending
             .as_ref()
-            .expect("active image transaction must own its lease")
-            .allocation()
+            .map(AllocationLease::allocation)
+            .ok_or_else(crate::error::invalid)
     }
 
     #[inline]
@@ -514,7 +514,7 @@ impl<M: ImageMemory> ImageLoadTransaction<M> {
     /// transaction's own allocation descriptor. Bytes modifications must go
     /// through `write`/`zero` so the progress marker stays accurate.
     pub(crate) fn read(&self, offset: AllocationOffset, dst: &mut [u8]) -> LoadResult<()> {
-        let allocation = *self.allocation();
+        let allocation = *self.allocation()?;
         self.memory.read(&allocation, offset, dst)
     }
 
@@ -522,7 +522,7 @@ impl<M: ImageMemory> ImageLoadTransaction<M> {
     /// as bytes-modified before issuing the write so that an abort on error
     /// still observes the modification.
     pub(crate) fn write(&mut self, offset: AllocationOffset, src: &[u8]) -> LoadResult<()> {
-        let allocation = *self.allocation();
+        let allocation = *self.allocation()?;
         self.mark_bytes_modified();
         self.memory.write(&allocation, offset, src)
     }
@@ -530,13 +530,13 @@ impl<M: ImageMemory> ImageLoadTransaction<M> {
     /// Owner-bound wrapper around `ImageMemory::zero`. Marks the allocation
     /// as bytes-modified before issuing the zero fill.
     pub(crate) fn zero(&mut self, offset: AllocationOffset, len: u64) -> LoadResult<()> {
-        let allocation = *self.allocation();
+        let allocation = *self.allocation()?;
         self.mark_bytes_modified();
         self.memory.zero(&allocation, offset, len)
     }
 
     pub(crate) fn validate_range(&self, offset: AllocationOffset, len: u64) -> LoadResult<()> {
-        self.memory.validate_range(self.allocation(), offset, len)
+        self.memory.validate_range(self.allocation()?, offset, len)
     }
 }
 
@@ -554,10 +554,7 @@ impl<M: ImageMemory + ?Sized> ImageLoadTransaction<&mut M> {
     ) -> LoadResult<SessionAllocation> {
         rollback.reserve_entry()?;
         debug_assert!(rollback.entries.len() < rollback.entries.capacity());
-        let lease = self
-            .pending
-            .take()
-            .expect("active image transaction must own its lease");
+        let lease = self.pending.take().ok_or_else(crate::error::invalid)?;
         Ok(rollback.push_reserved(lease, self.progress))
     }
 }

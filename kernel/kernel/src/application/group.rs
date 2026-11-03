@@ -380,14 +380,23 @@ impl ThreadGroup {
     /// the pending system batch so no half-initialized descriptor is
     /// published.
     pub fn begin_exit(&self) -> Result<(), ThreadGroupError> {
-        let (batch, registry) = {
+        let (batch, registry, backing) = {
             let mut inner = self.inner.irqsave_lock();
             match inner.state {
                 GroupState::Linked => {
+                    let backing = inner
+                        .receipt
+                        .as_ref()
+                        .ok_or(ThreadGroupError::NotLinked)?
+                        .backing();
                     // `add_member` checks this state under the same lock, so
                     // no child can join after `Draining` becomes observable.
                     inner.state = GroupState::Draining;
-                    (inner.pending_system_batch.take(), inner.registry.clone())
+                    (
+                        inner.pending_system_batch.take(),
+                        inner.registry.clone(),
+                        backing,
+                    )
                 }
                 GroupState::Draining => return Err(ThreadGroupError::AlreadyDraining),
                 GroupState::New => return Err(ThreadGroupError::NotLinked),
@@ -396,12 +405,9 @@ impl ThreadGroup {
         };
         if let Some(batch) = batch {
             let allocations = registry.fail_initialization_batch(batch);
-            let mut inner = self.inner.irqsave_lock();
-            let receipt = inner
-                .receipt
-                .as_mut()
-                .expect("a linked group must retain its publication receipt");
-            receipt.retain_failed_system_allocations(allocations);
+            // Retain the owner before failing the batch, so a concurrent
+            // reaper cannot remove the sink while release authority moves.
+            backing.retain_failed_system_allocations(allocations);
         }
         Ok(())
     }
@@ -445,13 +451,11 @@ impl ThreadGroup {
         &self,
     ) -> Result<(KernelLinkReceipt, Option<ApplicationStartStorage>), ThreadGroupError> {
         let mut inner = self.inner.irqsave_lock();
-        if inner.state != GroupState::Draining {
-            return Err(match inner.state {
-                GroupState::Reaped => ThreadGroupError::AlreadyReaped,
-                GroupState::New => ThreadGroupError::NotLinked,
-                GroupState::Linked => ThreadGroupError::NotDraining,
-                GroupState::Draining => unreachable!(),
-            });
+        match inner.state {
+            GroupState::Draining => {}
+            GroupState::Reaped => return Err(ThreadGroupError::AlreadyReaped),
+            GroupState::New => return Err(ThreadGroupError::NotLinked),
+            GroupState::Linked => return Err(ThreadGroupError::NotDraining),
         }
         if !inner.members.is_empty() {
             return Err(ThreadGroupError::MembersRemaining);
@@ -474,4 +478,18 @@ impl ThreadGroup {
 fn bump_members_epoch(epoch: &Arc<AtomicUsize>) {
     epoch.fetch_add(1, Ordering::Release);
     crate::sync::atomic_wake(epoch, usize::MAX).ignore_result();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use blueos_test_macro::test;
+
+    #[test]
+    fn exit_rejects_missing_resources_before_changing_state() {
+        let group = ThreadGroup::new(&SystemDsoRegistry::new());
+        group.inner.irqsave_lock().state = GroupState::Linked;
+        assert_eq!(group.begin_exit(), Err(ThreadGroupError::NotLinked));
+        assert_eq!(group.state(), GroupState::Linked);
+    }
 }

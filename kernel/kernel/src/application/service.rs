@@ -98,16 +98,13 @@ impl<T> LinkHandoff<T> {
         crate::sync::atomic_wake(&self.completed, usize::MAX).ignore_result();
     }
 
-    fn wait(&self) -> T {
+    fn wait(&self) -> Option<T> {
         while self.completed.load(Ordering::Acquire) == 0 {
             // Re-check completion after a spurious return. The worker marks
             // completion exactly once and never resets it.
             crate::sync::atomic_wait(&self.completed, 0, Tick::MAX).ignore_result();
         }
-        self.outcome
-            .irqsave_lock()
-            .take()
-            .expect("link worker published its result before completing")
+        self.outcome.irqsave_lock().take()
     }
 }
 
@@ -123,8 +120,10 @@ static APPLICATION_SERVICE: Once<ApplicationService> = Once::new();
 impl ApplicationService {
     /// Assemble the process-wide service over a fixed system library catalog.
     /// Idempotent: later calls return the existing singleton.
-    pub(crate) fn init(catalog: &'static SystemLibraryPaths) -> &'static ApplicationService {
-        APPLICATION_SERVICE.call_once(|| {
+    pub(crate) fn init(
+        catalog: &'static SystemLibraryPaths,
+    ) -> Result<&'static ApplicationService, ApplicationLaunchError> {
+        APPLICATION_SERVICE.try_call_once(|| {
             let memory = FlatImageMemory::new();
             let registry = SystemDsoRegistry::new();
             let loader = ApplicationLoader::new(catalog, registry.clone(), memory.clone());
@@ -132,12 +131,12 @@ impl ApplicationService {
             let manager = ApplicationManager::new(registry);
             // The deferred reaper thread owns clones of the reaper and the
             // manager and releases drained groups outside every manager lock
-            reaper.spawn(manager.clone());
-            Self {
+            reaper.spawn(manager.clone())?;
+            Ok(Self {
                 manager,
                 loader,
                 reaper,
-            }
+            })
         })
     }
 
@@ -191,7 +190,7 @@ impl ApplicationService {
             worker.complete(result);
         })
         .ok_or(libc::ENOMEM)?;
-        handoff.wait()
+        handoff.wait().ok_or(libc::EIO)?
     }
 
     /// Accept the application's init completion: first advance
@@ -302,7 +301,9 @@ impl ApplicationService {
             worker.complete(result);
         })
         .ok_or(ApplicationLaunchError::PrepareFailed)?;
-        handoff.wait()
+        handoff
+            .wait()
+            .ok_or(ApplicationLaunchError::PrepareFailed)?
     }
 
     /// The manager's slow prepare closure: VFS open, link preparation, start
@@ -337,7 +338,10 @@ impl ApplicationService {
             .link(namespace, group)
             .map_err(|error| prepare_failed("link application", &error))?;
 
-        let pending = product.receipt_mut().take_pending();
+        let pending = product
+            .receipt_mut()
+            .take_pending()
+            .map_err(|_| ApplicationLaunchError::PrepareFailed)?;
         group
             .install_pending_system_batch(pending)
             .map_err(|_| ApplicationLaunchError::PrepareFailed)?;
@@ -422,4 +426,26 @@ impl ApplicationService {
 fn prepare_failed(step: &str, error: &blueos_loader::LoadError) -> ApplicationLaunchError {
     log::error!("application prepare: {step} failed: {:?}", error);
     ApplicationLaunchError::PrepareFailed
+}
+
+#[cfg(test)]
+mod tests {
+    use super::LinkHandoff;
+    use blueos_test_macro::test;
+    use core::sync::atomic::Ordering;
+
+    #[test]
+    fn completed_link_handoff_transfers_its_outcome_once() {
+        let handoff = LinkHandoff::new();
+        handoff.complete(17usize);
+        assert_eq!(handoff.wait(), Some(17));
+        assert_eq!(handoff.wait(), None);
+    }
+
+    #[test]
+    fn completed_link_handoff_reports_an_absent_outcome() {
+        let handoff = LinkHandoff::<usize>::new();
+        handoff.completed.store(1, Ordering::Release);
+        assert_eq!(handoff.wait(), None);
+    }
 }

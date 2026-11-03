@@ -92,7 +92,7 @@ fn multidso_namespace_vertical() {
     // Boot installed the embedded bundle artifacts and initialized the
     // runtime; this idempotent call retrieves the same service without
     // reseeding the VFS.
-    let service = runtime::init();
+    let service = runtime::init().expect("initialize application runtime");
 
     // First launch: this link is the first loading generation for libc.so.1
     // (DSO_LOAD); the namespace planner walks the ELF closure (root ->

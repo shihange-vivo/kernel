@@ -27,7 +27,7 @@ use semihosting::println;
 
 #[test]
 fn undefined_weak_call_is_rejected() {
-    let service = runtime::init();
+    let service = runtime::init().expect("initialize application runtime");
     let mut argv = Vec::new();
     argv.push(b"/apps/scope_bad/app.elf".to_vec());
     assert!(

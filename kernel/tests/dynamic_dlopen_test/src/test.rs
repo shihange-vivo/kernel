@@ -82,7 +82,7 @@ fn wait(service: &ApplicationService, handle: ApplicationHandle) {
 
 #[test]
 fn runtime_libraries_are_reclaimed() {
-    let service = runtime::init();
+    let service = runtime::init().expect("initialize application runtime");
     wait(service, spawn(service, b""));
     // let baseline = blueos::allocator::memory_info().used;
     for round in 1..=3 {
@@ -95,13 +95,13 @@ fn runtime_libraries_are_reclaimed() {
 
 #[test]
 fn outstanding_handles_are_finalized_at_exit() {
-    let service = runtime::init();
+    let service = runtime::init().expect("initialize application runtime");
     wait(service, spawn(service, b"exit"));
 }
 
 #[test]
 fn runtime_handles_belong_to_the_calling_application() {
-    let service = runtime::init();
+    let service = runtime::init().expect("initialize application runtime");
     let handle_path = b"/dlopen-handle\0";
     let release_path = b"/dlopen-release\0";
     let _ = blueos::vfs::syscalls::unlink(handle_path.as_ptr().cast());

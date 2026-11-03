@@ -68,7 +68,7 @@ fn launch_and_wait(service: &ApplicationService) {
 
 #[test]
 fn rust_std_vertical() {
-    launch_and_wait(runtime::init());
+    launch_and_wait(runtime::init().expect("initialize application runtime"));
 }
 
 #[no_mangle]

@@ -432,9 +432,9 @@ impl RuntimeNamespace {
             .filter(|object| object.opens != 0)
             .ok_or(libc::EINVAL)?;
         object.opens -= 1;
-        let result = state.collect();
+        let result = state.collect(0);
         if result.is_err() {
-            state.object_mut(handle).unwrap().opens += 1;
+            state.object_mut(handle).ok_or(libc::EINVAL)?.opens += 1;
         }
         let plan = result?;
         drop(state);
@@ -451,7 +451,7 @@ impl RuntimeNamespace {
             return Err(libc::EBUSY);
         }
         state.exiting = true;
-        let plan = state.collect()?;
+        let plan = state.collect(0)?;
         drop(state);
         if plan.token != 0 {
             gate.hand_off();
@@ -467,7 +467,23 @@ impl RuntimeNamespace {
         if token == 0 || state.pending.last().is_none_or(|op| op.token != token) {
             return Err(libc::EINVAL);
         }
-        let operation = state.pending.pop().unwrap();
+        if let Some(Operation {
+            kind: OperationKind::Open { batch, .. },
+            ..
+        }) = state.pending.last()
+        {
+            let batch = state
+                .batches
+                .iter()
+                .find(|candidate| candidate.id == *batch)
+                .ok_or(libc::EINVAL)?;
+            if batch.receipt.is_none()
+                || batch.objects.first().is_none_or(|object| object.opens == 0)
+            {
+                return Err(libc::EINVAL);
+            }
+        }
+        let operation = state.pending.pop().ok_or(libc::EINVAL)?;
         if state.pending.is_empty() {
             state.pending = Vec::new();
         }
@@ -489,7 +505,11 @@ impl RuntimeNamespace {
                             .iter_mut()
                             .find(|candidate| candidate.id == batch)
                             .ok_or(libc::EINVAL)?;
-                        batch.receipt.as_mut().unwrap().attach_system_leases(leases);
+                        batch
+                            .receipt
+                            .as_mut()
+                            .ok_or(libc::EINVAL)?
+                            .attach_system_leases(leases);
                         batch.initializing = false;
                         Ok(BlueOsDlPlan::empty())
                     }
@@ -504,20 +524,19 @@ impl RuntimeNamespace {
                         failed
                             .receipt
                             .as_mut()
-                            .unwrap()
+                            .ok_or(libc::EINVAL)?
                             .retain_failed_system_allocations(allocations);
                         failed.initializing = false;
                         failed.fini = core::mem::take(&mut failed.rollback_fini);
-                        failed.objects[0].opens -= 1;
+                        let root = failed.objects.first_mut().ok_or(libc::EINVAL)?;
+                        root.opens = root.opens.checked_sub(1).ok_or(libc::EINVAL)?;
                         for object in &mut failed.objects {
                             object.global = false;
                         }
-                        let mut plan = state.collect()?;
+                        let plan = state.collect(error)?;
                         if plan.token == 0 {
                             Err(error)
                         } else {
-                            state.pending.last_mut().unwrap().error = error;
-                            plan.error = error;
                             Ok(plan)
                         }
                     }
@@ -527,7 +546,7 @@ impl RuntimeNamespace {
                 drop(batches);
                 // A recursive fini may close a provider retained by this
                 // operation. Collect it only after these consumers are gone.
-                self.state.irqsave_lock().collect()
+                self.state.irqsave_lock().collect(0)
             }
         };
         if result.as_ref().is_ok_and(|plan| plan.token != 0) {
@@ -580,7 +599,7 @@ impl State {
             .collect()
     }
 
-    fn collect(&mut self) -> Result<BlueOsDlPlan> {
+    fn collect(&mut self, error: i32) -> Result<BlueOsDlPlan> {
         let exit_collect = self.exiting && self.pending.is_empty();
         let mut reachable = Vec::new();
         reachable
@@ -645,7 +664,7 @@ impl State {
             token: id,
             handle: 0,
             entries: entries.into_boxed_slice(),
-            error: 0,
+            error,
             kind: OperationKind::Close { batches: removed },
         };
         let plan = operation.plan();

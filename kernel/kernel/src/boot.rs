@@ -135,7 +135,12 @@ extern "C" fn init() {
     logger::logger_init();
 
     #[cfg(dynamic_loader)]
-    crate::application::runtime::init();
+    if let Err(error) = crate::application::runtime::init() {
+        log::error!(
+            "boot: dynamic application runtime initialization failed: {:?}",
+            error
+        );
+    }
     time::timer::init();
     #[cfg(kernel_async)]
     asynk::init();

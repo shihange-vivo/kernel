@@ -79,7 +79,7 @@ fn dynamic_app_vertical() {
     // Boot installed the embedded artifacts and initialized the runtime
     //; this idempotent call retrieves the same service without
     // reseeding the VFS.
-    let service = runtime::init();
+    let service = runtime::init().expect("initialize application runtime");
 
     // First launch: this link is the first loading generation for libc.so.1
     // (DSO_LOAD), the app runs its main through the shared libc, exits and is
@@ -110,7 +110,11 @@ fn dynamic_app_from_direct_rtos_thread() {
         assert!(blueos::process::current_process().is_none());
         // The RTOS caller needs no Process object to launch an application;
         // its I/O uses the shared system descriptors throughout the launch.
-        launch_and_wait(runtime::init(), "/apps/hello/app.elf", false);
+        launch_and_wait(
+            runtime::init().expect("initialize application runtime"),
+            "/apps/hello/app.elf",
+            false,
+        );
         assert!(blueos::process::current_process().is_none());
         completed.store(1, Ordering::Release);
         blueos::sync::wake(&completed);

@@ -23,6 +23,7 @@ use alloc::vec::Vec;
 
 use crate::application::{
     adapters::system_paths::{SystemLibraryEntry, SystemLibraryPaths},
+    manager::ApplicationLaunchError,
     service::ApplicationService,
 };
 
@@ -54,7 +55,9 @@ static CATALOG: SystemLibraryPaths = SystemLibraryPaths::new(SYSTEM_LIBRARIES);
 ///
 /// This does not write or replace any VFS file. The underlying service is a
 /// `Once` singleton, so later calls return the already assembled runtime.
-pub fn init() -> &'static ApplicationService {
+/// Failure to start the reaper is returned without publishing the singleton;
+/// initialization may be retried later.
+pub fn init() -> Result<&'static ApplicationService, ApplicationLaunchError> {
     ApplicationService::init(&CATALOG)
 }
 
@@ -64,8 +67,10 @@ pub fn init() -> &'static ApplicationService {
 /// fatal: the runtime stays available for diagnostics or a later explicit
 /// spawn.
 pub fn launch_bootstrap_shell() {
-    let service = ApplicationService::get()
-        .expect("dynamic application runtime must be initialized before launching the shell");
+    let Some(service) = ApplicationService::get() else {
+        log::error!("boot: dynamic application runtime is unavailable");
+        return;
+    };
     let argv = alloc::vec![b"/apps/shell/app.elf".to_vec()];
     if let Err(error) = service.spawn("/apps/shell/app.elf", argv, Vec::new()) {
         log::error!("boot: bootstrap shell launch failed: {:?}", error);

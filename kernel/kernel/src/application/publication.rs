@@ -48,6 +48,11 @@ pub(crate) struct ReceiptBacking {
     // a concurrent link's namespace pin still prevents their bytes from being freed.
     _physical: Vec<FlatBackingPin>,
 }
+impl ReceiptBacking {
+    pub(crate) fn retain_failed_system_allocations(&self, allocations: Vec<AllocationLease>) {
+        self.resources.lock().failed = allocations;
+    }
+}
 impl Drop for ReceiptBacking {
     fn drop(&mut self) {
         let resources = self.resources.get_mut();
@@ -67,10 +72,11 @@ pub struct KernelLinkReceipt {
     images: Vec<ImageHandle>,
 }
 impl KernelLinkReceipt {
-    pub(crate) fn take_pending(&mut self) -> SystemInitBatch {
-        self.pending
-            .take()
-            .expect("one pending initialization batch")
+    pub(crate) fn take_pending(&mut self) -> LoadResult<SystemInitBatch> {
+        self.pending.take().ok_or_else(loader_error)
+    }
+    pub(crate) fn backing(&self) -> Arc<ReceiptBacking> {
+        self.backing.clone()
     }
     pub(crate) fn pin(&self, image: &ImageHandle) -> LoadResult<KernelImagePin> {
         if !self
@@ -86,7 +92,7 @@ impl KernelLinkReceipt {
         })
     }
     pub fn retain_failed_system_allocations(&mut self, allocations: Vec<AllocationLease>) {
-        self.backing.resources.lock().failed = allocations;
+        self.backing.retain_failed_system_allocations(allocations);
     }
     pub fn attach_system_leases(&mut self, leases: Vec<SystemDsoLease>) {
         // Initialization completes once. Moving the preallocated result also avoids a new
@@ -120,7 +126,7 @@ struct CandidateMetadata {
 pub(crate) struct KernelLinkPreparedBatch {
     receipt: KernelLinkReceipt,
     system: SystemPublication,
-    metadata: Vec<CandidateMetadata>,
+    metadata: Vec<(usize, CandidateMetadata)>,
     backings: Vec<SystemCandidateBacking>,
 }
 pub(crate) struct KernelLinkPublisher {
@@ -184,6 +190,19 @@ impl LoadPublisher<FlatImageMemory, KernelImagePin, KernelReservation> for Kerne
         if reservation.permits.len() != manifest.shared_images() {
             return Err(loader_error());
         }
+        // Simulate commit's swap-removals now, while every failure still rolls
+        // back. The resulting indices remain valid for the unchanged resource
+        // order, so commit never searches for or validates an allocation.
+        let mut remaining = Vec::new();
+        remaining
+            .try_reserve_exact(manifest.allocations().len())
+            .map_err(|_| loader_oom())?;
+        remaining.extend(
+            manifest
+                .allocations()
+                .iter()
+                .map(|(image, _)| image.instance_id()),
+        );
         for (key, _) in &reservation.permits {
             let image = manifest
                 .allocations()
@@ -210,14 +229,22 @@ impl LoadPublisher<FlatImageMemory, KernelImagePin, KernelReservation> for Kerne
             let fini_plan = super::start_storage::build_plan_targets(manifest.image_fini(image))
                 .map_err(|_| loader_error())?
                 .into_vec();
-            metadata.push(CandidateMetadata {
-                descriptor: image.clone(),
-                fini_plan,
-                dependency_keys,
-                dependencies,
-                scc_members,
-                keep_cached,
-            });
+            let index = remaining
+                .iter()
+                .position(|id| *id == image.instance_id())
+                .ok_or_else(loader_error)?;
+            remaining.swap_remove(index);
+            metadata.push((
+                index,
+                CandidateMetadata {
+                    descriptor: image.clone(),
+                    fini_plan,
+                    dependency_keys,
+                    dependencies,
+                    scc_members,
+                    keep_cached,
+                },
+            ));
         }
         let system = self.registry.prepare_publication(&reservation.permits)?;
         let backing = Arc::new(ReceiptBacking {
@@ -242,6 +269,9 @@ impl LoadPublisher<FlatImageMemory, KernelImagePin, KernelReservation> for Kerne
             backings,
         })
     }
+    // SAFETY: the caller supplies this prepare's unchanged resource order.
+    // Every removal index and destination capacity was checked in prepare;
+    // commit only moves each lease into its preallocated owner.
     unsafe fn commit(
         &mut self,
         mut prepared: Self::Prepared,
@@ -249,12 +279,8 @@ impl LoadPublisher<FlatImageMemory, KernelImagePin, KernelReservation> for Kerne
     ) -> KernelLinkReceipt {
         // SAFETY: the prepared owner has a sink for every allocation and retains all providers.
         let (_, mut allocations, pins, reservation) = unsafe { resources.into_parts() };
-        for metadata in prepared.metadata {
-            // Identity and capacity were checked in prepare; exclusive permits preserve them.
-            let index = allocations
-                .iter()
-                .position(|(i, _)| i.instance_id() == metadata.descriptor.instance_id())
-                .expect("prepared allocation");
+        for (index, metadata) in prepared.metadata {
+            // prepare simulated these exact removals from this resource order.
             let (_, allocation) = allocations.swap_remove(index);
             prepared.backings.push(SystemCandidateBacking {
                 descriptor: metadata.descriptor,
@@ -267,10 +293,7 @@ impl LoadPublisher<FlatImageMemory, KernelImagePin, KernelReservation> for Kerne
             });
         }
         {
-            let owned = Arc::get_mut(&mut prepared.receipt.backing)
-                .expect("unpublished backing")
-                .resources
-                .get_mut();
+            let mut owned = prepared.receipt.backing.resources.lock();
             for (_, allocation) in allocations {
                 owned.private.push(allocation);
             }

@@ -187,8 +187,7 @@ impl<M: ImageMemory> MappedImage<M> {
         ))
     }
 
-    fn decode_dynamic_tags(&self) -> LoadResult<DynamicTags> {
-        let dynamic = self.dynamic.as_ref().unwrap();
+    fn decode_dynamic_tags(&self, dynamic: &DynamicSegmentInfo) -> LoadResult<DynamicTags> {
         let entry_size = dynamic_entry_size(self.request.profile().class());
 
         if dynamic.file_range().is_empty() || !dynamic.file_range().len().is_multiple_of(entry_size)
@@ -331,9 +330,9 @@ impl<M: ImageMemory> MappedImage<M> {
             .resolve(self.load_bias)
             .map_err(|error| error.at_stage(LoadStage::Decode))?;
         let mut metadata = RuntimeImageMetadata::empty(program_headers);
-        if self.dynamic.is_some() {
+        if let Some(dynamic) = &self.dynamic {
             let tags = self
-                .decode_dynamic_tags()
+                .decode_dynamic_tags(dynamic)
                 .map_err(|error| error.at_stage(LoadStage::Decode))?;
             let mut records = Vec::new();
             self.decode_relocation_table(tags.rel(), RelocationTableKind::Rel, &mut records)

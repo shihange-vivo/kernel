@@ -13,7 +13,11 @@
 // limitations under the License.
 
 //! Complete load preparation and publication through separate host capabilities.
-use super::{materialize::load_images, planning::LoadPlan, publication::CapturePublisher};
+use super::{
+    materialize::load_images,
+    planning::LoadPlan,
+    publication::{CapturePublisher, LoadResources},
+};
 use crate::{
     dynamic_linker::prepare_link,
     error::{invalid, oom, ErrorContext, LoadErrorKind},
@@ -354,28 +358,22 @@ where
     let sealed = prepare_link(images, cache)?;
     phase(observer, LoadPhase::Link, true);
     let mut capture = CapturePublisher::new(&plan);
-    let mut product = sealed.publish(&mut capture)?;
+    let product = sealed.publish(&mut capture)?;
     let entry = (request.role == ArtifactRole::ExecutableRoot).then(|| product.entry());
     // No fallible work occurs between disarming the internal log and arming this owning rollback guard.
-    let mut prepared = PreparedLoad {
-        memory: Some(memory),
-        allocations: Vec::new(),
-        pins,
-        reservation: Some(reservation),
-        manifest: None,
-    };
-    prepared.allocations = product.take_publication();
+    let ((mut facts, owned_allocations), product) = product.into_publication_parts();
+    let mut resources = LoadResources::prepared(memory, owned_allocations, pins, reservation);
     trace_product(observer, &product);
-    let mut facts = capture.facts.take().expect("capture prepared facts");
     facts.entry = entry;
     let mut allocations = Vec::new();
     allocations
-        .try_reserve_exact(prepared.allocations.len())
+        .try_reserve_exact(resources.parts.allocations.len())
         .map_err(|_| oom())?;
-    for (image, lease) in &prepared.allocations {
+    for (image, lease) in &resources.parts.allocations {
         allocations.push((image.clone(), *lease.allocation()));
     }
-    prepared
+    resources
+        .parts
         .pins
         .try_reserve(request.namespace.pins.len())
         .map_err(|_| oom())?;
@@ -385,14 +383,20 @@ where
             .iter()
             .any(|i| i.instance_id() == pin.image().instance_id())
         {
-            prepared.pins.push(pin);
+            resources.parts.pins.push(pin);
         }
     }
-    prepared.manifest = Some(PublicationManifest {
-        image: LoadedImage::new((), facts),
+    let image = LoadedImage::new((), facts);
+    let root = image.images().next().cloned().ok_or_else(invalid)?;
+    let manifest = PublicationManifest {
+        root,
+        image,
         allocations,
-    });
-    Ok(prepared)
+    };
+    Ok(PreparedLoad {
+        resources,
+        manifest,
+    })
 }
 fn validate_provider(
     image: &ImageHandle,
