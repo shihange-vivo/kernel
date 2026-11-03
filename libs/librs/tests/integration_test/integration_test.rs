@@ -31,6 +31,7 @@ use librs::pthread::{pthread_create, pthread_join, pthread_self};
 use semihosting::println;
 
 mod ctype;
+mod malloc;
 mod pthread;
 mod scal;
 
