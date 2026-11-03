@@ -333,7 +333,9 @@ pub trait ImageProtectionMemory: ImageMemory {
                 record.applied_range().len(),
                 record.permissions(),
             )?;
-            let _ = batch.record_level(index, level);
+            if !batch.record_level(index, level) {
+                return Err(crate::error::invalid());
+            }
         }
         Ok(())
     }

@@ -166,7 +166,8 @@ pub fn finish() {
                     );
                     static WAIT: core::sync::atomic::AtomicUsize =
                         core::sync::atomic::AtomicUsize::new(0);
-                    let _ = blueos::sync::atomic_wait(&WAIT, 0, blueos::time::Tick::from_millis(1));
+                    let _wait_result =
+                        blueos::sync::atomic_wait(&WAIT, 0, blueos::time::Tick::from_millis(1));
                 }
             }
         }

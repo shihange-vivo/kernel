@@ -73,7 +73,7 @@ fn mkdirs(path: &str) {
         };
         // SAFETY: `dir` points into `buf`, which holds a NUL-terminated copy of
         // the directory prefix for the duration of the call.
-        let _ = crate::vfs::syscalls::mkdir(dir, 0o755);
+        let _mkdir_result = crate::vfs::syscalls::mkdir(dir, 0o755);
         prefix_end = slash + 1;
     }
 }

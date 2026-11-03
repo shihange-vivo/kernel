@@ -40,7 +40,7 @@ extern crate rsrt;
 use crate::application_context::LibcApplicationContext;
 #[cfg(dynamic_image)]
 use blueos_header::syscalls::NR::{
-    ApplicationBeginExit, ApplicationFinishExit, ApplicationInitComplete,
+    ApplicationBeginExit, ApplicationFinishExit, ApplicationInitComplete, Write,
 };
 #[cfg(dynamic_image)]
 use blueos_scal::bk_syscall;
@@ -154,13 +154,18 @@ pub unsafe extern "C" fn __librs_start_main(
 
     // Signal init completion. The server derives the authoritative group and
     // generation handle from the current thread's membership.
-    let _ = bk_syscall!(ApplicationInitComplete);
+    if bk_syscall!(ApplicationInitComplete) as isize != 0 {
+        lifecycle_failure(b"libc: ApplicationInitComplete failed\n");
+    }
 
     // invoke the application.
     let status = main(info.argc as c_int, info.argv, info.envp);
 
     // forbid new threads and wait for the other members.
-    let _ = bk_syscall!(ApplicationBeginExit, status);
+    if bk_syscall!(ApplicationBeginExit, status) as isize != 0 {
+        // Without successful quiescence, atexit/fini could race live members.
+        lifecycle_failure(b"libc: ApplicationBeginExit failed\n");
+    }
 
     // application-owned atexit, reverse registration order.
     context.run_atexit();
@@ -187,8 +192,9 @@ pub unsafe extern "C" fn __librs_start_main(
 
     // finish the two-phase exit and retire. `finish_exit` never returns
     // (it performs `retire_me`), which subsumes the trailing `ExitThread`.
-    let _ = bk_syscall!(ApplicationFinishExit);
-    park()
+    // Success retires the thread. Any return is a failed lifecycle boundary.
+    let _finish_result = bk_syscall!(ApplicationFinishExit);
+    lifecycle_failure(b"libc: ApplicationFinishExit unexpectedly returned\n")
 }
 
 /// Validate the start-info block and return a shared reference to it, or `None`
@@ -266,6 +272,14 @@ fn run_plan(plan: &blueos_header::application::BlueOsFunctionPlan) {
         let function: extern "C" fn() = unsafe { core::mem::transmute(target) };
         function();
     }
+}
+
+/// Report the failed lifecycle boundary before using the setup-error policy.
+#[cfg(dynamic_image)]
+fn lifecycle_failure(message: &[u8]) -> ! {
+    // The byte slice remains readable throughout this synchronous syscall.
+    let _written = bk_syscall!(Write, 2, message.as_ptr(), message.len());
+    park()
 }
 
 /// Terminal landing pad: park the core. Used on unrecoverable setup errors and

@@ -57,7 +57,7 @@ mod soname_relaxation {
     use goblin::elf::header::{EM_RISCV, ET_DYN};
 
     use crate::{
-        error::{LoadErrorKind, ProgramHeaderField},
+        error::LoadErrorKind,
         image::{ArtifactRole, ImageLoader},
         profile::{LoadLimits, LoadProfile, LoadRequest},
         tests::fixture::{ElfFixtureBuilder, SliceElfReader},
@@ -134,7 +134,6 @@ mod soname_relaxation {
             error.context(),
             crate::error::ErrorContext::ProgramHeader { .. }
         ));
-        let _ = ProgramHeaderField::Type;
     }
 }
 

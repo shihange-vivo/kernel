@@ -568,6 +568,6 @@ fn panic(info: &core::panic::PanicInfo) -> ! {
         }
     }
     use core::fmt::Write;
-    let _ = writeln!(Writer, "DLOPEN_FAIL {info}");
+    let _write_result = writeln!(Writer, "DLOPEN_FAIL {info}");
     loop {}
 }

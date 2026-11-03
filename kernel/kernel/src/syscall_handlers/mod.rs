@@ -417,7 +417,7 @@ create_thread(spawn_args_ptr: *const SpawnArgs) -> c_long {
             .and_then(|service| service.manager().group_for_thread(current_id));
         if let Some(group) = group {
             if group.add_member(t.clone()).is_err() {
-                let _ = GlobalQueueVisitor::remove(&mut t);
+                let _removed = GlobalQueueVisitor::remove(&mut t);
                 return -1;
             }
             // This member's cleanup may enter application code or wake its
@@ -456,7 +456,7 @@ create_thread(spawn_args_ptr: *const SpawnArgs) -> c_long {
             if let Some(group) = joined_group {
                 group.remove_member(handle).ignore_result();
             }
-            let _ = GlobalQueueVisitor::remove(&mut t);
+            let _removed = GlobalQueueVisitor::remove(&mut t);
             return -1;
         }
     }
@@ -473,7 +473,7 @@ create_thread(spawn_args_ptr: *const SpawnArgs) -> c_long {
         if let Some(process) = process {
             process.remove_thread(&mut t);
         }
-        let _ = GlobalQueueVisitor::remove(&mut t);
+        let _removed = GlobalQueueVisitor::remove(&mut t);
         return -1;
     }
     // Same-width integer cast (usize -> c_long): c_long matches the pointer
