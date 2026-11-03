@@ -45,7 +45,7 @@ pub use seal::{
 };
 
 pub(crate) use metadata::{
-    ArtifactRole, DependencyName, ImageLifecycleMetadata, ProgramHeaderGeometry,
+    ArtifactRole, DependencyName, ImageLifecycleMetadata, ImagePublishParts, ProgramHeaderGeometry,
     ProgramHeaderRuntimeInfo, RuntimeImageMetadata, RuntimeImageState,
 };
 pub(crate) use symbol::{

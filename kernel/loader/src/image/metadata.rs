@@ -376,6 +376,17 @@ pub(crate) struct RuntimeImageState {
     stack: StackKind,
 }
 
+/// Decoded facts retained by a published image descriptor. The session's
+/// allocation lease remains in its rollback log while these facts move.
+#[must_use = "publish the mapped regions and frozen export surface"]
+pub(crate) struct ImagePublishParts {
+    pub(crate) regions: Vec<LoadedRegion>,
+    pub(crate) load_segments: Vec<LoadSegmentInfo>,
+    pub(crate) load_bias: TargetAddress,
+    pub(crate) program_headers: ProgramHeaderRuntimeInfo,
+    pub(crate) symbols: SymbolTable,
+}
+
 impl RuntimeImageState {
     #[inline]
     #[allow(clippy::too_many_arguments)]
@@ -447,25 +458,17 @@ impl RuntimeImageState {
     /// surface. The rest (needed names, relocation records, lifecycle entries,
     /// entry addresses) has served its purpose by publish time and is dropped.
     #[inline]
-    pub(crate) fn into_publish_parts(
-        self,
-    ) -> (
-        Vec<LoadedRegion>,
-        Vec<LoadSegmentInfo>,
-        TargetAddress,
-        ProgramHeaderRuntimeInfo,
-        SymbolTable,
-    ) {
+    pub(crate) fn into_publish_parts(self) -> ImagePublishParts {
         let program_headers = *self.metadata.program_headers();
         let load_bias = self.load_bias;
         let symbols = self.metadata.into_symbols();
-        (
-            self.regions,
-            self.load_segments,
+        ImagePublishParts {
+            regions: self.regions,
+            load_segments: self.load_segments,
             load_bias,
             program_headers,
             symbols,
-        )
+        }
     }
 }
 

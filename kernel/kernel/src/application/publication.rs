@@ -28,7 +28,8 @@ use super::{
 use alloc::{sync::Arc, vec::Vec};
 use blueos_loader::{
     memory::{AllocationLease, ImageMemory},
-    ImageHandle, ImagePin, LoadPublisher, LoadResources, LoadResult, PublicationManifest,
+    ImageHandle, ImagePin, LoadPublisher, LoadResourceParts, LoadResources, LoadResult,
+    PublicationManifest,
 };
 use spin::Mutex;
 
@@ -278,7 +279,12 @@ impl LoadPublisher<FlatImageMemory, KernelImagePin, KernelReservation> for Kerne
         resources: LoadResources<FlatImageMemory, KernelImagePin, KernelReservation>,
     ) -> KernelLinkReceipt {
         // SAFETY: the prepared owner has a sink for every allocation and retains all providers.
-        let (_, mut allocations, pins, reservation) = unsafe { resources.into_parts() };
+        let LoadResourceParts {
+            memory: _,
+            mut allocations,
+            pins,
+            reservation,
+        } = unsafe { resources.into_parts() };
         for (index, metadata) in prepared.metadata {
             // prepare simulated these exact removals from this resource order.
             let (_, allocation) = allocations.swap_remove(index);

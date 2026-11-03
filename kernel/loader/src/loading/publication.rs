@@ -84,15 +84,23 @@ pub trait LoadPublisher<M: ImageProtectionMemory, P: ImagePin, B: LoadReservatio
 
 #[must_use = "the publisher must adopt every allocation and retained provider"]
 pub struct LoadResources<M: ImageMemory, P: ImagePin, B: LoadReservation<Pin = P>> {
-    pub(crate) parts: ResourceParts<M, P, B>,
+    pub(crate) parts: LoadResourceParts<M, P, B>,
     rollback: bool,
 }
-#[must_use = "resource parts carry unique allocation release authority"]
-pub(crate) struct ResourceParts<M: ImageMemory, P: ImagePin, B: LoadReservation<Pin = P>> {
-    pub(crate) memory: M,
-    pub(crate) allocations: Vec<(ImageHandle, AllocationLease)>,
-    pub(crate) pins: Vec<P>,
-    pub(crate) reservation: B,
+/// Resources extracted from [`LoadResources`] for adoption by a host owner.
+///
+/// The caller must transfer or release every allocation through memory and
+/// retain the provider pins and reservation for their required lifetimes.
+#[must_use = "adopt every allocation and retain its memory, pins and reservation"]
+pub struct LoadResourceParts<M: ImageMemory, P: ImagePin, B: LoadReservation<Pin = P>> {
+    /// Memory backend paired with the allocation leases for their release.
+    pub memory: M,
+    /// Each image and its unique allocation lease, in publication order.
+    pub allocations: Vec<(ImageHandle, AllocationLease)>,
+    /// Retained namespace providers whose backing must outlive their users.
+    pub pins: Vec<P>,
+    /// Repository reservations and imports adopted by the publisher.
+    pub reservation: B,
 }
 impl<M: ImageMemory, P: ImagePin, B: LoadReservation<Pin = P>> LoadResources<M, P, B> {
     pub(crate) fn prepared(
@@ -102,7 +110,7 @@ impl<M: ImageMemory, P: ImagePin, B: LoadReservation<Pin = P>> LoadResources<M, 
         reservation: B,
     ) -> Self {
         Self {
-            parts: ResourceParts {
+            parts: LoadResourceParts {
                 memory,
                 allocations,
                 pins,
@@ -116,18 +124,12 @@ impl<M: ImageMemory, P: ImagePin, B: LoadReservation<Pin = P>> LoadResources<M, 
     /// The caller assumes all release authority, including the memory backing and provider pins.
     // SAFETY: the caller adopts every owned field and its release authority;
     // moving the complete parts value leaves no partially consumed state.
-    pub unsafe fn into_parts(self) -> (M, Vec<(ImageHandle, AllocationLease)>, Vec<P>, B) {
+    pub unsafe fn into_parts(self) -> LoadResourceParts<M, P, B> {
         let this = ManuallyDrop::new(self);
         // SAFETY: self is consumed and its destructor is disabled. parts is
         // initialized, aligned and read exactly once; no source field is used
         // or dropped again, so the returned fields are their unique owners.
-        let parts = unsafe { core::ptr::read(&this.parts) };
-        (
-            parts.memory,
-            parts.allocations,
-            parts.pins,
-            parts.reservation,
-        )
+        unsafe { core::ptr::read(&this.parts) }
     }
 }
 impl<M: ImageMemory, P: ImagePin, B: LoadReservation<Pin = P>> Drop for LoadResources<M, P, B> {

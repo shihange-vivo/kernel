@@ -66,9 +66,9 @@ pub use error::{LoadError, LoadResult};
 pub use loading::{
     load, prepare_load, ArtifactInfo, ArtifactResolver, ImageCandidate, ImageDependency,
     ImageHandle, ImagePin, ImageRepository, LifecycleEntry, LoadPublisher, LoadRequest,
-    LoadReservation, LoadResources, LoadServices, LoadedImage, LocalPin, LocalRepository,
-    LocalReservation, NamespaceSnapshot, OpenedArtifact, PreparedLoad, PublicationManifest,
-    ReservedImage, RetainResources,
+    LoadReservation, LoadResourceParts, LoadResources, LoadServices, LoadedImage, LocalPin,
+    LocalRepository, LocalReservation, NamespaceSnapshot, OpenedArtifact, PreparedLoad,
+    PublicationManifest, ReservedImage, RetainResources,
 };
 
 #[cfg(test)]

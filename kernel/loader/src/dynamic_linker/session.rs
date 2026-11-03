@@ -34,7 +34,7 @@ use crate::{
         ScopeSet,
     },
     error::{ErrorContext, LoadErrorKind, LoadStage},
-    image::{PreparedProtectionPlan, ProtectionBatch, SealPlan},
+    image::{ImagePublishParts, PreparedProtectionPlan, ProtectionBatch, SealPlan},
     memory::{
         address::TargetAddress,
         cache::{CacheRequirements, CodeCache},
@@ -676,8 +676,13 @@ impl<M: ImageMemory + ?Sized, A: ArchRelocator> SealedSession<'_, M, A> {
             snapshot_bytes = snapshot_bytes
                 .checked_add(snapshot.metadata_bytes())
                 .ok_or_else(session_overflow)?;
-            let (regions, load_segments, load_bias, program_headers, symbols) =
-                image.state.into_publish_parts();
+            let ImagePublishParts {
+                regions,
+                load_segments,
+                load_bias,
+                program_headers,
+                symbols,
+            } = image.state.into_publish_parts();
             let ownership = node.ownership();
             let descriptor = Arc::new(
                 PublishedImageDescriptor::from_node_and_state(
