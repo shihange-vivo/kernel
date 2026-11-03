@@ -242,8 +242,8 @@ unsafe fn validate_start_info<'a>(
 }
 
 /// Validate a constructor/destructor plan's versioned prefix. A
-/// non-empty plan must be backed by a non-null target array; an empty plan needs
-/// none (the array may still be present, so `count == 0` accepts either).
+/// non-empty plan must have a non-null, aligned target pointer and a byte
+/// length that fits a slice; an empty plan needs no array.
 #[cfg(dynamic_image)]
 fn plan_valid(plan: &blueos_header::application::BlueOsFunctionPlan) -> bool {
     use blueos_header::application::FUNCTION_PLAN_ABI_VERSION;
@@ -253,7 +253,10 @@ fn plan_valid(plan: &blueos_header::application::BlueOsFunctionPlan) -> bool {
     if plan.struct_size < core::mem::size_of_val(plan) as u32 {
         return false;
     }
-    plan.count == 0 || !plan.entries.is_null()
+    plan.count == 0
+        || (!plan.entries.is_null()
+            && plan.entries.is_aligned()
+            && plan.count <= isize::MAX as usize / core::mem::size_of::<usize>())
 }
 
 /// Walk a validated plan in storage order, invoking each entry. This is the
@@ -262,11 +265,15 @@ fn plan_valid(plan: &blueos_header::application::BlueOsFunctionPlan) -> bool {
 /// the stored address and is preserved by the `transmute`.
 #[cfg(dynamic_image)]
 fn run_plan(plan: &blueos_header::application::BlueOsFunctionPlan) {
-    for i in 0..plan.count {
-        // SAFETY: `entries` is the kernel-pinned target array; `i < count` and
-        // `plan_valid` confirmed the pointer/version/prefix. The target address
-        // was installed by the loader with a live allocation lease.
-        let target = unsafe { *plan.entries.add(i) };
+    if plan.count == 0 {
+        return;
+    }
+    // SAFETY: `plan_valid` checked the version, prefix, non-null aligned
+    // pointer and slice length. The startup ABI caller keeps this single
+    // initialized target allocation readable and immutable through application
+    // exit, with callback images pinned by their live allocation leases.
+    let entries = unsafe { core::slice::from_raw_parts(plan.entries, plan.count) };
+    for &target in entries {
         // SAFETY: the loader only emits canonical, executable Thumb entry
         // addresses here.
         let function: extern "C" fn() = unsafe { core::mem::transmute(target) };
