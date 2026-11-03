@@ -1,6 +1,7 @@
 // NEWLINE-TIMEOUT: 60
 // ASSERT-SUCC: coverage test end.
 // ASSERT-FAIL: Backtrace in Panic.*
+// ASSERT-FAIL: loader test: no stack
 
 #![no_std]
 extern crate alloc;
