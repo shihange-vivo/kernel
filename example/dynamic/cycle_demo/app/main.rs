@@ -42,10 +42,16 @@ pub extern "C" fn main(
 ) -> c_int {
     // a_cycle_value = b_cycle_value + common + 1
     // = (real a_probe=1 + common=40) + 40 + 1 = 82.
+    // SAFETY: the retained A/B SCC exports the declared extern C fn() -> i32
+    // and both members and their providers outlive this application call.
     let value = unsafe { a_cycle_value() };
+    // SAFETY: A's matching C counter export is pinned and init completed.
     let a_ctor = unsafe { a_ctor_count() };
+    // SAFETY: B's matching C counter export is pinned and init completed.
     let b_ctor = unsafe { b_ctor_count() };
     let ok = value == 82 && a_ctor == 1 && b_ctor == 1;
+    // SAFETY: the static terminated format expects three C ints; each scalar
+    // argument has that type and the libc provider remains mapped.
     unsafe {
         printf(
             b"cycle: value=%d a_ctor=%d b_ctor=%d\n\0".as_ptr() as *const c_char,

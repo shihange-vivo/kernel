@@ -36,6 +36,7 @@ pub extern "C" fn main(
     _argv: *const *const c_char,
     _envp: *const *const c_char,
 ) -> c_int {
-    // Unreachable: the package link is rejected before any constructor runs.
+    // SAFETY: the declared C signature matches the retained private export.
+    // This negative package is rejected before any constructor or main runs.
     unsafe { weakcall_present() }
 }

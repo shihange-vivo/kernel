@@ -65,6 +65,8 @@ pub static sys_target: i32 = 777;
 
 #[no_mangle]
 pub extern "C" fn sys_report() -> i32 {
+    // SAFETY: sys_target is an aligned immutable i32 in this retained system
+    // instance; the system scope binds this owner-local reference to it.
     unsafe { core::ptr::read_volatile(&sys_target) }
 }
 

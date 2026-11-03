@@ -22,24 +22,34 @@ extern "C" {
 }
 static mut VALUE: usize = 0;
 extern "C" fn load_child() {
-    unsafe {
-        let handle = dlopen(b"libdl_dep.so.1\0".as_ptr().cast(), 2);
-        assert!(!handle.is_null());
-        let pointer = dlsym(handle, b"dl_dep_value\0".as_ptr().cast());
-        assert!(!pointer.is_null());
-        let function: extern "C" fn() -> usize = core::mem::transmute(pointer);
-        VALUE = function();
-        assert_eq!(dlclose(handle), 0);
-    }
+    // SAFETY: the static terminated filename remains live through dlopen;
+    // libc is mapped during this nested constructor/destructor call.
+    let handle = unsafe { dlopen(b"libdl_dep.so.1\0".as_ptr().cast(), 2) };
+    assert!(!handle.is_null());
+    // SAFETY: handle is open and the static export name is terminated.
+    let pointer = unsafe { dlsym(handle, b"dl_dep_value\0".as_ptr().cast()) };
+    assert!(!pointer.is_null());
+    // SAFETY: the known export is extern C fn() -> usize and the child handle
+    // stays open through the call, pinning code and all its providers.
+    let function: extern "C" fn() -> usize = unsafe { core::mem::transmute(pointer) };
+    let value = function();
+    // SAFETY: this private instance's lifecycle callbacks are serialized;
+    // the fixture reads VALUE after init and stops readers before fini.
+    unsafe { VALUE = value };
+    // SAFETY: handle is the owned token from this call's successful open.
+    assert_eq!(unsafe { dlclose(handle) }, 0);
 }
 extern "C" fn init() {
     load_child();
+    // SAFETY: the root supplies the matching extern C fn(usize) callback and
+    // remains mapped throughout this dependency's init plan.
     unsafe {
         dl_event(4);
     }
 }
 extern "C" fn fini() {
     load_child();
+    // SAFETY: the pinned root's C callback remains callable until fini ends.
     unsafe {
         dl_event(5);
     }
@@ -52,6 +62,8 @@ static INIT: extern "C" fn() = init;
 static FINI: extern "C" fn() = fini;
 #[no_mangle]
 pub extern "C" fn dl_nested_value() -> usize {
+    // SAFETY: the fixture reads after init, before serialized finalization;
+    // no lifecycle callback writes VALUE concurrently with this export.
     unsafe { VALUE }
 }
 #[panic_handler]
@@ -60,6 +72,8 @@ fn panic(_: &core::panic::PanicInfo) -> ! {
         fn write(fd: i32, data: *const u8, len: usize) -> isize;
     }
     let message = b"DLOPEN_FAIL nested\n";
+    // SAFETY: the static slice is readable for its length through write, and
+    // the libc provider remains mapped during lifecycle error reporting.
     unsafe {
         write(1, message.as_ptr(), message.len());
     }

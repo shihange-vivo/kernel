@@ -28,7 +28,8 @@ pub static hidden_probe: i32 = 999;
 
 #[no_mangle]
 pub extern "C" fn hidden_report() -> i32 {
-    // Owner access: the reference binds this image's own definition.
+    // SAFETY: this is an aligned, initialized immutable i32 in the retained
+    // image. Hidden visibility binds the reference to this owner's definition.
     unsafe { core::ptr::read_volatile(&hidden_probe) }
 }
 

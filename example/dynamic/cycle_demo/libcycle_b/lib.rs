@@ -47,9 +47,12 @@ pub extern "C" fn b_ctor_count() -> u32 {
 
 #[no_mangle]
 pub extern "C" fn b_cycle_value() -> i32 {
-    // The back edge: B's call into A binds the *real* A at runtime — the
-    // bootstrap stub only keeps the DT_NEEDED on the link line.
-    (unsafe { a_probe() }) + (unsafe { common_value() })
+    // SAFETY: the SCC retains the real A export, matching extern C fn() ->
+    // i32. The bootstrap stub is not loaded into the runtime closure.
+    let a = unsafe { a_probe() };
+    // SAFETY: common's matching C export remains mapped as a retained provider.
+    let common = unsafe { common_value() };
+    a + common
 }
 
 #[panic_handler]

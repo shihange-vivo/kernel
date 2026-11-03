@@ -40,8 +40,14 @@ pub extern "C" fn main(
     _argv: *const *const c_char,
     _envp: *const *const c_char,
 ) -> c_int {
+    // SAFETY: foo's export matches extern C fn() -> i32; the application's
+    // receipt pins foo and its transitive providers until application exit.
     let foo = unsafe { foo_value() }; // common(40) + 2
+                                      // SAFETY: bar's export has the same C signature and is pinned by the same
+                                      // application-owned closure for this call.
     let bar = unsafe { bar_value() }; // common(40) * 2
+                                      // SAFETY: the static NUL-terminated format expects two C ints; both
+                                      // arguments are i32 and libc remains pinned for the application.
     unsafe {
         printf(
             b"multi: foo=%d bar=%d\n\0".as_ptr() as *const c_char,

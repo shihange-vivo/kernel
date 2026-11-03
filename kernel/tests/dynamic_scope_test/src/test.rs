@@ -131,11 +131,14 @@ mod gate_argument_tests {
     #[test]
     fn checks_argc_and_null_argv_before_access() {
         assert_eq!(
+            // SAFETY: zero argc returns before inspecting the NULL array.
             unsafe { from_argv(0, core::ptr::null()) },
             TestGate::NotRequested
         );
         for argc in [-1, 1, 3] {
             assert_eq!(
+                // SAFETY: from_argv rejects these NULL/invalid-count cases
+                // before dereferencing any array pointer.
                 unsafe { from_argv(argc, core::ptr::null()) },
                 TestGate::Invalid
             );
@@ -150,6 +153,8 @@ mod gate_argument_tests {
             [program, core::ptr::null(), core::ptr::null()],
             [program, flag, core::ptr::null()],
         ] {
+            // SAFETY: three initialized slots and static C strings remain
+            // live; NULL flag/value is rejected before reading its contents.
             assert_eq!(unsafe { from_argv(3, argv.as_ptr()) }, TestGate::Invalid);
         }
     }
@@ -162,6 +167,7 @@ mod gate_argument_tests {
             b"ignored\0".as_ptr().cast(),
         ];
         assert_eq!(
+            // SAFETY: every slot points into a live static terminated string.
             unsafe { from_argv(3, argv.as_ptr()) },
             TestGate::NotRequested
         );
@@ -250,6 +256,8 @@ extern "C" fn concurrent_launcher(flag: *mut core::ffi::c_void) {
     static WAIT_ATOM: AtomicUsize = AtomicUsize::new(0);
     for _ in 0..600 {
         if !service.manager().contains(handle) {
+            // SAFETY: Entry::Posix received a pointer to this launcher's
+            // aligned static AtomicBool; only atomic accesses touch it.
             unsafe { (*done).store(true, Ordering::Release) };
             return;
         }

@@ -90,6 +90,8 @@ mod loader_test_config {
     pub const TEST_REGION_PERMISSIONS: loader::memory::MemoryPermissions =
         parse_permissions(env!("LOADER_TEST_RELOCATION_PERMISSIONS"));
 
+    // SAFETY: the board linker reserves this mapped region for this test's
+    // fixed image; no other object aliases it and the mapping stays live.
     pub static TEST_REGIONS: [loader::memory::MemoryRegion; 1] = [unsafe {
         loader::memory::MemoryRegion::new(
             TEST_REGION_START,
@@ -100,6 +102,8 @@ mod loader_test_config {
 }
 
 fn open_test_elf(ptr: *const core::ffi::c_char) -> semihosting::fs::File {
+    // SAFETY: all callers use build-generated non-null pointers to immutable
+    // static NUL-terminated path strings, retained for the entire test image.
     let path = unsafe { core::ffi::CStr::from_ptr(ptr) };
     semihosting::fs::File::open(path).expect("open test ELF")
 }
@@ -363,8 +367,9 @@ mod test_elf_loader {
     const EXPECTED_RESULT: u32 = 0x9afc_e987;
 
     #[cfg(loader_test_exec)]
+    // SAFETY: this mapped subset belongs to the board-reserved test range;
+    // the fixture has no concurrent user of those bytes.
     static SHORT_REGIONS: [loader::memory::MemoryRegion; 1] = [unsafe {
-        // SAFETY: This is a valid subset of the configured loader test range.
         loader::memory::MemoryRegion::new(
             TEST_REGION_START,
             TEST_REGION_START + 16,
@@ -373,8 +378,9 @@ mod test_elf_loader {
     }];
 
     #[cfg(loader_test_exec)]
+    // SAFETY: this is the reserved mapped test range with only its valid
+    // read/write permissions advertised; no other test runs concurrently.
     static NON_EXEC_REGIONS: [loader::memory::MemoryRegion; 1] = [unsafe {
-        // SAFETY: The configured region supports read and write accesses.
         loader::memory::MemoryRegion::new(
             TEST_REGION_START,
             TEST_REGION_END,
@@ -401,6 +407,8 @@ mod test_elf_loader {
 
     #[test]
     fn test_load_and_run() {
+        // SAFETY: this immutable pointer is generated from the build's static
+        // terminated ELF path and remains valid throughout the test image.
         let file = open_test_elf(unsafe { LOADER_TEST_ELF_PATH });
         let reader = SemihostingElfReader::new(&file).unwrap();
         let image = load(reader, new_mapper()).expect("load ELF through the public entry");
@@ -408,34 +416,42 @@ mod test_elf_loader {
 
         #[cfg(all(loader_test_exec))]
         {
+            // SAFETY: this fixture's validated ELF entry is extern C fn() ->
+            // u32. image retains its executable mapping through the call.
             let run = unsafe { core::mem::transmute::<usize, extern "C" fn() -> u32>(entry) };
             assert_eq!(run(), EXPECTED_RESULT);
         }
         #[cfg(not(loader_test_exec))]
         {
-            let run = unsafe { core::mem::transmute::<usize, fn()>(entry) };
+            // SAFETY: the no_std fixture exports extern C fn() _start; the
+            // loader validated its executable entry and image pins backing.
+            let run = unsafe { core::mem::transmute::<usize, extern "C" fn()>(entry) };
             run();
         }
     }
 
     #[test]
     fn test_invalid_entry() {
+        // SAFETY: the build emits this immutable pointer to a static C path.
         assert_rejected_elf(unsafe { INVALID_ENTRY_ELF_PATH });
     }
 
     #[test]
     fn test_invalid_magic() {
+        // SAFETY: the build emits this immutable pointer to a static C path.
         assert_rejected_elf(unsafe { INVALID_MAGIC_ELF_PATH });
     }
 
     #[test]
     fn test_invalid_segment_size() {
+        // SAFETY: the build emits this immutable pointer to a static C path.
         assert_rejected_elf(unsafe { INVALID_SEGMENT_SIZE_ELF_PATH });
     }
 
     #[cfg(loader_test_exec)]
     #[test]
     fn test_exec_rejects_allocated_mapper() {
+        // SAFETY: the build owns this immutable static C path pointer.
         let file = open_test_elf(unsafe { LOADER_TEST_ELF_PATH });
         let reader = SemihostingElfReader::new(&file).unwrap();
         assert!(load(reader, loader::memory::MemoryMapper::new(None)).is_err());
@@ -444,14 +460,19 @@ mod test_elf_loader {
     #[cfg(loader_test_exec)]
     #[test]
     fn test_exec_rejects_out_of_range_without_writing() {
+        // SAFETY: the build owns this immutable static C path pointer.
         let file = open_test_elf(unsafe { LOADER_TEST_ELF_PATH });
         let reader = SemihostingElfReader::new(&file).unwrap();
+        // SAFETY: the board-reserved region is mapped, readable, word-aligned
+        // and has no concurrent user; reading its first word stays in bounds.
         let before = unsafe { (TEST_REGION_START as *const u32).read_volatile() };
         assert!(load(
             reader,
             loader::memory::MemoryMapper::new(Some(&SHORT_REGIONS))
         )
         .is_err());
+        // SAFETY: the same reserved aligned word remains readable; rejection
+        // above occurs before writing the range or changing its mapping.
         let after = unsafe { (TEST_REGION_START as *const u32).read_volatile() };
         assert_eq!(after, before);
     }
@@ -459,6 +480,7 @@ mod test_elf_loader {
     #[cfg(loader_test_exec)]
     #[test]
     fn test_exec_rejects_non_executable_region() {
+        // SAFETY: the build owns this immutable static C path pointer.
         let file = open_test_elf(unsafe { LOADER_TEST_ELF_PATH });
         let reader = SemihostingElfReader::new(&file).unwrap();
         assert!(load(

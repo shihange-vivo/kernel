@@ -636,7 +636,8 @@ struct PosixRoutineInfo {
 }
 
 extern "C" fn posix_start_routine(arg: *mut c_void) {
-    // The startup metadata sits in the stack tail and outlives this thread:
+    // SAFETY: pthread_create initialized this aligned record in the allocated
+    // stack tail before publishing the thread. It outlives this routine:
     // `posix_cleanup_routine` reads it back once the scheduler has switched
     // off this stack.
     let routine = unsafe { &*arg.cast::<PosixRoutineInfo>() };
@@ -646,8 +647,12 @@ extern "C" fn posix_start_routine(arg: *mut c_void) {
 
 extern "C" fn posix_cleanup_routine(arg: *mut c_void) {
     assert_ne!(arg, core::ptr::null_mut());
+    // SAFETY: this callback receives the initialized stack-tail record from
+    // pthread_create only after the retired thread stopped using its stack.
     let routine = unsafe { &*arg.cast::<PosixRoutineInfo>() };
     let layout = Layout::from_size_align(routine.storage_size, STACK_ALIGN).unwrap();
+    // SAFETY: storage_start and layout identify the one allocation made by
+    // pthread_create; the kernel invokes cleanup once after switching off it.
     unsafe { system_dealloc(routine.storage_start, layout) };
 }
 
@@ -764,26 +769,39 @@ pub extern "C" fn pthread_create(
     let stack_size = if attr.is_null() {
         DEFAULT_STACK_SIZE
     } else {
+        // SAFETY: a non-null pthread attr points to an initialized attribute
+        // object supplied by the caller and remains readable during creation.
         unsafe { (*(attr as *const InnerPthreadAttr)).stack_size }
     };
     assert_eq!(stack_size % STACK_ALIGN, 0);
     // The startup metadata lives in the stack tail, so the whole allocation
     // is reclaimed in one piece by `posix_cleanup_routine`.
-    let storage_size = stack_size + core::mem::size_of::<PosixRoutineInfo>();
+    let Some(storage_size) = stack_size.checked_add(core::mem::size_of::<PosixRoutineInfo>())
+    else {
+        return -1;
+    };
     let layout = Layout::from_size_align(storage_size, STACK_ALIGN).unwrap();
+    // SAFETY: the layout is validated and includes a nonempty metadata tail.
     let storage_start = unsafe { system_alloc(layout) };
     assert_ne!(storage_start, core::ptr::null_mut());
+    // SAFETY: stack_size is an offset inside the non-null allocation; the
+    // trailing storage has room for the complete PosixRoutineInfo record.
     let posix_routine_info_ptr = unsafe { storage_start.add(stack_size) as *mut c_void };
     assert_eq!(
         posix_routine_info_ptr.align_offset(core::mem::align_of::<PosixRoutineInfo>()),
         0
     );
-    {
-        let posix_routine_info = unsafe { &mut *posix_routine_info_ptr.cast::<PosixRoutineInfo>() };
-        posix_routine_info.entry = start_routine;
-        posix_routine_info.arg = arg;
-        posix_routine_info.storage_start = storage_start;
-        posix_routine_info.storage_size = storage_size;
+    // SAFETY: the tail is aligned, writable and not yet published. Initialize
+    // the whole record with a raw write before creating any Rust reference.
+    unsafe {
+        posix_routine_info_ptr
+            .cast::<PosixRoutineInfo>()
+            .write(PosixRoutineInfo {
+                entry: start_routine,
+                arg,
+                storage_start,
+                storage_size,
+            });
     }
     let mut spawn_args = SpawnArgs {
         spawn_hook: Some(register_posix_tcb),
@@ -798,11 +816,13 @@ pub extern "C" fn pthread_create(
     };
     let tid = bk_syscall!(CreateThread, &mut spawn_args as *mut SpawnArgs) as pthread_t;
     if tid == !0 {
-        // Thread creation failed, so the kernel never took the stack: the
-        // allocation is still ours to reclaim.
+        // SAFETY: creation failed before transferring stack ownership. This
+        // remains the live allocation associated with the original layout.
         unsafe { system_dealloc(storage_start, layout) };
         return -1;
     }
+    // SAFETY: pthread_create's C caller supplies a writable, aligned pthread_t
+    // output slot for the duration of this call.
     unsafe { thread.write_volatile(tid) };
     0
 }

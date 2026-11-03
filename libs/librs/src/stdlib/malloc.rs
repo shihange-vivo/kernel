@@ -126,9 +126,7 @@ pub unsafe extern "C" fn memalign(alignment: size_t, size: size_t) -> *mut c_voi
 #[no_mangle]
 pub extern "C" fn abort() -> ! {
     const MESSAGE: &[u8] = b"libc: abort()\n";
-    unsafe {
-        bk_syscall!(Write, 2, MESSAGE.as_ptr(), MESSAGE.len());
-    }
+    bk_syscall!(Write, 2, MESSAGE.as_ptr(), MESSAGE.len());
     loop {
         core::hint::spin_loop();
     }

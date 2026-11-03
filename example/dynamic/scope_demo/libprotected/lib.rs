@@ -31,6 +31,8 @@ pub static self_value: i32 = 333;
 
 #[no_mangle]
 pub extern "C" fn protected_report() -> i32 {
+    // SAFETY: the protected symbol is this image's aligned immutable i32;
+    // its owner remains mapped and no writer races this volatile read.
     unsafe { core::ptr::read_volatile(&self_value) }
 }
 

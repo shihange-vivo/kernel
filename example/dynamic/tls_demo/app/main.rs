@@ -43,7 +43,11 @@ extern "C" fn tls_worker(arg: *mut c_void) -> *mut c_void {
     let mut foo = 0u32;
     let mut bar = 0u32;
     for _ in 0..loops {
+        // SAFETY: the application's pinned foo DSO exports this exact C
+        // signature; its thread-local counter belongs to this worker.
         foo = unsafe { foo_tls_next() };
+        // SAFETY: bar's matching C export and emutls control stay mapped for
+        // the worker lifetime, with a distinct per-thread counter.
         bar = unsafe { bar_tls_next() };
     }
     (((foo as usize) << 16) | bar as usize) as *mut c_void
@@ -52,6 +56,9 @@ extern "C" fn tls_worker(arg: *mut c_void) -> *mut c_void {
 fn run_worker(loops: usize) -> (u32, u32) {
     let mut thread: usize = 0;
     let mut result: *mut c_void = core::ptr::null_mut();
+    // SAFETY: thread is a writable local output slot; NULL attr selects the
+    // default. tls_worker has the required C signature and treats arg as an
+    // opaque integer. The root and private DSOs remain mapped through join.
     let rc = unsafe {
         pthread_create(
             &mut thread,
@@ -63,6 +70,8 @@ fn run_worker(loops: usize) -> (u32, u32) {
     if rc != 0 {
         return (u32::MAX, u32::MAX);
     }
+    // SAFETY: creation succeeded and this thread owns the joinable id; result
+    // is a writable local pointer slot that outlives the blocking join.
     unsafe { pthread_join(thread, &mut result) };
     let packed = result as usize;
     (((packed >> 16) & 0xffff) as u32, (packed & 0xffff) as u32)
@@ -93,6 +102,8 @@ pub extern "C" fn main(
     }
 
     let ok = a_foo == 7 && a_bar == 7 && b_foo == 13 && b_bar == 13 && repeat_ok;
+    // SAFETY: the static terminated format expects five C ints; the promoted
+    // scalar arguments match it and libc remains pinned through the call.
     unsafe {
         printf(
             b"tls: a_foo=%d a_bar=%d b_foo=%d b_bar=%d repeat=%d\n\0".as_ptr() as *const c_char,

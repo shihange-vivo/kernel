@@ -164,12 +164,11 @@ impl Clone for FlatImageMemory {
 
 impl FlatImageMemory {
     fn image_span(
-        &self,
+        service: &FlatMemoryService,
         allocation: &ImageAllocation,
         offset: AllocationOffset,
         len: u64,
     ) -> LoadResult<*mut u8> {
-        let service = self.service.lock();
         let entry = service
             .entry(allocation)
             .ok_or_else(|| not_allocated_error(*allocation))?;
@@ -186,6 +185,9 @@ impl FlatImageMemory {
         if base.is_null() || entry.storage.size() < end_usize {
             return Err(memory_access_error(*allocation, offset, len));
         }
+        // SAFETY: checked offset+len stays in this live Storage allocation;
+        // offset may be one-past only for an empty access. The caller retains
+        // the service lock until any returned pointer has finished being used.
         Ok(unsafe { base.add(offset_usize) })
     }
 }
@@ -274,7 +276,8 @@ impl ImageMemory for FlatImageMemory {
         offset: AllocationOffset,
         len: u64,
     ) -> LoadResult<()> {
-        self.image_span(allocation, offset, len).map(|_| ())
+        let service = self.service.lock();
+        Self::image_span(&service, allocation, offset, len).map(|_| ())
     }
 
     fn write(
@@ -285,8 +288,12 @@ impl ImageMemory for FlatImageMemory {
     ) -> LoadResult<()> {
         let len = u64::try_from(data.len())
             .map_err(|_| memory_access_error(*allocation, offset, u64::MAX))?;
-        let target = self.image_span(allocation, offset, len)?;
+        let service = self.service.lock();
+        let target = Self::image_span(&service, allocation, offset, len)?;
         if !data.is_empty() {
+            // SAFETY: the lock keeps the validated backing live and excludes
+            // concurrent accesses. The input slice is readable for its length
+            // and does not alias the backend's private allocation.
             unsafe {
                 core::ptr::copy_nonoverlapping(data.as_ptr(), target, data.len());
             }
@@ -300,10 +307,13 @@ impl ImageMemory for FlatImageMemory {
         offset: AllocationOffset,
         len: u64,
     ) -> LoadResult<()> {
-        let target = self.image_span(allocation, offset, len)?;
+        let service = self.service.lock();
+        let target = Self::image_span(&service, allocation, offset, len)?;
         let len =
             usize::try_from(len).map_err(|_| memory_access_error(*allocation, offset, len))?;
         if len != 0 {
+            // SAFETY: image_span validated this byte range, and the held
+            // service lock prevents release or competing writes until done.
             unsafe {
                 core::ptr::write_bytes(target, 0, len);
             }
@@ -319,8 +329,11 @@ impl ImageMemory for FlatImageMemory {
     ) -> LoadResult<()> {
         let len = u64::try_from(dst.len())
             .map_err(|_| memory_access_error(*allocation, offset, u64::MAX))?;
-        let source = self.image_span(allocation, offset, len)?;
+        let service = self.service.lock();
+        let source = Self::image_span(&service, allocation, offset, len)?;
         if !dst.is_empty() {
+            // SAFETY: the locked table retains readable backing for len bytes;
+            // dst is an exclusive, disjoint output slice of the same length.
             unsafe {
                 core::ptr::copy_nonoverlapping(source, dst.as_mut_ptr(), dst.len());
             }
@@ -339,7 +352,8 @@ impl ImageProtectionMemory for FlatImageMemory {
     ) -> LoadResult<ProtectionLevel> {
         // The shared flat address space has no per-image hardware protection;
         // protection is a logical record only.
-        self.image_span(allocation, offset, len)?;
+        let service = self.service.lock();
+        Self::image_span(&service, allocation, offset, len)?;
         Ok(ProtectionLevel::LogicalOnly)
     }
 

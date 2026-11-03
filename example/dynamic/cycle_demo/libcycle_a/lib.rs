@@ -54,8 +54,12 @@ pub extern "C" fn a_probe() -> i32 {
 
 #[no_mangle]
 pub extern "C" fn a_cycle_value() -> i32 {
-    // Cross the cycle edge: A calls into B, which calls back into A.
-    (unsafe { b_cycle_value() }) + (unsafe { common_value() }) + 1
+    // SAFETY: the SCC retains B while A runs; its export is extern C fn() ->
+    // i32 and its back-edge calls a_probe without recursing into this function.
+    let b = unsafe { b_cycle_value() };
+    // SAFETY: common's matching C export is retained by the dependency closure.
+    let common = unsafe { common_value() };
+    b + common + 1
 }
 
 #[panic_handler]

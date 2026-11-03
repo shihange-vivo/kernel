@@ -297,6 +297,8 @@ impl<'a> LoadPublisher<SharedMemory, Pin, Reservation<'a>> for Host<'a> {
         mut prepared: Self::Prepared,
         resources: LoadResources<SharedMemory, Pin, Reservation<'a>>,
     ) -> Receipt {
+        // SAFETY: prepare reserved this owner's sinks for the same manifest;
+        // the following moves adopt every allocation and retained provider.
         let (_, allocations, pins, mut reservation) = unsafe { resources.into_parts() };
         let owner = Rc::get_mut(&mut prepared.inner).expect("unpublished owner");
         for (_, lease) in allocations {
@@ -696,8 +698,10 @@ fn load_executable_uses_elf_fixed_placement() {
         &mut bytes,
         base as u64 | u64::from(profile.entry_mode().is_thumb()),
     );
+    // SAFETY: backing is the test's aligned mapped allocation and outlives the
+    // mapper/receipt below. Only the mapper accesses its bytes during loading;
+    // the test never executes the synthetic image or creates aliasing slices.
     let regions = alloc::boxed::Box::leak(alloc::boxed::Box::new([unsafe {
-        // The test owns this backing until its receipt and backend are gone.
         MemoryRegion::new(
             base,
             base + 0x100,

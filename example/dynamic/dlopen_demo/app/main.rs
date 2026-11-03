@@ -17,7 +17,7 @@
 #![feature(c_variadic)]
 
 use core::{
-    ffi::{c_char, c_int, c_void},
+    ffi::{c_char, c_int, c_void, CStr},
     sync::atomic::{AtomicUsize, Ordering},
 };
 const NOW: i32 = 2;
@@ -73,306 +73,462 @@ pub extern "C" fn dl_event(tag: usize) {
 }
 
 fn print(message: &[u8]) {
+    // SAFETY: the slice supplies exactly len readable bytes for this
+    // synchronous call; the application pins its libc provider throughout.
     unsafe {
         write(1, message.as_ptr(), message.len());
     }
 }
-unsafe fn load(name: &[u8], flags: i32) -> *mut c_void {
-    let handle = dlopen(name.as_ptr().cast(), flags);
+
+fn open_object(name: Option<&[u8]>, flags: i32) -> *mut c_void {
+    let name = name.map(|bytes| CStr::from_bytes_with_nul(bytes).expect("fixture C filename"));
+    let pointer = name.map_or(core::ptr::null(), CStr::as_ptr);
+    // SAFETY: pointer is either NULL (the supported main-image query) or a
+    // borrowed terminated string that outlives the call. Flags are validated
+    // by libc/kernel; the returned handle is an opaque token, not a pointer.
+    unsafe { dlopen(pointer, flags) }
+}
+
+fn lookup_symbol(handle: *mut c_void, name: Option<&[u8]>) -> *mut c_void {
+    let name = name.map(|bytes| CStr::from_bytes_with_nul(bytes).expect("fixture C symbol"));
+    let pointer = name.map_or(core::ptr::null(), CStr::as_ptr);
+    // SAFETY: the optional symbol string is borrowed and terminated; NULL
+    // deliberately tests libc's error path. Kernel validation treats every
+    // handle, including invalid test values, as an opaque numeric token.
+    unsafe { dlsym(handle, pointer) }
+}
+
+fn close_object(handle: *mut c_void) -> c_int {
+    // SAFETY: dlclose accepts an opaque token and validates ownership before
+    // accessing objects; it never dereferences the token as caller memory.
+    unsafe { dlclose(handle) }
+}
+
+fn error_pointer() -> *mut c_char {
+    // SAFETY: dlerror has no pointer inputs. It returns this thread's own
+    // error buffer; callers only inspect NULL or borrow it until the next call.
+    unsafe { dlerror() }
+}
+
+fn pause(microseconds: u32) {
+    // SAFETY: usleep takes only a scalar delay and uses the pinned libc export.
+    unsafe { usleep(microseconds) };
+}
+
+fn load(name: &[u8], flags: i32) -> *mut c_void {
+    let handle = open_object(Some(name), flags);
     if handle.is_null() {
-        let error = dlerror();
+        let error = error_pointer();
         if !error.is_null() {
-            let mut len = 0;
-            while *error.add(len) != 0 {
-                len += 1;
-            }
-            write(1, error.cast(), len);
+            // SAFETY: dlerror returns a terminated thread-local buffer; no
+            // later dlerror or loader call mutates it while print reads it.
+            let error = unsafe { CStr::from_ptr(error) };
+            print(error.to_bytes());
             print(b"\n");
         }
         panic!("dlopen fixture failed");
     }
     handle
 }
+/// # Safety
+/// name must identify an extern C fn() -> usize fixture export whose provider
+/// remains retained through the returned function's synchronous invocation.
 unsafe fn value(handle: *mut c_void, name: &[u8]) -> usize {
-    let pointer = dlsym(handle, name.as_ptr().cast());
+    let pointer = lookup_symbol(handle, Some(name));
     assert!(!pointer.is_null());
-    let function: extern "C" fn() -> usize = core::mem::transmute(pointer);
+    // SAFETY: callers select only the fixture's extern C fn() -> usize
+    // exports and retain their open handle or GLOBAL provider through this call.
+    let function: extern "C" fn() -> usize = unsafe { core::mem::transmute(pointer) };
     function()
 }
-unsafe fn error_once() {
-    assert!(!dlerror().is_null());
-    assert!(dlerror().is_null());
+
+/// # Safety
+/// name must identify an extern C fn() -> i32 fixture export whose provider
+/// remains retained through the returned function's synchronous invocation.
+unsafe fn value_i32(handle: *mut c_void, name: &[u8]) -> i32 {
+    let pointer = lookup_symbol(handle, Some(name));
+    assert!(!pointer.is_null());
+    // SAFETY: the caller selects the known i32 C signature and retains code.
+    let function: extern "C" fn() -> i32 = unsafe { core::mem::transmute(pointer) };
+    function()
+}
+
+/// # Safety
+/// name must identify an extern C fn() -> u32 fixture export whose provider
+/// remains retained through the returned function's synchronous invocation.
+unsafe fn value_u32(handle: *mut c_void, name: &[u8]) -> u32 {
+    let pointer = lookup_symbol(handle, Some(name));
+    assert!(!pointer.is_null());
+    // SAFETY: the caller selects the known u32 C signature and retains code.
+    let function: extern "C" fn() -> u32 = unsafe { core::mem::transmute(pointer) };
+    function()
+}
+
+fn error_once() {
+    assert!(!error_pointer().is_null());
+    assert!(error_pointer().is_null());
 }
 
 fn failures_and_startup() {
-    unsafe {
-        assert!(dlerror().is_null());
-        assert_eq!(dlopen_c_api_probe(), 0);
-        assert!(dlopen(b"missing.so\0".as_ptr().cast(), NOW).is_null());
+    assert!(error_pointer().is_null());
+    // SAFETY: this declared C export takes no pointer arguments and its
+    // startup dependency remains retained throughout the application.
+    assert_eq!(unsafe { dlopen_c_api_probe() }, 0);
+    assert!(open_object(Some(b"missing.so\0"), NOW).is_null());
+    error_once();
+    for flags in [0, 3, 0x4000] {
+        assert!(open_object(None, flags).is_null());
         error_once();
-        for flags in [0, 3, 0x4000] {
-            assert!(dlopen(core::ptr::null(), flags).is_null());
-            error_once();
-        }
-        assert_eq!(dlclose(DEFAULT), -1);
-        error_once();
-        assert_eq!(dlclose(usize::MAX as *mut c_void), -1);
-        error_once();
-        assert!(dlsym(DEFAULT, core::ptr::null()).is_null());
-        error_once();
-        let root = dlopen(core::ptr::null(), NOW);
-        assert!(!root.is_null());
-        assert!(!dlsym(root, b"main\0".as_ptr().cast()).is_null());
-        assert!(!dlsym(root, b"write\0".as_ptr().cast()).is_null());
-        assert_eq!(dlclose(root), 0);
-        assert_eq!(dl_base_count(), 1);
-        let base = load(b"libdl_base.so.1\0", NOW);
-        assert_eq!(value(base, b"dl_base_count\0"), 1);
-        assert_eq!(dlclose(base), 0);
-        assert_eq!(dl_base_count(), 1);
-        for _ in 0..3 {
-            assert!(dlopen(b"libdl_bad.so.1\0".as_ptr().cast(), NOW).is_null());
-            error_once();
-        }
-        let system = load(b"libscope_sys.so\0", NOW);
-        assert_eq!(value(system, b"sys_report\0"), 777);
-        assert_eq!(value(system, b"sys_ctor_count\0"), 1);
-        let same = load(b"/system/lib/libscope_sys.so.1\0", NOW);
-        assert_eq!(same, system);
-        assert_eq!(dlclose(system), 0);
-        assert_eq!(value(same, b"sys_ctor_count\0"), 1);
-        assert_eq!(dlclose(same), 0);
-        let fresh = load(b"libscope_sys.so\0", NOW);
-        assert_ne!(fresh, system);
-        assert_eq!(value(fresh, b"sys_ctor_count\0"), 1);
-        assert_eq!(dlclose(fresh), 0);
     }
+    assert_eq!(close_object(DEFAULT), -1);
+    error_once();
+    assert_eq!(close_object(usize::MAX as *mut c_void), -1);
+    error_once();
+    assert!(lookup_symbol(DEFAULT, None).is_null());
+    error_once();
+    let root = open_object(None, NOW);
+    assert!(!root.is_null());
+    assert!(!lookup_symbol(root, Some(b"main\0")).is_null());
+    assert!(!lookup_symbol(root, Some(b"write\0")).is_null());
+    assert_eq!(close_object(root), 0);
+    // SAFETY: this declared C export takes no pointer arguments and its
+    // startup dependency remains retained throughout the application.
+    assert_eq!(unsafe { dl_base_count() }, 1);
+    let base = load(b"libdl_base.so.1\0", NOW);
+    // SAFETY: dl_base_count is the known C fn() -> usize export;
+    // the open token or retained namespace pins its code through this call.
+    assert_eq!(unsafe { value(base, b"dl_base_count\0") }, 1);
+    assert_eq!(close_object(base), 0);
+    // SAFETY: this declared C export takes no pointer arguments and its
+    // startup dependency remains retained throughout the application.
+    assert_eq!(unsafe { dl_base_count() }, 1);
+    for _ in 0..3 {
+        assert!(open_object(Some(b"libdl_bad.so.1\0"), NOW).is_null());
+        error_once();
+    }
+    let system = load(b"libscope_sys.so\0", NOW);
+    // SAFETY: sys_report is the known C fn() -> i32 export;
+    // the open token or retained namespace pins its code through this call.
+    assert_eq!(unsafe { value_i32(system, b"sys_report\0") }, 777);
+    // SAFETY: sys_ctor_count is the known C fn() -> u32 export;
+    // the open token or retained namespace pins its code through this call.
+    assert_eq!(unsafe { value_u32(system, b"sys_ctor_count\0") }, 1);
+    let same = load(b"/system/lib/libscope_sys.so.1\0", NOW);
+    assert_eq!(same, system);
+    assert_eq!(close_object(system), 0);
+    // SAFETY: sys_ctor_count is the known C fn() -> u32 export;
+    // the open token or retained namespace pins its code through this call.
+    assert_eq!(unsafe { value_u32(same, b"sys_ctor_count\0") }, 1);
+    assert_eq!(close_object(same), 0);
+    let fresh = load(b"libscope_sys.so\0", NOW);
+    assert_ne!(fresh, system);
+    // SAFETY: sys_ctor_count is the known C fn() -> u32 export;
+    // the open token or retained namespace pins its code through this call.
+    assert_eq!(unsafe { value_u32(fresh, b"sys_ctor_count\0") }, 1);
+    assert_eq!(close_object(fresh), 0);
+
     print(b"DLOPEN_FAILURES_OK\n");
 }
 
 fn reference_counts() {
-    unsafe {
-        let dep_fini = EVENTS[1].load(Ordering::SeqCst);
-        let plugin_fini = EVENTS[3].load(Ordering::SeqCst);
-        let first = load(b"libdl_plugin.so.1\0", NOW);
-        assert_eq!(value(first, b"dl_plugin_value\0"), 42);
-        assert_eq!(value(first, b"dl_dep_value\0"), 41);
-        assert_eq!(value(first, b"dl_plugin_ctor_count\0"), 1);
-        assert_eq!(value(first, b"dl_plugin_next\0"), 1);
-        assert!(dlerror().is_null());
-        assert!(dlsym(first, b"dl_absolute_zero\0".as_ptr().cast()).is_null());
-        assert!(
-            dlerror().is_null(),
-            "a defined zero-valued symbol is not an error"
-        );
-        assert!(dlsym(first, b"dl_plugin_hidden\0".as_ptr().cast()).is_null());
-        error_once();
-        assert!(dlsym(DEFAULT, b"dl_plugin_value\0".as_ptr().cast()).is_null());
-        error_once();
-        let again = load(b"/apps/dlopen/lib/../lib/libdl_plugin.so.1\0", NOW);
-        assert_eq!(first, again);
-        assert_eq!(value(again, b"dl_plugin_next\0"), 2);
-        assert_eq!(dlclose(first), 0);
-        assert_eq!(value(again, b"dl_plugin_ctor_count\0"), 1);
-        assert_eq!(EVENTS[3].load(Ordering::SeqCst), plugin_fini);
-        assert_eq!(dlclose(again), 0);
-        assert_eq!(EVENTS[3].load(Ordering::SeqCst), plugin_fini + 1);
-        assert_eq!(EVENTS[1].load(Ordering::SeqCst), dep_fini + 1);
+    let dep_fini = EVENTS[1].load(Ordering::SeqCst);
+    let plugin_fini = EVENTS[3].load(Ordering::SeqCst);
+    let first = load(b"libdl_plugin.so.1\0", NOW);
+    // SAFETY: dl_plugin_value is the known C fn() -> usize export;
+    // the open token or retained namespace pins its code through this call.
+    assert_eq!(unsafe { value(first, b"dl_plugin_value\0") }, 42);
+    // SAFETY: dl_dep_value is the known C fn() -> usize export;
+    // the open token or retained namespace pins its code through this call.
+    assert_eq!(unsafe { value(first, b"dl_dep_value\0") }, 41);
+    // SAFETY: dl_plugin_ctor_count is the known C fn() -> usize export;
+    // the open token or retained namespace pins its code through this call.
+    assert_eq!(unsafe { value(first, b"dl_plugin_ctor_count\0") }, 1);
+    // SAFETY: dl_plugin_next is the known C fn() -> usize export;
+    // the open token or retained namespace pins its code through this call.
+    assert_eq!(unsafe { value(first, b"dl_plugin_next\0") }, 1);
+    assert!(error_pointer().is_null());
+    assert!(lookup_symbol(first, Some(b"dl_absolute_zero\0")).is_null());
+    assert!(
+        error_pointer().is_null(),
+        "a defined zero-valued symbol is not an error"
+    );
+    assert!(lookup_symbol(first, Some(b"dl_plugin_hidden\0")).is_null());
+    error_once();
+    assert!(lookup_symbol(DEFAULT, Some(b"dl_plugin_value\0")).is_null());
+    error_once();
+    let again = load(b"/apps/dlopen/lib/../lib/libdl_plugin.so.1\0", NOW);
+    assert_eq!(first, again);
+    // SAFETY: dl_plugin_next is the known C fn() -> usize export;
+    // the open token or retained namespace pins its code through this call.
+    assert_eq!(unsafe { value(again, b"dl_plugin_next\0") }, 2);
+    assert_eq!(close_object(first), 0);
+    // SAFETY: dl_plugin_ctor_count is the known C fn() -> usize export;
+    // the open token or retained namespace pins its code through this call.
+    assert_eq!(unsafe { value(again, b"dl_plugin_ctor_count\0") }, 1);
+    assert_eq!(EVENTS[3].load(Ordering::SeqCst), plugin_fini);
+    assert_eq!(close_object(again), 0);
+    assert_eq!(EVENTS[3].load(Ordering::SeqCst), plugin_fini + 1);
+    assert_eq!(EVENTS[1].load(Ordering::SeqCst), dep_fini + 1);
 
-        // GLOBAL includes a dependency that was already loaded LOCAL.
-        let dep = load(b"libdl_dep.so.1\0", NOW);
-        let plugin = load(b"libdl_plugin.so.1\0", NOW | GLOBAL);
-        assert_eq!(value(DEFAULT, b"dl_dep_value\0"), 41);
-        assert_eq!(dlclose(dep), 0);
-        assert_eq!(dlclose(plugin), 0);
-        assert!(dlsym(DEFAULT, b"dl_dep_value\0".as_ptr().cast()).is_null());
-        error_once();
-        assert!(dlsym(first, b"dl_plugin_value\0".as_ptr().cast()).is_null());
-        error_once();
-        assert_eq!(dlclose(first), -1);
-        error_once();
-        let fresh = load(b"libdl_plugin.so.1\0", NOW);
-        assert_ne!(fresh, first);
-        assert_eq!(value(fresh, b"dl_plugin_next\0"), 1);
-        assert_eq!(value(fresh, b"dl_plugin_ctor_count\0"), 1);
-        assert_eq!(dlclose(fresh), 0);
+    // GLOBAL includes a dependency that was already loaded LOCAL.
+    let dep = load(b"libdl_dep.so.1\0", NOW);
+    let plugin = load(b"libdl_plugin.so.1\0", NOW | GLOBAL);
+    // SAFETY: dl_dep_value is the known C fn() -> usize export;
+    // the open token or retained namespace pins its code through this call.
+    assert_eq!(unsafe { value(DEFAULT, b"dl_dep_value\0") }, 41);
+    assert_eq!(close_object(dep), 0);
+    assert_eq!(close_object(plugin), 0);
+    assert!(lookup_symbol(DEFAULT, Some(b"dl_dep_value\0")).is_null());
+    error_once();
+    assert!(lookup_symbol(first, Some(b"dl_plugin_value\0")).is_null());
+    error_once();
+    assert_eq!(close_object(first), -1);
+    error_once();
+    let fresh = load(b"libdl_plugin.so.1\0", NOW);
+    assert_ne!(fresh, first);
+    // SAFETY: dl_plugin_next is the known C fn() -> usize export;
+    // the open token or retained namespace pins its code through this call.
+    assert_eq!(unsafe { value(fresh, b"dl_plugin_next\0") }, 1);
+    // SAFETY: dl_plugin_ctor_count is the known C fn() -> usize export;
+    // the open token or retained namespace pins its code through this call.
+    assert_eq!(unsafe { value(fresh, b"dl_plugin_ctor_count\0") }, 1);
+    assert_eq!(close_object(fresh), 0);
 
-        let dep = load(b"libdl_dep.so.1\0", NOW);
-        let dep_fini = EVENTS[1].load(Ordering::SeqCst);
-        let plugin = load(b"libdl_plugin.so.1\0", NOW);
-        assert_eq!(dlclose(dep), 0);
-        assert_eq!(EVENTS[1].load(Ordering::SeqCst), dep_fini);
-        assert_eq!(value(plugin, b"dl_plugin_value\0"), 42);
-        assert_eq!(dlclose(plugin), 0);
-        assert_eq!(EVENTS[1].load(Ordering::SeqCst), dep_fini + 1);
-    }
+    let dep = load(b"libdl_dep.so.1\0", NOW);
+    let dep_fini = EVENTS[1].load(Ordering::SeqCst);
+    let plugin = load(b"libdl_plugin.so.1\0", NOW);
+    assert_eq!(close_object(dep), 0);
+    assert_eq!(EVENTS[1].load(Ordering::SeqCst), dep_fini);
+    // SAFETY: dl_plugin_value is the known C fn() -> usize export;
+    // the open token or retained namespace pins its code through this call.
+    assert_eq!(unsafe { value(plugin, b"dl_plugin_value\0") }, 42);
+    assert_eq!(close_object(plugin), 0);
+    assert_eq!(EVENTS[1].load(Ordering::SeqCst), dep_fini + 1);
+
     print(b"DLOPEN_REFS_OK\n");
 }
 
 fn global_scope() {
-    unsafe {
-        let provider = load(b"libdl_provider.so.1\0", NOW);
-        assert!(dlsym(DEFAULT, b"dl_runtime_provider\0".as_ptr().cast()).is_null());
-        error_once();
-        // LAZY is admitted but unresolved strong references still fail eagerly.
-        assert!(dlopen(b"libdl_consumer.so.1\0".as_ptr().cast(), 1).is_null());
-        error_once();
-        let promoted = load(b"libdl_provider.so.1\0", NOW | GLOBAL);
-        assert_eq!(provider, promoted);
-        assert_eq!(value(DEFAULT, b"dl_runtime_provider\0"), 70);
-        let root = dlopen(core::ptr::null(), NOW);
-        assert_eq!(value(root, b"dl_runtime_provider\0"), 70);
-        let consumer = load(b"libdl_consumer.so.1\0", NOW);
-        assert_eq!(value(consumer, b"dl_consumer_value\0"), 77);
-        assert_eq!(dlclose(provider), 0);
-        assert_eq!(dlclose(promoted), 0);
-        // The consumer's relocation keeps the now-unopened provider mapped.
-        assert_eq!(value(consumer, b"dl_consumer_value\0"), 77);
-        assert_eq!(dlclose(consumer), 0);
-        assert!(dlsym(root, b"dl_runtime_provider\0".as_ptr().cast()).is_null());
-        error_once();
-        assert_eq!(dlclose(root), 0);
-    }
+    let provider = load(b"libdl_provider.so.1\0", NOW);
+    assert!(lookup_symbol(DEFAULT, Some(b"dl_runtime_provider\0")).is_null());
+    error_once();
+    // LAZY is admitted but unresolved strong references still fail eagerly.
+    assert!(open_object(Some(b"libdl_consumer.so.1\0"), 1).is_null());
+    error_once();
+    let promoted = load(b"libdl_provider.so.1\0", NOW | GLOBAL);
+    assert_eq!(provider, promoted);
+    // SAFETY: dl_runtime_provider is the known C fn() -> usize export;
+    // the open token or retained namespace pins its code through this call.
+    assert_eq!(unsafe { value(DEFAULT, b"dl_runtime_provider\0") }, 70);
+    let root = open_object(None, NOW);
+    // SAFETY: dl_runtime_provider is the known C fn() -> usize export;
+    // the open token or retained namespace pins its code through this call.
+    assert_eq!(unsafe { value(root, b"dl_runtime_provider\0") }, 70);
+    let consumer = load(b"libdl_consumer.so.1\0", NOW);
+    // SAFETY: dl_consumer_value is the known C fn() -> usize export;
+    // the open token or retained namespace pins its code through this call.
+    assert_eq!(unsafe { value(consumer, b"dl_consumer_value\0") }, 77);
+    assert_eq!(close_object(provider), 0);
+    assert_eq!(close_object(promoted), 0);
+    // The consumer's relocation keeps the now-unopened provider mapped.
+    // SAFETY: dl_consumer_value is the known C fn() -> usize export;
+    // the open token or retained namespace pins its code through this call.
+    assert_eq!(unsafe { value(consumer, b"dl_consumer_value\0") }, 77);
+    assert_eq!(close_object(consumer), 0);
+    assert!(lookup_symbol(root, Some(b"dl_runtime_provider\0")).is_null());
+    error_once();
+    assert_eq!(close_object(root), 0);
+
     print(b"DLOPEN_GLOBAL_OK\n");
 }
 
 fn recursive_and_tls() {
-    unsafe {
-        let nested = load(b"libdl_nested.so.1\0", NOW);
-        assert_eq!(value(nested, b"dl_nested_value\0"), 41);
-        assert_eq!(EVENTS[4].load(Ordering::SeqCst), 1);
-        assert_eq!(dlclose(nested), 0);
-        assert_eq!(EVENTS[5].load(Ordering::SeqCst), 1);
-        let tls = load(b"libdl_tls.so.1\0", NOW);
-        assert_eq!(value(tls, b"dl_tls_next\0"), 8);
-        assert_eq!(value(tls, b"dl_tls_next\0"), 9);
-        assert_eq!(dlclose(tls), 0);
-        let fresh = load(b"libdl_tls.so.1\0", NOW);
-        assert_ne!(tls, fresh);
-        assert_eq!(value(fresh, b"dl_tls_next\0"), 8);
-        assert_eq!(dlclose(fresh), 0);
-    }
+    let nested = load(b"libdl_nested.so.1\0", NOW);
+    // SAFETY: dl_nested_value is the known C fn() -> usize export;
+    // the open token or retained namespace pins its code through this call.
+    assert_eq!(unsafe { value(nested, b"dl_nested_value\0") }, 41);
+    assert_eq!(EVENTS[4].load(Ordering::SeqCst), 1);
+    assert_eq!(close_object(nested), 0);
+    assert_eq!(EVENTS[5].load(Ordering::SeqCst), 1);
+    let tls = load(b"libdl_tls.so.1\0", NOW);
+    // SAFETY: dl_tls_next is the known C fn() -> usize export;
+    // the open token or retained namespace pins its code through this call.
+    assert_eq!(unsafe { value(tls, b"dl_tls_next\0") }, 8);
+    // SAFETY: dl_tls_next is the known C fn() -> usize export;
+    // the open token or retained namespace pins its code through this call.
+    assert_eq!(unsafe { value(tls, b"dl_tls_next\0") }, 9);
+    assert_eq!(close_object(tls), 0);
+    let fresh = load(b"libdl_tls.so.1\0", NOW);
+    assert_ne!(tls, fresh);
+    // SAFETY: dl_tls_next is the known C fn() -> usize export;
+    // the open token or retained namespace pins its code through this call.
+    assert_eq!(unsafe { value(fresh, b"dl_tls_next\0") }, 8);
+    assert_eq!(close_object(fresh), 0);
+
     print(b"DLOPEN_RECURSIVE_TLS_OK\n");
 }
 
 extern "C" fn concurrent_worker(_: *mut c_void) -> *mut c_void {
-    unsafe {
-        assert!(dlerror().is_null(), "dlerror must be thread-local");
-        let handle = load(b"libdl_tls.so.1\0", NOW);
-        let previous = SHARED_HANDLE
-            .compare_exchange(0, handle as usize, Ordering::SeqCst, Ordering::SeqCst)
-            .unwrap_or_else(|old| old);
-        assert!(previous == 0 || previous == handle as usize);
-        WORKERS_OPEN.fetch_add(1, Ordering::SeqCst);
-        while WORKERS_OPEN.load(Ordering::SeqCst) != 4 {
-            usleep(10_000);
-        }
-        assert_eq!(value(handle, b"dl_tls_next\0"), 8);
-        assert_eq!(value(handle, b"dl_tls_next\0"), 9);
-        assert!(dlsym(handle, b"missing_worker_symbol\0".as_ptr().cast()).is_null());
-        error_once();
-        assert_eq!(dlclose(handle), 0);
-        core::ptr::null_mut()
+    assert!(error_pointer().is_null(), "dlerror must be thread-local");
+    let handle = load(b"libdl_tls.so.1\0", NOW);
+    let previous = SHARED_HANDLE
+        .compare_exchange(0, handle as usize, Ordering::SeqCst, Ordering::SeqCst)
+        .unwrap_or_else(|old| old);
+    assert!(previous == 0 || previous == handle as usize);
+    WORKERS_OPEN.fetch_add(1, Ordering::SeqCst);
+    while WORKERS_OPEN.load(Ordering::SeqCst) != 4 {
+        pause(10_000);
     }
+    // SAFETY: dl_tls_next is the known C fn() -> usize export;
+    // the open token or retained namespace pins its code through this call.
+    assert_eq!(unsafe { value(handle, b"dl_tls_next\0") }, 8);
+    // SAFETY: dl_tls_next is the known C fn() -> usize export;
+    // the open token or retained namespace pins its code through this call.
+    assert_eq!(unsafe { value(handle, b"dl_tls_next\0") }, 9);
+    assert!(lookup_symbol(handle, Some(b"missing_worker_symbol\0")).is_null());
+    error_once();
+    assert_eq!(close_object(handle), 0);
+    core::ptr::null_mut()
 }
 
 fn concurrent_and_errors() {
-    unsafe {
-        assert!(dlsym(DEFAULT, b"missing_main_symbol\0".as_ptr().cast()).is_null());
-        let mut threads = [0usize; 4];
-        for thread in &mut threads {
-            assert_eq!(
+    assert!(lookup_symbol(DEFAULT, Some(b"missing_main_symbol\0")).is_null());
+    let mut threads = [0usize; 4];
+    for thread in &mut threads {
+        assert_eq!(
+            // SAFETY: thread is a writable local id slot and NULL attr selects
+            // defaults. concurrent_worker has the C entry signature and ignores its
+            // NULL argument; the root remains mapped until every worker is joined.
+            unsafe {
                 pthread_create(
                     thread,
                     core::ptr::null(),
                     concurrent_worker,
-                    core::ptr::null_mut()
-                ),
-                0
-            );
-        }
-        for thread in threads {
-            assert_eq!(pthread_join(thread, core::ptr::null_mut()), 0);
-        }
-        error_once();
+                    core::ptr::null_mut(),
+                )
+            },
+            0
+        );
     }
+    for thread in threads {
+        // SAFETY: each id came from successful creation above and is joined
+        // once here; a NULL result slot is explicitly supported by pthread_join.
+        assert_eq!(unsafe { pthread_join(thread, core::ptr::null_mut()) }, 0);
+    }
+    error_once();
+
     print(b"DLOPEN_THREADS_OK\n");
 }
 
-unsafe fn exchange_file(path: &[u8], bytes: &mut [u8], writing: bool) {
+fn exchange_file(path: &[u8], bytes: &mut [u8], writing: bool) {
     let flags = if writing { 512 | 1024 | 1 } else { 0 };
-    let fd = open(path.as_ptr().cast(), flags, 0o644i32);
+    let path = CStr::from_bytes_with_nul(path).expect("fixture C path");
+    // SAFETY: path is a borrowed C string live through open; the create-mode
+    // argument has the required promoted integer representation.
+    let fd = unsafe { open(path.as_ptr(), flags, 0o644i32) };
     assert!(fd >= 0);
     let count = if writing {
-        write(fd, bytes.as_ptr(), bytes.len())
+        // SAFETY: fd is owned by this call and bytes is readable for its length
+        // until the synchronous write returns.
+        unsafe { write(fd, bytes.as_ptr(), bytes.len()) }
     } else {
-        read(fd, bytes.as_mut_ptr(), bytes.len())
+        // SAFETY: fd is open and bytes supplies an exclusive writable range
+        // of exactly the advertised length through the synchronous read.
+        unsafe { read(fd, bytes.as_mut_ptr(), bytes.len()) }
     };
     assert_eq!(count, bytes.len() as isize);
-    assert_eq!(close(fd), 0);
+    // SAFETY: this call owns fd from the successful open above and closes it
+    // once, after completing every borrowed-buffer operation.
+    assert_eq!(unsafe { close(fd) }, 0);
 }
 
-unsafe fn holding_app() {
+fn holding_app() {
     let handle = load(b"libdl_plugin.so.1\0", NOW);
     let mut bytes = (handle as usize).to_ne_bytes();
     exchange_file(b"/dlopen-handle\0", &mut bytes, true);
     loop {
-        let fd = open(b"/dlopen-release\0".as_ptr().cast(), 0);
+        // SAFETY: the static path is terminated and stays readable through
+        // open; supplying the optional scalar mode is valid for all flags.
+        let fd = unsafe { open(b"/dlopen-release\0".as_ptr().cast(), 0, 0o644i32) };
         if fd >= 0 {
-            close(fd);
+            // SAFETY: fd is the owned descriptor just returned by open.
+            unsafe { close(fd) };
             break;
         }
-        usleep(10_000);
+        pause(10_000);
     }
-    assert_eq!(value(handle, b"dl_plugin_next\0"), 1);
-    assert_eq!(dlclose(handle), 0);
+    // SAFETY: dl_plugin_next is the known C fn() -> usize export;
+    // the open token or retained namespace pins its code through this call.
+    assert_eq!(unsafe { value(handle, b"dl_plugin_next\0") }, 1);
+    assert_eq!(close_object(handle), 0);
     print(b"DLOPEN_OWNER_OK\n");
 }
 
-unsafe fn foreign_app() {
+fn foreign_app() {
     let mut bytes = [0u8; core::mem::size_of::<usize>()];
     exchange_file(b"/dlopen-handle\0", &mut bytes, false);
     let foreign = usize::from_ne_bytes(bytes) as *mut c_void;
-    assert!(dlsym(foreign, b"dl_plugin_value\0".as_ptr().cast()).is_null());
+    assert!(lookup_symbol(foreign, Some(b"dl_plugin_value\0")).is_null());
     error_once();
-    assert_eq!(dlclose(foreign), -1);
+    assert_eq!(close_object(foreign), -1);
     error_once();
     let own = load(b"libdl_plugin.so.1\0", NOW);
     assert_ne!(own, foreign);
-    assert_eq!(value(own, b"dl_plugin_next\0"), 1);
-    assert_eq!(dlclose(own), 0);
+    // SAFETY: dl_plugin_next is the known C fn() -> usize export;
+    // the open token or retained namespace pins its code through this call.
+    assert_eq!(unsafe { value(own, b"dl_plugin_next\0") }, 1);
+    assert_eq!(close_object(own), 0);
     print(b"DLOPEN_FOREIGN_OK\n");
 }
 
+/// # Safety
+/// The runtime supplies argc initialized argv entries and readable terminated
+/// strings, all retained by the application's start storage through this call.
 #[no_mangle]
-pub extern "C" fn main(argc: c_int, argv: *const *const c_char, _: *const *const c_char) -> c_int {
-    unsafe {
-        if argc > 1 {
-            let mode = **argv.add(1);
-            match mode as u8 {
-                b'h' => {
-                    holding_app();
-                    return 0;
-                }
-                b'f' => {
-                    foreign_app();
-                    return 0;
-                }
-                b'e' => {
-                    EXIT_MODE.store(1, Ordering::SeqCst);
-                    let handle = load(b"libdl_plugin.so.1\0", NOW);
-                    assert_eq!(value(handle, b"dl_plugin_value\0"), 42);
-                    assert_eq!(value(handle, b"dl_plugin_set_key\0"), 1);
-                    let nested = load(b"libdl_nested.so.1\0", NOW);
-                    assert_eq!(value(nested, b"dl_nested_value\0"), 41);
-                    print(b"DLOPEN_EXIT_OPEN\n");
-                    // Outstanding runtime handles must be finalized at exit.
-                    return 0;
-                }
-                _ => {}
+pub unsafe extern "C" fn main(
+    argc: c_int,
+    argv: *const *const c_char,
+    _: *const *const c_char,
+) -> c_int {
+    if argc > 1 {
+        assert!(!argv.is_null());
+        // SAFETY: argc > 1 indexes the runtime's initialized argv array;
+        // that pinned array remains live and immutable through main.
+        let argument = unsafe { *argv.add(1) };
+        assert!(!argument.is_null());
+        // SAFETY: the runtime provides a terminated string, so even an
+        // empty argument contains a readable first byte (its NUL).
+        let mode = unsafe { *argument };
+        match mode as u8 {
+            b'h' => {
+                holding_app();
+                return 0;
             }
+            b'f' => {
+                foreign_app();
+                return 0;
+            }
+            b'e' => {
+                EXIT_MODE.store(1, Ordering::SeqCst);
+                let handle = load(b"libdl_plugin.so.1\0", NOW);
+                // SAFETY: dl_plugin_value is the known C fn() -> usize export;
+                // the open token or retained namespace pins its code through this call.
+                assert_eq!(unsafe { value(handle, b"dl_plugin_value\0") }, 42);
+                // SAFETY: dl_plugin_set_key is the known C fn() -> usize export;
+                // the open token or retained namespace pins its code through this call.
+                assert_eq!(unsafe { value(handle, b"dl_plugin_set_key\0") }, 1);
+                let nested = load(b"libdl_nested.so.1\0", NOW);
+                // SAFETY: dl_nested_value is the known C fn() -> usize export;
+                // the open token or retained namespace pins its code through this call.
+                assert_eq!(unsafe { value(nested, b"dl_nested_value\0") }, 41);
+                print(b"DLOPEN_EXIT_OPEN\n");
+                // Outstanding runtime handles must be finalized at exit.
+                return 0;
+            }
+            _ => {}
         }
     }
+
     failures_and_startup();
     reference_counts();
     global_scope();

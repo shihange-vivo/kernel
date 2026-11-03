@@ -54,22 +54,30 @@ impl ArchitectureCodeCache {
         };
 
         #[cfg(any(target_arch = "riscv32", target_arch = "riscv64"))]
+        // SAFETY: this kernel-local instruction publishes preceding code
+        // writes on the current hart; it has no pointer or stack operands.
         unsafe {
             core::arch::asm!("fence.i", options(nostack));
         }
 
         #[cfg(all(target_arch = "arm", armv7m))]
+        // SAFETY: these Cortex-M kernel barriers synchronize instruction
+        // fetch without accessing an application address or modifying stack.
         unsafe {
             core::arch::asm!("dsb", "isb", options(nostack, preserves_flags));
         }
 
         #[cfg(all(target_arch = "arm", not(armv7m)))]
         for range in prepared.executable_ranges() {
+            // SAFETY: the loader retains the validated mapped allocation;
+            // this privileged ARMv8-M kernel accesses architectural SCB MMIO.
             unsafe { synchronize_arm_v8m(*range)? };
         }
 
         #[cfg(target_arch = "aarch64")]
         for range in prepared.executable_ranges() {
+            // SAFETY: loader-owned executable ranges remain mapped, and the
+            // kernel executes at the privilege level needed for maintenance.
             unsafe { synchronize_aarch64(*range)? };
         }
 

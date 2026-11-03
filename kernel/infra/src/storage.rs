@@ -19,6 +19,7 @@ use core::{
 };
 
 #[derive(Debug)]
+#[must_use = "keep the storage owner alive while its allocation is in use"]
 pub enum Storage {
     Alloc(*mut u8, Layout),
     Raw(*mut u8, usize),
@@ -39,6 +40,11 @@ impl Storage {
 
     #[inline]
     pub fn try_from_layout(layout: Layout) -> Option<Self> {
+        if layout.size() == 0 {
+            return None;
+        }
+        // SAFETY: Layout validates alignment and representable size; the
+        // nonzero check above satisfies alloc's additional precondition.
         let base = unsafe { alloc::alloc::alloc(layout) };
         if base.is_null() {
             None
@@ -98,3 +104,28 @@ impl Drop for Storage {
 // FIXME: Workaround for pointer based storage.
 unsafe impl Send for Storage {}
 unsafe impl Sync for Storage {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn fallible_storage_rejects_zero_sized_layouts() {
+        for alignment in [1, 8, 64] {
+            let layout = Layout::from_size_align(0, alignment).unwrap();
+            assert!(Storage::try_from_layout(layout).is_none());
+        }
+    }
+
+    #[test]
+    fn fallible_storage_keeps_the_requested_layout() {
+        let layout = Layout::from_size_align(32, 16).unwrap();
+        let storage = Storage::try_from_layout(layout).expect("allocate test storage");
+        assert_eq!(storage.size(), 32);
+        assert!(storage.base().is_aligned_to(16));
+        // SAFETY: storage uniquely owns this nonempty block; initialize all
+        // bytes before observing them through its shared slice view.
+        unsafe { core::ptr::write_bytes(storage.base(), 0xa5, storage.size()) };
+        assert_eq!(storage.as_slice(), &[0xa5; 32]);
+    }
+}

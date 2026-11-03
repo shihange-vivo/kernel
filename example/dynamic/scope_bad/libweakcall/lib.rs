@@ -27,6 +27,9 @@ extern "C" {
 }
 
 extern "C" fn weak_call_ctor() {
+    // SAFETY: this intentionally invalid relocation is negative test input.
+    // The loader must reject the unresolved weak function before any init
+    // target is executable; the test never executes this constructor.
     unsafe { missing_fn() };
 }
 

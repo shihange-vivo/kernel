@@ -24,12 +24,17 @@ extern "C" {
 /// A function the root calls; crosses the foo→common dependency edge.
 #[no_mangle]
 pub extern "C" fn foo_value() -> i32 {
-    unsafe { common_value() + 2 }
+    // SAFETY: common's export matches extern C fn() -> i32 and its retained
+    // dependency backing outlives this call from foo.
+    let value = unsafe { common_value() };
+    value + 2
 }
 
 #[no_mangle]
 pub extern "C" fn foo_report() {
     static MSG: &[u8] = b"foo ran\n";
+    // SAFETY: MSG is a live immutable byte range of exactly MSG.len(); write
+    // consumes it synchronously through the retained libc dependency.
     unsafe {
         write(1, MSG.as_ptr(), MSG.len());
     }
