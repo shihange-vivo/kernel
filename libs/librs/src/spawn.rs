@@ -57,33 +57,46 @@ fn string_view(s: *const c_char) -> Option<BlueOsStringView> {
 
 /// Convert a NUL-terminated `char **` array into `Vec<BlueOsStringView>`,
 /// bounding both the element count and the total byte length. A null head is an
-/// empty array (argc/envc 0), matching a bare `main()` launch.
-fn string_array(head: *const *const c_char) -> Option<Vec<BlueOsStringView>> {
+/// empty array (argc/envc 0), matching a bare `main()` launch. The caller keeps
+/// the pointer array and strings immutable throughout both bounded passes.
+fn string_array(head: *const *const c_char) -> Result<Vec<BlueOsStringView>, libc::c_int> {
     if head.is_null() {
-        return Some(Vec::new());
+        return Ok(Vec::new());
     }
-    let mut views = Vec::new();
-    let mut total = 0usize;
+    // Count once so short argv/envp lists do not allocate for MAX_ARGC slots.
+    let mut count = 0usize;
     let mut p = head;
     loop {
         // SAFETY: `p` walks the caller's `char **` array, terminated by a null
-        // entry; the array-length and total-byte bounds below bound the walk.
+        // entry and retained through this call; at most MAX_ARGC+1 slots are
+        // inspected, including the required terminator at the count limit.
         let entry = unsafe { *p };
         if entry.is_null() {
             break;
         }
-        if views.len() >= MAX_ARGC {
-            return None;
+        if count == MAX_ARGC {
+            return Err(libc::E2BIG);
         }
-        let view = string_view(entry)?;
-        total = total.checked_add(view.len)?;
-        if total > MAX_TOTAL_BYTES {
-            return None;
-        }
-        views.push(view);
+        count += 1;
+        // SAFETY: a non-null entry precedes the array's terminator, so the
+        // next pointer slot remains in this caller-owned array.
         p = unsafe { p.add(1) };
     }
-    Some(views)
+    let mut views = Vec::new();
+    views.try_reserve_exact(count).map_err(|_| libc::ENOMEM)?;
+    let mut total = 0usize;
+    for index in 0..count {
+        // SAFETY: the first pass established count non-null slots. The caller
+        // retains this initialized array unchanged throughout the second pass.
+        let entry = unsafe { *head.add(index) };
+        let view = string_view(entry).ok_or(libc::E2BIG)?;
+        total = total.checked_add(view.len).ok_or(libc::E2BIG)?;
+        if total > MAX_TOTAL_BYTES {
+            return Err(libc::E2BIG);
+        }
+        views.push(view);
+    }
+    Ok(views)
 }
 
 /// Stable C ABI `spawn(path, argv, envp)`.
@@ -101,11 +114,13 @@ pub extern "C" fn spawn(
     let Some(path_view) = string_view(path) else {
         return -(libc::EINVAL as c_long);
     };
-    let Some(argv_views) = string_array(argv) else {
-        return -(libc::E2BIG as c_long);
+    let argv_views = match string_array(argv) {
+        Ok(views) => views,
+        Err(errno) => return -(errno as c_long),
     };
-    let Some(envp_views) = string_array(envp) else {
-        return -(libc::E2BIG as c_long);
+    let envp_views = match string_array(envp) {
+        Ok(views) => views,
+        Err(errno) => return -(errno as c_long),
     };
 
     let argv_ptr = if argv_views.is_empty() {
