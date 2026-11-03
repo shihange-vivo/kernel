@@ -20,7 +20,10 @@
 
 use blueos_infra::no_let_underscore::IgnoreResult;
 
-use alloc::{sync::Arc, vec::Vec};
+use alloc::{
+    sync::{Arc, Weak},
+    vec::Vec,
+};
 use core::sync::atomic::{AtomicUsize, Ordering};
 
 use super::adapters::system_paths::SystemLibraryKey;
@@ -213,6 +216,7 @@ impl SystemBatchWait {
 /// releases backing memory. `Initializing` hides descriptors until
 /// constructors complete; `Failed` retains a failed constructor's backing for
 /// deferred release.
+#[must_use = "retain the instance state until its backing and dependencies are released"]
 enum InstanceState {
     Vacant,
     Loading,
@@ -234,8 +238,9 @@ enum InstanceState {
         descriptor: ImageHandle,
         fini_plan: Vec<usize>,
         /// The instance owns its backing: the unique allocation lease
-        /// and its system-to-system dependency leases live with the Ready
-        /// state, released only by the quiescence worker.
+        /// and its counted dependency leases live with the Ready state,
+        /// released only by the quiescence worker. Those leases weakly refer
+        /// back to the registry so the slot table cannot retain itself.
         allocation: AllocationLease,
         dependencies: Vec<SystemDsoLease>,
         scc_members: Vec<SystemLibraryKey>,
@@ -316,7 +321,7 @@ impl SystemDsoRegistry {
                 })?;
                 Ok(SystemSnapshotOutcome::Ready(
                     SystemDsoLease {
-                        inner: Arc::clone(&self.inner),
+                        inner: LeaseRegistry::External(Arc::clone(&self.inner)),
                         slot: index,
                         generation: slot.generation,
                         key,
@@ -346,7 +351,7 @@ impl SystemDsoRegistry {
                     *leases = leases.checked_add(1).ok_or_else(stale_error)?;
                     return Ok((
                         SystemDsoLease {
-                            inner: Arc::clone(&self.inner),
+                            inner: LeaseRegistry::External(Arc::clone(&self.inner)),
                             slot: index,
                             generation: slot.generation,
                             key: slot.key.clone(),
@@ -433,7 +438,7 @@ impl SystemDsoRegistry {
                     imports.push((
                         key,
                         SystemDsoLease {
-                            inner: Arc::clone(&self.inner),
+                            inner: LeaseRegistry::External(Arc::clone(&self.inner)),
                             slot: index,
                             generation: slot.generation,
                             key: slot.key.clone(),
@@ -634,7 +639,7 @@ impl SystemDsoRegistry {
                     };
                     pending_dependencies.push((member.slot, dependency_keys));
                     leases.push(SystemDsoLease {
-                        inner: Arc::clone(&inner),
+                        inner: LeaseRegistry::External(Arc::clone(&inner)),
                         slot: member.slot,
                         generation: member.generation,
                         key: instance.key.clone(),
@@ -663,7 +668,7 @@ impl SystemDsoRegistry {
                     provider.generation
                 };
                 let dependency = SystemDsoLease {
-                    inner: Arc::clone(&inner),
+                    inner: LeaseRegistry::Dependency(Arc::downgrade(&inner)),
                     slot: provider_slot,
                     generation,
                     key,
@@ -817,13 +822,18 @@ impl SystemDsoRegistry {
                 descriptor: _,
                 fini_plan,
                 allocation,
-                dependencies,
+                mut dependencies,
                 scc_members: _,
                 keep_cached: _,
             } = state
             else {
                 unreachable!("SCC quiescence was validated before transition")
             };
+            // The leases are leaving the slot table. Keep the registry and
+            // its providers alive until the worker releases these backings.
+            for dependency in &mut dependencies {
+                dependency.retain_registry(&self.inner);
+            }
             batch_members.push(BatchMember {
                 slot: member,
                 generation: slot.generation,
@@ -952,7 +962,18 @@ impl Drop for LoadPermit {
     }
 }
 
+/// Ownership of the registry associated with a counted DSO reference.
+#[must_use = "external references retain the registry; dependency references do not"]
+enum LeaseRegistry {
+    External(Arc<Mutex<RegistryInner>>),
+    Dependency(Weak<Mutex<RegistryInner>>),
+}
+
 /// One counted reference to a Ready system DSO.
+///
+/// External leases keep the registry alive. Leases inside Ready slots use a
+/// weak back-reference to avoid a cycle, while still counting provider use.
+/// Moving dependencies into an unload backing restores external ownership.
 ///
 /// `Drop` only decrements the instance's lease count. A zero-user instance
 /// remains `Ready` and reusable until an application reaper explicitly asks
@@ -962,13 +983,17 @@ impl Drop for LoadPermit {
 /// Unloading remains a reaper decision made with quiescence evidence
 #[must_use = "keep the lease while using the system DSO"]
 pub struct SystemDsoLease {
-    inner: Arc<Mutex<RegistryInner>>,
+    inner: LeaseRegistry,
     slot: usize,
     generation: u32,
     key: SystemLibraryKey,
 }
 
 impl SystemDsoLease {
+    fn retain_registry(&mut self, inner: &Arc<Mutex<RegistryInner>>) {
+        self.inner = LeaseRegistry::External(Arc::clone(inner));
+    }
+
     /// The canonical system catalog path key this lease was minted for.
     #[inline]
     pub fn key(&self) -> &SystemLibraryKey {
@@ -978,7 +1003,14 @@ impl SystemDsoLease {
 
 impl Drop for SystemDsoLease {
     fn drop(&mut self) {
-        let mut guard = self.inner.lock();
+        let inner = match &self.inner {
+            LeaseRegistry::External(inner) => Some(Arc::clone(inner)),
+            LeaseRegistry::Dependency(inner) => inner.upgrade(),
+        };
+        let Some(inner) = inner else {
+            return;
+        };
+        let mut guard = inner.lock();
         let Some(slot) = guard.slots.get_mut(self.slot) else {
             return;
         };
@@ -1021,7 +1053,16 @@ fn stale_error() -> LoadError {
 #[cfg(test)]
 mod publication_tests {
     use super::*;
+    use crate::application::adapters::flat_memory::FlatImageMemory;
+    use blueos_loader::{
+        memory::{CoherentCodeCache, ImageMemory},
+        profile::{LoadProfile, SessionLimits},
+        reader::ElfReader,
+        ArtifactId, ArtifactInfo, ArtifactResolver, ImageKey, LoadRequest, LoadServices,
+        LocalRepository, OpenedArtifact, RetainResources,
+    };
     use blueos_test_macro::test;
+
     fn key(name: &[u8]) -> SystemLibraryKey {
         SystemLibraryKey::from_bytes(name).unwrap()
     }
@@ -1029,6 +1070,242 @@ mod publication_tests {
         match registry.acquire_batch(keys).unwrap() {
             AcquireBatchOutcome::Acquired(batch) => batch,
             _ => panic!("unexpected pending closure"),
+        }
+    }
+
+    #[derive(Clone)]
+    struct MetadataElf([u8; 128]);
+
+    impl MetadataElf {
+        fn new() -> Self {
+            // A metadata-only ELF64 PIE with one executable PT_LOAD. The
+            // fixture is decoded and mapped but its bytes are never executed.
+            let mut bytes = [0; 128];
+            bytes[..7].copy_from_slice(b"\x7fELF\x02\x01\x01");
+            bytes[16..18].copy_from_slice(&3u16.to_le_bytes());
+            bytes[18..20].copy_from_slice(&243u16.to_le_bytes());
+            bytes[20..24].copy_from_slice(&1u32.to_le_bytes());
+            bytes[24..32].copy_from_slice(&0x1000u64.to_le_bytes());
+            bytes[32..40].copy_from_slice(&64u64.to_le_bytes());
+            bytes[52..54].copy_from_slice(&64u16.to_le_bytes());
+            bytes[54..56].copy_from_slice(&56u16.to_le_bytes());
+            bytes[56..58].copy_from_slice(&1u16.to_le_bytes());
+            bytes[58..60].copy_from_slice(&64u16.to_le_bytes());
+            bytes[64..68].copy_from_slice(&1u32.to_le_bytes());
+            bytes[68..72].copy_from_slice(&5u32.to_le_bytes());
+            bytes[80..88].copy_from_slice(&0x1000u64.to_le_bytes());
+            bytes[96..104].copy_from_slice(&128u64.to_le_bytes());
+            bytes[104..112].copy_from_slice(&128u64.to_le_bytes());
+            bytes[112..120].copy_from_slice(&16u64.to_le_bytes());
+            Self(bytes)
+        }
+    }
+
+    impl ElfReader for MetadataElf {
+        fn len(&self) -> LoadResult<u64> {
+            Ok(128)
+        }
+
+        fn read_exact_at(&self, offset: u64, dst: &mut [u8]) -> LoadResult<()> {
+            let start = usize::try_from(offset).map_err(|_| stale_error())?;
+            let end = start.checked_add(dst.len()).ok_or_else(stale_error)?;
+            let bytes = self.0.get(start..end).ok_or_else(stale_error)?;
+            dst.copy_from_slice(bytes);
+            Ok(())
+        }
+    }
+
+    impl ArtifactResolver for MetadataElf {
+        type Source = ArtifactInfo;
+        type Reader = Self;
+
+        fn info<'a>(&self, source: &'a ArtifactInfo) -> &'a ArtifactInfo {
+            source
+        }
+
+        fn resolve(&mut self, _: &ArtifactInfo, _: &[u8]) -> LoadResult<ArtifactInfo> {
+            Err(stale_error())
+        }
+
+        fn open(&mut self, _: &ArtifactInfo) -> LoadResult<OpenedArtifact<Self>> {
+            Ok(OpenedArtifact::new(self.clone(), ArtifactId::fresh()?))
+        }
+    }
+
+    fn candidate(
+        memory: &FlatImageMemory,
+        key: &SystemLibraryKey,
+        dependency_keys: Vec<SystemLibraryKey>,
+        keep_cached: bool,
+    ) -> SystemCandidateBacking {
+        let source = ArtifactInfo::new(ImageKey::new(0, key.as_bytes()).unwrap(), false);
+        let image = blueos_loader::load(
+            LoadRequest::executable(source, LoadProfile::riscv64(), SessionLimits::DEFAULT),
+            LoadServices {
+                sources: &mut MetadataElf::new(),
+                images: &mut LocalRepository,
+                memory: memory.clone(),
+                cache: &mut CoherentCodeCache,
+                observer: &mut (),
+            },
+            &mut RetainResources,
+        )
+        .expect("load registry metadata fixture");
+        let descriptor = image.images().next().unwrap().clone();
+        // SAFETY: the fixture transfers the sole allocation into the registry
+        // and keeps the shared memory service alive throughout each scenario.
+        let (_, mut allocations, pins, _) = unsafe { image.into_receipt().into_parts() };
+        assert_eq!(allocations.len(), 1);
+        assert!(pins.is_empty());
+        let (_, allocation) = allocations.pop().unwrap();
+        let dependencies = Vec::with_capacity(dependency_keys.len());
+        SystemCandidateBacking {
+            descriptor,
+            fini_plan: Vec::new(),
+            allocation,
+            dependency_keys,
+            dependencies,
+            scc_members: alloc::vec![key.clone()],
+            keep_cached,
+        }
+    }
+
+    fn ready_pair(keep_cached: bool) -> (SystemDsoRegistry, FlatImageMemory, Vec<SystemDsoLease>) {
+        let registry = SystemDsoRegistry::new();
+        let memory = FlatImageMemory::new();
+        let source = key(b"source");
+        let provider = key(b"provider");
+        let batch = acquire(&registry, &[source.clone(), provider.clone()]);
+        let prepared = registry.prepare_publication(&batch.loads).unwrap();
+        let backings = batch
+            .loads
+            .iter()
+            .map(|(name, _)| {
+                let dependencies = if name == &source {
+                    alloc::vec![provider.clone()]
+                } else {
+                    Vec::new()
+                };
+                candidate(&memory, name, dependencies, keep_cached)
+            })
+            .collect();
+        let initializing = registry.commit_publication(prepared, batch.loads, backings);
+        let leases = registry.finish_initialization_batch(initializing).unwrap();
+        (registry, memory, leases)
+    }
+
+    fn lease_count(registry: &SystemDsoRegistry, name: &[u8]) -> usize {
+        let inner = registry.inner.lock();
+        let slot = inner
+            .slots
+            .iter()
+            .find(|slot| slot.key.as_bytes() == name)
+            .unwrap();
+        match slot.state {
+            InstanceState::Ready { leases, .. } => leases,
+            _ => panic!("expected Ready provider"),
+        }
+    }
+
+    fn unload(registry: &SystemDsoRegistry, name: &[u8]) -> SystemUnloadBatch {
+        match registry.resolve_quiescence(&key(name)) {
+            Some(QuiescenceResolution::Unloaded(batch)) => batch,
+            _ => panic!("expected an unloadable instance"),
+        }
+    }
+
+    fn release_backing(memory: &mut FlatImageMemory, backing: SystemUnloadBacking) {
+        memory.release_committed(backing.allocation);
+        drop(backing.dependencies);
+    }
+
+    fn check_dependency_lease_lifetimes() {
+        // Cached and unloadable instances must both release their registry
+        // metadata when the last external owner disappears.
+        for keep_cached in [false, true] {
+            let (registry, _memory, leases) = ready_pair(keep_cached);
+            let weak = Arc::downgrade(&registry.inner);
+            drop(leases);
+            assert_eq!(lease_count(&registry, b"source"), 0);
+            assert_eq!(lease_count(&registry, b"provider"), 1);
+            assert_eq!(Arc::strong_count(&registry.inner), 1);
+            drop(registry);
+            assert!(weak.upgrade().is_none());
+        }
+
+        // Every public way to acquire a lease must retain the registry and
+        // the source's counted provider edge after registry handles are gone.
+        let (registry, _memory, leases) = ready_pair(false);
+        let weak = Arc::downgrade(&registry.inner);
+        let (snapshot, descriptor) = match registry.snapshot(key(b"source")).unwrap() {
+            SystemSnapshotOutcome::Ready(lease, descriptor) => (lease, descriptor),
+            _ => panic!("expected Ready source"),
+        };
+        let (exact, _) = registry.pin_exact(descriptor.instance_id()).unwrap();
+        let imports = acquire(&registry, &[key(b"source")]);
+        drop(registry);
+        drop(leases);
+        assert!(weak.upgrade().is_some());
+        drop(snapshot);
+        assert!(weak.upgrade().is_some());
+        drop(exact);
+        assert!(weak.upgrade().is_some());
+        let retained = SystemDsoRegistry {
+            inner: weak.upgrade().unwrap(),
+        };
+        assert_eq!(lease_count(&retained, b"provider"), 1);
+        drop(retained);
+        drop(imports);
+        assert!(weak.upgrade().is_none());
+
+        // Outgoing edges block provider unloading through the source's fini
+        // and backing release, then allow the provider to quiesce.
+        let (registry, mut memory, leases) = ready_pair(false);
+        drop(leases);
+        assert!(registry.resolve_quiescence(&key(b"provider")).is_none());
+        let mut batch = unload(&registry, b"source");
+        let mut backings = batch.take_backings();
+        assert!(registry.resolve_quiescence(&key(b"provider")).is_none());
+        release_backing(&mut memory, backings.pop().unwrap());
+        registry.finish_unload(batch).unwrap();
+        assert_eq!(lease_count(&registry, b"provider"), 0);
+        let mut batch = unload(&registry, b"provider");
+        let mut backings = batch.take_backings();
+        release_backing(&mut memory, backings.pop().unwrap());
+        registry.finish_unload(batch).unwrap();
+        assert!(matches!(
+            registry.snapshot(key(b"provider")).unwrap(),
+            SystemSnapshotOutcome::Vacant
+        ));
+
+        // Once moved out of the registry, dependency leases must themselves
+        // retain it even if the unload batch and registry handles are dropped.
+        let (registry, mut memory, leases) = ready_pair(false);
+        let weak = Arc::downgrade(&registry.inner);
+        drop(leases);
+        let mut batch = unload(&registry, b"source");
+        let mut backings = batch.take_backings();
+        drop(batch);
+        drop(registry);
+        assert!(weak.upgrade().is_some());
+        release_backing(&mut memory, backings.pop().unwrap());
+        assert!(weak.upgrade().is_none());
+    }
+
+    #[test]
+    fn registry_dependency_leases_preserve_external_lifetimes_without_an_arc_cycle() {
+        // The fixture exercises the full loader; keep its parser frames off
+        // the small kernel test harness stack. One worker runs every scenario.
+        let done = Arc::new(AtomicUsize::new(0));
+        let worker_done = done.clone();
+        let worker = crate::thread::spawn_with_stack(64 * 1024, move || {
+            check_dependency_lease_lifetimes();
+            worker_done.store(1, Ordering::Release);
+            atomic_wake(&worker_done, usize::MAX).ignore_result();
+        });
+        assert!(worker.is_some(), "registry tests need a worker stack");
+        while done.load(Ordering::Acquire) == 0 {
+            atomic_wait(&done, 0, Tick::MAX).ignore_result();
         }
     }
     #[test]
