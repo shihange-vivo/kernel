@@ -337,7 +337,8 @@ impl RuntimeImageMetadata {
 
     /// Total owned runtime metadata bytes this image keeps: the symbol table,
     /// the dependency names, and the decoded relocation records. Charged
-    /// against `max_runtime_metadata_bytes` after decoding.
+    /// against `max_runtime_metadata_bytes` after decoding. Overflow saturates
+    /// at `u64::MAX`.
     pub(crate) fn metadata_bytes(&self) -> u64 {
         let symbols = self.symbols.metadata_bytes();
         let names = self
@@ -350,8 +351,8 @@ impl RuntimeImageMetadata {
                     .map(|name| name.as_bytes().len() as u64),
             )
             .fold(0u64, |acc, len| acc.saturating_add(len));
-        let records =
-            self.relocations.len() as u64 * core::mem::size_of::<RelocationRecord>() as u64;
+        let records = (self.relocations.len() as u64)
+            .saturating_mul(core::mem::size_of::<RelocationRecord>() as u64);
         symbols
             .checked_add(names)
             .and_then(|v| v.checked_add(records))

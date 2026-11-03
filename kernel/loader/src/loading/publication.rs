@@ -234,16 +234,23 @@ impl<S, R> LinkPublisher for CapturePublisher<'_, S, R> {
         let metadata_bytes = facts
             .metadata_bytes()
             .checked_add(self.plan.metadata_bytes()?)
-            .and_then(|b| {
-                b.checked_add(
-                    (self.handles.capacity() * core::mem::size_of::<ImageHandle>()
-                        + self.allocations.capacity()
-                            * (core::mem::size_of::<(ImageHandle, AllocationLease)>()
-                                + core::mem::size_of::<(ImageHandle, ImageAllocation)>()))
-                        as u64,
-                )
-            })
             .ok_or_else(overflow)?;
+        let metadata_bytes = [
+            (self.handles.capacity(), core::mem::size_of::<ImageHandle>()),
+            (
+                self.allocations.capacity(),
+                core::mem::size_of::<(ImageHandle, AllocationLease)>(),
+            ),
+            (
+                self.allocations.capacity(),
+                core::mem::size_of::<(ImageHandle, ImageAllocation)>(),
+            ),
+        ]
+        .into_iter()
+        .try_fold(metadata_bytes, |bytes, (count, size)| {
+            bytes.checked_add((count as u64).checked_mul(size as u64)?)
+        })
+        .ok_or_else(overflow)?;
         self.facts = Some(facts);
         Ok(metadata_bytes)
     }

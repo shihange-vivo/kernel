@@ -23,7 +23,8 @@ static TLS_COUNTER: core::cell::Cell<u32> = core::cell::Cell::new(0);
 
 #[no_mangle]
 pub extern "C" fn bar_tls_next() -> u32 {
-    let next = TLS_COUNTER.get() + 1;
+    // This fixture counter stays at its maximum once exhausted.
+    let next = TLS_COUNTER.get().saturating_add(1);
     TLS_COUNTER.set(next);
     next
 }

@@ -70,29 +70,43 @@ impl<S, R> LoadPlan<S, R> {
                 })
     }
     pub(crate) fn metadata_bytes(&self) -> LoadResult<u64> {
-        let mut bytes = core::mem::size_of::<Self>() as u64
-            + (self.images.capacity() * core::mem::size_of::<PlannedImage<S, R>>()) as u64
-            + (self.edges.capacity() * core::mem::size_of::<PlannedEdge>()) as u64;
+        let mut bytes = [
+            (
+                self.images.capacity(),
+                core::mem::size_of::<PlannedImage<S, R>>(),
+            ),
+            (self.edges.capacity(), core::mem::size_of::<PlannedEdge>()),
+        ]
+        .into_iter()
+        .try_fold(
+            core::mem::size_of::<Self>() as u64,
+            |bytes, (count, size)| bytes.checked_add((count as u64).checked_mul(size as u64)?),
+        )
+        .ok_or_else(overflow)?;
         for i in &self.images {
             let names = i
                 .scanned
                 .needed
                 .iter()
                 .map(|n| n.as_bytes().len() as u64)
-                .sum::<u64>();
-            bytes = bytes
-                .checked_add(
-                    i.identity.metadata_bytes()
-                        + names
-                        + (i.scanned.needed.capacity() * core::mem::size_of::<DependencyName>())
-                            as u64
-                        + i.scanned
-                            .declared_soname
-                            .as_ref()
-                            .map_or(0, |n| n.as_bytes().len() as u64)
-                        + i.info.key().identity().len() as u64,
-                )
+                .try_fold(0u64, u64::checked_add)
                 .ok_or_else(overflow)?;
+            let needed_bytes = (i.scanned.needed.capacity() as u64)
+                .checked_mul(core::mem::size_of::<DependencyName>() as u64)
+                .ok_or_else(overflow)?;
+            bytes = [
+                i.identity.metadata_bytes(),
+                names,
+                needed_bytes,
+                i.scanned
+                    .declared_soname
+                    .as_ref()
+                    .map_or(0, |n| n.as_bytes().len() as u64),
+                i.info.key().identity().len() as u64,
+            ]
+            .into_iter()
+            .try_fold(bytes, u64::checked_add)
+            .ok_or_else(overflow)?;
         }
         Ok(bytes)
     }

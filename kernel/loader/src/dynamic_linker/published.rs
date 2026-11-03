@@ -142,17 +142,19 @@ impl PublishedLoadSnapshot {
     pub(crate) fn dependencies(&self) -> &[ImageDependency] {
         &self.dependencies
     }
+    // Saturate the byte total so quota accounting never wraps to a smaller value.
     pub(crate) fn metadata_bytes(&self) -> u64 {
-        core::mem::size_of::<Self>() as u64
-            + self.key.identity().len() as u64
-            + (self.dependencies.capacity() * core::mem::size_of::<ImageDependency>()) as u64
-            + self
-                .dependencies
-                .iter()
-                .map(|dependency| {
-                    dependency.name.as_bytes().len() as u64 + dependency.identity.metadata_bytes()
-                })
-                .sum::<u64>()
+        let bytes = (core::mem::size_of::<Self>() as u64)
+            .saturating_add(self.key.identity().len() as u64)
+            .saturating_add(
+                (self.dependencies.capacity() as u64)
+                    .saturating_mul(core::mem::size_of::<ImageDependency>() as u64),
+            );
+        self.dependencies.iter().fold(bytes, |bytes, dependency| {
+            bytes
+                .saturating_add(dependency.name.as_bytes().len() as u64)
+                .saturating_add(dependency.identity.metadata_bytes())
+        })
     }
 }
 
