@@ -482,6 +482,112 @@ fn file_and_header_count_limits_precede_further_reads() {
 }
 
 #[test]
+fn metadata_headers_do_not_consume_the_load_segment_budget() {
+    for profile in PROFILES {
+        for count in [33u16, 128, 129] {
+            let mut builder =
+                fixture(profile, ET_DYN).with_program_header(ProgramHeaderFixture::load());
+            for index in 1..count {
+                builder = builder.with_program_header(ProgramHeaderFixture {
+                    kind: if index % 2 == 0 { PT_NOTE } else { PT_NULL },
+                    ..ProgramHeaderFixture::load()
+                });
+            }
+            let bytes = builder.build();
+            let result = loader(&bytes, profile).admit();
+            if count > 128 {
+                let error = failure(result);
+                assert_error(&error, LoadStage::Admit, LoadErrorKind::ResourceLimit);
+                assert!(matches!(
+                    error.context(),
+                    ErrorContext::Limit {
+                        resource: LimitKind::ProgramHeaderCount,
+                        actual: 129,
+                        maximum: 128,
+                    }
+                ));
+            } else {
+                let inspected = result
+                    .expect("program-header count within limit")
+                    .inspect()
+                    .expect("only one PT_LOAD consumes the segment budget");
+                assert_eq!(inspected.scan_parts().2.len(), 1);
+            }
+        }
+    }
+}
+
+#[test]
+fn inspection_enforces_the_actual_load_segment_count_before_further_reads() {
+    for profile in PROFILES {
+        for (maximum, actual) in [
+            (0u16, 0u16),
+            (0, 1),
+            (1, 1),
+            (1, 2),
+            (1, 5),
+            (2, 1),
+            (2, 2),
+            (2, 3),
+            (32, 32),
+            (32, 33),
+        ] {
+            let limits = LoadLimits::new(
+                64 * 1024 * 1024,
+                128,
+                maximum,
+                64 * 1024 * 1024,
+                1024 * 1024 * 1024,
+                1024,
+                1024 * 1024,
+                64 * 1024 * 1024,
+                64 * 1024 * 1024,
+                64 * 1024 * 1024,
+                256,
+                256,
+            );
+            let mut builder = fixture(profile, ET_DYN).with_program_header(ProgramHeaderFixture {
+                kind: PT_NOTE,
+                ..ProgramHeaderFixture::load()
+            });
+            for _index in 0..actual {
+                builder = builder.with_program_header(ProgramHeaderFixture::load());
+            }
+            let bytes = builder.build();
+            let reads = Cell::new(0);
+            let reader = ProbeReader {
+                bytes: &bytes,
+                file_len: bytes.len() as u64,
+                reads: &reads,
+                fail_at: None,
+            };
+            let result = ImageLoader::new(reader, LoadRequest::new(profile, limits))
+                .admit()
+                .expect("program-header count within limit")
+                .inspect();
+            if actual <= maximum {
+                let inspected = result.expect("PT_LOAD count within limit");
+                assert_eq!(inspected.scan_parts().2.len(), usize::from(actual));
+            } else {
+                let error = failure(result);
+                assert_error(&error, LoadStage::Inspect, LoadErrorKind::ResourceLimit);
+                assert!(matches!(
+                    error.context(),
+                    ErrorContext::Limit {
+                        resource: LimitKind::LoadSegmentCount,
+                        actual: rejected_count,
+                        maximum: reported_maximum,
+                    } if *rejected_count == u64::from(maximum.saturating_add(1))
+                        && *reported_maximum == u64::from(maximum)
+                ));
+                // Two ELF-header reads, one PT_NOTE, then the first extra load.
+                assert_eq!(reads.get(), usize::from(maximum).saturating_add(4));
+            }
+        }
+    }
+}
+
+#[test]
 fn admission_rejects_overlapping_truncated_and_overflowing_header_tables() {
     let profile = LoadProfile::riscv64();
     for (offset, file_len, kind) in [

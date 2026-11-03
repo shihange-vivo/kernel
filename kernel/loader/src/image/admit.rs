@@ -97,12 +97,12 @@ impl<R: ElfReader> AdmittedImage<R> {
 
     fn inspect_inner(self) -> LoadResult<InspectedImage<R>> {
         let count = self.header.program_header_count();
-        self.request
-            .limits()
-            .check_load_segment_count(count.into())?;
+        // Admission already bounded the whole table. Only PT_LOAD entries
+        // consume the separate segment budget and need storage in this vector.
+        let segment_capacity = count.min(self.request.limits().max_load_segments());
         let mut load_segments = Vec::new();
         load_segments
-            .try_reserve_exact(usize::from(count))
+            .try_reserve_exact(usize::from(segment_capacity))
             .map_err(|_| LoadError::new(LoadErrorKind::OutOfMemory, ErrorContext::None))?;
 
         let entry_size = usize::from(self.header.program_header_entry_size());
@@ -173,6 +173,9 @@ impl<R: ElfReader> AdmittedImage<R> {
                 })?;
             match kind {
                 PT_LOAD => {
+                    self.request
+                        .limits()
+                        .check_load_segment_count(load_segments.len().saturating_add(1))?;
                     let permissions = self
                         .request
                         .profile()
