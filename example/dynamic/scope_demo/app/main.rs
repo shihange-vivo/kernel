@@ -167,8 +167,12 @@ pub unsafe extern "C" fn main(
     // scalar is i32 or explicitly promoted to c_int and libc stays mapped.
     unsafe {
         printf(
-            b"scope: value=%d fn=%d hidden=%d hidden_report=%d protected=%d self=%d sys=%d sys_target=%d sys_ctor=%d weakdata=%d\n\0"
-                .as_ptr() as *const c_char,
+            concat!(
+                "scope: value=%d fn=%d hidden=%d hidden_report=%d ",
+                "protected=%d self=%d sys=%d sys_target=%d ",
+                "sys_ctor=%d weakdata=%d\n\0",
+            )
+            .as_ptr() as *const c_char,
             value,
             fn_value,
             hidden,

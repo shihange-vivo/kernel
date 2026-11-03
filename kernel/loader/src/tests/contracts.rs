@@ -12,7 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Exercise the public pipeline using target addresses that are never host pointers.
+//! Exercise the public pipeline using target addresses that are never host
+//! pointers.
 use super::fixture::{ElfFixtureBuilder, ProgramHeaderFixture, SliceElfReader};
 use crate::{
     memory::*,
@@ -257,7 +258,7 @@ fn target_memory_loads_every_profile_without_host_addresses() {
         .unwrap();
         assert_eq!(
             loaded.entry().unwrap().get(),
-            0x100000 | u64::from(profile.entry_mode().is_thumb())
+            0x100000 | u64::from(profile.entry_mode().is_thumb()),
         );
         assert_eq!(cache.ranges.len(), 1);
         assert_eq!(cache.ranges[0].start().get(), 0x100000);
@@ -288,9 +289,9 @@ fn cache_and_protection_failures_abort_before_publication() {
                 images: &mut LocalRepository,
                 memory: memory.clone(),
                 cache: &mut cache,
-                observer: &mut ()
+                observer: &mut (),
             },
-            &mut RetainResources
+            &mut RetainResources,
         )
         .is_err());
         let s = memory.0.borrow();
@@ -334,8 +335,8 @@ fn mismatched_execution_domain_rejects_before_open_or_allocation() {
             images: &mut LocalRepository,
             memory: memory.clone(),
             cache: &mut cache,
-            observer: &mut ()
-        }
+            observer: &mut (),
+        },
     )
     .is_err());
     assert_eq!(memory.0.borrow().aborts, 0);
@@ -463,8 +464,8 @@ fn insufficient_cache_scope_rejects_before_instruction_publication() {
             images: &mut LocalRepository,
             memory: memory.clone(),
             cache: &mut cache,
-            observer: &mut ()
-        }
+            observer: &mut (),
+        },
     )
     .is_err());
     assert_eq!(cache.syncs, 0);
@@ -501,7 +502,8 @@ fn lifecycle_plans_keep_exact_owners_and_never_execute_callbacks() {
                 ],
             )
             .build();
-        bytes.resize(0x400, 0); // Deliberately non-executable host bytes: only the plans may be produced.
+        // Deliberately non-executable host bytes: only plans may be produced.
+        bytes.resize(0x400, 0);
         let memory = TargetMemory::default();
         let mut files = Source { bytes };
         let loaded = crate::load(

@@ -55,7 +55,7 @@ pub extern "C" fn dl_event(tag: usize) {
     if tag == 2 || tag == 3 {
         assert!(
             EVENTS[0].load(Ordering::SeqCst) > EVENTS[1].load(Ordering::SeqCst),
-            "dependency must outlive its consumer"
+            "dependency must outlive its consumer",
         );
     }
     EVENTS[tag].fetch_add(1, Ordering::SeqCst);
@@ -143,7 +143,8 @@ unsafe fn value(handle: *mut c_void, name: &[u8]) -> usize {
     let pointer = lookup_symbol(handle, Some(name));
     assert!(!pointer.is_null());
     // SAFETY: callers select only the fixture's extern C fn() -> usize
-    // exports and retain their open handle or GLOBAL provider through this call.
+    // exports and retain their open handle or GLOBAL provider through this
+    // call.
     let function: extern "C" fn() -> usize = unsafe { core::mem::transmute(pointer) };
     function()
 }
@@ -266,7 +267,7 @@ fn reference_counts() {
     assert!(lookup_symbol(first, Some(b"dl_absolute_zero\0")).is_null());
     assert!(
         error_pointer().is_null(),
-        "a defined zero-valued symbol is not an error"
+        "a defined zero-valued symbol is not an error",
     );
     assert!(lookup_symbol(first, Some(b"dl_plugin_hidden\0")).is_null());
     error_once();
@@ -413,8 +414,10 @@ fn concurrent_and_errors() {
     for thread in &mut threads {
         assert_eq!(
             // SAFETY: thread is a writable local id slot and NULL attr selects
-            // defaults. concurrent_worker has the C entry signature and ignores its
-            // NULL argument; the root remains mapped until every worker is joined.
+            // defaults. concurrent_worker has the C entry signature and ignores
+            // its
+            // NULL argument; the root remains mapped until every worker is
+            // joined.
             unsafe {
                 pthread_create(
                     thread,
@@ -423,12 +426,13 @@ fn concurrent_and_errors() {
                     core::ptr::null_mut(),
                 )
             },
-            0
+            0,
         );
     }
     for thread in threads {
         // SAFETY: each id came from successful creation above and is joined
-        // once here; a NULL result slot is explicitly supported by pthread_join.
+        // once here; a NULL result slot is explicitly supported by
+        // pthread_join.
         assert_eq!(unsafe { pthread_join(thread, core::ptr::null_mut()) }, 0);
     }
     error_once();
@@ -503,7 +507,8 @@ fn foreign_app() {
 /// and immutable throughout this call. The runtime must retain these arrays
 /// and strings in the application's start storage until main returns.
 // SAFETY: the startup ABI supplies the caller-owned argument storage; this
-// entry only reads argv[1] when argc > 1 and does not retain a borrowed pointer.
+// entry only reads argv[1] when argc > 1 and does not retain a borrowed
+// pointer.
 #[no_mangle]
 pub unsafe extern "C" fn main(
     argc: c_int,
@@ -532,14 +537,18 @@ pub unsafe extern "C" fn main(
                 EXIT_MODE.store(1, Ordering::SeqCst);
                 let handle = load(b"libdl_plugin.so.1\0", NOW);
                 // SAFETY: dl_plugin_value is the known C fn() -> usize export;
-                // the open token or retained namespace pins its code through this call.
+                // the open token or retained namespace pins its code through
+                // this call.
                 assert_eq!(unsafe { value(handle, b"dl_plugin_value\0") }, 42);
-                // SAFETY: dl_plugin_set_key is the known C fn() -> usize export;
-                // the open token or retained namespace pins its code through this call.
+                // SAFETY: dl_plugin_set_key is the known C fn() -> usize
+                // export;
+                // the open token or retained namespace pins its code through
+                // this call.
                 assert_eq!(unsafe { value(handle, b"dl_plugin_set_key\0") }, 1);
                 let nested = load(b"libdl_nested.so.1\0", NOW);
                 // SAFETY: dl_nested_value is the known C fn() -> usize export;
-                // the open token or retained namespace pins its code through this call.
+                // the open token or retained namespace pins its code through
+                // this call.
                 assert_eq!(unsafe { value(nested, b"dl_nested_value\0") }, 41);
                 print(b"DLOPEN_EXIT_OPEN\n");
                 // Outstanding runtime handles must be finalized at exit.
