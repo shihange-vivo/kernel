@@ -108,6 +108,24 @@ impl<T> LinkHandoff<T> {
     }
 }
 
+/// Run one link operation on a plain kernel thread and transfer its result.
+/// Callers capture any required process context before handing over the work.
+/// Work and completion waits run outside the handoff's lock.
+fn run_link_worker<T, E, F>(work: F, spawn_error: E, missing_outcome: E) -> Result<T, E>
+where
+    T: Send + Sync + 'static,
+    E: Send + Sync + 'static,
+    F: FnOnce() -> Result<T, E> + Send + 'static,
+{
+    let handoff = Arc::new(LinkHandoff::new());
+    let worker = Arc::clone(&handoff);
+    thread::spawn_with_stack(LINK_STACK_SIZE, move || {
+        worker.complete(work());
+    })
+    .ok_or(spawn_error)?;
+    handoff.wait().ok_or(missing_outcome)?
+}
+
 /// The assembled application control plane.
 pub struct ApplicationService {
     manager: ApplicationManager,
@@ -183,14 +201,11 @@ impl ApplicationService {
         path: alloc::string::String,
         existing: Vec<super::dynamic::ExistingImage>,
     ) -> Result<super::dynamic::PreparedLoad, i32> {
-        let handoff = Arc::new(LinkHandoff::new());
-        let worker = handoff.clone();
-        thread::spawn_with_stack(LINK_STACK_SIZE, move || {
-            let result = super::dynamic::prepare_load(self, &group, &namespace, &path, existing);
-            worker.complete(result);
-        })
-        .ok_or(libc::ENOMEM)?;
-        handoff.wait().ok_or(libc::EIO)?
+        run_link_worker(
+            move || super::dynamic::prepare_load(self, &group, &namespace, &path, existing),
+            libc::ENOMEM,
+            libc::EIO,
+        )
     }
 
     /// Accept the application's init completion: first advance
@@ -294,16 +309,11 @@ impl ApplicationService {
         // Capture the launcher's fd-table context before entering the plain
         // kernel link worker, which has no process membership of its own.
         let process = crate::process::current_process();
-        let handoff = Arc::new(LinkHandoff::new());
-        let worker = handoff.clone();
-        thread::spawn_with_stack(LINK_STACK_SIZE, move || {
-            let result = self.prepare(&group, &namespace, &argv, &envp, process.as_ref());
-            worker.complete(result);
-        })
-        .ok_or(ApplicationLaunchError::PrepareFailed)?;
-        handoff
-            .wait()
-            .ok_or(ApplicationLaunchError::PrepareFailed)?
+        run_link_worker(
+            move || self.prepare(&group, &namespace, &argv, &envp, process.as_ref()),
+            ApplicationLaunchError::PrepareFailed,
+            ApplicationLaunchError::PrepareFailed,
+        )
     }
 
     /// The manager's slow prepare closure: VFS open, link preparation, start
@@ -430,9 +440,39 @@ fn prepare_failed(step: &str, error: &blueos_loader::LoadError) -> ApplicationLa
 
 #[cfg(test)]
 mod tests {
-    use super::LinkHandoff;
+    use super::{run_link_worker, ApplicationLaunchError, LinkHandoff};
+    use alloc::boxed::Box;
     use blueos_test_macro::test;
-    use core::sync::atomic::Ordering;
+    use core::sync::atomic::{AtomicUsize, Ordering};
+
+    #[test]
+    fn link_worker_transfers_owned_results_and_preserves_work_errors() {
+        // AtomicUsize is not Clone: the result must cross by ownership.
+        let value = Box::new(AtomicUsize::new(17));
+        let result = run_link_worker(
+            move || {
+                assert!(crate::process::current_process().is_none());
+                value.store(23, Ordering::Relaxed);
+                Ok(value)
+            },
+            libc::ENOMEM,
+            libc::EIO,
+        )
+        .expect("run link worker");
+        assert_eq!(result.load(Ordering::Relaxed), 23);
+        assert_eq!(
+            run_link_worker(|| Err::<(), _>(libc::ENOEXEC), libc::ENOMEM, libc::EIO),
+            Err(libc::ENOEXEC),
+        );
+        assert_eq!(
+            run_link_worker(
+                || Err::<(), _>(ApplicationLaunchError::StaleGeneration),
+                ApplicationLaunchError::PrepareFailed,
+                ApplicationLaunchError::PrepareFailed,
+            ),
+            Err(ApplicationLaunchError::StaleGeneration),
+        );
+    }
 
     #[test]
     fn completed_link_handoff_transfers_its_outcome_once() {
