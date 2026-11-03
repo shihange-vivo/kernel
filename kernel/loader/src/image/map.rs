@@ -855,7 +855,7 @@ pub(crate) fn decode_dependency_name_at(
     let tail = dynstr
         .get(start..)
         .ok_or_else(|| dynamic_error(tag, offset))?;
-    let scan = core::cmp::min(max_len as usize + 1, tail.len());
+    let scan = core::cmp::min((max_len as usize).saturating_add(1), tail.len());
     let nul = tail[..scan]
         .iter()
         .position(|&byte| byte == 0)
@@ -871,4 +871,62 @@ pub(crate) fn unsupported_dynamic(tag: u64, value: u64) -> LoadError {
         LoadErrorKind::UnsupportedByProfile,
         ErrorContext::DynamicTag { tag, value },
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use blueos_test_macro::test;
+
+    #[test]
+    fn dependency_name_accepts_maximum_u32_length_limit() {
+        for tag in [DT_NEEDED, DT_SONAME] {
+            let name = decode_dependency_name_at(1, b"\0libok.so\0next", tag, u32::MAX)
+                .expect("a large limit must accept a short terminated name");
+            assert_eq!(name.as_bytes(), b"libok.so");
+        }
+    }
+
+    #[test]
+    fn dependency_name_length_limit_excludes_the_terminator() {
+        for tag in [DT_NEEDED, DT_SONAME] {
+            let dynstr = b"\0libok.so\0next";
+            let name = decode_dependency_name_at(1, dynstr, tag, 8)
+                .expect("the terminator may immediately follow the maximum name length");
+            assert_eq!(name.as_bytes(), b"libok.so");
+            for limit in [0, 7] {
+                let error = decode_dependency_name_at(1, dynstr, tag, limit)
+                    .expect_err("a name longer than the limit must fail");
+                assert!(matches!(error.kind(), LoadErrorKind::BadElf));
+                assert!(matches!(
+                    error.context(),
+                    ErrorContext::DynamicTag { tag: actual, value: 1 } if *actual == tag
+                ));
+            }
+        }
+    }
+
+    #[test]
+    fn maximum_name_limit_still_rejects_invalid_strings_and_offsets() {
+        let cases: &[(&[u8], u64)] = &[
+            (b"", 0),
+            (b"\0", 0),
+            (b"libbad.so", 0),
+            (b"x\0", 2),
+            (b"x\0", 3),
+            (b"x\0", u64::MAX),
+        ];
+        for tag in [DT_NEEDED, DT_SONAME] {
+            for &(dynstr, offset) in cases {
+                let error = decode_dependency_name_at(offset, dynstr, tag, u32::MAX)
+                    .expect_err("a large limit must still enforce string-table validity");
+                assert!(matches!(error.kind(), LoadErrorKind::BadElf));
+                assert!(matches!(
+                    error.context(),
+                    ErrorContext::DynamicTag { tag: actual, value }
+                        if *actual == tag && *value == offset
+                ));
+            }
+        }
+    }
 }
