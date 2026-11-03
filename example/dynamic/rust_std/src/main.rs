@@ -23,7 +23,8 @@
 //! fixtures use.
 //!
 //! It reached the tree only after `librs` grew the four symbols `std` actually
-//! needs (`calloc`, `realloc`, `memalign`, `abort`); before that the link failed
+//! needs (`calloc`, `realloc`, `memalign`, `abort`); before that the link
+//! failed
 //! on exactly those and nothing else.
 
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -69,7 +70,7 @@ fn main() {
     println!(
         "rust-std: sum={} len={}",
         values.iter().sum::<u32>(),
-        values.len()
+        values.len(),
     );
 
     // Formatting + a heap String.

@@ -220,7 +220,9 @@ impl ElfFixtureBuilder {
         let flags = if self.ph_count == 0 { 0x5 } else { 0x6 }; // PF_R|PF_X or PF_R|PF_W
         write_u32(&mut self.bytes, ph_offset, 1); // p_type = PT_LOAD
         write_u32(&mut self.bytes, ph_offset + 4, flags); // p_flags
-        write_u64(&mut self.bytes, ph_offset + 8, ph_offset as u64); // p_offset (right after headers)
+
+        // p_offset (right after headers)
+        write_u64(&mut self.bytes, ph_offset + 8, ph_offset as u64);
         write_u64(&mut self.bytes, ph_offset + 16, vaddr); // p_vaddr
         write_u64(&mut self.bytes, ph_offset + 24, vaddr); // p_paddr
         write_u64(&mut self.bytes, ph_offset + 32, filesz); // p_filesz

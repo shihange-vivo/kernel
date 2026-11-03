@@ -12,8 +12,10 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Optional observations of a complete load. Events describe facts, independently
-//! of a logger, output device or test framework. Borrowed data is valid only for
+//! Optional observations of a complete load. Events describe facts,
+//! independently
+//! of a logger, output device or test framework. Borrowed data is valid only
+//! for
 //! the synchronous [`LoadObserver::observe`] call.
 
 use crate::{
@@ -22,7 +24,8 @@ use crate::{
 };
 use core::fmt;
 
-/// Optional synchronous observations; callbacks cannot mutate load ownership or reenter.
+/// Optional synchronous observations; callbacks cannot mutate load ownership or
+/// reenter.
 pub trait LoadObserver {
     fn enabled(&self) -> bool {
         false
@@ -227,7 +230,7 @@ impl fmt::Display for LoadEvent<'_> {
                 } else {
                     "shared_object"
                 },
-                name(path)
+                name(path),
             ),
             Self::Phase { phase, completed } => {
                 write!(f, "LOAD_PHASE phase={phase:?} completed={completed}")
@@ -239,7 +242,7 @@ impl fmt::Display for LoadEvent<'_> {
             } => write!(
                 f,
                 "LOAD_INSPECT path={} system={system} snapshot={snapshot}",
-                name(path)
+                name(path),
             ),
             Self::Dependency {
                 requester,
@@ -251,27 +254,27 @@ impl fmt::Display for LoadEvent<'_> {
                 "LOAD_DEP requester={} name={} provider={} frozen={frozen}",
                 name(requester),
                 name(needed),
-                name(provider)
+                name(provider),
             ),
             Self::Closure {
                 images,
                 dependencies,
             } => write!(
                 f,
-                "LOAD_CLOSURE images={images} dependencies={dependencies}"
+                "LOAD_CLOSURE images={images} dependencies={dependencies}",
             ),
             Self::Retry => f.write_str("LOAD_RETRY"),
             Self::ImageLoadStarted { path, system } => write!(
                 f,
                 "{}_LOAD path={}",
                 if *system { "DSO" } else { "NS" },
-                name(path)
+                name(path),
             ),
             Self::ImageReused { path, system } => write!(
                 f,
                 "{}_REUSE path={}",
                 if *system { "DSO" } else { "NS" },
-                name(path)
+                name(path),
             ),
             Self::LifecyclePlan {
                 kind,
@@ -281,7 +284,7 @@ impl fmt::Display for LoadEvent<'_> {
             } => match kind {
                 LifecycleKind::Startup => write!(
                     f,
-                    "LIFECYCLE_INIT index={index} owner={owner} address={address:#x}"
+                    "LIFECYCLE_INIT index={index} owner={owner} address={address:#x}",
                 ),
                 LifecycleKind::GroupFini => {
                     write!(f, "LIFECYCLE_GROUP_FINI index={index} owner={owner}")
@@ -299,7 +302,7 @@ impl fmt::Display for LoadEvent<'_> {
             } => write!(
                 f,
                 "LINK_MAP owner={owner} soname={} bias={bias:#x}",
-                soname.map(name).unwrap_or("-")
+                soname.map(name).unwrap_or("-"),
             ),
             Self::Component { group, members } => {
                 write!(f, "LIFECYCLE_SCC group={group} members={members:?}")
@@ -312,7 +315,7 @@ impl fmt::Display for LoadEvent<'_> {
                 write!(
                     f,
                     "SCOPE_BIND requester={requester} name={} provider=",
-                    name(symbol)
+                    name(symbol),
                 )?;
                 match provider {
                     Some(provider) => write!(f, "{provider}"),

@@ -113,8 +113,10 @@ impl<'a> NamespaceSourceResolver<'a> {
             }
             // Only absence allows catalog fallback. A corrupt or inaccessible
             // private file remains selected and fails in the loader.
-            if matches!(open_path(path, libc::O_RDONLY, 0), Err(error) if error == code::ENOENT || error == code::ENOTDIR)
-            {
+            if matches!(
+                open_path(path, libc::O_RDONLY, 0),
+                Err(error) if error == code::ENOENT || error == code::ENOTDIR,
+            ) {
                 if let Some(entry) = self.catalog.resolve_name(name) {
                     return self.root(entry.path, false);
                 }

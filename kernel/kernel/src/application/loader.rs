@@ -12,7 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Assemble independent loader capabilities. Runtime installation belongs to the caller.
+//! Assemble independent loader capabilities. Runtime installation belongs to
+//! the caller.
 use super::{
     adapters::{
         code_cache::ArchitectureCodeCache, flat_memory::FlatImageMemory,
@@ -96,7 +97,8 @@ impl ApplicationLoader {
         global: Vec<blueos_loader::ImageInstanceId>,
     ) -> LoadResult<LoadedImage<KernelLinkReceipt>> {
         // The core can link foreign profiles into non-native memory. This host
-        // launches native threads, so retain the former native-only ABI gate here.
+        // launches native threads, so retain the former native-only ABI gate
+        // here.
         let profile = namespace.profile();
         let native = super::board_dynamic_profile();
         if profile.machine() != native.machine()
@@ -192,7 +194,7 @@ mod native_profile_tests {
             ApplicationNamespace::from_launch_path("/does-not-exist", "/", profile).unwrap();
         assert_eq!(
             loader.link(&namespace, &group).err().unwrap().kind(),
-            LoadErrorKind::UnsupportedByProfile
+            LoadErrorKind::UnsupportedByProfile,
         );
     }
 }

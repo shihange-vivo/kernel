@@ -130,7 +130,7 @@ fn import_single<'m>(
             scanned: crate::image::ScannedArtifact {
                 role,
                 declared_soname: None,
-                needed: Vec::new()
+                needed: Vec::new(),
             },
         }],
         edges: Vec::new(),

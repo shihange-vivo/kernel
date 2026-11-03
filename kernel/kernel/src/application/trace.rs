@@ -15,7 +15,8 @@
 //! Opt-in application observations. Install an observer before launching any
 //! applications. By default no detailed loader trace is generated or printed.
 //! An observer receives borrowed facts synchronously; it must copy anything it
-//! retains, must not panic, and must not reenter loading or application control.
+//! retains, must not panic, and must not reenter loading or application
+//! control.
 //! No kernel lock is held by this dispatcher while calling the observer.
 
 use super::manager::ApplicationHandle;
@@ -103,22 +104,56 @@ pub enum Event<'a> {
 impl fmt::Display for Event<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Load { application, operation, event } => {
+            Self::Load {
+                application,
+                operation,
+                event,
+            } => {
                 match application {
-                    Some(handle) => write!(f, "[APP:{}:{} LOAD:{operation}] ", handle.slot, handle.generation)?,
+                    Some(handle) => write!(
+                        f,
+                        "[APP:{}:{} LOAD:{operation}] ",
+                        handle.slot, handle.generation,
+                    )?,
                     None => write!(f, "[LOAD:{operation}] ")?,
                 }
                 fmt::Display::fmt(event, f)
             }
-            Self::Launched { handle, path } => write!(f,
-                "APP_LAUNCHED handle={}:{} path={path}", handle.slot, handle.generation),
-            Self::InitComplete { handle } => write!(f,
-                "APP_INIT_COMPLETE handle={}:{}", handle.slot, handle.generation),
-            Self::Reaped { handle, private_images, imported_dsos } => write!(f,
-                "APP_REAP handle={}:{} private_images={private_images} imported_dsos={imported_dsos}",
-                handle.slot, handle.generation),
-            Self::DsoFini { path } => write!(f, "DSO_FINI path={}", core::str::from_utf8(path).unwrap_or("<non-utf8>")),
-            Self::DsoUnload { path } => write!(f, "DSO_UNLOAD path={}", core::str::from_utf8(path).unwrap_or("<non-utf8>")),
+            Self::Launched { handle, path } => write!(
+                f,
+                "APP_LAUNCHED handle={}:{} path={path}",
+                handle.slot, handle.generation,
+            ),
+            Self::InitComplete { handle } => write!(
+                f,
+                "APP_INIT_COMPLETE handle={}:{}",
+                handle.slot, handle.generation,
+            ),
+            Self::Reaped {
+                handle,
+                private_images,
+                imported_dsos,
+            } => write!(
+                f,
+                concat!(
+                    "APP_REAP handle={}:{} private_images={private_images} ",
+                    "imported_dsos={imported_dsos}",
+                ),
+                handle.slot,
+                handle.generation,
+                private_images = private_images,
+                imported_dsos = imported_dsos,
+            ),
+            Self::DsoFini { path } => write!(
+                f,
+                "DSO_FINI path={}",
+                core::str::from_utf8(path).unwrap_or("<non-utf8>"),
+            ),
+            Self::DsoUnload { path } => write!(
+                f,
+                "DSO_UNLOAD path={}",
+                core::str::from_utf8(path).unwrap_or("<non-utf8>"),
+            ),
         }
     }
 }

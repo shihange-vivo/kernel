@@ -42,12 +42,8 @@ struct DsoAllocator;
 unsafe impl GlobalAlloc for DsoAllocator {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
         let mut ptr: *mut core::ffi::c_void = core::ptr::null_mut();
-        let rc = bk_syscall!(
-            AllocMem,
-            &mut ptr as *mut *mut core::ffi::c_void,
-            layout.size(),
-            layout.align()
-        );
+        let output = &mut ptr as *mut *mut core::ffi::c_void;
+        let rc = bk_syscall!(AllocMem, output, layout.size(), layout.align());
         if rc != 0 {
             core::ptr::null_mut()
         } else {
