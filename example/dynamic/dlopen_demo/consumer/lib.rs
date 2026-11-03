@@ -18,7 +18,10 @@ extern "C" {
 }
 #[no_mangle]
 pub extern "C" fn dl_consumer_value() -> usize {
-    unsafe { dl_runtime_provider() + 7 }
+    // SAFETY: the fixture export is extern C fn() -> usize. Its relocation
+    // retains the selected provider through this consumer's lifetime.
+    let value = unsafe { dl_runtime_provider() };
+    value + 7
 }
 #[panic_handler]
 fn panic(_: &core::panic::PanicInfo) -> ! {

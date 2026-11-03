@@ -583,6 +583,9 @@ realloc_mem(ptr: *mut *mut c_void, old: *mut c_void, newsize: usize) -> c_long {
     if addr.is_null() {
         return -1;
     }
+    // SAFETY: the shared-flat allocation ABI requires ptr to name one aligned
+    // writable pointer slot owned by the caller throughout the syscall. It is
+    // non-null here; successful realloc supplies the value written into it.
     unsafe { ptr.write(addr as *mut c_void) };
     0
 });
@@ -1026,8 +1029,9 @@ mod application_syscalls {
         }
         let mut cursor = head;
         for _ in 0..count {
-            // SAFETY: same shared-address-space contract as the header copy;
-            // `count` was validated against the caller-declared array length.
+            // SAFETY: the shared-flat caller supplies an aligned array of at
+            // least count initialized views, stable throughout copy-in. The
+            // resource-limit check bounds count but does not prove mapping.
             let view = unsafe { &*cursor };
             let mut bytes = Vec::new();
             copy_in_string(view, &mut bytes, budget)?;
@@ -1035,6 +1039,8 @@ mod application_syscalls {
                 return Err(());
             }
             out.push(bytes);
+            // SAFETY: iteration stays within that caller-owned array; the
+            // final increment produces only its permitted one-past pointer.
             cursor = unsafe { cursor.add(1) };
         }
         Ok(())

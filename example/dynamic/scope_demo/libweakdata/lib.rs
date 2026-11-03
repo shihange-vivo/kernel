@@ -48,6 +48,9 @@ extern "C" {
 
 #[no_mangle]
 pub extern "C" fn weakdata_read() -> usize {
+    // SAFETY: the assembler slot is native-width and sufficiently aligned.
+    // Relocation initializes it before use and its image remains mapped. This
+    // reads the slot's numeric value, not the unresolved symbol's address.
     unsafe { core::ptr::read_volatile(&weakdata_value) }
 }
 

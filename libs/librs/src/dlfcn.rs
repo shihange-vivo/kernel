@@ -100,12 +100,14 @@ fn finish_plans(plan: &mut BlueOsDlPlan) -> Result<(), i32> {
             return Err(libc::EINVAL);
         }
         for index in 0..plan.count {
-            // Kernel-produced, validated code targets. Backings and this array
-            // remain pinned until DlFinish, even through recursive callbacks.
-            unsafe {
-                let function: extern "C" fn() = core::mem::transmute(*plan.entries.add(index));
-                function();
-            }
+            // SAFETY: index < count indexes the kernel-produced target array;
+            // the operation token pins its initialized entries until DlFinish.
+            let target = unsafe { *plan.entries.add(index) };
+            // SAFETY: the kernel emits validated extern C fn() init/fini
+            // targets, preserving any Thumb bit. The token retains their code
+            // and providers through this call, including recursive loading.
+            let function: extern "C" fn() = unsafe { core::mem::transmute(target) };
+            function();
         }
         let rc = bk_syscall!(DlFinish, plan.token, plan as *mut BlueOsDlPlan) as isize;
         if rc < 0 {

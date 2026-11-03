@@ -30,8 +30,9 @@ pub fn command(args: &[&str]) -> Result<(), String> {
     argv.push(ptr::null());
     let envp = [ptr::null()];
 
-    // The owned strings and null-terminated arrays remain live through spawn;
-    // the syscall copies the arguments before returning.
+    // SAFETY: each pointer names a CString in storage; both pointer arrays are
+    // NUL-terminated and all owners remain live through spawn. The syscall
+    // copies the arguments before returning and retains no borrowed pointer.
     let result = unsafe { platform::spawn(argv[0], argv.as_ptr(), envp.as_ptr()) };
     if result < 0 {
         return Err(format!("spawn failed: errno {}", -result));

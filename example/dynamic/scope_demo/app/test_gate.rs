@@ -63,17 +63,24 @@ pub(super) unsafe fn from_argv(argc: c_int, argv: *const *const c_char) -> TestG
     if argc != 3 {
         return TestGate::NotRequested;
     }
+    // SAFETY: argc is three and argv is non-null; the caller guarantees at
+    // least three initialized pointer slots, so index one stays in bounds.
     let flag = unsafe { *argv.add(1) };
     if flag.is_null() {
         return TestGate::Invalid;
     }
+    // SAFETY: flag is non-null; its caller-owned terminated string remains
+    // readable and immutable through this bounded argument-decoding call.
     if unsafe { CStr::from_ptr(flag).to_bytes() } != b"--test-gate" {
         return TestGate::NotRequested;
     }
+    // SAFETY: index two is inside the same caller-owned pointer array.
     let value = unsafe { *argv.add(2) };
     if value.is_null() {
         return TestGate::Invalid;
     }
+    // SAFETY: value is non-null and the caller retains its immutable C string
+    // through this call. parse_address only inspects its borrowed bytes.
     match parse_address(unsafe { CStr::from_ptr(value).to_bytes() }) {
         Some(pointer) => TestGate::Address(pointer),
         None => TestGate::Invalid,

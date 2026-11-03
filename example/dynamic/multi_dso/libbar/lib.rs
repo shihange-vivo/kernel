@@ -23,7 +23,10 @@ extern "C" {
 /// A function the root calls; crosses the bar→common dependency edge.
 #[no_mangle]
 pub extern "C" fn bar_value() -> i32 {
-    unsafe { common_value() * 2 }
+    // SAFETY: common's export is extern C fn() -> i32 and the retained
+    // dependency closure keeps its code mapped for this call.
+    let value = unsafe { common_value() };
+    value * 2
 }
 
 #[used]

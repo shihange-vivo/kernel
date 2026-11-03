@@ -37,8 +37,9 @@ mod enabled {
         if ptr.is_null() || len == 0 || len > 256 {
             return Err(libc::EINVAL);
         }
-        // Shared-flat copy-in contract: the caller owns the pointer range;
-        // length, NUL and UTF-8 rules are bounded before linking starts.
+        // SAFETY: the shared-flat ABI requires caller-owned readable bytes
+        // that remain immutable during copy-in. ptr is non-null, u8 needs no
+        // extra alignment, and len <= 256 fits the slice-size limit.
         let src = unsafe { core::slice::from_raw_parts(ptr, len) };
         if src.contains(&0) {
             return Err(libc::EINVAL);
@@ -109,6 +110,9 @@ fn valid_plan(ptr: *mut BlueOsDlPlan) -> bool {
     if ptr.is_null() || !(ptr as usize).is_multiple_of(core::mem::align_of::<BlueOsDlPlan>()) {
         return false;
     }
+    // SAFETY: null/alignment were checked. The shared-flat ABI caller owns an
+    // initialized, readable BlueOsDlPlan for the syscall's duration; numeric
+    // validation cannot establish that mapping on the caller's behalf.
     let plan = unsafe { &*ptr };
     plan.abi_version == DL_PLAN_ABI_VERSION
         && plan.struct_size as usize >= core::mem::size_of::<BlueOsDlPlan>()
@@ -120,6 +124,9 @@ fn plan_result(ptr: *mut BlueOsDlPlan, call: impl FnOnce() -> Result<BlueOsDlPla
     }
     match call() {
         Ok(plan) => {
+            // SAFETY: valid_plan checked the aligned initialized output slot.
+            // The ABI caller reserves it exclusively through this syscall;
+            // the temporary validation borrow ended before this write.
             unsafe {
                 *ptr = plan;
             }
@@ -147,6 +154,9 @@ pub fn symbol(handle: usize, name: *const u8, len: usize, result: *mut usize) ->
     }
     match enabled::symbol(handle, name, len) {
         Ok(address) => {
+            // SAFETY: result is non-null and aligned, and the shared-flat ABI
+            // caller supplies an exclusive writable usize output slot. The
+            // returned address is stored as a value, not dereferenced here.
             unsafe {
                 *result = address;
             }

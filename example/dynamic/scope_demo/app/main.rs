@@ -86,6 +86,8 @@ pub unsafe extern "C" fn main(
     match unsafe { test_gate::from_argv(argc, argv) } {
         TestGate::NotRequested => {}
         TestGate::Invalid => {
+            // SAFETY: the static terminated format has no substitutions and
+            // libc is retained by this application's dependency closure.
             unsafe { printf(b"scope: invalid test gate arguments\n\0".as_ptr().cast()) };
             return -1;
         }
@@ -98,9 +100,13 @@ pub unsafe extern "C" fn main(
                     opened = true;
                     break;
                 }
+                // SAFETY: usleep takes only a scalar delay and its matching
+                // C implementation remains mapped in the retained libc.
                 unsafe { usleep(1000) };
             }
             if !opened {
+                // SAFETY: the immutable terminated format has no variadic
+                // operands and remains live throughout the libc call.
                 unsafe { printf(b"scope: concurrent gate timeout\n\0".as_ptr().cast()) };
                 return -1;
             }
@@ -109,21 +115,41 @@ pub unsafe extern "C" fn main(
 
     // The probe's null case is part of its C ABI contract and must not call
     // strlen. Exercise it in the relocated system DSO on every scope launch.
+    // SAFETY: this export explicitly accepts NULL as an error case without
+    // reading it, and the system DSO remains pinned for this application.
     if unsafe { sys_libc_dependency_probe(core::ptr::null()) } != usize::MAX {
+        // SAFETY: this static C format has no substitutions or pointer args.
         unsafe { printf(b"scope: null probe failed\n\0".as_ptr().cast()) };
         return -1;
     }
+    // SAFETY: this static terminated format has no variadic arguments.
     unsafe { printf(b"scope: null probe rejected\n\0".as_ptr().cast()) };
 
+    // SAFETY: scope lookup selects a relocated, aligned immutable i32 in the
+    // retained strong provider, and no concurrent code writes that symbol.
     let value = unsafe { scope_value };
+    // SAFETY: the selected export is extern C fn() -> i32; its provider stays
+    // pinned by the application receipt through this call.
     let fn_value = unsafe { scope_fn() };
+    // SAFETY: the visible provider exports an initialized immutable i32;
+    // its retained image supplies the reference's alignment and lifetime.
     let hidden = unsafe { hidden_probe };
+    // SAFETY: hidden_report's C signature matches and its owner stays mapped.
     let hidden_owner = unsafe { hidden_report() };
+    // SAFETY: protected_report's C signature matches and its owner is pinned.
     let protected_owner = unsafe { protected_report() };
+    // SAFETY: this owner's aligned immutable static remains mapped and is
+    // never written; volatile forces the intended relocation-backed access.
     let self_binding = unsafe { core::ptr::read_volatile(&self_value) };
+    // SAFETY: the retained system DSO exports extern C fn() -> i32.
     let sys = unsafe { sys_report() };
+    // SAFETY: the pinned system DSO exports extern C fn() -> u32; its
+    // constructor completed before main and the counter uses atomic reads.
     let sys_ctor = unsafe { sys_ctor_count() };
+    // SAFETY: sys_target is this owner's initialized aligned immutable static.
     let sys_local = unsafe { core::ptr::read_volatile(&sys_target) };
+    // SAFETY: weakdata_read matches extern C fn() -> usize and reads a data
+    // slot in its retained image, not a pointer to the missing weak symbol.
     let weakdata = unsafe { weakdata_read() };
 
     let ok = value == 111
@@ -137,6 +163,8 @@ pub unsafe extern "C" fn main(
         && sys_ctor == 1
         && weakdata == 0;
 
+    // SAFETY: the terminated static format expects ten C ints; every passed
+    // scalar is i32 or explicitly promoted to c_int and libc stays mapped.
     unsafe {
         printf(
             b"scope: value=%d fn=%d hidden=%d hidden_report=%d protected=%d self=%d sys=%d sys_target=%d sys_ctor=%d weakdata=%d\n\0"

@@ -18,6 +18,8 @@ extern "C" {
 }
 #[no_mangle]
 pub extern "C" fn dl_bad_value() -> usize {
+    // SAFETY: this is deliberately invalid ELF input, never callable in the
+    // test: unresolved strong relocation must reject dlopen before publish.
     unsafe { dl_missing_strong() }
 }
 #[panic_handler]

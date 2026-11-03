@@ -496,10 +496,11 @@ mod fixed_mapper {
 
     #[test]
     fn fixed_mapper_rejects_readonly_loading_span() {
-        static READONLY: [MemoryRegion; 1] = [unsafe {
-            // Only reservation is attempted; this range is never accessed.
-            MemoryRegion::new(0x5000_0000, 0x5000_2000, MemoryPermissions::READ)
-        }];
+        static READONLY: [MemoryRegion; 1] = [
+            // SAFETY: this fixture only tests rejection of a readonly
+            // reservation, without pointer/slice construction or target I/O.
+            unsafe { MemoryRegion::new(0x5000_0000, 0x5000_2000, MemoryPermissions::READ) },
+        ];
         let mut mapper = MemoryMapper::new(Some(&READONLY));
         let error = mapper
             .allocate_image(fixed_request(0x5000_0000, 0x1000))

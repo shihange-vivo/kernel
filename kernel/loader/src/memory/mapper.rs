@@ -240,6 +240,8 @@ impl MemoryMapper {
                 if base.is_null() || self.mem.size() < end {
                     return Err(memory_access_error(*allocation, offset, len));
                 };
+                // SAFETY: checked offset+len is within the live Storage owned
+                // by this mapper; an empty range may start one-past its end.
                 Ok(unsafe { base.add(offset_usize) })
             }
             // Fixed images already validated their span against the static
@@ -271,6 +273,9 @@ impl ImageMemory for MemoryMapper {
             .map_err(|_| memory_access_error(*allocation, offset, u64::MAX))?;
         let source = self.image_span(allocation, offset, len)?;
         if !dst.is_empty() {
+            // SAFETY: image_span checked this allocation and byte range.
+            // Owned backing lives in self; fixed backing is guaranteed by its
+            // unsafe MemoryRegion contract. dst is exclusive and disjoint.
             unsafe {
                 core::ptr::copy_nonoverlapping(source, dst.as_mut_ptr(), dst.len());
             }
@@ -373,6 +378,9 @@ impl ImageMemory for MemoryMapper {
             .map_err(|_| memory_access_error(*allocation, offset, u64::MAX))?;
         let target = self.image_span(allocation, offset, len)?;
         if !data.is_empty() {
+            // SAFETY: the checked target remains writable through self's
+            // owned Storage or the fixed-region contract; the readable input
+            // slice does not overlap that exclusively managed range.
             unsafe {
                 core::ptr::copy_nonoverlapping(data.as_ptr(), target, data.len());
             }
@@ -390,6 +398,8 @@ impl ImageMemory for MemoryMapper {
         let len =
             usize::try_from(len).map_err(|_| memory_access_error(*allocation, offset, len))?;
         if len != 0 {
+            // SAFETY: image_span checked the writable byte range and its
+            // lifetime is retained by self or the fixed-region contract.
             unsafe {
                 core::ptr::write_bytes(target, 0, len);
             }

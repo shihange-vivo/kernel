@@ -17,11 +17,15 @@ extern "C" {
     fn dl_event(tag: usize);
 }
 extern "C" fn init() {
+    // SAFETY: dl_event is the root's extern C fn(usize); the application root
+    // remains mapped while this dependency's lifecycle plan is executed.
     unsafe {
         dl_event(0);
     }
 }
 extern "C" fn fini() {
+    // SAFETY: the root's matching C callback is still mapped while fini runs;
+    // the scalar event tag has no pointer or borrowed-storage requirements.
     unsafe {
         dl_event(1);
     }

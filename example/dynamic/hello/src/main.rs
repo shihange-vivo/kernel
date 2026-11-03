@@ -37,13 +37,18 @@ fn panic(_info: &core::panic::PanicInfo) -> ! {
 
 /// Write a byte slice to fd 1 through libc's `write`.
 fn put(fd: c_int, bytes: &[u8]) {
+    // SAFETY: bytes is a readable slice for exactly its length and outlives
+    // write's synchronous copy; libc is pinned by the application receipt.
     unsafe {
         write(fd, bytes.as_ptr() as *const c_char, bytes.len());
     }
 }
 
+/// # Safety
+/// The runtime provides argc initialized argv entries and terminated strings
+/// pinned in application start storage for the duration of this call.
 #[no_mangle]
-pub extern "C" fn main(
+pub unsafe extern "C" fn main(
     argc: c_int,
     argv: *const *const c_char,
     envp: *const *const c_char,
@@ -57,17 +62,17 @@ pub extern "C" fn main(
     if argc > 0 && !argv.is_null() {
         // SAFETY: argv is the pinned C-style pointer array from the kernel
         // start storage, valid for the whole application lifetime.
-        unsafe {
-            let name = core::ffi::CStr::from_ptr(*argv);
-            put(1, b"argv0=");
-            put(1, name.to_bytes());
-            put(1, b"\n");
-        }
+        let name = unsafe { core::ffi::CStr::from_ptr(*argv) };
+        put(1, b"argv0=");
+        put(1, name.to_bytes());
+        put(1, b"\n");
     }
 
     // AT_PHDR must be resolvable through the shared libc's getauxval, which
     // proves the per-application auxv context round-tripped the SWI boundary.
     let at_phdr: usize = 3;
+    // SAFETY: getauxval's C signature takes only a scalar key; librs reads the
+    // current thread's owned auxv context while its provider stays mapped.
     let phdr = unsafe { getauxval(at_phdr) };
     if phdr == 0 {
         put(1, b"auxv: no AT_PHDR\n");
