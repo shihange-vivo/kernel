@@ -27,7 +27,8 @@
 //!
 //! [`ApplicationManager::release`] is the recycle primitive the reaper
 //! drives after quiescence: it returns a finished slot to `Vacant` so a later
-//! launch of the same identity reuses it with a bumped generation.
+//! launch can reuse it with a bumped generation. Exhausted generations are
+//! never recycled; their vacant slots remain in the table to reject old handles.
 
 use alloc::{sync::Arc, vec::Vec};
 use spin::Mutex;
@@ -37,8 +38,8 @@ use crate::application::{group::ThreadGroup, registry::SystemDsoRegistry};
 /// The lifecycle states of a live application.
 ///
 /// The slot-level "no application" state is [`SlotState::Vacant`], which is not
-/// an `ApplicationState`: it means the slot is free for reuse, not that an
-/// application is in some phase.
+/// an `ApplicationState`: it means the slot has no live application. It can be
+/// reused only if its generation can advance.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ApplicationState {
     Loading,
@@ -83,7 +84,7 @@ impl OwnedLaunchRequest {
 
 /// Per-`(identity)` construction slot.
 enum SlotState {
-    /// Free for reuse. A vacant slot has no live application.
+    /// No live application. Exhausted generations cannot be reused.
     Vacant,
     Occupied(ApplicationState),
 }
@@ -97,6 +98,15 @@ struct Slot {
 }
 
 impl Slot {
+    /// An exhausted slot stays vacant permanently to prevent handle ABA.
+    fn reusable_generation(&self) -> Option<u32> {
+        if matches!(self.state, SlotState::Vacant) {
+            self.generation.checked_add(1)
+        } else {
+            None
+        }
+    }
+
     /// Explicit `expected → next` transition; an illegal transition returns the
     /// error instead of silently crossing states.
     fn transition(
@@ -337,6 +347,7 @@ impl ApplicationManager {
 
     /// Return a finished application's slot to `Vacant` so a later launch of the
     /// same identity reuses it with a bumped generation, preventing ABA reuse.
+    /// If the generation is exhausted, the vacant slot is never reused.
     /// Only the
     /// deferred reaper may call this, and only after [`ApplicationManager::finish`]
     /// moved the slot into a terminal state — the two-phase exit
@@ -392,29 +403,27 @@ fn occupied_state(state: &SlotState) -> ApplicationState {
 
 /// Reserve a slot for `identity` and return `(index, generation)`, setting the
 /// slot to `Loading` and installing `group` as its thread group. Prefers a
-/// `Vacant` slot already bound to this identity (so re-launch reuses the slot
-/// with a bumped generation), then any `Vacant` slot, then appends a fresh one
+/// reusable vacant slot already bound to this identity, then any reusable
+/// vacant slot, then appends a fresh one. Exhausted slots are always skipped.
 fn reserve_slot(slots: &mut Vec<Slot>, identity: Vec<u8>, group: ThreadGroup) -> (usize, u32) {
-    if let Some(index) = slots
+    let reusable = slots
         .iter()
-        .position(|s| matches!(s.state, SlotState::Vacant) && s.identity == identity)
-    {
-        let slot = &mut slots[index];
-        slot.group = Some(group);
-        slot.generation = slot.generation.wrapping_add(1);
-        slot.state = SlotState::Occupied(ApplicationState::Loading);
-        return (index, slot.generation);
-    }
-    if let Some(index) = slots
-        .iter()
-        .position(|s| matches!(s.state, SlotState::Vacant))
-    {
+        .enumerate()
+        .filter(|(_, slot)| slot.identity == identity)
+        .find_map(|(index, slot)| slot.reusable_generation().map(|next| (index, next)))
+        .or_else(|| {
+            slots
+                .iter()
+                .enumerate()
+                .find_map(|(index, slot)| slot.reusable_generation().map(|next| (index, next)))
+        });
+    if let Some((index, generation)) = reusable {
         let slot = &mut slots[index];
         slot.identity = identity;
         slot.group = Some(group);
-        slot.generation = slot.generation.wrapping_add(1);
+        slot.generation = generation;
         slot.state = SlotState::Occupied(ApplicationState::Loading);
-        return (index, slot.generation);
+        return (index, generation);
     }
     slots.push(Slot {
         identity,
@@ -423,4 +432,181 @@ fn reserve_slot(slots: &mut Vec<Slot>, identity: Vec<u8>, group: ThreadGroup) ->
         group: Some(group),
     });
     (slots.len() - 1, 1)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use blueos_test_macro::test;
+
+    fn vacant(identity: &[u8], generation: u32) -> Slot {
+        Slot {
+            identity: identity.to_vec(),
+            generation,
+            state: SlotState::Vacant,
+            group: None,
+        }
+    }
+
+    fn with_slots(slots: Vec<Slot>) -> ApplicationManager {
+        let manager = ApplicationManager::default();
+        manager.inner.lock().slots = slots;
+        manager
+    }
+
+    fn launch(manager: &ApplicationManager, identity: &[u8]) -> ApplicationHandle {
+        manager
+            .launch(OwnedLaunchRequest::new(identity.to_vec()), |_| Ok(()))
+            .expect("reserve an application slot")
+    }
+
+    fn finish_and_release(manager: &ApplicationManager, handle: ApplicationHandle) {
+        manager.complete_init(handle).expect("init completion");
+        manager.begin_exit(handle).expect("begin exit");
+        manager.finish(handle).expect("finish application");
+        manager.release(handle).expect("release slot");
+        assert!(!manager.contains(handle));
+    }
+
+    #[test]
+    fn exhausted_generation_is_not_reissued_for_the_same_identity() {
+        let manager = with_slots(alloc::vec![vacant(b"app", u32::MAX)]);
+        let historical = ApplicationHandle {
+            slot: 0,
+            generation: 1,
+        };
+        let first = launch(&manager, b"app");
+        assert_eq!(
+            first,
+            ApplicationHandle {
+                slot: 1,
+                generation: 1
+            }
+        );
+        assert!(manager.contains(first));
+        assert!(!manager.contains(historical));
+        finish_and_release(&manager, first);
+
+        let second = launch(&manager, b"app");
+        assert_eq!(
+            second,
+            ApplicationHandle {
+                slot: 1,
+                generation: 2
+            }
+        );
+        assert!(!manager.contains(historical));
+        assert!(!manager.contains(first));
+        assert_eq!(
+            manager.complete_init(historical),
+            Err(ApplicationLaunchError::StaleGeneration)
+        );
+        assert_eq!(manager.state(second), Some(ApplicationState::Loading));
+    }
+
+    #[test]
+    fn exhausted_generation_is_not_reissued_for_a_different_identity() {
+        let manager = with_slots(alloc::vec![vacant(b"old", u32::MAX)]);
+        let handle = launch(&manager, b"new");
+        assert_eq!(
+            handle,
+            ApplicationHandle {
+                slot: 1,
+                generation: 1
+            }
+        );
+        let inner = manager.inner.lock();
+        assert_eq!(inner.slots[0].identity, b"old");
+        assert_eq!(inner.slots[0].generation, u32::MAX);
+        assert!(matches!(inner.slots[0].state, SlotState::Vacant));
+        assert!(inner.slots[0].group.is_none());
+    }
+
+    #[test]
+    fn exhausted_preferred_slot_allows_another_vacant_slot() {
+        let manager = with_slots(alloc::vec![vacant(b"app", u32::MAX), vacant(b"other", 7),]);
+        let handle = launch(&manager, b"app");
+        assert_eq!(
+            handle,
+            ApplicationHandle {
+                slot: 1,
+                generation: 8
+            }
+        );
+        assert_eq!(manager.inner.lock().slots.len(), 2);
+        assert_eq!(manager.handle_by_identity(b"app"), Some(handle));
+    }
+
+    #[test]
+    fn reusable_identity_still_precedes_other_vacant_slots() {
+        let manager = with_slots(alloc::vec![
+            vacant(b"other", 7),
+            vacant(b"app", u32::MAX),
+            vacant(b"app", 11),
+        ]);
+        let handle = launch(&manager, b"app");
+        assert_eq!(
+            handle,
+            ApplicationHandle {
+                slot: 2,
+                generation: 12
+            }
+        );
+        assert_eq!(manager.inner.lock().slots[0].generation, 7);
+    }
+
+    #[test]
+    fn final_generation_is_issued_once_then_its_slot_is_skipped() {
+        let previous = u32::MAX.checked_sub(1).unwrap();
+        let manager = with_slots(alloc::vec![vacant(b"app", previous)]);
+        let last = launch(&manager, b"app");
+        assert_eq!(
+            last,
+            ApplicationHandle {
+                slot: 0,
+                generation: u32::MAX
+            }
+        );
+        finish_and_release(&manager, last);
+        assert!(manager.inner.lock().slots[0].group.is_none());
+
+        let next = launch(&manager, b"app");
+        assert_eq!(
+            next,
+            ApplicationHandle {
+                slot: 1,
+                generation: 1
+            }
+        );
+        assert!(!manager.contains(last));
+        assert_eq!(manager.inner.lock().slots[0].generation, u32::MAX);
+    }
+
+    #[test]
+    fn failed_prepare_also_consumes_the_final_generation() {
+        let manager = with_slots(alloc::vec![vacant(
+            b"app",
+            u32::MAX.checked_sub(1).unwrap()
+        ),]);
+        let mut failed = None;
+        let result = manager.launch(OwnedLaunchRequest::new(b"app".to_vec()), |group| {
+            failed = group.handle();
+            Err(ApplicationLaunchError::PrepareFailed)
+        });
+        assert_eq!(result, Err(ApplicationLaunchError::PrepareFailed));
+        let failed = failed.expect("failed attempt still has its own handle");
+        assert_eq!(failed.generation, u32::MAX);
+        assert_eq!(manager.state(failed), Some(ApplicationState::Failed));
+        manager.release(failed).expect("release failed attempt");
+
+        let retry = launch(&manager, b"app");
+        assert_eq!(
+            retry,
+            ApplicationHandle {
+                slot: 1,
+                generation: 1
+            }
+        );
+        assert!(!manager.contains(failed));
+    }
 }
