@@ -382,7 +382,7 @@ impl ApplicationService {
         // application group before the new thread can execute its entry.
         if let Some(process) = process {
             if !process.add_thread(main.clone()) {
-                let _ = GlobalQueueVisitor::remove(&mut main);
+                let _removed = GlobalQueueVisitor::remove(&mut main);
                 group.begin_exit().ignore_result();
                 group.skip_fini().ignore_result();
                 return Err(ApplicationLaunchError::PrepareFailed);
@@ -392,7 +392,7 @@ impl ApplicationService {
             if let Some(process) = process {
                 process.remove_thread(&mut main);
             }
-            let _ = GlobalQueueVisitor::remove(&mut main);
+            let _removed = GlobalQueueVisitor::remove(&mut main);
             // The product is installed but the main thread could not join:
             // move the group to draining with a skipped fini so the deferred
             // reaper releases the installed resources (abnormal path).
@@ -414,7 +414,7 @@ impl ApplicationService {
             if let Some(process) = process {
                 process.remove_thread(&mut main);
             }
-            let _ = GlobalQueueVisitor::remove(&mut main);
+            let _removed = GlobalQueueVisitor::remove(&mut main);
             group.begin_exit().ignore_result();
             group.skip_fini().ignore_result();
             return Err(ApplicationLaunchError::PrepareFailed);

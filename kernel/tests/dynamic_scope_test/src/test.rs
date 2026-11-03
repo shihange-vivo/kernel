@@ -193,7 +193,7 @@ fn launch_and_wait(
         if !service.manager().contains(handle) {
             return handle;
         }
-        let _ = blueos::sync::atomic_wait(
+        let _wait_result = blueos::sync::atomic_wait(
             &WAIT_ATOM,
             WAIT_ATOM.load(Ordering::Acquire),
             blueos::time::Tick::from_millis(50),
@@ -261,7 +261,7 @@ extern "C" fn concurrent_launcher(flag: *mut core::ffi::c_void) {
             unsafe { (*done).store(true, Ordering::Release) };
             return;
         }
-        let _ = blueos::sync::atomic_wait(
+        let _wait_result = blueos::sync::atomic_wait(
             &WAIT_ATOM,
             WAIT_ATOM.load(Ordering::Acquire),
             blueos::time::Tick::from_millis(50),
@@ -292,10 +292,10 @@ fn concurrent_system_closure() {
     ))
     .set_stack(Stack::from_size(LINKER_WORKER_STACK_SIZE).expect("linker worker stack"))
     .build();
-    let _ = scheduler::queue_ready_thread(IDLE, a);
-    let _ = scheduler::queue_ready_thread(IDLE, b);
+    scheduler::queue_ready_thread(IDLE, a).expect("queue first concurrent launcher");
+    scheduler::queue_ready_thread(IDLE, b).expect("queue second concurrent launcher");
     while !DONE_A.load(Ordering::Acquire) || !DONE_B.load(Ordering::Acquire) {
-        let _ = blueos::sync::atomic_wait(
+        let _wait_result = blueos::sync::atomic_wait(
             &WAIT_ATOM,
             WAIT_ATOM.load(Ordering::Acquire),
             blueos::time::Tick::from_millis(10),

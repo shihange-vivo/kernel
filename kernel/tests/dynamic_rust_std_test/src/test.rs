@@ -57,7 +57,7 @@ fn launch_and_wait(service: &ApplicationService) {
         if !service.manager().contains(handle) {
             return;
         }
-        let _ = blueos::sync::atomic_wait(
+        let _wait_result = blueos::sync::atomic_wait(
             &WAIT_ATOM,
             WAIT_ATOM.load(Ordering::Acquire),
             blueos::time::Tick::from_millis(50),

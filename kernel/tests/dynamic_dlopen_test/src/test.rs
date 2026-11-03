@@ -56,7 +56,7 @@ use semihosting::println;
 
 static WAIT: AtomicUsize = AtomicUsize::new(0);
 fn pause() {
-    let _ = blueos::sync::atomic_wait(&WAIT, 0, blueos::time::Tick::from_millis(50));
+    let _wait_result = blueos::sync::atomic_wait(&WAIT, 0, blueos::time::Tick::from_millis(50));
 }
 fn spawn(service: &ApplicationService, mode: &[u8]) -> ApplicationHandle {
     let path = "/apps/dlopen/app.elf";
@@ -104,8 +104,13 @@ fn runtime_handles_belong_to_the_calling_application() {
     let service = runtime::init().expect("initialize application runtime");
     let handle_path = b"/dlopen-handle\0";
     let release_path = b"/dlopen-release\0";
-    let _ = blueos::vfs::syscalls::unlink(handle_path.as_ptr().cast());
-    let _ = blueos::vfs::syscalls::unlink(release_path.as_ptr().cast());
+    for path in [handle_path.as_slice(), release_path.as_slice()] {
+        let removed = blueos::vfs::syscalls::unlink(path.as_ptr().cast());
+        assert!(
+            removed == 0 || removed == -libc::ENOENT,
+            "remove stale dlopen fixture: {removed}"
+        );
+    }
     let owner = spawn(service, b"hold");
     let deadline = blueos::time::now() + core::time::Duration::from_secs(10);
     loop {

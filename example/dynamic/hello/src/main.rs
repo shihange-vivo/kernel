@@ -51,7 +51,7 @@ fn put(fd: c_int, bytes: &[u8]) {
 pub unsafe extern "C" fn main(
     argc: c_int,
     argv: *const *const c_char,
-    envp: *const *const c_char,
+    _envp: *const *const c_char,
 ) -> c_int {
     put(1, b"hello dynamic app\n");
 
@@ -80,6 +80,5 @@ pub unsafe extern "C" fn main(
         put(1, b"auxv: AT_PHDR ok\n");
     }
 
-    let _ = envp;
     0
 }
