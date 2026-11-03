@@ -13,7 +13,7 @@
 // limitations under the License.
 
 // Private C++ DSO used by the clang_cxx dynamic-loading fixture.
-// Its constructor sets private_state to 37 before the application's main;
+// Its constructor sets kPrivateState to 37 before the application's main;
 // the exported C ABI accessor reads that state through PrivateValue.
 // Constructor/destructor logs let the integration test verify one-time
 // initialization and finalization while the DSO remains mapped. This DSO
@@ -23,7 +23,7 @@ extern "C" int printf(const char *format, ...);
 
 namespace {
 
-int private_state;
+int kPrivateState;
 
 class PrivateValue {
  public:
@@ -36,16 +36,16 @@ class PrivateValue {
 };
 
 __attribute__((constructor)) void initializePrivate() {
-  private_state = 37;
-  printf("clang-cxx: private ctor state=%d\n", private_state);
+  kPrivateState = 37;
+  printf("clang-cxx: private ctor state=%d\n", kPrivateState);
 }
 
 __attribute__((destructor)) void finalizePrivate() {
-  printf("clang-cxx: private fini state=%d\n", private_state);
+  printf("clang-cxx: private fini state=%d\n", kPrivateState);
 }
 
 } // namespace
 
 extern "C" int clangCxxPrivateValue(int input) {
-  return PrivateValue(private_state).add(input);
+  return PrivateValue(kPrivateState).add(input);
 }
