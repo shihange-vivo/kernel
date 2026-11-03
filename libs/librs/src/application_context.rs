@@ -126,10 +126,19 @@ impl LibcApplicationContext {
         true
     }
 
-    /// Run every registered destructor in reverse order.
+    /// Run every registered destructor in reverse order, including callbacks
+    /// registered by a running destructor before older pending callbacks.
     pub fn run_atexit(&self) {
-        let mut list = self.atexit.write();
-        while let Some(function) = list.pop() {
+        loop {
+            let function = {
+                let mut list = self.atexit.write();
+                list.pop()
+            };
+            let Some(function) = function else {
+                break;
+            };
+            // A callback may call `atexit` and acquire this same write lock.
+            // The guard above must be released before invoking it.
             function();
         }
     }

@@ -26,7 +26,38 @@
 //! needs (`calloc`, `realloc`, `memalign`, `abort`); before that the link failed
 //! on exactly those and nothing else.
 
+use std::sync::atomic::{AtomicUsize, Ordering};
+
+static ATEXIT_STAGE: AtomicUsize = AtomicUsize::new(0);
+
+extern "C" fn atexit_last() {
+    assert_eq!(ATEXIT_STAGE.swap(3, Ordering::SeqCst), 2);
+    println!("rust-std: atexit=last");
+}
+
+extern "C" fn atexit_nested() {
+    assert_eq!(ATEXIT_STAGE.swap(2, Ordering::SeqCst), 1);
+    println!("rust-std: atexit=nested");
+}
+
+extern "C" fn atexit_register() {
+    assert_eq!(ATEXIT_STAGE.swap(1, Ordering::SeqCst), 0);
+    // SAFETY: The callback has the required C ABI and its application image
+    // stays mapped until the exit callbacks finish.
+    assert_eq!(unsafe { libc::atexit(atexit_nested) }, 0);
+    println!("rust-std: atexit=register");
+}
+
 fn main() {
+    // The later callback registers another destructor during exit. The new
+    // callback must run before the older pending callback, without deadlock.
+    // SAFETY: Both callbacks have the required C ABI and remain mapped until
+    // all application-owned exit callbacks finish.
+    unsafe {
+        assert_eq!(libc::atexit(atexit_last), 0);
+        assert_eq!(libc::atexit(atexit_register), 0);
+    }
+
     println!("rust-std: hello");
 
     // Heap: `Vec` growth goes through `realloc`, and `with_capacity` is the
