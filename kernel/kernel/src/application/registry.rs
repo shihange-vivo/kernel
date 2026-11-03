@@ -1162,7 +1162,12 @@ mod publication_tests {
         let descriptor = image.images().next().unwrap().clone();
         // SAFETY: the fixture transfers the sole allocation into the registry
         // and keeps the shared memory service alive throughout each scenario.
-        let (_, mut allocations, pins, _) = unsafe { image.into_receipt().into_parts() };
+        let blueos_loader::LoadResourceParts {
+            memory: _,
+            mut allocations,
+            pins,
+            reservation: _,
+        } = unsafe { image.into_receipt().into_parts() };
         assert_eq!(allocations.len(), 1);
         assert!(pins.is_empty());
         let (_, allocation) = allocations.pop().unwrap();

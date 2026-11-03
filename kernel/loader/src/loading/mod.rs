@@ -32,7 +32,8 @@ mod source;
 pub use load::{load, prepare_load, LoadRequest, LoadServices};
 pub use loaded::{ImageDependency, ImageHandle, LifecycleEntry, LoadedImage};
 pub use publication::{
-    LoadPublisher, LoadResources, PreparedLoad, PublicationManifest, RetainResources,
+    LoadPublisher, LoadResourceParts, LoadResources, PreparedLoad, PublicationManifest,
+    RetainResources,
 };
 pub use repository::{
     ImageCandidate, ImagePin, ImageRepository, LoadReservation, LocalPin, LocalRepository,

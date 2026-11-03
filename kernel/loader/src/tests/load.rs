@@ -21,9 +21,9 @@ use crate::{
     tests::fixture::{SharedMemory, SliceElfReader},
     trace::{LoadEvent, LoadPhase},
     ArtifactId, ArtifactInfo, ArtifactResolver, ImageCandidate, ImageHandle, ImageInstanceId,
-    ImageKey, ImagePin, ImageRepository, LoadError, LoadPublisher, LoadReservation, LoadResources,
-    LoadResult, LoadServices, LoadedImage, NamespaceSnapshot, OpenedArtifact, PreparedLoad,
-    PublicationManifest, ReservedImage,
+    ImageKey, ImagePin, ImageRepository, LoadError, LoadPublisher, LoadReservation,
+    LoadResourceParts, LoadResources, LoadResult, LoadServices, LoadedImage, NamespaceSnapshot,
+    OpenedArtifact, PreparedLoad, PublicationManifest, ReservedImage,
 };
 use alloc::{rc::Rc, vec::Vec};
 use blueos_test_macro::test;
@@ -303,7 +303,12 @@ impl<'a> LoadPublisher<SharedMemory, Pin, Reservation<'a>> for Host<'a> {
     ) -> Receipt {
         // SAFETY: prepare reserved this owner's sinks for the same manifest;
         // the following moves adopt every allocation and retained provider.
-        let (_, allocations, pins, mut reservation) = unsafe { resources.into_parts() };
+        let LoadResourceParts {
+            memory: _,
+            allocations,
+            pins,
+            mut reservation,
+        } = unsafe { resources.into_parts() };
         let owner = Rc::get_mut(&mut prepared.inner).expect("unpublished owner");
         for (_, lease) in allocations {
             owner.leases.push(lease);
