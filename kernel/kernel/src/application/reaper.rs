@@ -38,11 +38,11 @@ use crate::{
     application::{
         adapters::flat_memory::FlatImageMemory,
         group::{GroupState, ThreadGroup, ThreadGroupError},
-        manager::ApplicationManager,
+        manager::{ApplicationLaunchError, ApplicationManager},
         publication::KernelLinkReceipt,
         registry::{QuiescenceResolution, SystemDsoRegistry},
     },
-    thread::{self, Builder, Entry},
+    thread::{self, Builder, Entry, GlobalQueueVisitor},
 };
 
 use crate::thread::deferred;
@@ -95,16 +95,17 @@ impl ApplicationReaper {
     /// manager and never returns. The reaper releases resources outside every
     /// registry or manager lock.
     ///
-    /// Retirement depends on this thread: it runs the cleanups that release a
-    /// retired thread's stack and drop its group membership, so an application
-    /// cannot finish exiting until the reaper is scheduled. A spawn that fails
-    /// would strand every later cleanup, so it is fatal rather than asserted.
-    pub fn spawn(&self, manager: ApplicationManager) {
+    /// Retirement depends on this thread. Report a queueing failure so the
+    /// caller does not publish a service that cannot reap its applications.
+    pub fn spawn(&self, manager: ApplicationManager) -> Result<(), ApplicationLaunchError> {
         let reaper = self.clone();
-        let thread = Builder::new(Entry::Closure(Box::new(move || reaper.run(manager)))).build();
-        if crate::scheduler::queue_ready_thread(thread::IDLE, thread).is_err() {
-            panic!("application reaper thread must queue");
+        let mut thread =
+            Builder::new(Entry::Closure(Box::new(move || reaper.run(manager)))).build();
+        if crate::scheduler::queue_ready_thread(thread::IDLE, thread.clone()).is_err() {
+            let _removed = GlobalQueueVisitor::remove(&mut thread);
+            return Err(ApplicationLaunchError::PrepareFailed);
         }
+        Ok(())
     }
 
     /// The reaper thread body.

@@ -126,7 +126,7 @@ impl<R: ElfReader> PlannedImage<R> {
         let transaction = ImageLoadTransaction::new(memory, lease);
 
         validate_allocation(
-            transaction.allocation(),
+            transaction.allocation().map_err(at_allocate)?,
             &request,
             self.request.profile().class(),
         )
@@ -134,6 +134,7 @@ impl<R: ElfReader> PlannedImage<R> {
         let load_bias = TargetAddress::new(
             transaction
                 .allocation()
+                .map_err(at_allocate)?
                 .base()
                 .checked_sub(self.aligned_min_vaddr)
                 .map_err(at_allocate)?,

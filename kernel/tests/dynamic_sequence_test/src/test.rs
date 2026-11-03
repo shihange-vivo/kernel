@@ -81,7 +81,7 @@ fn reject_scope_bad(service: &ApplicationService) {
 
 #[test]
 fn different_elf_closures_are_isolated() {
-    let service = runtime::init();
+    let service = runtime::init().expect("initialize application runtime");
 
     // Establish the shared libc instance with the simplest root-only image.
     launch_and_wait(service, "/apps/hello/app.elf");

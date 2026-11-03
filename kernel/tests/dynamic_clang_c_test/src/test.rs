@@ -63,7 +63,7 @@ fn launch_and_wait(service: &ApplicationService) {
 
 #[test]
 fn clang_c_private_dso_vertical() {
-    launch_and_wait(runtime::init());
+    launch_and_wait(runtime::init().expect("initialize application runtime"));
 }
 
 #[no_mangle]

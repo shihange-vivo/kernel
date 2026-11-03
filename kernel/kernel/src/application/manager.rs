@@ -200,10 +200,12 @@ impl ApplicationManager {
             // A fresh group always accepts its first handle; failure here means
             // an internal invariant broke, not a caller error.
             let mut inner = self.inner.lock();
-            let instance = inner
-                .slots
-                .get_mut(slot)
-                .expect("a reserved slot stays present");
+            let Some(instance) = inner.slots.get_mut(slot) else {
+                return (Err(ApplicationLaunchError::StaleGeneration), prepare_group);
+            };
+            if instance.generation != generation {
+                return (Err(ApplicationLaunchError::StaleGeneration), prepare_group);
+            }
             instance.state = SlotState::Occupied(ApplicationState::Failed);
             return (Err(ApplicationLaunchError::PrepareFailed), prepare_group);
         }
@@ -211,10 +213,9 @@ impl ApplicationManager {
         let result = prepare(&prepare_group);
 
         let mut inner = self.inner.lock();
-        let instance = inner
-            .slots
-            .get_mut(slot)
-            .expect("a reserved slot stays present");
+        let Some(instance) = inner.slots.get_mut(slot) else {
+            return (Err(ApplicationLaunchError::StaleGeneration), prepare_group);
+        };
         if instance.generation != generation {
             return (Err(ApplicationLaunchError::StaleGeneration), prepare_group);
         }
@@ -452,6 +453,16 @@ mod tests {
         let manager = ApplicationManager::default();
         manager.inner.lock().slots = slots;
         manager
+    }
+
+    #[test]
+    fn launch_reports_a_slot_removed_during_preparation() {
+        let manager = ApplicationManager::default();
+        let result = manager.launch(OwnedLaunchRequest::new(b"removed".to_vec()), |_| {
+            manager.inner.lock().slots.clear();
+            Ok(())
+        });
+        assert_eq!(result, Err(ApplicationLaunchError::StaleGeneration));
     }
 
     fn launch(manager: &ApplicationManager, identity: &[u8]) -> ApplicationHandle {

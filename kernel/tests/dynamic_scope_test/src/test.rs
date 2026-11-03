@@ -207,7 +207,7 @@ fn scope_visibility_vertical() {
     // Boot installed the embedded corpus artifacts and initialized the runtime
     //; this idempotent call retrieves the same service without
     // reseeding the VFS.
-    let service = runtime::init();
+    let service = runtime::init().expect("initialize application runtime");
 
     // The scope corpus application: all bindings are asserted by the checker
     // through the app's printed values and the SCOPE_BIND diagnostic lines.

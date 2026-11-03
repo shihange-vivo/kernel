@@ -357,6 +357,7 @@ pub trait LinkPublisher {
 /// context, the root entry, the constructor/destructor plans, the flat link
 /// map, and the publisher's receipt (the long-term owner
 /// of every committed allocation lease).
+#[must_use = "retain the publication receipt or release its resources"]
 pub struct LinkProduct<Receipt> {
     context: LinkContext,
     entry: TargetAddress,
@@ -431,10 +432,17 @@ impl<Receipt> LinkProduct<Receipt> {
         self.publication
     }
 
-    pub(crate) fn take_publication(&mut self) -> Receipt
-    where
-        Receipt: Default,
-    {
-        core::mem::take(&mut self.publication)
+    pub(crate) fn into_publication_parts(self) -> (Receipt, LinkProduct<()>) {
+        (
+            self.publication,
+            LinkProduct {
+                context: self.context,
+                entry: self.entry,
+                plans: self.plans,
+                link_map: self.link_map,
+                bindings: self.bindings,
+                publication: (),
+            },
+        )
     }
 }

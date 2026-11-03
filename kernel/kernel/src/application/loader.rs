@@ -83,7 +83,7 @@ impl ApplicationLoader {
         global: Vec<blueos_loader::ImageInstanceId>,
     ) -> LoadResult<(LoadedImage<KernelLinkReceipt>, SystemInitBatch)> {
         let mut product = self.link_inner(namespace, path, group, true, existing, global)?;
-        let batch = product.receipt_mut().take_pending();
+        let batch = product.receipt_mut().take_pending()?;
         Ok((product, batch))
     }
     fn link_inner(

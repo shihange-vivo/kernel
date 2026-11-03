@@ -761,17 +761,17 @@ fn load_rejects_executable_dependencies_before_mapping() {
     assert!(!backend.memory.acquired.get());
     assert_eq!(backend.memory.allocations.get(), 0);
 }
-#[test]
-fn dropping_prepared_load_rolls_back_without_commit() {
-    let (bytes, profile) = super::linker::native_fixture();
-    let mut backend = Backend::new(alloc::vec![("root", bytes)]);
+fn prepare_root<'a>(
+    backend: &'a mut Backend,
+    profile: LoadProfile,
+) -> PreparedLoad<SharedMemory, Pin, Reservation<'a>> {
     let input = request(
         LoadRequest::executable("root", profile, SessionLimits::DEFAULT),
         false,
     );
     let memory = backend.memory.clone();
-    let host = Host(Rc::new(RefCell::new(&mut backend)));
-    let prepared = crate::prepare_load(
+    let host = Host(Rc::new(RefCell::new(backend)));
+    crate::prepare_load(
         input,
         LoadServices {
             sources: &mut host.clone(),
@@ -781,12 +781,34 @@ fn dropping_prepared_load_rolls_back_without_commit() {
             observer: &mut host.clone(),
         },
     )
-    .unwrap();
+    .unwrap()
+}
+
+#[test]
+fn dropping_prepared_load_rolls_back_without_commit() {
+    let (bytes, profile) = super::linker::native_fixture();
+    let mut backend = Backend::new(alloc::vec![("root", bytes)]);
+    let prepared = prepare_root(&mut backend, profile);
     assert_eq!(prepared.manifest().allocations().len(), 1);
     drop(prepared);
-    drop(host);
     assert!(backend.memory.mappers.borrow().is_empty());
     assert_eq!(backend.commits, 0);
+    assert_eq!(backend.cancels, 1);
+    assert_eq!(backend.memory.releases.get(), 0);
+}
+
+#[test]
+fn retained_load_resources_release_committed_backing_once() {
+    let (bytes, profile) = super::linker::native_fixture();
+    let mut backend = Backend::new(alloc::vec![("root", bytes)]);
+    let memory = backend.memory.clone();
+    let prepared = prepare_root(&mut backend, profile);
+    let loaded = prepared.publish(&mut crate::RetainResources).unwrap();
+    assert_eq!(memory.mappers.borrow().len(), 1);
+    assert_eq!(memory.releases.get(), 0);
+    drop(loaded);
+    assert!(memory.mappers.borrow().is_empty());
+    assert_eq!(memory.releases.get(), 1);
     assert_eq!(backend.cancels, 1);
 }
 #[test]

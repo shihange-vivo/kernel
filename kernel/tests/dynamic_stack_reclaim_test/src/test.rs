@@ -83,7 +83,7 @@ fn launch_fixture(service: &ApplicationService) {
 
 #[test]
 fn application_launch_resources_are_reclaimed() {
-    let service = runtime::init();
+    let service = runtime::init().expect("initialize application runtime");
 
     // Warm-up: the first launch loads cached `libc.so.1` and reserves the
     // manager/reaper tables. Private DSOs are reloaded and freed each round.
