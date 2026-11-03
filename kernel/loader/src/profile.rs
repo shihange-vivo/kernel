@@ -658,6 +658,10 @@ impl LoadLimits {
         self.max_file_len
     }
 
+    pub(crate) const fn max_load_segments(&self) -> u16 {
+        self.max_load_segments
+    }
+
     pub fn check_file_len(&self, actual: u64) -> LoadResult<()> {
         check_limit(LimitKind::FileLength, actual, self.max_file_len)
     }
