@@ -48,6 +48,11 @@ pub struct BlueOsStringView {
     pub len: usize,
 }
 
+#[cfg(target_pointer_width = "32")]
+assert_ffi_layout!(BlueOsStringView, 8, 4, { data: 0, len: 4 });
+#[cfg(target_pointer_width = "64")]
+assert_ffi_layout!(BlueOsStringView, 16, 8, { data: 0, len: 8 });
+
 /// One `auxv` entry. The kernel fills the array in `ApplicationStartStorage`;
 /// `librs::getauxval` searches it per application, never through a process-global
 /// pointer that two applications could overwrite.
@@ -57,6 +62,11 @@ pub struct BlueOsAuxvEntry {
     pub key: usize,
     pub value: usize,
 }
+
+#[cfg(target_pointer_width = "32")]
+assert_ffi_layout!(BlueOsAuxvEntry, 8, 4, { key: 0, value: 4 });
+#[cfg(target_pointer_width = "64")]
+assert_ffi_layout!(BlueOsAuxvEntry, 16, 8, { key: 0, value: 8 });
 
 /// A constructor/destructor plan: an array of target entry addresses (Thumb bit
 /// preserved on ARM) plus its own version/size prefix. The array is pinned for
@@ -69,6 +79,21 @@ pub struct BlueOsFunctionPlan {
     pub entries: *const usize,
     pub count: usize,
 }
+
+#[cfg(target_pointer_width = "32")]
+assert_ffi_layout!(BlueOsFunctionPlan, 16, 4, {
+    abi_version: 0,
+    struct_size: 4,
+    entries: 8,
+    count: 12,
+});
+#[cfg(target_pointer_width = "64")]
+assert_ffi_layout!(BlueOsFunctionPlan, 24, 8, {
+    abi_version: 0,
+    struct_size: 4,
+    entries: 8,
+    count: 16,
+});
 
 /// The pinned start-information block handed to `blueos_scrt1::_start`
 ///
@@ -93,6 +118,33 @@ pub struct BlueOsApplicationStartInfo {
     pub fini_plan: BlueOsFunctionPlan,
 }
 
+#[cfg(target_pointer_width = "32")]
+assert_ffi_layout!(BlueOsApplicationStartInfo, 64, 4, {
+    abi_version: 0,
+    struct_size: 4,
+    argc: 8,
+    argv: 12,
+    envc: 16,
+    envp: 20,
+    auxv: 24,
+    auxv_count: 28,
+    init_plan: 32,
+    fini_plan: 48,
+});
+#[cfg(target_pointer_width = "64")]
+assert_ffi_layout!(BlueOsApplicationStartInfo, 104, 8, {
+    abi_version: 0,
+    struct_size: 4,
+    argc: 8,
+    argv: 16,
+    envc: 24,
+    envp: 32,
+    auxv: 40,
+    auxv_count: 48,
+    init_plan: 56,
+    fini_plan: 80,
+});
+
 /// The bounded launch request a dynamic application sends to start another
 /// application. `librs::spawn` converts POSIX inputs into this shape;
 /// the kernel copies a fixed-size header, validates counts/byte totals/string
@@ -109,6 +161,27 @@ pub struct BlueOsApplicationLaunchRequest {
     pub envp: *const BlueOsStringView,
     pub envc: usize,
 }
+
+#[cfg(target_pointer_width = "32")]
+assert_ffi_layout!(BlueOsApplicationLaunchRequest, 32, 4, {
+    abi_version: 0,
+    struct_size: 4,
+    path: 8,
+    argv: 16,
+    argc: 20,
+    envp: 24,
+    envc: 28,
+});
+#[cfg(target_pointer_width = "64")]
+assert_ffi_layout!(BlueOsApplicationLaunchRequest, 56, 8, {
+    abi_version: 0,
+    struct_size: 4,
+    path: 8,
+    argv: 24,
+    argc: 32,
+    envp: 40,
+    envc: 48,
+});
 
 /// Auxiliary-vector keys shared by the kernel and `librs`.
 ///
