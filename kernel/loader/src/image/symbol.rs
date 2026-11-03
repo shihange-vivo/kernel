@@ -211,15 +211,13 @@ impl SysVHash {
         }
 
         // Prove that every bucket-reachable chain terminates at STN_UNDEF.
-        // A bounded walk avoids auxiliary allocation while rejecting cycles.
+        // Valid buckets have disjoint chains. A whole-table budget rejects
+        // cycles and bounds repeated walks without auxiliary allocation.
+        let mut remaining = chains.len();
         for &bucket in &buckets {
             let mut index = bucket;
-            let mut steps = 0_u32;
             while index != 0 {
-                steps = steps.checked_add(1).ok_or_else(hash_error)?;
-                if steps > nchain {
-                    return Err(hash_error());
-                }
+                remaining = remaining.checked_sub(1).ok_or_else(hash_error)?;
                 index = chains[index as usize];
             }
         }
@@ -345,6 +343,9 @@ impl GnuHash {
             chains.push(read_u32(bytes, chain_base + 4 * index, endian)?);
         }
 
+        // Valid bucket chains are disjoint. Sharing one budget prevents
+        // repeated or overlapping chains from multiplying validation work.
+        let mut remaining = chains.len();
         let mut highest_end = None;
         for &bucket in &buckets {
             if bucket == 0 {
@@ -352,6 +353,7 @@ impl GnuHash {
             }
             let mut index = (bucket - symndx) as usize;
             loop {
+                remaining = remaining.checked_sub(1).ok_or_else(hash_error)?;
                 let chain = *chains.get(index).ok_or_else(hash_error)?;
                 if chain & 1 != 0 {
                     highest_end = Some(highest_end.map_or(index, |end| core::cmp::max(end, index)));
@@ -844,4 +846,254 @@ fn hash_error() -> LoadError {
 
 fn hash_oom() -> LoadError {
     LoadError::new(LoadErrorKind::OutOfMemory, ErrorContext::None)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use blueos_test_macro::test;
+
+    fn append_u32(bytes: &mut Vec<u8>, value: u32, endian: ElfData) {
+        bytes.extend_from_slice(&match endian {
+            ElfData::Little => value.to_le_bytes(),
+            ElfData::Big => value.to_be_bytes(),
+        });
+    }
+
+    fn sysv_bytes(buckets: &[u32], chains: &[u32], endian: ElfData) -> Vec<u8> {
+        let size = buckets
+            .len()
+            .checked_add(chains.len())
+            .and_then(|words| words.checked_add(2))
+            .and_then(|words| words.checked_mul(4))
+            .unwrap();
+        let mut bytes = Vec::with_capacity(size);
+        append_u32(&mut bytes, u32::try_from(buckets.len()).unwrap(), endian);
+        append_u32(&mut bytes, u32::try_from(chains.len()).unwrap(), endian);
+        for &word in buckets.iter().chain(chains) {
+            append_u32(&mut bytes, word, endian);
+        }
+        bytes
+    }
+
+    fn gnu_bytes(
+        buckets: &[u32],
+        chains: &[u32],
+        symndx: u32,
+        class: ElfClass,
+        endian: ElfData,
+    ) -> Vec<u8> {
+        let word_size = match class {
+            ElfClass::Elf32 => 4,
+            ElfClass::Elf64 => 8,
+        };
+        let size = buckets
+            .len()
+            .checked_add(chains.len())
+            .and_then(|words| words.checked_mul(4))
+            .and_then(|bytes| bytes.checked_add(16))
+            .and_then(|bytes| bytes.checked_add(word_size))
+            .unwrap();
+        let mut bytes = Vec::with_capacity(size);
+        for word in [u32::try_from(buckets.len()).unwrap(), symndx, 1, 5] {
+            append_u32(&mut bytes, word, endian);
+        }
+        // An all-ones Bloom filter deliberately permits every lookup.
+        bytes.resize(bytes.len().checked_add(word_size).unwrap(), 0xff);
+        for &word in buckets.iter().chain(chains) {
+            append_u32(&mut bytes, word, endian);
+        }
+        bytes
+    }
+
+    #[test]
+    fn sysv_hash_rejects_shared_chain_work_amplification() {
+        let chains: Vec<u32> = (0..=64u32)
+            .map(|index| {
+                if index == 0 || index == 64 {
+                    0
+                } else {
+                    index.saturating_add(1)
+                }
+            })
+            .collect();
+        for endian in [ElfData::Little, ElfData::Big] {
+            for bytes in [
+                sysv_bytes(&[1; 64], &chains, endian),
+                sysv_bytes(&[1, 2], &[0, 3, 3, 4, 0], endian),
+            ] {
+                let error = SysVHash::parse(&bytes, endian)
+                    .err()
+                    .expect("shared chain amplification");
+                assert_eq!(error.kind(), LoadErrorKind::BadElf);
+            }
+        }
+    }
+
+    #[test]
+    fn sysv_hash_accepts_disjoint_and_long_chains() {
+        let chains: Vec<u32> = (0..=64u32)
+            .map(|index| {
+                if index == 0 || index == 64 {
+                    0
+                } else {
+                    index.saturating_add(1)
+                }
+            })
+            .collect();
+        for endian in [ElfData::Little, ElfData::Big] {
+            for (buckets, chains) in [
+                (&[1, 0, 0][..], chains.as_slice()),
+                (&[1, 3, 0][..], &[0, 2, 0, 4, 0][..]),
+                (&[0][..], &[0][..]),
+            ] {
+                let bytes = sysv_bytes(buckets, chains, endian);
+                let (_table, count) = SysVHash::parse(&bytes, endian).expect("valid SysV chains");
+                assert_eq!(count as usize, chains.len());
+            }
+        }
+    }
+
+    #[test]
+    fn sysv_hash_rejects_cycles_and_out_of_range_links() {
+        for endian in [ElfData::Little, ElfData::Big] {
+            for (buckets, chains) in [
+                (&[1][..], &[0, 2, 1][..]),
+                (&[1][..], &[0, 1][..]),
+                (&[3][..], &[0, 0, 0][..]),
+                (&[1][..], &[0, 3, 0][..]),
+                (&[][..], &[0][..]),
+                (&[0][..], &[][..]),
+            ] {
+                let bytes = sysv_bytes(buckets, chains, endian);
+                let error = SysVHash::parse(&bytes, endian)
+                    .err()
+                    .expect("invalid SysV table");
+                assert_eq!(error.kind(), LoadErrorKind::BadElf);
+            }
+        }
+    }
+
+    #[test]
+    fn gnu_hash_rejects_shared_chain_work_amplification() {
+        let mut chains = [0x10u32; 64];
+        chains[63] |= 1;
+        for class in [ElfClass::Elf32, ElfClass::Elf64] {
+            for endian in [ElfData::Little, ElfData::Big] {
+                for bytes in [
+                    gnu_bytes(&[1; 64], &chains, 1, class, endian),
+                    gnu_bytes(&[7, 8], &[0x10, 0x20, 0x31], 7, class, endian),
+                ] {
+                    let error = GnuHash::parse(&bytes, endian, class)
+                        .err()
+                        .expect("shared chain amplification");
+                    assert_eq!(error.kind(), LoadErrorKind::BadElf);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn gnu_hash_accepts_disjoint_long_and_empty_chains() {
+        let mut chains = [0x10u32; 64];
+        chains[63] |= 1;
+        for class in [ElfClass::Elf32, ElfClass::Elf64] {
+            for endian in [ElfData::Little, ElfData::Big] {
+                for (buckets, chains, symndx) in [
+                    (&[1, 0][..], chains.as_slice(), 1u32),
+                    (&[3, 0, 5][..], &[0x12, 0x19, 0x1a, 0x21][..], 3),
+                    (&[0, 0][..], &[][..], 3),
+                ] {
+                    let bytes = gnu_bytes(buckets, chains, symndx, class, endian);
+                    let (_table, count) =
+                        GnuHash::parse(&bytes, endian, class).expect("valid GNU chains");
+                    assert_eq!(
+                        count as usize,
+                        (symndx as usize).checked_add(chains.len()).unwrap()
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn gnu_hash_rejects_missing_terminators_and_unreachable_tail() {
+        for class in [ElfClass::Elf32, ElfClass::Elf64] {
+            for endian in [ElfData::Little, ElfData::Big] {
+                for (buckets, chains, symndx) in [
+                    (&[1][..], &[0x10, 0x20][..], 1),
+                    (&[1][..], &[0x11, 0x31][..], 1),
+                    (&[0][..], &[0x11][..], 1),
+                    (&[2][..], &[0x11][..], 3),
+                    (&[2][..], &[0x11][..], 1),
+                ] {
+                    let bytes = gnu_bytes(buckets, chains, symndx, class, endian);
+                    let error = GnuHash::parse(&bytes, endian, class)
+                        .err()
+                        .expect("invalid GNU table");
+                    assert_eq!(error.kind(), LoadErrorKind::BadElf);
+                }
+            }
+        }
+    }
+
+    fn symbol(name_offset: u32, name_len: u32) -> SymbolEntry {
+        SymbolEntry {
+            name_offset,
+            name_len,
+            value: TargetAddress::new(0),
+            size: 0,
+            binding: if name_offset == 0 {
+                SymbolBinding::Local
+            } else {
+                SymbolBinding::Global
+            },
+            visibility: SymbolVisibility::Default,
+            symbol_type: SymbolType::NoType,
+            definition: SymbolDefinition::Undefined,
+            absolute: false,
+        }
+    }
+
+    #[test]
+    fn hash_validation_preserves_lookup_and_count_agreement() {
+        let dynstr = b"\0alpha\0beta\0gamma\0";
+        let entries = [symbol(0, 0), symbol(1, 5), symbol(7, 4), symbol(12, 5)];
+        let gnu_chains = [
+            gnu_hash(b"alpha") & !1,
+            gnu_hash(b"beta") & !1,
+            gnu_hash(b"gamma") | 1,
+        ];
+        for class in [ElfClass::Elf32, ElfClass::Elf64] {
+            for endian in [ElfData::Little, ElfData::Big] {
+                let sysv_raw = sysv_bytes(&[1], &[0, 2, 3, 0], endian);
+                let gnu_raw = gnu_bytes(&[1], &gnu_chains, 1, class, endian);
+                let (sysv, count) = SysVHash::parse(&sysv_raw, endian).expect("SysV table");
+                assert_eq!(count, 4);
+                let (gnu, count) = GnuHash::parse(&gnu_raw, endian, class).expect("GNU table");
+                assert_eq!(count, 4);
+                for (name, expected) in [
+                    (&b"alpha"[..], Some(1)),
+                    (&b"beta"[..], Some(2)),
+                    (&b"gamma"[..], Some(3)),
+                    (&b"absent"[..], None),
+                ] {
+                    assert_eq!(
+                        sysv.lookup(name, sysv_hash(name), dynstr, &entries),
+                        expected
+                    );
+                    assert_eq!(gnu.lookup(name, gnu_hash(name), dynstr, &entries), expected);
+                }
+                assert_eq!(
+                    symbol_count_from_hash(class, endian, Some(&gnu_raw), Some(&sysv_raw))
+                        .expect("matching counts"),
+                    4
+                );
+                let mismatch = sysv_bytes(&[1], &[0, 2, 3, 4, 0], endian);
+                let error = symbol_count_from_hash(class, endian, Some(&gnu_raw), Some(&mismatch))
+                    .expect_err("mismatched counts");
+                assert_eq!(error.kind(), LoadErrorKind::BadElf);
+            }
+        }
+    }
 }
