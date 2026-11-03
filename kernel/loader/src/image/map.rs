@@ -130,8 +130,13 @@ impl<M: ImageMemory> MappedImage<M> {
     }
 
     fn locate_vaddr_at(&self, vaddr: TargetAddress, len: u64) -> LoadResult<AllocationOffset> {
-        let region = self
-            .regions
+        let region = self.locate_region(vaddr, len)?;
+        let offset = vaddr.checked_sub(region.vaddr_range().start())?;
+        region.allocation_offset().checked_add(offset)
+    }
+
+    fn locate_region(&self, vaddr: TargetAddress, len: u64) -> LoadResult<&LoadedRegion> {
+        self.regions
             .iter()
             .find(|region| region.vaddr_range().contains_span(vaddr, len))
             .ok_or_else(|| {
@@ -143,9 +148,7 @@ impl<M: ImageMemory> MappedImage<M> {
                         align: 0,
                     },
                 )
-            })?;
-        let offset = vaddr.checked_sub(region.vaddr_range().start())?;
-        region.allocation_offset().checked_add(offset)
+            })
     }
 
     fn locate_file_backed_dynamic(
@@ -689,31 +692,69 @@ impl<M: ImageMemory> MappedImage<M> {
         let maximum_chain_count = max_symbols
             .checked_sub(u64::from(symndx))
             .ok_or_else(|| dynamic_error(DT_GNU_HASH, vaddr))?;
+        // The final table must fit one mapped region. Cache that mapping and
+        // cap every scan read by both its extent and the metadata budget.
+        let table_vaddr = TargetAddress::new(vaddr);
+        let region = self.locate_region(table_vaddr, head_len)?;
+        let region_delta = table_vaddr.checked_sub(region.vaddr_range().start())?;
+        let table_offset = region.allocation_offset().checked_add(region_delta)?;
+        let region_bytes = region
+            .vaddr_range()
+            .len()
+            .checked_sub(region_delta)
+            .ok_or_else(|| dynamic_error(DT_GNU_HASH, vaddr))?;
+        let maximum_table_bytes =
+            region_bytes.min(self.request.limits().max_runtime_metadata_bytes());
+        let mut buffer = [0u8; 256];
         loop {
             if u64::from(chain_index) >= maximum_chain_count {
                 return Err(dynamic_error(DT_GNU_HASH, u64::from(chain_index)));
             }
-            let word_delta = u64::from(chain_index)
+            let prefix_len = u64::from(chain_index)
                 .checked_mul(4)
+                .and_then(|bytes| bytes.checked_add(head_len))
                 .ok_or_else(|| dynamic_error(DT_GNU_HASH, vaddr))?;
-            let word_vaddr = vaddr
-                .checked_add(head_len)
-                .and_then(|value| value.checked_add(word_delta))
-                .ok_or_else(|| dynamic_error(DT_GNU_HASH, vaddr))?;
-            let word = self.read_table_bytes(word_vaddr, 4, DT_GNU_HASH)?;
-            if read_u32(&word, 0, endian)? & 1 != 0 {
-                let chain_count = chain_index
-                    .checked_add(1)
-                    .ok_or_else(|| dynamic_error(DT_GNU_HASH, vaddr))?;
-                let total = head_len
-                    .checked_add(u64::from(chain_count) * 4)
+            let words = (maximum_table_bytes.saturating_sub(prefix_len) / 4)
+                .min(maximum_chain_count.saturating_sub(u64::from(chain_index)))
+                .min((buffer.len() / 4) as u64);
+            if words == 0 {
+                let total = prefix_len
+                    .checked_add(4)
                     .ok_or_else(|| dynamic_error(DT_GNU_HASH, vaddr))?;
                 self.request.limits().check_runtime_metadata_bytes(total)?;
-                return self.read_table_bytes(vaddr, total, DT_GNU_HASH);
+                return Err(LoadError::new(
+                    LoadErrorKind::OutOfBounds,
+                    ErrorContext::TargetRange {
+                        start: table_vaddr,
+                        len: total,
+                        align: 0,
+                    },
+                ));
             }
-            chain_index = chain_index
-                .checked_add(1)
-                .ok_or_else(|| dynamic_error(DT_GNU_HASH, vaddr))?;
+            let len = usize::try_from(
+                words
+                    .checked_mul(4)
+                    .ok_or_else(|| dynamic_error(DT_GNU_HASH, vaddr))?,
+            )
+            .map_err(|_| dynamic_error(DT_GNU_HASH, vaddr))?;
+            let offset = table_offset.checked_add(prefix_len)?;
+            self.transaction.validate_range(offset, len as u64)?;
+            self.transaction.read(offset, &mut buffer[..len])?;
+            for word in buffer[..len].chunks_exact(4) {
+                if read_u32(word, 0, endian)? & 1 != 0 {
+                    let chain_count = chain_index
+                        .checked_add(1)
+                        .ok_or_else(|| dynamic_error(DT_GNU_HASH, vaddr))?;
+                    let total = head_len
+                        .checked_add(u64::from(chain_count) * 4)
+                        .ok_or_else(|| dynamic_error(DT_GNU_HASH, vaddr))?;
+                    self.request.limits().check_runtime_metadata_bytes(total)?;
+                    return self.read_table_bytes(vaddr, total, DT_GNU_HASH);
+                }
+                chain_index = chain_index
+                    .checked_add(1)
+                    .ok_or_else(|| dynamic_error(DT_GNU_HASH, vaddr))?;
+            }
         }
     }
 }
@@ -875,7 +916,347 @@ pub(crate) fn unsupported_dynamic(tag: u64, value: u64) -> LoadError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{
+        memory::{
+            AllocationLease, AllocationRequest, ImageAllocation, MemoryMapper, MutationProgress,
+            Placement,
+        },
+        profile::{LoadLimits, LoadProfile},
+        ExecutionDomainId,
+    };
+    use alloc::rc::Rc;
     use blueos_test_macro::test;
+    use core::cell::{Cell, RefCell};
+
+    #[derive(Default)]
+    struct ReadState {
+        calls: RefCell<Vec<(u64, usize)>>,
+        fail_at: Cell<Option<u64>>,
+        aborts: Cell<usize>,
+    }
+
+    #[must_use = "keep the test memory alive through its image transaction"]
+    struct ReadCountingMemory {
+        mapper: MemoryMapper,
+        state: Rc<ReadState>,
+    }
+
+    impl ImageMemory for ReadCountingMemory {
+        fn execution_domain(&self) -> ExecutionDomainId {
+            self.mapper.execution_domain()
+        }
+        fn allocate_image(&mut self, request: AllocationRequest) -> LoadResult<AllocationLease> {
+            self.mapper.allocate_image(request)
+        }
+        fn abort_image(&mut self, lease: AllocationLease, progress: MutationProgress) {
+            self.state
+                .aborts
+                .set(self.state.aborts.get().saturating_add(1));
+            self.mapper.abort_image(lease, progress);
+        }
+        fn release_committed(&mut self, lease: AllocationLease) {
+            self.mapper.release_committed(lease);
+        }
+        fn validate_range(
+            &self,
+            allocation: &ImageAllocation,
+            offset: AllocationOffset,
+            len: u64,
+        ) -> LoadResult<()> {
+            self.mapper.validate_range(allocation, offset, len)
+        }
+        fn read(
+            &self,
+            allocation: &ImageAllocation,
+            offset: AllocationOffset,
+            dst: &mut [u8],
+        ) -> LoadResult<()> {
+            self.state
+                .calls
+                .borrow_mut()
+                .push((offset.value(), dst.len()));
+            if self.state.fail_at.get() == Some(offset.value()) {
+                return Err(LoadError::new(LoadErrorKind::Io, ErrorContext::None));
+            }
+            self.mapper.read(allocation, offset, dst)
+        }
+        fn write(
+            &mut self,
+            allocation: &ImageAllocation,
+            offset: AllocationOffset,
+            bytes: &[u8],
+        ) -> LoadResult<()> {
+            self.mapper.write(allocation, offset, bytes)
+        }
+        fn zero(
+            &mut self,
+            allocation: &ImageAllocation,
+            offset: AllocationOffset,
+            len: u64,
+        ) -> LoadResult<()> {
+            self.mapper.zero(allocation, offset, len)
+        }
+    }
+
+    fn hash_image(
+        bytes: &[u8],
+        spans: &[(u64, u64)],
+        metadata_limit: u64,
+    ) -> (MappedImage<ReadCountingMemory>, Rc<ReadState>) {
+        let state = Rc::new(ReadState::default());
+        let mut memory = ReadCountingMemory {
+            mapper: MemoryMapper::new(None),
+            state: Rc::clone(&state),
+        };
+        let lease = memory
+            .allocate_image(AllocationRequest::new(
+                Placement::Anywhere,
+                bytes.len() as u64,
+                1,
+            ))
+            .unwrap();
+        let allocation = *lease.allocation();
+        memory
+            .write(&allocation, AllocationOffset::new(0), bytes)
+            .unwrap();
+        let regions = spans
+            .iter()
+            .map(|&(offset, len)| {
+                LoadedRegion::new(
+                    TargetRange::new(TargetAddress::new(0x1000).checked_add(offset).unwrap(), len),
+                    TargetRange::new(allocation.base().checked_add(offset).unwrap(), len),
+                    FileRange::new(offset, len),
+                    AllocationOffset::new(offset),
+                )
+            })
+            .collect();
+        let limits = LoadLimits::new(
+            64 * 1024 * 1024,
+            128,
+            32,
+            64 * 1024 * 1024,
+            1024 * 1024 * 1024,
+            1024,
+            1024 * 1024,
+            metadata_limit,
+            64 * 1024 * 1024,
+            64 * 1024 * 1024,
+            256,
+            256,
+        );
+        let image = MappedImage::new(
+            ImageLoadTransaction::new(memory, lease),
+            allocation.base(),
+            LoadRequest::new(LoadProfile::riscv64(), limits),
+            TargetAddress::new(0),
+            Vec::new(),
+            regions,
+            None,
+            None,
+            StackKind::NotDeclared,
+            ProgramHeaderGeometry::new(0, 0, None),
+        );
+        (image, state)
+    }
+
+    fn gnu_table(
+        class: ElfClass,
+        endian: ElfData,
+        symndx: u32,
+        buckets: &[u32],
+        chains: &[u32],
+    ) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        let append = |bytes: &mut Vec<u8>, word: u32| {
+            bytes.extend_from_slice(&match endian {
+                ElfData::Little => word.to_le_bytes(),
+                ElfData::Big => word.to_be_bytes(),
+            });
+        };
+        for word in [u32::try_from(buckets.len()).unwrap(), symndx, 1, 5] {
+            append(&mut bytes, word);
+        }
+        bytes.resize(
+            match class {
+                ElfClass::Elf32 => 20,
+                ElfClass::Elf64 => 24,
+            },
+            0xff,
+        );
+        for &word in buckets.iter().chain(chains) {
+            append(&mut bytes, word);
+        }
+        bytes
+    }
+
+    fn symbol_size(class: ElfClass) -> u64 {
+        match class {
+            ElfClass::Elf32 => 16,
+            ElfClass::Elf64 => 24,
+        }
+    }
+
+    #[test]
+    fn gnu_hash_long_chain_uses_bounded_chunk_reads() {
+        let mut chains = [0x100; 129];
+        chains[128] |= 1;
+        for class in [ElfClass::Elf32, ElfClass::Elf64] {
+            for endian in [ElfData::Little, ElfData::Big] {
+                let table = gnu_table(class, endian, 3, &[3], &chains);
+                let mut bytes = alloc::vec![0; 13];
+                bytes.extend_from_slice(&table);
+                let (image, state) = hash_image(&bytes, &[(0, bytes.len() as u64)], 65536);
+                let result = image
+                    .read_gnu_hash_bytes(0x100d, class, endian, symbol_size(class), None)
+                    .unwrap();
+                assert_eq!(result, table);
+                assert_eq!(state.calls.borrow().len(), 6);
+                assert_eq!(
+                    state.calls.borrow()[2..5]
+                        .iter()
+                        .map(|call| call.1)
+                        .collect::<Vec<_>>(),
+                    [256, 256, 4]
+                );
+                drop(image);
+                assert_eq!(state.aborts.get(), 1);
+            }
+        }
+    }
+
+    #[test]
+    fn gnu_hash_chunk_scan_stops_at_the_first_terminator() {
+        for count in [1usize, 64, 65, 128, 129] {
+            let mut chains = [0x100; 129];
+            chains[count - 1] |= 1;
+            let mut table = gnu_table(ElfClass::Elf64, ElfData::Little, 1, &[1], &chains);
+            // A non-word tail is readable, but must never become a chain word.
+            table.extend_from_slice(&[0xfe; 3]);
+            let (image, state) = hash_image(&table, &[(0, table.len() as u64)], 65536);
+            let result = image
+                .read_gnu_hash_bytes(0x1000, ElfClass::Elf64, ElfData::Little, 24, None)
+                .unwrap();
+            let total = 28usize.checked_add(count.checked_mul(4).unwrap()).unwrap();
+            assert_eq!(result, table[..total]);
+            assert_eq!(
+                symbol_count_from_hash(ElfClass::Elf64, ElfData::Little, Some(&result), None)
+                    .unwrap(),
+                u32::try_from(count).unwrap().saturating_add(1)
+            );
+            assert!(state
+                .calls
+                .borrow()
+                .iter()
+                .all(
+                    |&(offset, len)| offset.checked_add(len as u64).unwrap() <= table.len() as u64
+                ));
+        }
+    }
+
+    #[test]
+    fn gnu_hash_chunk_scan_rejects_truncated_or_split_chains() {
+        let mut table = gnu_table(ElfClass::Elf64, ElfData::Little, 1, &[1], &[0x100; 65]);
+        let end = table.len() as u64;
+        for (spans, readable_end) in [
+            (alloc::vec![(0, end)], end),
+            (alloc::vec![(0, end - 1)], end - 1),
+            (alloc::vec![(0, end - 4), (end - 4, 4)], end - 4),
+        ] {
+            let (image, state) = hash_image(&table, &spans, 65536);
+            let error = image
+                .read_gnu_hash_bytes(0x1000, ElfClass::Elf64, ElfData::Little, 24, None)
+                .unwrap_err();
+            assert_eq!(error.kind(), LoadErrorKind::OutOfBounds);
+            assert!(state
+                .calls
+                .borrow()
+                .iter()
+                .all(|&(offset, len)| offset.checked_add(len as u64).unwrap() <= readable_end));
+            drop(image);
+            assert_eq!(state.aborts.get(), 1);
+        }
+        // A terminator in a separate adjacent region still cannot prove one
+        // contiguous, readable table extent.
+        let last_word = table.len().checked_sub(4).unwrap();
+        table[last_word] |= 1;
+        let (image, state) = hash_image(&table, &[(0, end - 4), (end - 4, 4)], 65536);
+        let error = image
+            .read_gnu_hash_bytes(0x1000, ElfClass::Elf64, ElfData::Little, 24, None)
+            .unwrap_err();
+        assert_eq!(error.kind(), LoadErrorKind::OutOfBounds);
+        assert!(state
+            .calls
+            .borrow()
+            .iter()
+            .all(|&(offset, len)| offset.checked_add(len as u64).unwrap() <= end - 4));
+    }
+
+    #[test]
+    fn gnu_hash_chunk_scan_enforces_metadata_and_symbol_limits() {
+        let mut buckets = [0; 32];
+        buckets[0] = 1;
+        for chains in [&[0x101][..], &[0x100, 0x101][..]] {
+            let table = gnu_table(ElfClass::Elf64, ElfData::Little, 1, &buckets, chains);
+            let limit = 156; // 152-byte header/Bloom/buckets plus one chain word.
+            let (image, state) = hash_image(&table, &[(0, table.len() as u64)], limit);
+            let result =
+                image.read_gnu_hash_bytes(0x1000, ElfClass::Elf64, ElfData::Little, 24, None);
+            if chains.len() == 1 {
+                assert_eq!(result.unwrap(), table);
+            } else {
+                assert_eq!(result.unwrap_err().kind(), LoadErrorKind::ResourceLimit);
+            }
+            assert!(state
+                .calls
+                .borrow()
+                .iter()
+                .all(|&(offset, len)| offset.checked_add(len as u64).unwrap() <= limit));
+        }
+        let table = gnu_table(
+            ElfClass::Elf64,
+            ElfData::Little,
+            1,
+            &[1],
+            &[0x100, 0x100, 0x101],
+        );
+        let (image, state) = hash_image(&table, &[(0, table.len() as u64)], 72);
+        let error = image
+            .read_gnu_hash_bytes(0x1000, ElfClass::Elf64, ElfData::Little, 24, None)
+            .unwrap_err();
+        assert_eq!(error.kind(), LoadErrorKind::BadElf);
+        assert_eq!(state.calls.borrow().last(), Some(&(28, 8)));
+    }
+
+    #[test]
+    fn gnu_hash_known_count_reads_the_exact_extent_without_scanning() {
+        for class in [ElfClass::Elf32, ElfClass::Elf64] {
+            let table = gnu_table(class, ElfData::Little, 3, &[3], &[0x100, 0x100, 0x101]);
+            let (image, state) = hash_image(&table, &[(0, table.len() as u64)], table.len() as u64);
+            let result = image
+                .read_gnu_hash_bytes(0x1000, class, ElfData::Little, symbol_size(class), Some(6))
+                .unwrap();
+            assert_eq!(result, table);
+            assert_eq!(
+                state.calls.borrow().as_slice(),
+                &[(0, 16), (0, table.len())]
+            );
+        }
+    }
+
+    #[test]
+    fn gnu_hash_chunk_read_failure_keeps_rollback_armed() {
+        let table = gnu_table(ElfClass::Elf64, ElfData::Little, 1, &[1], &[0x101]);
+        let (image, state) = hash_image(&table, &[(0, table.len() as u64)], 65536);
+        state.fail_at.set(Some(28));
+        let error = image
+            .read_gnu_hash_bytes(0x1000, ElfClass::Elf64, ElfData::Little, 24, None)
+            .unwrap_err();
+        assert_eq!(error.kind(), LoadErrorKind::Io);
+        assert_eq!(state.calls.borrow().len(), 3);
+        assert_eq!(state.aborts.get(), 0);
+        drop(image);
+        assert_eq!(state.aborts.get(), 1);
+    }
 
     #[test]
     fn dependency_name_accepts_maximum_u32_length_limit() {
