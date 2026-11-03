@@ -163,7 +163,7 @@ impl ElfReader for SemihostingElfReader<'_> {
 /// program also needs room for callbacks into `librs` (`malloc`, `Box`, `Vec`).
 const RUN_STACK_SIZE: usize = 64 * 1024;
 
-/// Run the whole suite on a stack this test owns, and return once it ends.
+/// Run the whole suite on its own stack; return true only after it completes.
 ///
 /// One thread for the suite, not one per test. A thread per test keeps two
 /// `RUN_STACK_SIZE` stacks (131 KiB) in the heap at once, because a worker
@@ -175,10 +175,10 @@ const RUN_STACK_SIZE: usize = 64 * 1024;
 /// exactly the size being asked for - the ones the previous tests released -
 /// are searched past, and `spawn_with_stack` returns `None`.
 ///
-/// A failed spawn ends in a silent `Check Timeout`: nothing reports a panic on
-/// this board (see the panic handler in `kernel/rsrt/src/lib.rs`), so the
-/// checker only sees the output stop.
-fn run_suite_on_own_stack() {
+/// Report a failed spawn explicitly and return false. Some boards do not print
+/// panic diagnostics, so relying on a panic can leave the checker waiting
+/// until timeout (see the panic handler in `kernel/rsrt/src/lib.rs`).
+fn run_suite_on_own_stack() -> bool {
     let done = Arc::new(AtomicUsize::new(0));
     let worker_done = done.clone();
     let spawned = thread::spawn_with_stack(RUN_STACK_SIZE, move || {
@@ -194,7 +194,7 @@ fn run_suite_on_own_stack() {
     if spawned.is_none() {
         // Say why, rather than letting the checker time out on a silent hang.
         println!("loader test: no stack for the {RUN_STACK_SIZE}-byte test suite");
-        return;
+        return false;
     }
 
     while done.load(Ordering::Acquire) == 0 {
@@ -202,6 +202,7 @@ fn run_suite_on_own_stack() {
         // once and never resets it.
         atomic_wait(&done, 0, Tick::MAX).ignore_result();
     }
+    true
 }
 
 mod test_elf_loader {
@@ -485,7 +486,9 @@ pub extern "C" fn main() -> i32 {
     pthread::register_my_posix_tcb();
     // The suite owns its stack, so a test that runs away on deep parser frames
     // cannot reach this thread's control block.
-    run_suite_on_own_stack();
+    if !run_suite_on_own_stack() {
+        return 1;
+    }
     #[cfg(coverage)]
     common_cov::write_coverage_data();
     0
