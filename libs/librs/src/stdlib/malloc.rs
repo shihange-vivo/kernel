@@ -13,16 +13,24 @@
 // limitations under the License.
 
 // FIXME: We are using kernel's allocator currently. Formally, we should use mmap to implement malloc.
+use crate::errno::ERRNO;
 use blueos_header::syscalls::NR::{AllocMem, FreeMem, ReallocMem, Write};
 use blueos_scal::bk_syscall;
-use libc::{c_int, c_void, size_t, ENOMEM};
+use libc::{c_int, c_void, size_t, EINVAL, ENOMEM};
 
+/// Allocate with a power-of-two alignment that is a multiple of pointer size.
+/// Failure leaves the output pointer and `errno` unchanged.
+// SAFETY: A non-null `ptr` must point to writable storage for one pointer;
+// the kernel writes the allocation address there only on success.
 #[no_mangle]
 pub unsafe extern "C" fn posix_memalign(
     ptr: *mut *mut c_void,
     align: size_t,
     size: size_t,
 ) -> c_int {
+    if ptr.is_null() || !align.is_power_of_two() || align < core::mem::size_of::<*mut c_void>() {
+        return EINVAL;
+    }
     let rc = bk_syscall!(AllocMem, ptr, size, align);
     if rc != 0 {
         return ENOMEM;
@@ -87,12 +95,24 @@ pub unsafe extern "C" fn calloc(count: size_t, size: size_t) -> *mut c_void {
     ptr
 }
 
-/// `memalign` is `posix_memalign` with C's return convention instead of the
-/// error-code one.
+/// Allocate with any nonzero power-of-two alignment, returning null and
+/// setting `errno` on failure.
+// SAFETY: Allocation itself has no caller memory preconditions. The returned
+// block, when non-null, must be accessed within `size` bytes and freed once.
 #[no_mangle]
 pub unsafe extern "C" fn memalign(alignment: size_t, size: size_t) -> *mut c_void {
+    if !alignment.is_power_of_two() {
+        ERRNO.set(EINVAL);
+        return core::ptr::null_mut();
+    }
+    // `memalign` accepts smaller alignments than `posix_memalign`. A stronger
+    // alignment also satisfies the original request.
+    let alignment = alignment.max(core::mem::size_of::<*mut c_void>());
     let mut ptr: *mut c_void = core::ptr::null_mut();
-    if posix_memalign(&mut ptr as *mut *mut c_void, alignment, size) != 0 {
+    // SAFETY: `ptr` is writable local storage and outlives the allocation call.
+    let rc = unsafe { posix_memalign(&mut ptr as *mut *mut c_void, alignment, size) };
+    if rc != 0 {
+        ERRNO.set(rc);
         return core::ptr::null_mut();
     }
     ptr

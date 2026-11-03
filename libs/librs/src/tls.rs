@@ -107,7 +107,9 @@ fn get_index(control: &mut EmutlsControl) -> usize {
 
 fn allocate_object(ctrl: &EmutlsControl) -> *mut u8 {
     let size = ctrl.size;
-    let align = ctrl.align;
+    // TLS objects may be byte-aligned; POSIX allocation requires at least
+    // pointer-size alignment.
+    let align = ctrl.align.max(core::mem::size_of::<*mut c_void>());
     let mut base: *mut u8 = core::ptr::null_mut();
     unsafe {
         // We'll deallocate it via `free()`.

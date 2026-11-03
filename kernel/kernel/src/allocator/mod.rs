@@ -302,12 +302,16 @@ pub fn calloc(count: usize, size: usize) -> *mut u8 {
 ///
 /// * `size` - Minimum size of the memory region to allocate.
 /// * `align` - Alignment requirement for the returned memory.
+///
+/// Returns null for zero size, an invalid layout, or allocation failure.
 pub fn malloc_align(size: usize, align: usize) -> *mut u8 {
     if core::intrinsics::unlikely(size == 0) {
         return ptr::null_mut();
     }
 
-    let layout = Layout::from_size_align(size, align).unwrap();
+    let Ok(layout) = Layout::from_size_align(size, align) else {
+        return ptr::null_mut();
+    };
     HEAP.alloc(layout)
         .map_or(ptr::null_mut(), |allocation| allocation.as_ptr())
 }
