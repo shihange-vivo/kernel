@@ -12,6 +12,12 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+// Freestanding C++ PIE root linked to one private DSO and shared libc.so.1.
+// blueos_scrt1::_start enters through the shared runtime, which runs the
+// private DSO's constructor before main. The C ABI call to
+// clangCxxPrivateValue, template calculation and printed argv verify dynamic
+// symbol binding, initialized DSO state and argument delivery.
+
 extern "C" int printf(const char *format, ...);
 extern "C" int clangCxxPrivateValue(int input);
 
