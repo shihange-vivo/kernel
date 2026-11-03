@@ -12,9 +12,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use alloc::vec::Vec;
+use alloc::{rc::Rc, vec::Vec};
 use blueos_test_macro::test;
-use core::cell::Cell;
+use core::cell::{Cell, RefCell};
 use goblin::elf::{
     header::{
         EI_ABIVERSION, EI_CLASS, EI_DATA, EI_OSABI, EI_VERSION, ELFDATA2MSB, ELFOSABI_FREEBSD,
@@ -26,11 +26,11 @@ use goblin::elf::{
     },
 };
 
-use super::fixture::{ElfFixtureBuilder, ProgramHeaderFixture, SliceElfReader};
+use super::fixture::{ElfFixtureBuilder, ProgramHeaderFixture, RecordingMemory, SliceElfReader};
 use crate::{
     error::{ErrorContext, HeaderField, LimitKind, LoadErrorKind, LoadStage, ProgramHeaderField},
     image::ImageLoader,
-    memory::{address::TargetAddress, MemoryPermissions},
+    memory::{address::TargetAddress, AllocationRequest, MemoryPermissions, Placement},
     profile::{
         ElfClass, ElfData, ElfMachine, LoadLimits, LoadProfile, LoadRequest, ProgramHeaderPolicy,
     },
@@ -92,6 +92,20 @@ fn loader(bytes: &[u8], profile: LoadProfile) -> ImageLoader<SliceElfReader<'_>>
         SliceElfReader::new(bytes),
         LoadRequest::new(profile, LoadLimits::DEFAULT),
     )
+}
+
+fn record_planned_allocation(bytes: &[u8], profile: LoadProfile) -> AllocationRequest {
+    let planned = loader(bytes, profile)
+        .admit()
+        .expect("admit")
+        .inspect()
+        .expect("inspect")
+        .plan()
+        .expect("plan");
+    let sink = Rc::new(RefCell::new(None));
+    let memory = RecordingMemory::new(Rc::clone(&sink));
+    drop(planned.allocate(memory).expect("allocate"));
+    RecordingMemory::recorded(&sink).expect("recorded allocation request")
 }
 
 fn failure<T>(result: LoadResult<T>) -> LoadError {
@@ -584,6 +598,168 @@ fn inspection_enforces_the_actual_load_segment_count_before_further_reads() {
                 assert_eq!(reads.get(), usize::from(maximum).saturating_add(4));
             }
         }
+    }
+}
+
+#[test]
+fn planning_alignment_zero_and_one_match_unconstrained_layouts() {
+    for profile in PROFILES {
+        for elf_type in [ET_DYN, ET_EXEC] {
+            for align in [0, 1] {
+                let bytes = fixture(profile, elf_type)
+                    .with_entry(0x1000 | u64::from(profile.entry_mode().is_thumb()))
+                    .with_program_header(ProgramHeaderFixture {
+                        align,
+                        ..ProgramHeaderFixture::load()
+                    })
+                    .build();
+                let request = record_planned_allocation(&bytes, profile);
+                assert_eq!(request.align(), 1);
+                assert_eq!(request.size(), 0x100);
+                match request.placement() {
+                    Placement::Fixed(range) => {
+                        assert_eq!(elf_type, ET_EXEC);
+                        assert_eq!(range.start().get(), 0x1000);
+                        assert_eq!(range.len(), 0x100);
+                    }
+                    Placement::Anywhere => assert_eq!(elf_type, ET_DYN),
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn planning_combines_normalized_segment_alignments() {
+    for profile in PROFILES {
+        let bytes = fixture(profile, ET_DYN)
+            .with_entry(0x1000 | u64::from(profile.entry_mode().is_thumb()))
+            .with_program_header(ProgramHeaderFixture {
+                align: 0,
+                ..ProgramHeaderFixture::load()
+            })
+            .with_program_header(ProgramHeaderFixture {
+                vaddr: TargetAddress::new(0x3000),
+                align: 0x1000,
+                ..ProgramHeaderFixture::load()
+            })
+            .build();
+        let request = record_planned_allocation(&bytes, profile);
+        assert_eq!(request.align(), 0x1000);
+        assert_eq!(request.size(), 0x3000);
+    }
+}
+
+#[test]
+fn planning_empty_segments_do_not_change_allocation_geometry() {
+    for profile in PROFILES {
+        for elf_type in [ET_DYN, ET_EXEC] {
+            for (vaddr, align) in [(0, 0), (0x1080, 3), (0x8000_0000, 0x8000_0000)] {
+                let bytes = fixture(profile, elf_type)
+                    .with_entry(0x1000 | u64::from(profile.entry_mode().is_thumb()))
+                    .with_program_header(ProgramHeaderFixture {
+                        vaddr: TargetAddress::new(vaddr),
+                        filesz: 0,
+                        memsz: 0,
+                        align,
+                        ..ProgramHeaderFixture::load()
+                    })
+                    .with_program_header(ProgramHeaderFixture::load())
+                    .build();
+                let request = record_planned_allocation(&bytes, profile);
+                assert_eq!(request.align(), 4);
+                assert_eq!(request.size(), 0x100);
+                if let Placement::Fixed(range) = request.placement() {
+                    assert_eq!(range.start().get(), 0x1000);
+                    assert_eq!(range.len(), 0x100);
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn planning_rejects_invalid_alignment_on_nonempty_segments() {
+    for profile in PROFILES {
+        for (vaddr, align, expected) in [
+            (0x1000, 3, LoadErrorKind::InvalidAlignment),
+            (0x1000, 0x8000_0000, LoadErrorKind::ResourceLimit),
+            (0x1002, 4, LoadErrorKind::BadElf),
+        ] {
+            let bytes = fixture(profile, ET_DYN)
+                .with_entry(0x1000 | u64::from(profile.entry_mode().is_thumb()))
+                .with_program_header(ProgramHeaderFixture {
+                    vaddr: TargetAddress::new(vaddr),
+                    align,
+                    ..ProgramHeaderFixture::load()
+                })
+                .build();
+            let error = failure(
+                loader(&bytes, profile)
+                    .admit()
+                    .unwrap()
+                    .inspect()
+                    .unwrap()
+                    .plan(),
+            );
+            assert_error(&error, LoadStage::Plan, expected);
+        }
+    }
+}
+
+#[test]
+fn planning_rejects_empty_images_and_overlaps_hidden_by_empty_segments() {
+    for profile in PROFILES {
+        let empty = ProgramHeaderFixture {
+            vaddr: TargetAddress::new(0x1080),
+            filesz: 0,
+            memsz: 0,
+            align: 3,
+            ..ProgramHeaderFixture::load()
+        };
+        let bytes = fixture(profile, ET_DYN)
+            .with_entry(0x1000 | u64::from(profile.entry_mode().is_thumb()))
+            .with_program_header(empty)
+            .build();
+        let error = failure(
+            loader(&bytes, profile)
+                .admit()
+                .unwrap()
+                .inspect()
+                .unwrap()
+                .plan(),
+        );
+        assert_error(&error, LoadStage::Plan, LoadErrorKind::BadElf);
+
+        let bytes = fixture(profile, ET_DYN)
+            .with_entry(0x1000 | u64::from(profile.entry_mode().is_thumb()))
+            .with_program_header(ProgramHeaderFixture {
+                memsz: 0x200,
+                ..ProgramHeaderFixture::load()
+            })
+            .with_program_header(empty)
+            .with_program_header(ProgramHeaderFixture {
+                vaddr: TargetAddress::new(0x1100),
+                ..ProgramHeaderFixture::load()
+            })
+            .build();
+        let error = failure(
+            loader(&bytes, profile)
+                .admit()
+                .unwrap()
+                .inspect()
+                .unwrap()
+                .plan(),
+        );
+        assert_error(&error, LoadStage::Plan, LoadErrorKind::BadElf);
+        assert!(matches!(
+            error.context(),
+            ErrorContext::ProgramHeader {
+                index: 2,
+                field: ProgramHeaderField::VirtualRange,
+                ..
+            }
+        ));
     }
 }
 
