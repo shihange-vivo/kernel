@@ -247,7 +247,9 @@ fn runtime_global_prefix_precedes_local_closure_but_cannot_interpose_system() {
     let system = graph
         .insert_scope_provider(identity(b"system"), None, ImageOwnership::ExternalReady)
         .unwrap();
-    let scopes = ScopeSet::freeze_with_prefix(&graph, &[global, system]).unwrap();
+    let scopes =
+        ScopeSet::freeze_with_prefix(&graph, &[global, system], 0, &SessionLimits::DEFAULT)
+            .unwrap();
     let tables = [
         symbols(1, 0, true, 11),
         symbols(1, 0, true, 22),

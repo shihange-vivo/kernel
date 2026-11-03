@@ -18,7 +18,7 @@
 //! init-completion signal publishes Ready instances. Leases retain provider SCCs;
 //! Drop releases references and the reaper alone executes application destructors.
 
-use blueos_infra::no_let_underscore::IgnoreResult;
+use blueos_infra::{collections::HashSet, no_let_underscore::IgnoreResult};
 
 use alloc::{
     sync::{Arc, Weak},
@@ -524,14 +524,19 @@ impl SystemDsoRegistry {
     }
 
     /// Only Ready instances with no pins are candidates for deferred quiescence.
-    pub(crate) fn quiescent_keys(&self) -> Vec<SystemLibraryKey> {
+    pub(crate) fn quiescent_keys(&self) -> LoadResult<Vec<SystemLibraryKey>> {
         let guard = self.inner.lock();
-        guard
-            .slots
-            .iter()
-            .filter(|s| matches!(s.state, InstanceState::Ready { leases: 0, .. }))
-            .map(|s| s.key.clone())
-            .collect()
+        let mut keys = Vec::new();
+        keys.try_reserve_exact(guard.slots.len())
+            .map_err(|_| registry_oom())?;
+        keys.extend(
+            guard
+                .slots
+                .iter()
+                .filter(|s| matches!(s.state, InstanceState::Ready { leases: 0, .. }))
+                .map(|s| s.key.clone()),
+        );
+        Ok(keys)
     }
 
     /// Complete a published initialization batch: every slot moves
@@ -783,10 +788,13 @@ impl SystemDsoRegistry {
         };
 
         let mut members = Vec::new();
-        members.try_reserve(scc_members.len()).ok()?;
+        let mut seen = HashSet::default();
+        let capacity = scc_members.len().max(1);
+        members.try_reserve_exact(capacity).ok()?;
+        seen.try_reserve(capacity).ok()?;
         for member in scc_members {
             let member_index = inner.slots.iter().position(|slot| &slot.key == member)?;
-            if !members.contains(&member_index) {
+            if seen.insert(member_index) {
                 members.push(member_index);
             }
         }
@@ -1292,6 +1300,41 @@ mod publication_tests {
         assert!(weak.upgrade().is_none());
     }
 
+    fn check_duplicate_scc_members() {
+        let registry = SystemDsoRegistry::new();
+        let mut memory = FlatImageMemory::new();
+        let first = key(b"scc-first");
+        let second = key(b"scc-second");
+        let batch = acquire(&registry, &[first.clone(), second.clone()]);
+        let prepared = registry.prepare_publication(&batch.loads).unwrap();
+        let backings = batch
+            .loads
+            .iter()
+            .map(|(name, _)| {
+                let mut backing = candidate(&memory, name, Vec::new(), false);
+                backing.scc_members = alloc::vec![second.clone(), first.clone(), second.clone()];
+                backing
+            })
+            .collect();
+        let initializing = registry.commit_publication(prepared, batch.loads, backings);
+        drop(registry.finish_initialization_batch(initializing).unwrap());
+        let mut batch = unload(&registry, b"scc-first");
+        let backings = batch.take_backings();
+        assert_eq!(backings.len(), 2);
+        assert_eq!(backings[0].key, second);
+        assert_eq!(backings[1].key, first);
+        for backing in backings {
+            release_backing(&mut memory, backing);
+        }
+        registry.finish_unload(batch).unwrap();
+        for name in [first, second] {
+            assert!(matches!(
+                registry.snapshot(name).unwrap(),
+                SystemSnapshotOutcome::Vacant
+            ));
+        }
+    }
+
     #[test]
     fn registry_dependency_leases_preserve_external_lifetimes_without_an_arc_cycle() {
         // The fixture exercises the full loader; keep its parser frames off
@@ -1300,6 +1343,7 @@ mod publication_tests {
         let worker_done = done.clone();
         let worker = crate::thread::spawn_with_stack(64 * 1024, move || {
             check_dependency_lease_lifetimes();
+            check_duplicate_scc_members();
             worker_done.store(1, Ordering::Release);
             atomic_wake(&worker_done, usize::MAX).ignore_result();
         });

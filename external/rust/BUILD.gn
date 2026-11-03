@@ -770,3 +770,18 @@ cargo_spec("libc") {
   version = "=0.2.186"
   default_features = false
 }
+
+# Kernel identity sets use the same no_std implementations as the loader branch.
+cargo_spec("hashbrown") {
+  package = "hashbrown"
+  version = "=0.17.1"
+  default_features = false
+}
+
+# Keep FNV's root features independent from std users in other closures.
+cargo_spec("fnv_no_std") {
+  package = "fnv"
+  version = "=1.0.7"
+  default_features = false
+  isolation = "root"
+}

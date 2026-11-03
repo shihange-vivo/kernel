@@ -29,7 +29,7 @@ use blueos_loader::{
 };
 
 /// Kernel registry identity: a canonical catalog path, independent of ELF metadata.
-#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct SystemLibraryKey(Arc<Vec<u8>>);
 
 impl SystemLibraryKey {

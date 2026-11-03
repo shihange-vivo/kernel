@@ -28,6 +28,7 @@ use crate::image::{
 };
 
 use alloc::vec::Vec;
+use blueos_infra::collections::HashSet;
 
 use crate::{
     dynamic_linker::{graph::DependencyGraph, session::SessionUsage, ImageId, ImageOwnership},
@@ -156,14 +157,25 @@ impl ScopeSet {
     /// Freeze a closed dependency graph into immutable scopes.
     ///
     pub(crate) fn freeze(graph: &DependencyGraph) -> LoadResult<Self> {
-        Self::freeze_with_prefix(graph, &[])
+        Self::freeze_with_prefix(graph, &[], 0, &SessionLimits::DEFAULT)
     }
 
     pub(crate) fn freeze_with_prefix(
         graph: &DependencyGraph,
         prefix: &[ImageId],
+        metadata_bytes: u64,
+        limits: &SessionLimits,
     ) -> LoadResult<Self> {
         let nodes = graph.nodes();
+        if !prefix.is_empty() {
+            // Reject budgets smaller than the entries alone before reserving
+            // storage. Hash-table control bytes are checked after reservation.
+            let minimum = (nodes.len() as u64)
+                .checked_mul(core::mem::size_of::<ImageId>() as u64)
+                .and_then(|bytes| bytes.checked_add(metadata_bytes))
+                .ok_or_else(crate::error::overflow)?;
+            limits.check_total_runtime_metadata_bytes(minimum)?;
+        }
         let mut session_private = Vec::new();
         let mut system_candidates = Vec::new();
         session_private
@@ -193,16 +205,31 @@ impl ScopeSet {
 
         // Runtime relocation searches the existing global namespace before
         // the new local closure. System requesters still use only system scope.
-        let mut prefixed = Vec::new();
-        prefixed
-            .try_reserve_exact(application_order.len())
-            .map_err(|_| scope_oom())?;
-        prefixed.extend_from_slice(prefix);
-        prefixed.extend(
+        let prefixed = if prefix.is_empty() {
+            // The graph already gives each node one ID; no membership set is
+            // needed when there is no global prefix to merge.
             application_order
-                .into_iter()
-                .filter(|id| !prefix.contains(id)),
-        );
+        } else {
+            let mut prefixed = Vec::new();
+            let mut seen = HashSet::default();
+            prefixed
+                .try_reserve_exact(application_order.len())
+                .map_err(|_| scope_oom())?;
+            seen.try_reserve(nodes.len()).map_err(|_| scope_oom())?;
+            // This set exists only while freezing. Check its actual peak heap
+            // cost without permanently charging it to retained runtime metadata.
+            let peak = metadata_bytes
+                .checked_add(seen.allocation_size() as u64)
+                .ok_or_else(crate::error::overflow)?;
+            limits.check_total_runtime_metadata_bytes(peak)?;
+            for id in prefix.iter().copied().chain(application_order) {
+                graph.node(id).ok_or_else(crate::error::invalid)?;
+                if seen.insert(id) {
+                    prefixed.push(id);
+                }
+            }
+            prefixed
+        };
 
         let mut ownership = Vec::new();
         ownership
@@ -362,4 +389,75 @@ fn scope_error(kind: LoadErrorKind, context: ErrorContext) -> LoadError {
 
 fn scope_oom() -> LoadError {
     scope_error(LoadErrorKind::OutOfMemory, ErrorContext::None)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::dynamic_linker::ArtifactIdentity;
+    use blueos_test_macro::test;
+
+    fn node(graph: &mut DependencyGraph, name: &[u8], ownership: ImageOwnership) -> ImageId {
+        graph
+            .insert_scope_provider(ArtifactIdentity::from_bytes(name).unwrap(), None, ownership)
+            .unwrap()
+    }
+
+    #[test]
+    fn duplicate_global_prefix_keeps_first_occurrence_and_system_isolation() {
+        let mut graph = DependencyGraph::new(SessionLimits::DEFAULT);
+        let root = node(&mut graph, b"root", ImageOwnership::SessionPrivate);
+        let global = node(&mut graph, b"global", ImageOwnership::NamespaceReady);
+        let system = node(&mut graph, b"system", ImageOwnership::ExternalReady);
+        let scopes = ScopeSet::freeze_with_prefix(
+            &graph,
+            &[global, system, global, system],
+            0,
+            &SessionLimits::DEFAULT,
+        )
+        .unwrap();
+        assert_eq!(
+            scopes.scope_for(root).ordered_images(),
+            &[global, system, root]
+        );
+        assert_eq!(scopes.scope_for(system).ordered_images(), &[system]);
+    }
+
+    #[test]
+    fn global_prefix_rejects_unknown_image_ids() {
+        let mut graph = DependencyGraph::new(SessionLimits::DEFAULT);
+        node(&mut graph, b"root", ImageOwnership::SessionPrivate);
+        let error = ScopeSet::freeze_with_prefix(
+            &graph,
+            &[ImageId::new(u32::MAX)],
+            0,
+            &SessionLimits::DEFAULT,
+        )
+        .unwrap_err();
+        assert!(matches!(error.kind(), LoadErrorKind::Backend));
+    }
+
+    #[test]
+    fn global_prefix_membership_storage_obeys_the_metadata_budget() {
+        let mut graph = DependencyGraph::new(SessionLimits::DEFAULT);
+        let root = node(&mut graph, b"root", ImageOwnership::SessionPrivate);
+        let limits = SessionLimits::new(
+            crate::profile::LoadLimits::DEFAULT,
+            4,
+            4,
+            4,
+            u64::MAX,
+            0,
+            u64::MAX,
+            u64::MAX,
+            256,
+            256,
+        );
+        let error = ScopeSet::freeze_with_prefix(&graph, &[root], 0, &limits).unwrap_err();
+        assert!(matches!(error.kind(), LoadErrorKind::ResourceLimit));
+        let error =
+            ScopeSet::freeze_with_prefix(&graph, &[root], u64::MAX, &SessionLimits::DEFAULT)
+                .unwrap_err();
+        assert!(matches!(error.kind(), LoadErrorKind::IntegerOverflow));
+    }
 }
