@@ -292,7 +292,6 @@ impl ApplicationReaper {
                     }
                     Some(QuiescenceResolution::Unloaded(mut batch)) => {
                         let backings = batch.take_backings();
-                        let mut unloaded_names = Vec::new();
                         // Every SCC member and outgoing provider must stay
                         // mapped until all destructors in the component finish.
                         // A later member's fini can call an earlier member.
@@ -318,6 +317,12 @@ impl ApplicationReaper {
                                 );
                             }
                         }
+                        // Reuse the still-owned SCC keys instead of allocating
+                        // another list after the slots entered Unloading.
+                        // Outgoing leases only target other SCCs, so releasing
+                        // them below cannot requeue a removed member's key.
+                        quiescence
+                            .retain(|key| !backings.iter().any(|backing| &backing.key == key));
                         for backing in backings {
                             let crate::application::registry::SystemUnloadBacking {
                                 key,
@@ -344,14 +349,12 @@ impl ApplicationReaper {
                                 }
                                 drop(dependency);
                             }
-                            unloaded_names.push(key);
                         }
                         let finished = self.registry.finish_unload(batch);
                         debug_assert!(finished.is_ok());
                         if finished.is_err() {
                             log::error!("system DSO unload completion rejected");
                         }
-                        quiescence.retain(|key| !unloaded_names.contains(key));
                         made_progress = true;
                     }
                     None => request += 1,

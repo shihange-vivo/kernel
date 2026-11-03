@@ -234,6 +234,11 @@ impl<'a> ImageRepository for Host<'a> {
         if b.reject_acquire {
             return Err(failure());
         }
+        let mut reserved = Vec::new();
+        let extra = usize::from(b.malformed_reservation == 1);
+        reserved
+            .try_reserve_exact(candidates.len().saturating_add(extra))
+            .map_err(|_| crate::error::oom())?;
         b.memory.acquired.set(true);
         let arriving = core::mem::take(&mut b.ready_after_acquire);
         b.ready.extend(arriving);
@@ -243,7 +248,6 @@ impl<'a> ImageRepository for Host<'a> {
             .filter(|p| candidates.iter().any(|c| &c.key == p.image.key()))
             .cloned()
             .collect();
-        let mut reserved = Vec::new();
         for c in candidates {
             if !imported.iter().any(|p| p.image.key() == &c.key) {
                 reserved.push(ReservedImage {

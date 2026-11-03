@@ -995,6 +995,11 @@ mod application_syscalls {
 
         let mut argv = Vec::new();
         let mut envp = Vec::new();
+        if argv.try_reserve_exact(request.argc).is_err()
+            || envp.try_reserve_exact(request.envc).is_err()
+        {
+            return -(libc::ENOMEM as c_long);
+        }
         if copy_in_strings(request.argv, request.argc, &mut argv, &mut budget).is_err()
             || copy_in_strings(request.envp, request.envc, &mut envp, &mut budget).is_err()
         {

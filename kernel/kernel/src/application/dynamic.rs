@@ -693,6 +693,9 @@ pub(crate) fn prepare_load(
         .link_shared(namespace, path, group, imports, globals)
         .map_err(load_errno)?;
     let mut dependencies = Vec::new();
+    dependencies
+        .try_reserve_exact(existing.len())
+        .map_err(|_| libc::ENOMEM)?;
     for image in &existing {
         if image.batch != 0
             && product
@@ -711,6 +714,9 @@ pub(crate) fn prepare_load(
     let rollback_fini = super::start_storage::build_plan_targets(product.rollback_fini())
         .map_err(|_| libc::ENOEXEC)?;
     let mut objects = Vec::new();
+    objects
+        .try_reserve_exact(product.images().count())
+        .map_err(|_| libc::ENOMEM)?;
     for image in product.images() {
         if existing
             .iter()
