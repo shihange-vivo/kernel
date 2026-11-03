@@ -15,7 +15,8 @@
 //! Per-application runtime context.
 //!
 //! Every dynamic application gets one [`LibcApplicationContext`], built by the
-//! dynamic entry from the pinned [`BlueOsApplicationStartInfo`] and installed on
+//! dynamic entry from the pinned
+//! [`blueos_header::application::BlueOsApplicationStartInfo`] and installed on
 //! the main thread's TCB. It owns the state that must stay application-local
 //! rather than shared across two concurrently-running applications: the `auxv`
 //! table and the atexit list. The kernel's
@@ -24,13 +25,11 @@
 //! future larger `struct_size` (appended fields) can never dangle.
 
 use alloc::{boxed::Box, sync::Arc, vec::Vec};
-use core::slice;
-
 use spin::RwLock;
 
-use blueos_header::application::{
-    BlueOsApplicationStartInfo, BlueOsAuxvEntry, APPLICATION_START_INFO_ABI_VERSION,
-};
+use blueos_header::application::BlueOsAuxvEntry;
+#[cfg(any(dynamic_image, test))]
+use blueos_header::application::{BlueOsApplicationStartInfo, APPLICATION_START_INFO_ABI_VERSION};
 
 /// An application-owned destructor registered through `atexit`.
 pub type AtExitEntry = extern "C" fn();
@@ -42,23 +41,10 @@ pub struct LibcApplicationContext {
 }
 
 impl LibcApplicationContext {
-    /// Build the context from the pinned start-information block.
-    ///
-    /// Validates the versioned prefix: a block smaller than the v1 prefix
-    /// or with an unknown `abi_version` is rejected with `None`. On success the
-    /// auxv table is copied into an owned slice so the context holds its own
-    /// entries.
-    pub fn new(info: &BlueOsApplicationStartInfo) -> Option<Arc<Self>> {
-        if info.abi_version != APPLICATION_START_INFO_ABI_VERSION {
-            return None;
-        }
-        if info.struct_size < core::mem::size_of::<BlueOsApplicationStartInfo>() as u32 {
-            return None;
-        }
-
-        // SAFETY: `info.auxv`/`auxv_count` were validated when the kernel built
-        // `ApplicationStartStorage` and are pinned for the application lifetime
-        let entries = unsafe { slice::from_raw_parts(info.auxv, info.auxv_count) };
+    /// Copy an auxiliary vector into application-owned storage.
+    /// Returns `None` if reserving the copy fails. An empty slice is valid,
+    /// and the source need not outlive the returned context.
+    pub fn new(entries: &[BlueOsAuxvEntry]) -> Option<Arc<Self>> {
         let mut auxv = Vec::new();
         auxv.try_reserve_exact(entries.len()).ok()?;
         auxv.extend_from_slice(entries);
@@ -67,6 +53,47 @@ impl LibcApplicationContext {
             auxv: auxv.into_boxed_slice(),
             atexit: RwLock::new(Vec::new()),
         }))
+    }
+
+    /// Decode the startup ABI at the trusted dynamic-entry boundary.
+    /// Rejects unsupported prefixes and invalid pointer/range shapes; an
+    /// empty auxv never dereferences its pointer.
+    ///
+    /// # Safety
+    /// If the non-empty auxv passes the checks below, the caller must ensure
+    /// it denotes initialized, readable entries in one allocation, without
+    /// concurrent mutation, for this call. Pointer-shape checks cannot prove
+    /// that the memory is accessible or still alive.
+    // SAFETY: The startup caller supplies the readable auxv allocation. The
+    // checks below enforce the remaining slice preconditions before copying.
+    #[cfg(any(dynamic_image, test))]
+    pub(crate) unsafe fn from_start_info(info: &BlueOsApplicationStartInfo) -> Option<Arc<Self>> {
+        if info.abi_version != APPLICATION_START_INFO_ABI_VERSION {
+            return None;
+        }
+        if info.struct_size < core::mem::size_of::<BlueOsApplicationStartInfo>() as u32 {
+            return None;
+        }
+
+        if info.auxv_count == 0 {
+            return Self::new(&[]);
+        }
+        if info.auxv.is_null() || !info.auxv.is_aligned() {
+            return None;
+        }
+        let byte_len = info
+            .auxv_count
+            .checked_mul(core::mem::size_of::<BlueOsAuxvEntry>())?;
+        if byte_len > isize::MAX as usize {
+            return None;
+        }
+        (info.auxv as usize).checked_add(byte_len)?;
+
+        // SAFETY: The checks establish a non-null, aligned, non-wrapping
+        // range within the slice size limit. The caller guarantees readable,
+        // initialized entries in one live allocation throughout the copy.
+        let entries = unsafe { core::slice::from_raw_parts(info.auxv, info.auxv_count) };
+        Self::new(entries)
     }
 
     /// Look up an auxiliary-vector entry by key. Returns `0` when the
@@ -159,4 +186,122 @@ pub extern "C" fn getauxval(key: core::ffi::c_ulong) -> core::ffi::c_ulong {
 #[no_mangle]
 pub extern "C" fn atexit(function: AtExitEntry) -> core::ffi::c_int {
     LibcApplicationContext::atexit(function)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use blueos_header::application::{BlueOsFunctionPlan, FUNCTION_PLAN_ABI_VERSION};
+    use blueos_test_macro::test;
+    use core::{mem::size_of, ptr};
+
+    fn empty_start_info() -> BlueOsApplicationStartInfo {
+        let plan = BlueOsFunctionPlan {
+            abi_version: FUNCTION_PLAN_ABI_VERSION,
+            struct_size: size_of::<BlueOsFunctionPlan>() as u32,
+            entries: ptr::null(),
+            count: 0,
+        };
+        BlueOsApplicationStartInfo {
+            abi_version: APPLICATION_START_INFO_ABI_VERSION,
+            struct_size: size_of::<BlueOsApplicationStartInfo>() as u32,
+            argc: 0,
+            argv: ptr::null(),
+            envc: 0,
+            envp: ptr::null(),
+            auxv: ptr::null(),
+            auxv_count: 0,
+            init_plan: plan,
+            fini_plan: plan,
+        }
+    }
+
+    #[test]
+    fn context_accepts_an_empty_auxv_slice() {
+        let context = LibcApplicationContext::new(&[]).expect("empty context");
+        assert_eq!(context.getauxval(42), 0);
+    }
+
+    #[test]
+    fn context_owns_its_auxv_copy() {
+        let context = {
+            let entries = [BlueOsAuxvEntry { key: 42, value: 99 }];
+            LibcApplicationContext::new(&entries).expect("context")
+        };
+        assert_eq!(context.getauxval(42), 99);
+        assert_eq!(context.getauxval(43), 0);
+    }
+
+    #[test]
+    fn startup_accepts_empty_auxv_without_accessing_its_pointer() {
+        let mut info = empty_start_info();
+        let misaligned = ptr::dangling::<u8>().cast::<BlueOsAuxvEntry>();
+        for pointer in [ptr::null(), misaligned] {
+            info.auxv = pointer;
+            // SAFETY: A zero count needs no readable auxv allocation.
+            let context = unsafe { LibcApplicationContext::from_start_info(&info) }
+                .expect("empty startup auxv");
+            assert_eq!(context.getauxval(42), 0);
+        }
+    }
+
+    #[test]
+    fn startup_rejects_null_or_misaligned_nonempty_auxv() {
+        let mut info = empty_start_info();
+        info.auxv_count = 1;
+        let misaligned = ptr::dangling::<u8>().cast::<BlueOsAuxvEntry>();
+        for pointer in [ptr::null(), misaligned] {
+            info.auxv = pointer;
+            // SAFETY: These pointer shapes are rejected before dereferencing.
+            assert!(unsafe { LibcApplicationContext::from_start_info(&info) }.is_none());
+        }
+    }
+
+    #[test]
+    fn startup_rejects_invalid_auxv_extents() {
+        let mut info = empty_start_info();
+        let entries = [BlueOsAuxvEntry { key: 42, value: 99 }];
+        info.auxv = entries.as_ptr();
+        let over_slice_limit = (isize::MAX as usize / size_of::<BlueOsAuxvEntry>())
+            .checked_add(1)
+            .expect("count within usize");
+        for count in [usize::MAX, over_slice_limit] {
+            info.auxv_count = count;
+            // SAFETY: Invalid byte lengths are rejected before any auxv read.
+            assert!(unsafe { LibcApplicationContext::from_start_info(&info) }.is_none());
+        }
+        let alignment = core::mem::align_of::<BlueOsAuxvEntry>();
+        info.auxv = (usize::MAX & !alignment.saturating_sub(1)) as *const BlueOsAuxvEntry;
+        info.auxv_count = 1;
+        // SAFETY: The wrapping address range is rejected before any auxv read.
+        assert!(unsafe { LibcApplicationContext::from_start_info(&info) }.is_none());
+    }
+
+    #[test]
+    fn startup_validates_the_versioned_prefix() {
+        let mut info = empty_start_info();
+        info.abi_version = u32::MAX;
+        // SAFETY: No auxv storage is needed for this empty table.
+        assert!(unsafe { LibcApplicationContext::from_start_info(&info) }.is_none());
+        info.abi_version = APPLICATION_START_INFO_ABI_VERSION;
+        info.struct_size = 0;
+        // SAFETY: No auxv storage is needed for this empty table.
+        assert!(unsafe { LibcApplicationContext::from_start_info(&info) }.is_none());
+        info.struct_size = (size_of::<BlueOsApplicationStartInfo>() as u32).saturating_add(8);
+        // SAFETY: Only the initialized v1 prefix is read; the auxv is empty.
+        assert!(unsafe { LibcApplicationContext::from_start_info(&info) }.is_some());
+    }
+
+    #[test]
+    fn startup_copies_a_valid_auxv_before_its_source_is_dropped() {
+        let context = {
+            let entries = [BlueOsAuxvEntry { key: 42, value: 99 }];
+            let mut info = empty_start_info();
+            info.auxv = entries.as_ptr();
+            info.auxv_count = entries.len();
+            // SAFETY: `entries` is initialized and immutable for this call.
+            unsafe { LibcApplicationContext::from_start_info(&info) }.expect("startup context")
+        };
+        assert_eq!(context.getauxval(42), 99);
+    }
 }

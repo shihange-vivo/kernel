@@ -110,9 +110,17 @@ pub extern "C" fn __librs_start_main_static() {
 /// → `ApplicationBeginExit` → atexit/fini → `ApplicationFinishExit` — and never
 /// returns; the last step performs the retirement a trailing `ExitThread` would
 /// otherwise do.
+///
+/// # Safety
+/// A non-null, aligned `info` must point to an initialized start block. Its
+/// non-empty nested arrays and strings must remain readable and immutable,
+/// and its plan targets must remain valid C ABI callbacks, until application
+/// exit. The kernel pins this storage and the loaded images before `_start`.
+// SAFETY: The startup ABI caller must keep the block, nested buffers and
+// callback images alive through entry and exit; validation checks their shape.
 #[cfg(dynamic_image)]
 #[no_mangle]
-pub extern "C" fn __librs_start_main(
+pub unsafe extern "C" fn __librs_start_main(
     main: extern "C" fn(
         argc: c_int,
         argv: *const *const c_char,
@@ -121,7 +129,8 @@ pub extern "C" fn __librs_start_main(
     info: *const blueos_header::application::BlueOsApplicationStartInfo,
 ) -> ! {
     // validate the versioned prefix and every nested count/pointer.
-    let info = match validate_start_info(info) {
+    // SAFETY: The startup caller supplies the pinned, initialized start block.
+    let info = match unsafe { validate_start_info(info) } {
         Some(info) => info,
         None => park(),
     };
@@ -130,7 +139,9 @@ pub extern "C" fn __librs_start_main(
 
     // register the main TCB and install the application context before
     // any constructor runs (a ctor may call `getauxval`/`atexit`/`pthread_create`).
-    let context = match LibcApplicationContext::new(info) {
+    // SAFETY: The startup ABI caller keeps the auxv readable and immutable;
+    // `from_start_info` checks its shape and copies it into owned storage.
+    let context = match unsafe { LibcApplicationContext::from_start_info(info) } {
         Some(context) => context,
         None => park(),
     };
@@ -183,17 +194,23 @@ pub extern "C" fn __librs_start_main(
 /// Validate the start-info block and return a shared reference to it, or `None`
 /// when the version, prefix size, or a nested count/pointer pair is inconsistent.
 /// A `None` result is a fatal setup error: the entry parks.
+///
+/// # Safety
+/// A non-null, aligned `info` must point to an initialized block that remains
+/// readable and immutable for the returned reference's lifetime.
+// SAFETY: The caller guarantees the readable block; nested pointers are only
+// checked here, not dereferenced.
 #[cfg(dynamic_image)]
-fn validate_start_info(
+unsafe fn validate_start_info<'a>(
     info: *const blueos_header::application::BlueOsApplicationStartInfo,
-) -> Option<&'static blueos_header::application::BlueOsApplicationStartInfo> {
+) -> Option<&'a blueos_header::application::BlueOsApplicationStartInfo> {
     use blueos_header::application::APPLICATION_START_INFO_ABI_VERSION;
 
-    if info.is_null() {
+    if info.is_null() || !info.is_aligned() {
         return None;
     }
-    // SAFETY: `info` is the kernel-pinned start block handed to `_start`; the
-    // null check above and the count/pointer checks below bound every read.
+    // SAFETY: The caller guarantees initialized, readable storage for the
+    // returned lifetime; the pointer is non-null and aligned.
     let info = unsafe { &*info };
     if info.abi_version != APPLICATION_START_INFO_ABI_VERSION {
         return None;
