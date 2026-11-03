@@ -26,12 +26,12 @@ namespace {
 int private_state;
 
 class PrivateValue {
-public:
+ public:
   explicit constexpr PrivateValue(int base) : base_(base) {}
 
   constexpr int add(int value) const { return base_ + value; }
 
-private:
+ private:
   int base_;
 };
 

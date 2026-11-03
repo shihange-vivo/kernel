@@ -24,12 +24,12 @@ extern "C" int clangCxxPrivateValue(int input);
 namespace {
 
 template <typename T> class Accumulator {
-public:
+ public:
   explicit constexpr Accumulator(T initial) : value_(initial) {}
 
   constexpr T add(T value) const { return value_ + value; }
 
-private:
+ private:
   T value_;
 };
 
