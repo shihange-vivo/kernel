@@ -82,13 +82,13 @@ impl<P: ImagePin> NamespaceSnapshot<P> {
     }
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct ImageCandidate {
     pub key: ImageKey,
     pub artifact: ArtifactId,
     pub managed: bool,
 }
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct ReservedImage {
     pub key: ImageKey,
     pub instance: ImageInstanceId,

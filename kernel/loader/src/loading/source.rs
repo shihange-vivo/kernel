@@ -38,6 +38,15 @@ pub struct OpenedArtifact<R: ElfReader> {
     pub(crate) reader: R,
     pub(crate) artifact: ArtifactId,
 }
+
+impl<R: ElfReader> core::fmt::Debug for OpenedArtifact<R> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("OpenedArtifact")
+            .field("artifact", &self.artifact)
+            .finish_non_exhaustive()
+    }
+}
+
 impl<R: ElfReader> OpenedArtifact<R> {
     pub fn new(reader: R, artifact: ArtifactId) -> Self {
         Self { reader, artifact }

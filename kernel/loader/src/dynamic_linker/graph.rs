@@ -71,6 +71,7 @@ impl DependencyNode {
 
 /// A directed dependency edge: `requester` needs the `needed_index`-th
 /// `DT_NEEDED` of its dynamic table, satisfied by `provider`.
+#[derive(Debug)]
 pub struct DependencyEdge {
     requester: ImageId,
     provider: ImageId,

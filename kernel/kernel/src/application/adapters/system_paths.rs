@@ -76,6 +76,7 @@ impl SystemLibraryEntry {
 /// The mapping is static: it cannot be mutated at runtime, which keeps the
 /// resolver's catalog keyed on immutable byte names rather than a writable
 /// directory scan.
+#[derive(Debug)]
 pub struct SystemLibraryPaths {
     entries: &'static [SystemLibraryEntry],
 }

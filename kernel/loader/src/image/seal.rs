@@ -257,6 +257,8 @@ impl ProtectionRecord {
     }
 }
 
+#[derive(Debug)]
+#[must_use = "use the batch to report applied protection levels"]
 pub struct ProtectionBatch<'a> {
     records: &'a mut [ProtectionRecord],
 }

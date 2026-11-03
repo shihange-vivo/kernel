@@ -997,6 +997,16 @@ pub struct SystemDsoLease {
     key: SystemLibraryKey,
 }
 
+impl core::fmt::Debug for SystemDsoLease {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("SystemDsoLease")
+            .field("key", &self.key)
+            .field("slot", &self.slot)
+            .field("generation", &self.generation)
+            .finish_non_exhaustive()
+    }
+}
+
 impl SystemDsoLease {
     fn retain_registry(&mut self, inner: &Arc<Mutex<RegistryInner>>) {
         self.inner = LeaseRegistry::External(Arc::clone(inner));
