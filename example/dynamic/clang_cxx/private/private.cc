@@ -12,6 +12,13 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+// Private C++ DSO used by the clang_cxx dynamic-loading fixture.
+// Its constructor sets private_state to 37 before the application's main;
+// the exported C ABI accessor reads that state through PrivateValue.
+// Constructor/destructor logs let the integration test verify one-time
+// initialization and finalization while the DSO remains mapped. This DSO
+// shares libc.so.1 with the root and uses no separate C++ runtime library.
+
 extern "C" int printf(const char *format, ...);
 
 namespace {
