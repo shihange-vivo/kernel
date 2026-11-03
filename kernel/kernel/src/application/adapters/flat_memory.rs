@@ -163,6 +163,15 @@ impl Clone for FlatImageMemory {
 }
 
 impl FlatImageMemory {
+    /// Consume the unique lease and remove its exact descriptor. Removing
+    /// the table's Arc releases the bytes after any physical pins are gone.
+    fn remove_allocation(&mut self, allocation: AllocationLease) {
+        let mut service = self.service.lock();
+        if let Some(index) = service.entry_index(allocation.allocation()) {
+            service.entries.swap_remove(index);
+        }
+    }
+
     fn image_span(
         service: &FlatMemoryService,
         allocation: &ImageAllocation,
@@ -255,19 +264,11 @@ impl ImageMemory for FlatImageMemory {
     }
 
     fn abort_image(&mut self, allocation: AllocationLease, _progress: MutationProgress) {
-        // Exactly-once, infallible, no allocation: remove the entry keyed by
-        // the full descriptor; a second or stale lease finds nothing.
-        let mut service = self.service.lock();
-        if let Some(index) = service.entry_index(allocation.allocation()) {
-            service.entries.swap_remove(index);
-        }
+        self.remove_allocation(allocation);
     }
 
     fn release_committed(&mut self, allocation: AllocationLease) {
-        let mut service = self.service.lock();
-        if let Some(index) = service.entry_index(allocation.allocation()) {
-            service.entries.swap_remove(index);
-        }
+        self.remove_allocation(allocation);
     }
 
     fn validate_range(
@@ -550,23 +551,29 @@ mod pin_tests {
     use blueos_test_macro::test;
     #[test]
     fn physical_pin_keeps_bytes_alive_after_unique_lease_release() {
-        let mut memory = FlatImageMemory::new();
-        let lease = memory
-            .allocate_image(AllocationRequest::new(Placement::Anywhere, 32, 8))
-            .unwrap();
-        let allocation = *lease.allocation();
-        memory
-            .write(&allocation, AllocationOffset::new(0), b"pinned")
-            .unwrap();
-        let pin = memory.pin(&allocation).unwrap();
-        let retained = pin.clone();
-        memory.release_committed(lease);
-        assert!(memory.service.lock().entries.is_empty());
-        drop(pin);
-        assert_eq!(&retained.0.storage.as_slice()[..6], b"pinned");
-        assert!(memory
-            .validate_range(&allocation, AllocationOffset::new(0), 6)
-            .is_err());
-        drop(retained);
+        for abort in [false, true] {
+            let mut memory = FlatImageMemory::new();
+            let lease = memory
+                .allocate_image(AllocationRequest::new(Placement::Anywhere, 32, 8))
+                .unwrap();
+            let allocation = *lease.allocation();
+            memory
+                .write(&allocation, AllocationOffset::new(0), b"pinned")
+                .unwrap();
+            let pin = memory.pin(&allocation).unwrap();
+            let retained = pin.clone();
+            if abort {
+                memory.abort_image(lease, MutationProgress::BytesModified);
+            } else {
+                memory.release_committed(lease);
+            }
+            assert!(memory.service.lock().entries.is_empty());
+            drop(pin);
+            assert_eq!(&retained.0.storage.as_slice()[..6], b"pinned");
+            assert!(memory
+                .validate_range(&allocation, AllocationOffset::new(0), 6)
+                .is_err());
+            drop(retained);
+        }
     }
 }
