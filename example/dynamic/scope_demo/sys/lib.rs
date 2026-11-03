@@ -68,12 +68,20 @@ pub extern "C" fn sys_report() -> i32 {
     unsafe { core::ptr::read_volatile(&sys_target) }
 }
 
-/// Retained, but not called by the scope root: its `strlen` reference gives
-/// this system DSO a real outgoing dependency on `libc.so.1`, allowing the
-/// registry test to verify cross-SCC backing leases without adding a libc call
-/// to constructor/destructor execution.
+/// Its `strlen` reference gives this system DSO a real outgoing dependency on
+/// `libc.so.1`, allowing the registry test to verify cross-SCC backing leases
+/// without adding a libc call to constructor/destructor execution.
+/// Returns `usize::MAX` for a null pointer; the scope root tests that path.
+///
+/// # Safety
+/// A non-null `value` must point to a readable NUL-terminated C string that
+/// remains valid and unmodified for the duration of this call.
 #[no_mangle]
-pub extern "C" fn sys_libc_dependency_probe(value: *const core::ffi::c_char) -> usize {
+pub unsafe extern "C" fn sys_libc_dependency_probe(value: *const core::ffi::c_char) -> usize {
+    if value.is_null() {
+        return usize::MAX;
+    }
+    // SAFETY: the caller guarantees readable storage through the terminator.
     unsafe { strlen(value) }
 }
 

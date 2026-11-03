@@ -33,9 +33,12 @@
 #![feature(c_variadic)]
 
 use core::{
-    ffi::{c_char, c_int, c_ulonglong},
-    sync::atomic::{AtomicUsize, Ordering},
+    ffi::{c_char, c_int},
+    sync::atomic::Ordering,
 };
+
+mod test_gate;
+use test_gate::TestGate;
 
 extern "C" {
     fn printf(format: *const c_char, ...) -> c_int;
@@ -47,7 +50,7 @@ extern "C" {
     fn weakdata_read() -> usize;
     fn sys_report() -> i32;
     fn sys_ctor_count() -> u32;
-    fn strtoull(input: *const c_char, end: *mut *mut c_char, base: c_int) -> c_ulonglong;
+    fn sys_libc_dependency_probe(value: *const c_char) -> usize;
     fn usleep(usec: u32) -> c_int;
 }
 
@@ -65,31 +68,52 @@ fn panic(_info: &core::panic::PanicInfo) -> ! {
     loop {}
 }
 
+/// Run the scope fixture, optionally using the kernel test's shared gate.
+///
+/// # Safety
+/// Non-null `argv` must contain `argc` initialized C-string pointers, and each
+/// non-null string inspected here must remain readable through its NUL byte.
+/// Only the trusted kernel test may supply `--test-gate`: its address must
+/// name a live, initialized `AtomicUsize` in the shared flat address space for
+/// this whole call, with concurrent access performed through atomic operations.
 #[no_mangle]
-pub extern "C" fn main(
+pub unsafe extern "C" fn main(
     argc: c_int,
     argv: *const *const c_char,
     _envp: *const *const c_char,
 ) -> c_int {
-    // The concurrency test passes a shared atomic address in the flat kernel
-    // address space. Hold both DSO leases until both launchers have returned.
-    if argc == 3 && unsafe { core::ffi::CStr::from_ptr(*argv.add(1)).to_bytes() } == b"--test-gate"
-    {
-        let ready = unsafe { strtoull(*argv.add(2), core::ptr::null_mut(), 16) } as usize
-            as *const AtomicUsize;
-        let mut opened = false;
-        for _ in 0..30_000 {
-            if unsafe { (*ready).load(Ordering::Acquire) } == 2 {
-                opened = true;
-                break;
-            }
-            unsafe { usleep(1000) };
-        }
-        if !opened {
-            unsafe { printf(b"scope: concurrent gate timeout\n\0".as_ptr().cast()) };
+    // SAFETY: argv storage and C-string lifetimes follow the entry contract.
+    match unsafe { test_gate::from_argv(argc, argv) } {
+        TestGate::NotRequested => {}
+        TestGate::Invalid => {
+            unsafe { printf(b"scope: invalid test gate arguments\n\0".as_ptr().cast()) };
             return -1;
         }
+        TestGate::Address(ready) => {
+            let mut opened = false;
+            for _ in 0..30_000 {
+                // SAFETY: parsing checked null/alignment; the trusted kernel
+                // test guarantees the initialized atomic and its lifetime.
+                if unsafe { (*ready).load(Ordering::Acquire) } == 2 {
+                    opened = true;
+                    break;
+                }
+                unsafe { usleep(1000) };
+            }
+            if !opened {
+                unsafe { printf(b"scope: concurrent gate timeout\n\0".as_ptr().cast()) };
+                return -1;
+            }
+        }
     }
+
+    // The probe's null case is part of its C ABI contract and must not call
+    // strlen. Exercise it in the relocated system DSO on every scope launch.
+    if unsafe { sys_libc_dependency_probe(core::ptr::null()) } != usize::MAX {
+        unsafe { printf(b"scope: null probe failed\n\0".as_ptr().cast()) };
+        return -1;
+    }
+    unsafe { printf(b"scope: null probe rejected\n\0".as_ptr().cast()) };
 
     let value = unsafe { scope_value };
     let fn_value = unsafe { scope_fn() };

@@ -3,6 +3,9 @@
 // ASSERT-FAIL: Backtrace in Panic.*
 // ASSERT-FAIL: ASSERTION FAILED.*
 // ASSERT-FAIL: scope: concurrent gate timeout
+// ASSERT-FAIL: scope: invalid test gate
+// ASSERT-FAIL: scope: null probe failed
+// COUNT: scope: null probe rejected == 4
 // COUNT: DSO_LOAD path=/system/lib/libscope_sys\.so\.1 == 3
 // COUNT: DSO_LOAD path=/system/lib/libc\.so\.1 == 1
 // COUNT: DSO_REUSE path=/system/lib/libscope_sys\.so\.1 == 1
@@ -64,6 +67,106 @@ use blueos_test_macro::test;
 use core::sync::atomic::{AtomicUsize, Ordering};
 use librs::pthread;
 use semihosting::println;
+
+#[path = "../../../../example/dynamic/scope_demo/app/test_gate.rs"]
+mod test_gate;
+
+mod gate_argument_tests {
+    use super::test_gate::{from_argv, TestGate};
+    use alloc::{ffi::CString, format};
+    use blueos_test_macro::test;
+    use core::sync::atomic::AtomicUsize;
+
+    fn decode_address(value: &[u8]) -> TestGate {
+        let value = CString::new(value).unwrap();
+        let argv = [
+            b"scope\0".as_ptr().cast(),
+            b"--test-gate\0".as_ptr().cast(),
+            value.as_ptr(),
+        ];
+        // SAFETY: the array and every terminated string outlive this call.
+        unsafe { from_argv(3, argv.as_ptr()) }
+    }
+
+    #[test]
+    fn accepts_the_live_kernel_gate_address_format() {
+        let gate = AtomicUsize::new(0);
+        let pointer = core::ptr::addr_of!(gate);
+        let text = format!("{:x}", pointer as usize);
+        assert_eq!(decode_address(text.as_bytes()), TestGate::Address(pointer));
+    }
+
+    #[test]
+    fn rejects_empty_null_and_malformed_addresses() {
+        for text in [
+            &b""[..],
+            b"0",
+            b"0000",
+            b"-10",
+            b"+10",
+            b" 10",
+            b"10 ",
+            b"0x10",
+            b"10junk",
+            b"zz",
+        ] {
+            assert_eq!(decode_address(text), TestGate::Invalid);
+        }
+    }
+
+    #[test]
+    fn rejects_addresses_larger_than_usize() {
+        let text = format!("{:x}0", usize::MAX);
+        assert_eq!(decode_address(text.as_bytes()), TestGate::Invalid);
+    }
+
+    #[test]
+    fn rejects_misaligned_addresses() {
+        let gate = AtomicUsize::new(0);
+        let address = (core::ptr::addr_of!(gate) as usize).checked_add(1).unwrap();
+        let text = format!("{address:x}");
+        assert_eq!(decode_address(text.as_bytes()), TestGate::Invalid);
+    }
+
+    #[test]
+    fn checks_argc_and_null_argv_before_access() {
+        assert_eq!(
+            unsafe { from_argv(0, core::ptr::null()) },
+            TestGate::NotRequested
+        );
+        for argc in [-1, 1, 3] {
+            assert_eq!(
+                unsafe { from_argv(argc, core::ptr::null()) },
+                TestGate::Invalid
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_null_gate_argument_pointers() {
+        let program = b"scope\0".as_ptr().cast();
+        let flag = b"--test-gate\0".as_ptr().cast();
+        for argv in [
+            [program, core::ptr::null(), core::ptr::null()],
+            [program, flag, core::ptr::null()],
+        ] {
+            assert_eq!(unsafe { from_argv(3, argv.as_ptr()) }, TestGate::Invalid);
+        }
+    }
+
+    #[test]
+    fn ignores_other_arguments_without_decoding_an_address() {
+        let argv = [
+            b"scope\0".as_ptr().cast(),
+            b"other\0".as_ptr().cast(),
+            b"ignored\0".as_ptr().cast(),
+        ];
+        assert_eq!(
+            unsafe { from_argv(3, argv.as_ptr()) },
+            TestGate::NotRequested
+        );
+    }
+}
 
 /// Launch an application and wait (bounded) for the deferred reaper to recycle its
 /// slot. Returns the handle whose generation the relaunch assertion compares.
@@ -135,6 +238,9 @@ extern "C" fn concurrent_launcher(flag: *mut core::ffi::c_void) {
     // Keep both application leases alive until both spawns return. Without
     // this rendezvous a fast guest can reap the first app before the second
     // worker is scheduled, so the intended concurrent case becomes serial.
+    // CONCURRENT_READY is an initialized, aligned static in the shared flat
+    // address space. It remains live throughout both application calls; every
+    // access to it is atomic. This test is the trusted gate-address producer.
     argv.push(b"--test-gate".to_vec());
     argv.push(alloc::format!("{:x}", core::ptr::addr_of!(CONCURRENT_READY) as usize).into_bytes());
     let handle = service
