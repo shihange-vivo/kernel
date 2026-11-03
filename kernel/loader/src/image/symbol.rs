@@ -17,9 +17,9 @@
 //! A [`SymbolTable`] owns a copy of the validated `.dynstr` bytes and the
 //! decoded symbol entries. The symbol count is always *proven* from a SysV
 //! `DT_HASH` or GNU `DT_GNU_HASH` table — never inferred from section headers
-//! or from the tail of a segment. Lookup goes through the hash table's
-//! fast path; the bounded linear scan (`lookup_linear`) exists only as the
-//! diagnostic the tests compare against.
+//! or from the tail of a segment. Lookup checks the ELF hash result against
+//! an owned, sorted name index in logarithmic time. A bounded linear scan is
+//! kept only as a test oracle.
 
 use alloc::{boxed::Box, vec::Vec};
 
@@ -429,6 +429,7 @@ impl GnuHash {
 pub(crate) struct SymbolTable {
     dynstr: Vec<u8>,
     entries: Vec<SymbolEntry>,
+    name_index: Vec<u32>,
     gnu: Option<GnuHash>,
     sysv: Option<SysVHash>,
 }
@@ -439,6 +440,7 @@ impl SymbolTable {
         Self {
             dynstr: Vec::new(),
             entries: Vec::new(),
+            name_index: Vec::new(),
             gnu: None,
             sysv: None,
         }
@@ -524,12 +526,32 @@ impl SymbolTable {
             entries.push(entry);
         }
 
-        Ok(Self {
+        let mut table = Self {
             dynstr,
             entries,
+            name_index: Vec::new(),
             gnu,
             sysv,
-        })
+        };
+        table.name_index = table.build_name_index()?;
+        Ok(table)
+    }
+
+    /// Build from decoded names, independently of the untrusted hash tables.
+    /// Keep the lowest symbol index for duplicate names, matching a linear
+    /// scan even when a hash chain omits or reorders the first occurrence.
+    fn build_name_index(&self) -> LoadResult<Vec<u32>> {
+        let mut indices = Vec::new();
+        indices
+            .try_reserve_exact(self.entries.len())
+            .map_err(|_| hash_oom())?;
+        indices.extend(0..self.symbol_count());
+        let name = |index: u32| self.name(&self.entries[index as usize]);
+        indices.sort_unstable_by(|left, right| {
+            name(*left).cmp(name(*right)).then_with(|| left.cmp(right))
+        });
+        indices.dedup_by(|left, right| name(*left) == name(*right));
+        Ok(indices)
     }
 
     #[inline]
@@ -538,12 +560,15 @@ impl SymbolTable {
     }
 
     /// Total owned metadata bytes kept by this table: the `.dynstr` copy, the
-    /// decoded symbol entries, and the retained hash tables. Charged against
-    /// `max_runtime_metadata_bytes`. Overflow saturates at `u64::MAX`.
+    /// decoded symbol entries, sorted name index and retained hash tables.
+    /// Charged against `max_runtime_metadata_bytes`. Overflow saturates at
+    /// `u64::MAX`.
     pub(crate) fn metadata_bytes(&self) -> u64 {
         let dynstr = self.dynstr.len() as u64;
         let entries =
             (self.entries.len() as u64).saturating_mul(core::mem::size_of::<SymbolEntry>() as u64);
+        let name_index =
+            (self.name_index.capacity() as u64).saturating_mul(core::mem::size_of::<u32>() as u64);
         let sysv = self.sysv.as_ref().map_or(0, |table| {
             (table.buckets.len() as u64)
                 .saturating_add(table.chains.len() as u64)
@@ -560,6 +585,7 @@ impl SymbolTable {
         });
         dynstr
             .checked_add(entries)
+            .and_then(|v| v.checked_add(name_index))
             .and_then(|v| v.checked_add(sysv))
             .and_then(|v| v.checked_add(gnu))
             .unwrap_or(u64::MAX)
@@ -584,7 +610,7 @@ impl SymbolTable {
         &self.dynstr[start..end]
     }
 
-    /// Lookup by name through the hash table fast path.
+    /// Check the hash result against the first matching decoded symbol.
     pub(crate) fn lookup(&self, name: &[u8]) -> Option<u32> {
         let hashed = match (&self.gnu, &self.sysv) {
             (Some(gnu), Some(sysv)) => {
@@ -598,16 +624,28 @@ impl SymbolTable {
             }
             (Some(gnu), None) => gnu.lookup(name, gnu_hash(name), &self.dynstr, &self.entries),
             (None, Some(sysv)) => sysv.lookup(name, sysv_hash(name), &self.dynstr, &self.entries),
-            (None, None) => self.lookup_linear(name),
-        };
-        if self.gnu.is_none() && self.sysv.is_none() || hashed == self.lookup_linear(name) {
-            hashed
+            (None, None) => return self.lookup_indexed(name),
+        }?;
+        if self.lookup_indexed(name) == Some(hashed) {
+            Some(hashed)
         } else {
             None
         }
     }
 
-    /// Bounded linear scan — the diagnostic the hash lookup must agree with.
+    fn lookup_indexed(&self, name: &[u8]) -> Option<u32> {
+        self.name_index
+            .binary_search_by(|&index| {
+                #[cfg(test)]
+                tests::NAME_COMPARISONS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+                self.name(&self.entries[index as usize]).cmp(name)
+            })
+            .ok()
+            .map(|position| self.name_index[position])
+    }
+
+    /// Test oracle for the independently built name index.
+    #[cfg(test)]
     fn lookup_linear(&self, name: &[u8]) -> Option<u32> {
         self.entries
             .iter()
@@ -652,6 +690,8 @@ pub(crate) fn symbol_count_from_hash(
 
 #[inline]
 fn name_matches(dynstr: &[u8], entry: &SymbolEntry, name: &[u8]) -> bool {
+    #[cfg(test)]
+    tests::NAME_COMPARISONS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
     let start = entry.name_offset() as usize;
     let end = start + entry.name_len() as usize;
     end <= dynstr.len() && &dynstr[start..end] == name
@@ -860,6 +900,9 @@ fn hash_oom() -> LoadError {
 mod tests {
     use super::*;
     use blueos_test_macro::test;
+    use core::sync::atomic::{AtomicUsize, Ordering};
+
+    pub(super) static NAME_COMPARISONS: AtomicUsize = AtomicUsize::new(0);
 
     fn append_u32(bytes: &mut Vec<u8>, value: u32, endian: ElfData) {
         bytes.extend_from_slice(&match endian {
@@ -1102,6 +1145,186 @@ mod tests {
                     .expect_err("mismatched counts");
                 assert_eq!(error.kind(), LoadErrorKind::BadElf);
             }
+        }
+    }
+
+    fn decoded_symbols(
+        dynstr: &[u8],
+        offsets: &[u32],
+        gnu: Option<Vec<u8>>,
+        sysv: Option<Vec<u8>>,
+    ) -> SymbolTable {
+        let mut symtab = alloc::vec![0; offsets.len().checked_mul(24).unwrap()];
+        for (raw, &offset) in symtab.chunks_exact_mut(24).zip(offsets) {
+            raw[..4].copy_from_slice(&offset.to_le_bytes());
+            // Undefined global symbols need no mapped target allocation.
+            raw[4] = if offset == 0 { 0 } else { 0x10 };
+        }
+        SymbolTable::decode(
+            &symtab,
+            dynstr.to_vec(),
+            ElfClass::Elf64,
+            ElfData::Little,
+            TargetAddress::new(0),
+            &[],
+            false,
+            256,
+            gnu,
+            sysv,
+        )
+        .expect("decode symbol lookup fixture")
+    }
+
+    #[test]
+    fn name_index_preserves_first_duplicate_and_raw_byte_order() {
+        let dynstr = b"\0zeta\0\xff\xfe\0alpha\0zeta\0";
+        let offsets = [0, 1, 6, 9, 15];
+        let gnu = gnu_bytes(
+            &[1],
+            &[
+                gnu_hash(b"zeta") & !1,
+                gnu_hash(b"\xff\xfe") & !1,
+                gnu_hash(b"alpha") & !1,
+                gnu_hash(b"zeta") | 1,
+            ],
+            1,
+            ElfClass::Elf64,
+            ElfData::Little,
+        );
+        let sysv = sysv_bytes(&[1], &[0, 2, 3, 4, 0], ElfData::Little);
+        for (gnu, sysv) in [
+            (Some(gnu.clone()), None),
+            (None, Some(sysv.clone())),
+            (Some(gnu), Some(sysv)),
+        ] {
+            let table = decoded_symbols(dynstr, &offsets, gnu, sysv);
+            assert_eq!(table.name_index, [0, 3, 1, 2]);
+            for name in [&b""[..], b"zeta", b"\xff\xfe", b"alpha", b"absent"] {
+                assert_eq!(table.lookup_indexed(name), table.lookup_linear(name));
+            }
+            assert_eq!(table.lookup(b"zeta"), Some(1));
+            assert_eq!(table.lookup(b"\xff\xfe"), Some(2));
+            assert_eq!(table.lookup(b"alpha"), Some(3));
+            assert_eq!(table.lookup(b""), None);
+            assert_eq!(table.lookup(b"absent"), None);
+        }
+        let empty = SymbolTable::empty();
+        assert_eq!(empty.lookup(b""), None);
+        assert_eq!(empty.lookup(b"absent"), None);
+    }
+
+    #[test]
+    fn name_index_keeps_malformed_hash_lookups_fail_closed() {
+        let dynstr = b"\0dup\0other\0";
+        let offsets = [0, 1, 5, 1];
+        let chains = [
+            gnu_hash(b"dup") & !1,
+            gnu_hash(b"other") & !1,
+            gnu_hash(b"dup") | 1,
+        ];
+        let valid_gnu = gnu_bytes(&[1], &chains, 1, ElfClass::Elf64, ElfData::Little);
+        let valid_sysv = sysv_bytes(&[1], &[0, 2, 3, 0], ElfData::Little);
+        // Structurally bounded tables can still omit/reorder a duplicate,
+        // falsify a hash word/Bloom bit, or disagree with the other hash table.
+        let reordered_sysv = sysv_bytes(&[3], &[0, 0, 1, 2], ElfData::Little);
+        let omitted_gnu = gnu_bytes(&[3], &chains, 1, ElfClass::Elf64, ElfData::Little);
+        let mut false_bloom = valid_gnu.clone();
+        false_bloom[16..24].fill(0);
+        let mut false_hash = chains;
+        false_hash[0] = gnu_hash(b"unrelated") & !1;
+        let false_hash = gnu_bytes(&[1], &false_hash, 1, ElfClass::Elf64, ElfData::Little);
+        for (gnu, sysv) in [
+            (None, Some(reordered_sysv)),
+            (Some(omitted_gnu.clone()), None),
+            (Some(false_bloom), None),
+            (Some(false_hash), None),
+            (Some(omitted_gnu), Some(valid_sysv)),
+            (
+                Some(valid_gnu),
+                Some(sysv_bytes(&[2], &[0, 0, 0, 0], ElfData::Little)),
+            ),
+        ] {
+            let table = decoded_symbols(dynstr, &offsets, gnu, sysv);
+            assert_eq!(table.lookup_indexed(b"dup"), Some(1));
+            assert_eq!(table.lookup(b"dup"), None);
+            for name in [&b"dup"[..], b"other", b"missing", b""] {
+                // Retain exactly the original hash-vs-linear policy.
+                let hashed = match (&table.gnu, &table.sysv) {
+                    (Some(gnu), Some(sysv)) => {
+                        let gnu = gnu.lookup(name, gnu_hash(name), dynstr, &table.entries);
+                        let sysv = sysv.lookup(name, sysv_hash(name), dynstr, &table.entries);
+                        if gnu == sysv {
+                            gnu
+                        } else {
+                            None
+                        }
+                    }
+                    (Some(gnu), None) => gnu.lookup(name, gnu_hash(name), dynstr, &table.entries),
+                    (None, Some(sysv)) => {
+                        sysv.lookup(name, sysv_hash(name), dynstr, &table.entries)
+                    }
+                    (None, None) => panic!("fixture requires a hash table"),
+                };
+                let expected = if hashed == table.lookup_linear(name) {
+                    hashed
+                } else {
+                    None
+                };
+                assert_eq!(table.lookup(name), expected);
+            }
+        }
+    }
+
+    #[test]
+    fn name_index_charges_capacity_after_deduplication() {
+        let mut table = decoded_symbols(
+            b"\0dup\0other\0",
+            &[0, 1, 5, 1],
+            None,
+            Some(sysv_bytes(&[1], &[0, 2, 3, 0], ElfData::Little)),
+        );
+        assert!(table.name_index.len() < table.name_index.capacity());
+        let index_bytes = (table.name_index.capacity() as u64)
+            .checked_mul(core::mem::size_of::<u32>() as u64)
+            .unwrap();
+        let total = table.metadata_bytes();
+        table.name_index.clear();
+        assert_eq!(table.metadata_bytes(), total);
+        table.name_index = Vec::new();
+        assert_eq!(total.checked_sub(table.metadata_bytes()), Some(index_bytes));
+    }
+
+    #[test]
+    fn hash_lookup_avoids_full_scans_for_hits_and_misses() {
+        let mut dynstr = alloc::vec![0];
+        let mut offsets = alloc::vec![0];
+        let mut chains = alloc::vec![0];
+        for index in 1..=1024u32 {
+            let suffix = if index == 1024 { '1' } else { '0' };
+            let name = alloc::format!("symbol{index}{suffix}");
+            assert_eq!(sysv_hash(name.as_bytes()) % 2, u32::from(index == 1024));
+            offsets.push(u32::try_from(dynstr.len()).unwrap());
+            dynstr.extend_from_slice(name.as_bytes());
+            dynstr.push(0);
+            chains.push(if index >= 1023 {
+                0
+            } else {
+                index.saturating_add(1)
+            });
+        }
+        let table = decoded_symbols(
+            &dynstr,
+            &offsets,
+            None,
+            Some(sysv_bytes(&[1, 1024], &chains, ElfData::Little)),
+        );
+        let missing = b"absent1";
+        assert_eq!(sysv_hash(missing) % 2, 1);
+        for (name, expected) in [(&missing[..], None), (&b"symbol10241"[..], Some(1024))] {
+            NAME_COMPARISONS.store(0, Ordering::Relaxed);
+            assert_eq!(table.lookup(name), expected);
+            let comparisons = NAME_COMPARISONS.load(Ordering::Relaxed);
+            assert!(comparisons > 0 && comparisons <= usize::BITS as usize);
         }
     }
 }
