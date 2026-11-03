@@ -38,10 +38,10 @@ extern double clangCPrivateDouble(double first, double second);
 
 // A file-scope object in the root's own data segment, so the image has a
 // writable BSS word that only relocation + startup can have initialized.
-static int root_generation;
+static int kRootGeneration;
 
 __attribute__((constructor)) static void cRootConstructor(void) {
-  root_generation = 1;
+  kRootGeneration = 1;
 }
 
 // Fill a heap block, read it back through a second view of it, and release it.
@@ -87,7 +87,7 @@ int main(int argc, char *argv[], char *envp[]) {
   const int result = clangCPrivateValue(5) + 7;
 
   const char *argument = argc > 1 ? argv[1] : "-";
-  printf("clang-c: base=%d generation=%d\n", base, root_generation);
+  printf("clang-c: base=%d generation=%d\n", base, kRootGeneration);
   printf("clang-c: result=%d argc=%d argv1=%s argv1len=%u\n", result, argc,
          argument, (unsigned)strlen(argument));
   printf("clang-c: heap ok=%d\n", heapRoundTrip());

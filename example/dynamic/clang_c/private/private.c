@@ -17,26 +17,26 @@
 // deliberately plain C: no runtime library, only the `libc.so.1` symbols the
 // root also imports.
 //
-// `private_state` is written by the constructor and read afterwards by both
+// `kPrivateState` is written by the constructor and read afterwards by both
 // exported functions, so the root's reads exercise `R_ARM_GLOB_DAT`/`ABS32`
 // against a DSO-owned data object rather than only against functions.
 
 extern int printf(const char *format, ...);
 
-static int private_state;
+static int kPrivateState;
 
 __attribute__((constructor)) static void clangCPrivateConstructor(void) {
-  private_state = 37;
-  printf("clang-c: private ctor state=%d\n", private_state);
+  kPrivateState = 37;
+  printf("clang-c: private ctor state=%d\n", kPrivateState);
 }
 
 __attribute__((destructor)) static void clangCPrivateDestructor(void) {
-  printf("clang-c: private fini state=%d\n", private_state);
+  printf("clang-c: private fini state=%d\n", kPrivateState);
 }
 
-int clangCPrivateBase(void) { return private_state; }
+int clangCPrivateBase(void) { return kPrivateState; }
 
-int clangCPrivateValue(int input) { return private_state + input; }
+int clangCPrivateValue(int input) { return kPrivateState + input; }
 
 float clangCPrivateFloat(float first, float second) {
   (void)first;
