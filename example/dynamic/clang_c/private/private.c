@@ -25,25 +25,25 @@ extern int printf(const char *format, ...);
 
 static int private_state;
 
-__attribute__((constructor)) static void clang_c_private_constructor(void) {
+__attribute__((constructor)) static void clangCPrivateConstructor(void) {
   private_state = 37;
   printf("clang-c: private ctor state=%d\n", private_state);
 }
 
-__attribute__((destructor)) static void clang_c_private_destructor(void) {
+__attribute__((destructor)) static void clangCPrivateDestructor(void) {
   printf("clang-c: private fini state=%d\n", private_state);
 }
 
-int clang_c_private_base(void) { return private_state; }
+int clangCPrivateBase(void) { return private_state; }
 
-int clang_c_private_value(int input) { return private_state + input; }
+int clangCPrivateValue(int input) { return private_state + input; }
 
-float clang_c_private_float(float first, float second) {
+float clangCPrivateFloat(float first, float second) {
   (void)first;
   return second;
 }
 
-double clang_c_private_double(double first, double second) {
+double clangCPrivateDouble(double first, double second) {
   (void)first;
   return second;
 }
