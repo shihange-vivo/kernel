@@ -72,7 +72,7 @@ fn try_copy_bytes(bytes: &[u8]) -> LoadResult<Vec<u8>> {
 }
 
 /// Stable identifier of a loaded image within one session.
-#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct ImageId(u32);
 
 impl ImageId {

@@ -216,7 +216,12 @@ impl<'a, M: ImageMemory + ?Sized, A: ArchRelocator> LoadedSession<'a, M, A> {
         let scopes = if scope_prefix.is_empty() {
             ScopeSet::freeze(&graph)
         } else {
-            ScopeSet::freeze_with_prefix(&graph, &scope_prefix)
+            ScopeSet::freeze_with_prefix(
+                &graph,
+                &scope_prefix,
+                usage.runtime_metadata_bytes,
+                &limits,
+            )
         }
         .map_err(|error| error.at_stage(LoadStage::Scope))?;
 

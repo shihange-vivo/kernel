@@ -39,6 +39,8 @@ group("check_infra_by_clippy") {
 }
 
 shared_deps = [
+  "//external/rust:fnv_no_std",
+  "//external/rust:hashbrown",
   "//external/rust:memchr",
   "//external/rust:spin",
 ]

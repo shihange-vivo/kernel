@@ -27,12 +27,12 @@
 //! `Unloading` through fini and backing release. Dropping one group's outgoing
 //! leases can make another group quiescent, hence the bounded retry loop.
 
-use blueos_infra::no_let_underscore::IgnoreResult;
+use blueos_infra::{collections::HashSet, no_let_underscore::IgnoreResult};
 
 use alloc::{boxed::Box, sync::Arc, vec::Vec};
 
 use super::adapters::system_paths::SystemLibraryKey;
-use blueos_loader::memory::ImageMemory;
+use blueos_loader::{memory::ImageMemory, LoadResult};
 
 use crate::{
     application::{
@@ -277,8 +277,20 @@ impl ApplicationReaper {
     }
 
     fn resolve_quiescence(&self) {
+        if let Err(error) = self.try_resolve_quiescence() {
+            // scan retries from registry state on the next bounded poll.
+            log::error!("system DSO quiescence deferred: {:?}", error);
+        }
+    }
+
+    fn try_resolve_quiescence(&self) -> LoadResult<()> {
         let mut memory = self.memory.clone();
-        let mut quiescence = self.registry.quiescent_keys();
+        let mut quiescence = self.registry.quiescent_keys()?;
+        let mut queued = HashSet::default();
+        queued
+            .try_reserve(quiescence.len())
+            .map_err(|_| super::loader::loader_oom())?;
+        queued.extend(quiescence.iter().cloned());
 
         loop {
             let mut made_progress = false;
@@ -287,11 +299,29 @@ impl ApplicationReaper {
                 let resolution = self.registry.resolve_quiescence(&quiescence[request]);
                 match resolution {
                     Some(QuiescenceResolution::KeptCached) => {
-                        quiescence.swap_remove(request);
+                        let key = quiescence.swap_remove(request);
+                        queued.remove(&key);
                         made_progress = true;
                     }
                     Some(QuiescenceResolution::Unloaded(mut batch)) => {
                         let backings = batch.take_backings();
+                        // The registry already transferred release authority.
+                        // Even if queue growth fails, finish this batch before
+                        // returning; the next scan rediscovers its providers.
+                        let queue_capacity = backings
+                            .iter()
+                            .try_fold(0usize, |count, backing| {
+                                count.checked_add(backing.dependencies.len())
+                            })
+                            .ok_or_else(super::loader::loader_oom)
+                            .and_then(|additional| {
+                                quiescence
+                                    .try_reserve(additional)
+                                    .map_err(|_| super::loader::loader_oom())?;
+                                queued
+                                    .try_reserve(additional)
+                                    .map_err(|_| super::loader::loader_oom())
+                            });
                         // Every SCC member and outgoing provider must stay
                         // mapped until all destructors in the component finish.
                         // A later member's fini can call an earlier member.
@@ -321,8 +351,13 @@ impl ApplicationReaper {
                         // another list after the slots entered Unloading.
                         // Outgoing leases only target other SCCs, so releasing
                         // them below cannot requeue a removed member's key.
-                        quiescence
-                            .retain(|key| !backings.iter().any(|backing| &backing.key == key));
+                        quiescence.retain(|key| {
+                            let retain = !backings.iter().any(|backing| &backing.key == key);
+                            if !retain {
+                                queued.remove(key);
+                            }
+                            retain
+                        });
                         for backing in backings {
                             let crate::application::registry::SystemUnloadBacking {
                                 key,
@@ -344,17 +379,15 @@ impl ApplicationReaper {
                             // application's declared closure. Queue them when
                             // releasing retention leases so they are reaped too.
                             for dependency in dependencies {
-                                if !quiescence.contains(dependency.key()) {
+                                if queue_capacity.is_ok() && queued.insert(dependency.key().clone())
+                                {
                                     quiescence.push(dependency.key().clone());
                                 }
                                 drop(dependency);
                             }
                         }
-                        let finished = self.registry.finish_unload(batch);
-                        debug_assert!(finished.is_ok());
-                        if finished.is_err() {
-                            log::error!("system DSO unload completion rejected");
-                        }
+                        self.registry.finish_unload(batch)?;
+                        queue_capacity?;
                         made_progress = true;
                     }
                     None => request += 1,
@@ -364,5 +397,6 @@ impl ApplicationReaper {
                 break;
             }
         }
+        Ok(())
     }
 }

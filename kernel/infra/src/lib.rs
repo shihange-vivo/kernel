@@ -28,6 +28,7 @@
 #![feature(ptr_as_uninit)]
 #![feature(slice_ptr_get)]
 
+pub mod collections;
 pub mod intrusive;
 pub mod lifetime;
 pub mod list;

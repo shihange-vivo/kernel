@@ -23,7 +23,7 @@
 //! Two-phase operation tokens are thread-owned, checked in nesting order, and
 //! keep every function array/backing pinned until DlFinish.
 
-use blueos_infra::no_let_underscore::IgnoreResult;
+use blueos_infra::{collections::HashSet, no_let_underscore::IgnoreResult};
 
 use alloc::{boxed::Box, string::String, sync::Arc, vec::Vec};
 use core::sync::atomic::{AtomicUsize, Ordering};
@@ -602,23 +602,24 @@ impl State {
     fn collect(&mut self, error: i32) -> Result<BlueOsDlPlan> {
         let exit_collect = self.exiting && self.pending.is_empty();
         let mut reachable = Vec::new();
+        let mut seen = HashSet::default();
         reachable
             .try_reserve(self.batches.len())
+            .map_err(|_| libc::ENOMEM)?;
+        seen.try_reserve(self.batches.len())
             .map_err(|_| libc::ENOMEM)?;
         for batch in &self.batches {
             if batch.initializing
                 || (!exit_collect && batch.objects.iter().any(|object| object.opens != 0))
             {
-                reachable.push(batch.id);
+                record_reachable(&mut seen, &mut reachable, batch.id)?;
             }
         }
         for op in &self.pending {
             if let OperationKind::Close { batches } = &op.kind {
                 for batch in batches {
                     for dependency in &batch.dependencies {
-                        if !reachable.contains(dependency) {
-                            reachable.push(*dependency);
-                        }
+                        record_reachable(&mut seen, &mut reachable, *dependency)?;
                     }
                 }
             }
@@ -631,16 +632,14 @@ impl State {
                 .find(|batch| batch.id == reachable[cursor])
             {
                 for dependency in &batch.dependencies {
-                    if !reachable.contains(dependency) {
-                        reachable.push(*dependency);
-                    }
+                    record_reachable(&mut seen, &mut reachable, *dependency)?;
                 }
             }
             cursor += 1;
         }
         let Some(index) = (0..self.batches.len())
             .rev()
-            .find(|index| !reachable.contains(&self.batches[*index].id))
+            .find(|index| !seen.contains(&self.batches[*index].id))
         else {
             return Ok(BlueOsDlPlan::empty());
         };
@@ -673,6 +672,19 @@ impl State {
     }
 }
 
+/// Stage reachability without mutating live batches; OOM leaves collection
+/// ownership unchanged and the caller can restore its open reference.
+fn record_reachable(seen: &mut HashSet<usize>, queue: &mut Vec<usize>, id: usize) -> Result<()> {
+    if seen.contains(&id) {
+        return Ok(());
+    }
+    queue.try_reserve(1).map_err(|_| libc::ENOMEM)?;
+    seen.try_reserve(1).map_err(|_| libc::ENOMEM)?;
+    seen.insert(id);
+    queue.push(id);
+    Ok(())
+}
+
 /// Runs entirely on the service's link stack. Preparing descriptors, pinned
 /// plans and dependency retention must finish before the caller installs it.
 pub(crate) fn prepare_load(
@@ -693,8 +705,12 @@ pub(crate) fn prepare_load(
         .link_shared(namespace, path, group, imports, globals)
         .map_err(load_errno)?;
     let mut dependencies = Vec::new();
+    let mut dependency_ids = HashSet::default();
     dependencies
         .try_reserve_exact(existing.len())
+        .map_err(|_| libc::ENOMEM)?;
+    dependency_ids
+        .try_reserve(existing.len())
         .map_err(|_| libc::ENOMEM)?;
     for image in &existing {
         if image.batch != 0
@@ -702,7 +718,7 @@ pub(crate) fn prepare_load(
                 .retained_images()
                 .iter()
                 .any(|provider| provider.instance_id() == image.descriptor.instance_id())
-            && !dependencies.contains(&image.batch)
+            && dependency_ids.insert(image.batch)
         {
             dependencies.push(image.batch);
         }
