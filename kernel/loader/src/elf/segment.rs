@@ -17,6 +17,7 @@ use crate::memory::{
     MemoryPermissions,
 };
 
+#[derive(Debug)]
 pub(crate) struct LoadSegmentInfo {
     index: u16,
     file_range: FileRange,
@@ -77,7 +78,7 @@ impl LoadSegmentInfo {
     }
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub(crate) struct DynamicSegmentInfo {
     file_range: FileRange,
     vaddr: TargetAddress,

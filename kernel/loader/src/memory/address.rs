@@ -140,7 +140,7 @@ impl TargetRange {
     }
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug)]
 pub(crate) struct FileRange {
     offset: u64,
     len: u64,
