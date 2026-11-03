@@ -134,7 +134,8 @@ impl<S: Clone, R: crate::reader::ElfReader> LoadPlan<S, R> {
         plan.images.push(root);
         let mut queue = Vec::new();
         queue.try_reserve(1).map_err(|_| oom())?;
-        queue.push((0, 1u16));
+        // Match DependencyGraph: the root is depth 0, direct dependencies 1.
+        queue.push((0, 0u16));
         let mut input_bytes = plan.images[0]
             .reader
             .as_ref()
