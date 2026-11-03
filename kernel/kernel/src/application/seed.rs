@@ -73,7 +73,7 @@ fn mkdirs(path: &str) {
         };
         // SAFETY: `dir` points into `buf`, which holds a NUL-terminated copy of
         // the directory prefix for the duration of the call.
-        let _ = unsafe { crate::vfs::syscalls::mkdir(dir, 0o755) };
+        let _ = crate::vfs::syscalls::mkdir(dir, 0o755);
         prefix_end = slash + 1;
     }
 }
@@ -93,51 +93,51 @@ fn seed_host_file(vfs_path: &str, host_path: &CStr) -> usize {
     };
 
     // SAFETY: `c_path` points into `path_buf`, which holds a NUL-terminated
-    // copy of `vfs_path` for the duration of the calls below.
-    unsafe {
-        let fd = crate::vfs::syscalls::open(
-            c_path,
-            libc::O_CREAT | libc::O_WRONLY | libc::O_TRUNC,
-            0o644,
-        );
-        if fd < 0 {
-            log::warn!("boot seed: open {} failed ({})", vfs_path, fd);
-            return 0;
-        }
+    // copy of `vfs_path` and stays live and unchanged through this VFS call.
+    let fd = crate::vfs::syscalls::open(
+        c_path,
+        libc::O_CREAT | libc::O_WRONLY | libc::O_TRUNC,
+        0o644,
+    );
+    if fd < 0 {
+        log::warn!("boot seed: open {} failed ({})", vfs_path, fd);
+        return 0;
+    }
 
-        let mut installed = 0usize;
-        let mut chunk = [0u8; SEED_CHUNK];
-        loop {
-            let read = match semihosting::io::Read::read(&mut source, &mut chunk) {
-                Ok(0) => break,
-                Ok(read) => read,
-                Err(_) => {
-                    log::error!(
-                        "boot seed: reading {:?} failed after {} bytes",
-                        host_path,
-                        installed
-                    );
-                    installed = 0;
-                    break;
-                }
-            };
-            let written = crate::vfs::syscalls::write(fd, chunk.as_ptr(), read);
-            if written != read as isize {
+    let mut installed = 0usize;
+    let mut chunk = [0u8; SEED_CHUNK];
+    loop {
+        let read = match semihosting::io::Read::read(&mut source, &mut chunk) {
+            Ok(0) => break,
+            Ok(read) => read,
+            Err(_) => {
                 log::error!(
-                    "boot seed: writing {} truncated at {} bytes ({} of {})",
-                    vfs_path,
-                    installed,
-                    written,
-                    read
+                    "boot seed: reading {:?} failed after {} bytes",
+                    host_path,
+                    installed
                 );
                 installed = 0;
                 break;
             }
-            installed += read;
+        };
+        // SAFETY: File::read bounded read by chunk.len(); those initialized
+        // bytes remain live and unchanged until this synchronous write returns.
+        let written = crate::vfs::syscalls::write(fd, chunk.as_ptr(), read);
+        if written != read as isize {
+            log::error!(
+                "boot seed: writing {} truncated at {} bytes ({} of {})",
+                vfs_path,
+                installed,
+                written,
+                read
+            );
+            installed = 0;
+            break;
         }
-        crate::vfs::syscalls::close(fd);
-        installed
+        installed += read;
     }
+    crate::vfs::syscalls::close(fd);
+    installed
 }
 
 /// Install the system image into the root tmpfs.
