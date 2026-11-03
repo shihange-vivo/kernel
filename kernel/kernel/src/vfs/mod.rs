@@ -80,9 +80,7 @@ pub fn vfs_init() -> Result<(), Error> {
 
     // Direct RTOS threads keep their shared I/O context. Processes initialize
     // their own standard descriptors when they are created.
-    fd_manager::system_fd_manager()
-        .irqsave_lock()
-        .init_stdio()?;
+    fd_manager::init_system_stdio()?;
 
     #[cfg(fatfs)]
     {
