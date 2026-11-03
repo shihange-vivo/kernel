@@ -64,17 +64,41 @@ def collect_entries(files, layouts):
     return entries
 
 
-def c_literal(path):
-    """Render `path` as a Rust `c"..."` literal.
+def rust_literal(value):
+    """Render Unicode scalar values with Rust's string escape syntax.
 
-    Semihosting opens the artifact by host path, so the path has to survive
-    verbatim into the kernel. Reject anything that is not representable instead
-    of silently mangling it.
+    JSON's Unicode, backspace and form-feed escapes are not Rust escapes.
+    Escape non-ASCII/control characters explicitly to preserve their bytes,
+    including carriage returns that source-file parsing could normalize.
     """
-    if '"' in path or "\\" in path or "\n" in path or "\0" in path:
-        raise SystemExit(
-            f"boot seed artifact path is not a plain C string: {path!r}")
-    return f'c"{path}"'
+    escapes = {
+        '"': r'\"',
+        "\\": r"\\",
+        "\n": r"\n",
+        "\r": r"\r",
+        "\t": r"\t",
+    }
+    literal = ['"']
+    for character in value:
+        codepoint = ord(character)
+        if character in escapes:
+            literal.append(escapes[character])
+        elif 0x20 <= codepoint < 0x7f:
+            literal.append(character)
+        elif 0xd800 <= codepoint <= 0xdfff:
+            raise SystemExit(
+                f"boot seed path contains a Unicode surrogate: {value!r}")
+        else:
+            literal.append(f"\\u{{{codepoint:x}}}")
+    literal.append('"')
+    return "".join(literal)
+
+
+def c_literal(path):
+    """Render the exact UTF-8 host path as a Rust C string literal."""
+    if "\0" in path:
+        raise SystemExit(f"boot seed artifact path contains NUL: {path!r}")
+    return "c" + rust_literal(path)
 
 
 def write_catalog(entries, output):
@@ -93,7 +117,7 @@ def write_catalog(entries, output):
         handle.write("}\n\n")
         handle.write("pub static FILES: &[BootSeedFile] = &[\n")
         for entry in entries:
-            path = json.dumps(entry["vfs_path"])
+            path = rust_literal(entry["vfs_path"])
             handle.write(
                 f"    BootSeedFile {{ path: {path}, host_path: {c_literal(entry['artifact'])} }},\n"
             )
