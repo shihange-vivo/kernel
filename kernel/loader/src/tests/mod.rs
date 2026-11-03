@@ -213,6 +213,38 @@ mod dependency_scan {
     }
 
     #[test]
+    fn scan_accepts_maximum_dependency_name_length_limit() {
+        let bytes = scanned_dso(&[(DT_NEEDED, 0), (DT_SONAME, 10)], b"libc.so.1\0self.so\0");
+        let limits = LoadLimits::new(
+            64 * 1024 * 1024,
+            128,
+            32,
+            64 * 1024 * 1024,
+            1024 * 1024 * 1024,
+            1024,
+            1024 * 1024,
+            64 * 1024 * 1024,
+            64 * 1024 * 1024,
+            64 * 1024 * 1024,
+            256,
+            u32::MAX,
+        );
+        let scanned = scan_root_or_dependency(
+            &SliceElfReader::new(&bytes),
+            profile(),
+            ArtifactRole::SharedObject,
+            limits,
+        )
+        .expect("scan with the maximum name length limit");
+        assert_eq!(scanned.needed.len(), 1);
+        assert_eq!(scanned.needed[0].as_bytes(), b"libc.so.1");
+        assert_eq!(
+            scanned.declared_soname.as_ref().unwrap().as_bytes(),
+            b"self.so"
+        );
+    }
+
+    #[test]
     fn scan_accepts_dso_without_soname() {
         let dynstr: &[u8] = b"libc.so.1\0";
         let bytes = scanned_dso(&[(DT_NEEDED, 0)], dynstr);
