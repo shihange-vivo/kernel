@@ -33,7 +33,7 @@ template <typename T> class Accumulator {
   T value_;
 };
 
-} // namespace
+}  // namespace
 
 extern "C" int main(int argc, const char *const *argv, const char *const *) {
   const Accumulator<int> accumulator(clangCxxPrivateValue(5));
