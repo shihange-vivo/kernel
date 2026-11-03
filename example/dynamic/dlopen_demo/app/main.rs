@@ -130,9 +130,15 @@ fn load(name: &[u8], flags: i32) -> *mut c_void {
     }
     handle
 }
+
+/// Resolve and synchronously call a usize-valued fixture export.
+///
 /// # Safety
-/// name must identify an extern C fn() -> usize fixture export whose provider
-/// remains retained through the returned function's synchronous invocation.
+/// name must identify an extern C fn() -> usize export. Its calling
+/// preconditions, including any fixture serialization, must hold. The caller
+/// must keep the selected provider loaded through the entire invocation.
+// SAFETY: the caller establishes the exact signature and provider lifetime;
+// lookup checks the name and this helper rejects NULL before conversion.
 unsafe fn value(handle: *mut c_void, name: &[u8]) -> usize {
     let pointer = lookup_symbol(handle, Some(name));
     assert!(!pointer.is_null());
@@ -142,9 +148,14 @@ unsafe fn value(handle: *mut c_void, name: &[u8]) -> usize {
     function()
 }
 
+/// Resolve and synchronously call an i32-valued fixture export.
+///
 /// # Safety
-/// name must identify an extern C fn() -> i32 fixture export whose provider
-/// remains retained through the returned function's synchronous invocation.
+/// name must identify an extern C fn() -> i32 export. The caller must meet
+/// that export's calling preconditions and keep its provider loaded until the
+/// synchronous invocation returns, including during any recursive callbacks.
+// SAFETY: the caller establishes the i32 C signature and pins the provider;
+// this helper validates lookup success before constructing the function value.
 unsafe fn value_i32(handle: *mut c_void, name: &[u8]) -> i32 {
     let pointer = lookup_symbol(handle, Some(name));
     assert!(!pointer.is_null());
@@ -153,9 +164,14 @@ unsafe fn value_i32(handle: *mut c_void, name: &[u8]) -> i32 {
     function()
 }
 
+/// Resolve and synchronously call a u32-valued fixture export.
+///
 /// # Safety
-/// name must identify an extern C fn() -> u32 fixture export whose provider
-/// remains retained through the returned function's synchronous invocation.
+/// name must identify an extern C fn() -> u32 export. The caller must meet
+/// that export's calling preconditions and keep its provider loaded until the
+/// synchronous invocation returns, including during any recursive callbacks.
+// SAFETY: the caller establishes the u32 C signature and pins the provider;
+// this helper validates lookup success before constructing the function value.
 unsafe fn value_u32(handle: *mut c_void, name: &[u8]) -> u32 {
     let pointer = lookup_symbol(handle, Some(name));
     assert!(!pointer.is_null());
@@ -482,8 +498,12 @@ fn foreign_app() {
 }
 
 /// # Safety
-/// The runtime supplies argc initialized argv entries and readable terminated
-/// strings, all retained by the application's start storage through this call.
+/// When argc > 1, argv must name at least argc initialized, aligned pointer
+/// slots. Each inspected argument must be non-null, readable through its NUL
+/// and immutable throughout this call. The runtime must retain these arrays
+/// and strings in the application's start storage until main returns.
+// SAFETY: the startup ABI supplies the caller-owned argument storage; this
+// entry only reads argv[1] when argc > 1 and does not retain a borrowed pointer.
 #[no_mangle]
 pub unsafe extern "C" fn main(
     argc: c_int,

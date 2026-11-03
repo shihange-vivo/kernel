@@ -80,6 +80,10 @@ impl LinkPublisher for Publisher {
         }
     }
 
+    // SAFETY: LinkPublisher requires the product and prepared unit to belong
+    // to this publisher's same active session. These fixtures publish once
+    // from a zero counter, so increment cannot overflow; into_leases moves the
+    // existing Vec into its receipt without allocation or dropping any lease.
     unsafe fn commit_batch(&mut self, _: (), product: CommittingLinkProduct) -> Self::Receipt {
         self.commits += 1;
         product.into_leases()
