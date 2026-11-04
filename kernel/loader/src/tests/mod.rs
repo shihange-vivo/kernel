@@ -484,7 +484,10 @@ mod fixed_mapper {
     fn fixed_mapper_allocates_borrowed_span() {
         let mut mapper = MemoryMapper::new(Some(&REGIONS));
         let lease = mapper
-            .allocate_image(fixed_request(0x5000_0000, 0x1000))
+            .prepare_image(&crate::tests::fixture::full_image_layout(fixed_request(
+                0x5000_0000,
+                0x1000,
+            )))
             .expect("allocate");
         let allocation = lease.allocation();
         assert_eq!(allocation.base().get(), 0x5000_0000);
@@ -502,12 +505,17 @@ mod fixed_mapper {
         ];
         let mut mapper = MemoryMapper::new(Some(&READONLY));
         let error = mapper
-            .allocate_image(fixed_request(0x5000_0000, 0x1000))
+            .prepare_image(&crate::tests::fixture::full_image_layout(fixed_request(
+                0x5000_0000,
+                0x1000,
+            )))
             .unwrap_err();
         assert!(matches!(error.kind(), LoadErrorKind::PermissionConflict));
         assert!(!mapper.is_poisoned(), "reject before target mutation");
         let lease = mapper
-            .allocate_image(AllocationRequest::new(Placement::Anywhere, 16, 4))
+            .prepare_image(&crate::tests::fixture::full_image_layout(
+                AllocationRequest::new(Placement::Anywhere, 16, 4),
+            ))
             .expect("failed reservation leaves mapper reusable");
         mapper.abort_image(lease, crate::memory::MutationProgress::Reserved);
     }
@@ -517,7 +525,10 @@ mod fixed_mapper {
         let mut mapper = MemoryMapper::new(Some(&REGIONS));
         // The region ends at 0x5000_2000; a span of 0x3000 overruns it.
         let error = mapper
-            .allocate_image(fixed_request(0x5000_0000, 0x3000))
+            .prepare_image(&crate::tests::fixture::full_image_layout(fixed_request(
+                0x5000_0000,
+                0x3000,
+            )))
             .unwrap_err();
         assert!(matches!(error.kind(), LoadErrorKind::OutOfBounds));
         assert!(matches!(
@@ -531,7 +542,10 @@ mod fixed_mapper {
     fn fixed_mapper_rejects_span_outside_regions() {
         let mut mapper = MemoryMapper::new(Some(&REGIONS));
         assert!(mapper
-            .allocate_image(fixed_request(0x6000_0000, 0x1000))
+            .prepare_image(&crate::tests::fixture::full_image_layout(fixed_request(
+                0x6000_0000,
+                0x1000
+            )))
             .is_err());
     }
 
@@ -539,7 +553,10 @@ mod fixed_mapper {
     fn allocated_mapper_rejects_fixed_request() {
         let mut mapper = MemoryMapper::new(None);
         assert!(mapper
-            .allocate_image(fixed_request(0x5000_0000, 0x1000))
+            .prepare_image(&crate::tests::fixture::full_image_layout(fixed_request(
+                0x5000_0000,
+                0x1000
+            )))
             .is_err());
     }
 
@@ -547,7 +564,9 @@ mod fixed_mapper {
     fn fixed_regions_also_allow_movable_images() {
         let mut mapper = MemoryMapper::new(Some(&REGIONS));
         let request = AllocationRequest::new(Placement::Anywhere, 0x1000, 4);
-        let lease = mapper.allocate_image(request).expect("movable allocation");
+        let lease = mapper
+            .prepare_image(&crate::tests::fixture::full_image_layout(request))
+            .expect("movable allocation");
         assert_eq!(
             lease.allocation().ownership(),
             crate::memory::AllocationOwnership::Owned

@@ -20,7 +20,8 @@ use crate::{
     image::{allocate::AllocatedImage, inspect::StackKind, ProgramHeaderGeometry},
     memory::{
         address::{TargetAddress, TargetRange},
-        AllocationRequest, ImageAllocation, ImageLoadTransaction, ImageMemory, Placement,
+        AllocationOffset, AllocationRequest, ImageAllocation, ImageLayout, ImageLoadTransaction,
+        ImageMemory, Placement, SegmentLayout,
     },
     profile::{ElfClass, ElfType, LoadRequest},
     reader::ElfReader,
@@ -113,6 +114,21 @@ impl<R: ElfReader> PlannedImage<R> {
         Ok(AllocationRequest::new(placement, size, align))
     }
 
+    fn image_layout(&self) -> LoadResult<ImageLayout> {
+        let mut segments = Vec::new();
+        segments
+            .try_reserve_exact(self.load_segments.len())
+            .map_err(|_| crate::error::oom())?;
+        for segment in &self.load_segments {
+            segments.push(SegmentLayout::new(
+                AllocationOffset::new(segment.vaddr().checked_sub(self.aligned_min_vaddr)?),
+                segment.memory_size(),
+                segment.permissions(),
+            ));
+        }
+        ImageLayout::new(self.allocation_request()?, segments)
+    }
+
     pub fn allocate<M>(self, mut memory: M) -> LoadResult<AllocatedImage<R, M>>
     where
         M: ImageMemory,
@@ -121,8 +137,9 @@ impl<R: ElfReader> PlannedImage<R> {
         // leaving this function, including the ones raised by helpers.
         let at_allocate = |error: LoadError| error.at_stage(LoadStage::Allocate);
 
-        let request = self.allocation_request().map_err(at_allocate)?;
-        let lease = memory.allocate_image(request).map_err(at_allocate)?;
+        let layout = self.image_layout().map_err(at_allocate)?;
+        let request = layout.request();
+        let lease = memory.prepare_image(&layout).map_err(at_allocate)?;
         let transaction = ImageLoadTransaction::new(memory, lease);
 
         validate_allocation(

@@ -218,7 +218,7 @@ mod test_elf_loader {
     use blueos_test_macro::test;
     use loader::{
         memory::{
-            AllocationLease, AllocationOffset, AllocationRequest, ImageAllocation, ImageMemory,
+            AllocationLease, AllocationOffset, ImageAllocation, ImageLayout, ImageMemory,
             ImageProtectionMemory, MemoryMapper, MemoryPermissions, MutationProgress,
             PreparedProtectionPlan, ProtectionCapabilities, ProtectionLevel,
         },
@@ -235,8 +235,8 @@ mod test_elf_loader {
         fn execution_domain(&self) -> loader::ExecutionDomainId {
             loader::ExecutionDomainId::FLAT
         }
-        fn allocate_image(&mut self, request: AllocationRequest) -> LoadResult<AllocationLease> {
-            self.0.borrow_mut().allocate_image(request)
+        fn prepare_image(&mut self, layout: &ImageLayout) -> LoadResult<AllocationLease> {
+            self.0.borrow_mut().prepare_image(layout)
         }
         fn abort_image(&mut self, lease: AllocationLease, progress: MutationProgress) {
             self.0.borrow_mut().abort_image(lease, progress);
