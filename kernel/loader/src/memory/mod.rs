@@ -17,6 +17,11 @@
 //! `address` provides checked target and file ranges; `mapper` implements a
 //! single-image memory backend; `cache` synchronizes freshly written code.
 //! This module defines the public memory API and the internal transaction log.
+//!
+//! Submit one validated [`ImageLayout`] to [`ImageMemory::prepare_image`]. Its
+//! segment offsets share one image base; a backend may use contiguous storage
+//! or scattered pages and leave gaps unbacked. Reads/writes address that image
+//! by descriptor and offset, independently of physical or kernel alias addresses.
 
 pub(crate) mod address;
 pub mod cache;
@@ -24,6 +29,7 @@ pub use cache::{
     CacheMaintenance, CacheRequirements, CacheSync, CodeCache, CoherentCodeCache, ExecutionScope,
     PreparedCacheSync,
 };
+mod layout;
 mod mapper;
 
 use alloc::vec::Vec;
@@ -38,6 +44,7 @@ pub use crate::image::{
     ProtectionRecord,
 };
 pub use address::{TargetAddress, TargetRange};
+pub use layout::{ImageLayout, SegmentLayout};
 pub use mapper::{MemoryMapper, MemoryPermissions, MemoryRegion};
 
 /// Where an image wants its memory to come from.
@@ -258,12 +265,22 @@ pub trait ImageMemory {
     /// Execution address space served by this memory handle.
     fn execution_domain(&self) -> crate::ExecutionDomainId;
 
-    /// Allocate or borrow exactly the logical range requested by the loader.
+    /// Prepare one image reservation and every listed loadable segment.
+    ///
+    /// `layout.request()` describes the complete logical reservation, while
+    /// `layout.segments()` identifies the ranges requiring backing. Reserve
+    /// the span once and keep all offsets fixed; physical pages may be scattered
+    /// and gaps need not be backed. Return the target execution VA in the
+    /// allocation's base, not a physical address or a kernel write alias.
+    /// Provide loader reads/writes for the segment ranges until sealing; their
+    /// declared permissions are applied by `ImageProtectionMemory` afterwards.
+    /// A flat backend may back the entire reservation with one allocation.
+    ///
     /// Returning `Err` must leave no allocation behind. On success the
     /// backend returns the unique allocation lease; the loader transfers it
     /// back through `abort_image` on failure, or into the committed owner
     /// during publication.
-    fn allocate_image(&mut self, request: AllocationRequest) -> LoadResult<AllocationLease>;
+    fn prepare_image(&mut self, layout: &ImageLayout) -> LoadResult<AllocationLease>;
 
     /// Abort an uncommitted image. This operation must not allocate, fail or
     /// panic. Modified borrowed-fixed ranges must become poisoned.
@@ -273,7 +290,9 @@ pub trait ImageMemory {
     /// lifetime. Borrowed-fixed contents are not restored or poisoned.
     fn release_committed(&mut self, allocation: AllocationLease);
 
-    /// Validate access without requiring a host-accessible target pointer.
+    /// Validate a logical reservation range without requiring backing or a
+    /// host-accessible target pointer. Protection plans also validate gaps;
+    /// read/write/zero must separately require backing for their actual access.
     fn validate_range(
         &self,
         allocation: &ImageAllocation,
@@ -304,6 +323,8 @@ pub trait ImageMemory {
 }
 
 pub trait ImageProtectionMemory: ImageMemory {
+    /// Apply final permissions to a reservation range. NONE also covers gaps
+    /// without backing; revoking an unmapped gap must not allocate pages.
     fn protect(
         &mut self,
         allocation: &ImageAllocation,
@@ -570,8 +591,8 @@ impl<M: ImageMemory> Drop for ImageLoadTransaction<M> {
 }
 
 impl<M: ImageMemory + ?Sized> ImageMemory for &mut M {
-    fn allocate_image(&mut self, request: AllocationRequest) -> LoadResult<AllocationLease> {
-        (**self).allocate_image(request)
+    fn prepare_image(&mut self, layout: &ImageLayout) -> LoadResult<AllocationLease> {
+        (**self).prepare_image(layout)
     }
 
     fn abort_image(&mut self, allocation: AllocationLease, progress: MutationProgress) {

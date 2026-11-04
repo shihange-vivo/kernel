@@ -96,7 +96,9 @@ fn assert_memory_reusable(memory: &mut SharedMemory) {
         "preparation must have rolled back every allocation"
     );
     let lease = memory
-        .allocate_image(AllocationRequest::new(Placement::Anywhere, 16, 4))
+        .prepare_image(&crate::tests::fixture::full_image_layout(
+            AllocationRequest::new(Placement::Anywhere, 16, 4),
+        ))
         .expect("preparation must have rolled back its allocation");
     memory.abort_image(lease, MutationProgress::Reserved);
 }

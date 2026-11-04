@@ -918,8 +918,8 @@ mod tests {
     use super::*;
     use crate::{
         memory::{
-            AllocationLease, AllocationRequest, ImageAllocation, MemoryMapper, MutationProgress,
-            Placement,
+            AllocationLease, AllocationRequest, ImageAllocation, ImageLayout, MemoryMapper,
+            MutationProgress, Placement,
         },
         profile::{LoadLimits, LoadProfile},
         ExecutionDomainId,
@@ -945,8 +945,8 @@ mod tests {
         fn execution_domain(&self) -> ExecutionDomainId {
             self.mapper.execution_domain()
         }
-        fn allocate_image(&mut self, request: AllocationRequest) -> LoadResult<AllocationLease> {
-            self.mapper.allocate_image(request)
+        fn prepare_image(&mut self, layout: &ImageLayout) -> LoadResult<AllocationLease> {
+            self.mapper.prepare_image(layout)
         }
         fn abort_image(&mut self, lease: AllocationLease, progress: MutationProgress) {
             self.state
@@ -1009,10 +1009,8 @@ mod tests {
             state: Rc::clone(&state),
         };
         let lease = memory
-            .allocate_image(AllocationRequest::new(
-                Placement::Anywhere,
-                bytes.len() as u64,
-                1,
+            .prepare_image(&crate::tests::fixture::full_image_layout(
+                AllocationRequest::new(Placement::Anywhere, bytes.len() as u64, 1),
             ))
             .unwrap();
         let allocation = *lease.allocation();

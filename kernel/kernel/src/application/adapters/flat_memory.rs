@@ -34,8 +34,9 @@ use blueos_loader::{
     error::{ErrorContext, LoadErrorKind},
     memory::{
         AllocationId, AllocationLease, AllocationOffset, AllocationOwnership, AllocationRequest,
-        ImageAllocation, ImageMemory, ImageProtectionMemory, MemoryPermissions, MutationProgress,
-        Placement, PreparedProtectionPlan, ProtectionCapabilities, ProtectionLevel, TargetAddress,
+        ImageAllocation, ImageLayout, ImageMemory, ImageProtectionMemory, MemoryPermissions,
+        MutationProgress, Placement, PreparedProtectionPlan, ProtectionCapabilities,
+        ProtectionLevel, TargetAddress,
     },
     LoadError, LoadResult,
 };
@@ -205,7 +206,8 @@ impl ImageMemory for FlatImageMemory {
     fn execution_domain(&self) -> blueos_loader::ExecutionDomainId {
         blueos_loader::ExecutionDomainId::FLAT
     }
-    fn allocate_image(&mut self, request: AllocationRequest) -> LoadResult<AllocationLease> {
+    fn prepare_image(&mut self, layout: &ImageLayout) -> LoadResult<AllocationLease> {
+        let request = layout.request();
         // Dynamic images are movable ET_DYN objects loaded from the
         // shared heap. A fixed placement cannot be honoured against this heap
         // backing and is rejected rather than silently redirected.
@@ -431,6 +433,19 @@ fn protection_backend_error(allocation: &ImageAllocation) -> LoadError {
 }
 
 #[cfg(test)]
+fn test_layout(request: AllocationRequest) -> ImageLayout {
+    ImageLayout::new(
+        request,
+        alloc::vec![blueos_loader::memory::SegmentLayout::new(
+            AllocationOffset::new(0),
+            request.size(),
+            MemoryPermissions::READ.bitor(MemoryPermissions::WRITE),
+        )],
+    )
+    .expect("valid fixture layout")
+}
+
+#[cfg(test)]
 mod id_tests {
     use super::*;
     use blueos_test_macro::test;
@@ -452,7 +467,11 @@ mod id_tests {
     fn counter_exhaustion_does_not_publish_an_allocation() {
         let mut memory = FlatImageMemory::new();
         let lease = memory
-            .allocate_image(AllocationRequest::new(Placement::Anywhere, 32, 8))
+            .prepare_image(&test_layout(AllocationRequest::new(
+                Placement::Anywhere,
+                32,
+                8,
+            )))
             .unwrap();
         let allocation = *lease.allocation();
         memory
@@ -460,13 +479,21 @@ mod id_tests {
             .unwrap();
         memory.service.lock().last_counter = u32::MAX - 1;
         let last = memory
-            .allocate_image(AllocationRequest::new(Placement::Anywhere, 16, 8))
+            .prepare_image(&test_layout(AllocationRequest::new(
+                Placement::Anywhere,
+                16,
+                8,
+            )))
             .unwrap();
         memory.release_committed(last);
 
         for _ in 0..2 {
             assert!(memory
-                .allocate_image(AllocationRequest::new(Placement::Anywhere, 16, 8))
+                .prepare_image(&test_layout(AllocationRequest::new(
+                    Placement::Anywhere,
+                    16,
+                    8
+                )))
                 .is_err());
             assert_eq!(memory.service.lock().entries.len(), 1);
         }
@@ -499,9 +526,9 @@ mod id_tests {
         let mut clone = memory.clone();
         let mut independent = FlatImageMemory::new();
         let request = AllocationRequest::new(Placement::Anywhere, 16, 8);
-        let first = memory.allocate_image(request).unwrap();
-        let second = clone.allocate_image(request).unwrap();
-        let other = independent.allocate_image(request).unwrap();
+        let first = memory.prepare_image(&test_layout(request)).unwrap();
+        let second = clone.prepare_image(&test_layout(request)).unwrap();
+        let other = independent.prepare_image(&test_layout(request)).unwrap();
         let first_id = first.allocation().id().value();
         let second_id = second.allocation().id().value();
         let other_id = other.allocation().id().value();
@@ -536,7 +563,11 @@ mod id_tests {
         memory.service.lock().nonce = None;
         for _ in 0..2 {
             assert!(memory
-                .allocate_image(AllocationRequest::new(Placement::Anywhere, 16, 8))
+                .prepare_image(&test_layout(AllocationRequest::new(
+                    Placement::Anywhere,
+                    16,
+                    8
+                )))
                 .is_err());
             let service = memory.service.lock();
             assert!(service.entries.is_empty());
@@ -554,7 +585,11 @@ mod pin_tests {
         for abort in [false, true] {
             let mut memory = FlatImageMemory::new();
             let lease = memory
-                .allocate_image(AllocationRequest::new(Placement::Anywhere, 32, 8))
+                .prepare_image(&test_layout(AllocationRequest::new(
+                    Placement::Anywhere,
+                    32,
+                    8,
+                )))
                 .unwrap();
             let allocation = *lease.allocation();
             memory

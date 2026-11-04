@@ -22,7 +22,7 @@ use crate::{
     image::{PreparedProtectionPlan, ProtectionCapabilities, ProtectionLevel},
     memory::{
         address::TargetAddress, AllocationId, AllocationLease, AllocationOffset,
-        AllocationOwnership, AllocationRequest, ImageAllocation, ImageMemory,
+        AllocationOwnership, AllocationRequest, ImageAllocation, ImageLayout, ImageMemory,
         ImageProtectionMemory, MutationProgress, Placement,
     },
     LoadError, LoadResult,
@@ -283,7 +283,8 @@ impl ImageMemory for MemoryMapper {
         Ok(())
     }
 
-    fn allocate_image(&mut self, request: AllocationRequest) -> LoadResult<AllocationLease> {
+    fn prepare_image(&mut self, layout: &ImageLayout) -> LoadResult<AllocationLease> {
+        let request = layout.request();
         if self.poisoned.is_some() || self.allocation.is_some() {
             return Err(allocation_error(&request));
         }

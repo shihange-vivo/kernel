@@ -32,10 +32,23 @@ use crate::{
 
 use crate::memory::{
     address::TargetAddress, AllocationId, AllocationLease, AllocationOffset, AllocationOwnership,
-    AllocationRequest, ImageAllocation, ImageMemory, ImageProtectionMemory, MemoryMapper,
-    MemoryPermissions, MemoryRegion, MutationProgress, Placement, PreparedProtectionPlan,
-    ProtectionCapabilities, ProtectionLevel,
+    AllocationRequest, ImageAllocation, ImageLayout, ImageMemory, ImageProtectionMemory,
+    MemoryMapper, MemoryPermissions, MemoryRegion, MutationProgress, Placement,
+    PreparedProtectionPlan, ProtectionCapabilities, ProtectionLevel,
 };
+
+/// Full-span fixture for tests that exercise allocation identity rather than ELF layout.
+pub(crate) fn full_image_layout(request: AllocationRequest) -> ImageLayout {
+    ImageLayout::new(
+        request,
+        alloc::vec![crate::memory::SegmentLayout::new(
+            AllocationOffset::new(0),
+            request.size(),
+            MemoryPermissions::READ.bitor(MemoryPermissions::WRITE),
+        )],
+    )
+    .expect("valid fixture layout")
+}
 
 pub(super) const NATIVE_PROFILE: LoadProfile = {
     #[cfg(target_arch = "arm")]
@@ -515,10 +528,10 @@ impl ImageMemory for SharedMemory {
     fn execution_domain(&self) -> crate::ExecutionDomainId {
         crate::ExecutionDomainId::FLAT
     }
-    fn allocate_image(&mut self, request: AllocationRequest) -> LoadResult<AllocationLease> {
+    fn prepare_image(&mut self, layout: &ImageLayout) -> LoadResult<AllocationLease> {
         assert!(self.acquired.get(), "reserve closure before mapping");
         let mut mapper = MemoryMapper::new(self.regions);
-        let lease = mapper.allocate_image(request)?;
+        let lease = mapper.prepare_image(layout)?;
         self.mappers
             .borrow_mut()
             .push((*lease.allocation(), mapper));
@@ -671,7 +684,8 @@ impl ImageMemory for RecordingMemory {
     fn execution_domain(&self) -> crate::ExecutionDomainId {
         crate::ExecutionDomainId::FLAT
     }
-    fn allocate_image(&mut self, request: AllocationRequest) -> crate::LoadResult<AllocationLease> {
+    fn prepare_image(&mut self, layout: &ImageLayout) -> crate::LoadResult<AllocationLease> {
+        let request = layout.request();
         let (base, ownership) = match request.placement() {
             Placement::Fixed(range) => (range.start(), AllocationOwnership::BorrowedFixed),
             Placement::Anywhere => (
