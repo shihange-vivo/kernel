@@ -75,7 +75,7 @@ if (dynamic_loader) {
     soname = "libc.so.1"
     sources = [ "src/lib.rs" ]
     deps = [
-      "//external/vendor/spin-0.9.8:spin",
+      "//external/rust:spin",
       "//kernel/header:blueos_header",
       "//kernel/infra:blueos_infra",
       "//kernel/scal:blueos_scal_swi",

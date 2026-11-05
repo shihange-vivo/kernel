@@ -22,7 +22,7 @@ build_rust("dynamic_clang_c_test") {
   edition = "2021"
   sources = [ "src/test.rs" ]
   deps = [
-    "//external/vendor/semihosting-0.1.20:semihosting",
+    "//external/rust:semihosting",
     "//kernel/kernel:blueos",
     "//kernel/rsrt",
     "//kernel/tests/support:dynamic_test_support",
