@@ -1304,6 +1304,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "gnrt_external_rust_fnv_no_std_1_0_7_0bf3818ec5074215"
+version = "0.0.0"
+dependencies = [
+ "fnv",
+]
+
+[[package]]
 name = "gnrt_external_rust_fugit_0_3_9_04b7fc5b3269b2af"
 version = "0.0.0"
 dependencies = [
@@ -1350,6 +1357,13 @@ name = "gnrt_external_rust_goblin_0_9_3_1d675d42b65d2f69"
 version = "0.0.0"
 dependencies = [
  "goblin",
+]
+
+[[package]]
+name = "gnrt_external_rust_hashbrown_0_17_1_2217129b2062afbe"
+version = "0.0.0"
+dependencies = [
+ "hashbrown",
 ]
 
 [[package]]
