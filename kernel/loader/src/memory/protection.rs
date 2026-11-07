@@ -12,9 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Logical permission intervals and the backend's enforcement level.
-
-use super::{AllocationOffset, MemoryPermissions};
+//! Required and provided enforcement levels shared with memory backends.
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum ProtectionLevel {
@@ -23,46 +21,4 @@ pub enum ProtectionLevel {
     LogicalOnly,
     /// Permissions are enforced for the image's execution context.
     HardwareEnforced,
-}
-
-/// A nonempty permission range relative to the image allocation base.
-///
-/// Backends may use these records to track their current access rules.
-/// Updating a mapping only requires the interval passed to `set_permissions`.
-/// NONE spans need not have physical backing.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct ProtectionRange {
-    allocation_offset: AllocationOffset,
-    len: u64,
-    permissions: MemoryPermissions,
-}
-
-impl ProtectionRange {
-    pub const fn new(
-        allocation_offset: AllocationOffset,
-        len: u64,
-        permissions: MemoryPermissions,
-    ) -> Self {
-        Self {
-            allocation_offset,
-            len,
-            permissions,
-        }
-    }
-
-    pub const fn allocation_offset(&self) -> AllocationOffset {
-        self.allocation_offset
-    }
-
-    pub const fn len(&self) -> u64 {
-        self.len
-    }
-
-    pub const fn is_empty(&self) -> bool {
-        self.len == 0
-    }
-
-    pub const fn permissions(&self) -> MemoryPermissions {
-        self.permissions
-    }
 }

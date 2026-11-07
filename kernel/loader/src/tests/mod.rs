@@ -21,6 +21,10 @@ mod image;
 mod mapping;
 mod memory;
 mod plan;
+#[path = "../../tests/support/mod.rs"]
+mod support;
+
+use crate as loader;
 
 use blueos_test_macro::test;
 use goblin::elf::{
@@ -34,7 +38,8 @@ use crate::{
     reader::ElfReader,
     LoadError,
 };
-use fixture::{ElfFixtureBuilder, SliceElfReader};
+use fixture::ElfFixtureBuilder;
+use support::SliceElfReader;
 
 #[test]
 fn fixture_builder_emits_a_parseable_elf32_header() {
