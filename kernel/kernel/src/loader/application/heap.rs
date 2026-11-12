@@ -22,6 +22,47 @@ use crate::{allocator, scheduler};
 use alloc::sync::Arc;
 use core::ptr;
 
+/// Own one malloc-family block until it is explicitly freed or the group exits.
+#[must_use = "dropping a tracked block releases its heap allocation"]
+pub(super) struct HeapBlock {
+    address: usize,
+    #[cfg(test)]
+    released: Option<Arc<core::sync::atomic::AtomicUsize>>,
+}
+
+impl HeapBlock {
+    fn new(block: *mut u8) -> Self {
+        Self {
+            address: block.expose_provenance(),
+            #[cfg(test)]
+            released: None,
+        }
+    }
+
+    #[cfg(test)]
+    pub(super) fn address(&self) -> usize {
+        self.address
+    }
+
+    #[cfg(test)]
+    pub(super) fn observe_release(&mut self, released: Arc<core::sync::atomic::AtomicUsize>) {
+        self.released = Some(released);
+    }
+}
+
+impl Drop for HeapBlock {
+    fn drop(&mut self) {
+        // A zero address means realloc(size=0) already released the block.
+        if self.address != 0 {
+            allocator::free(ptr::with_exposed_provenance_mut(self.address));
+        }
+        #[cfg(test)]
+        if let Some(released) = &self.released {
+            released.fetch_add(1, core::sync::atomic::Ordering::Release);
+        }
+    }
+}
+
 fn current_group() -> Option<Arc<Group>> {
     let members = MEMBERS.irqsave_lock();
     // malloc is also used before scheduler initialization, when no group exists.
@@ -33,7 +74,12 @@ fn current_group() -> Option<Arc<Group>> {
 
 fn allocation_owner(address: usize) -> Option<Arc<Group>> {
     if let Some(group) = current_group()
-        && group.state.irqsave_lock().allocations.contains(&address)
+        && group
+            .state
+            .irqsave_lock()
+            .allocations
+            .iter()
+            .any(|block| block.address == address)
     {
         return Some(group);
     }
@@ -43,7 +89,14 @@ fn allocation_owner(address: usize) -> Option<Arc<Group>> {
     MEMBERS
         .irqsave_lock()
         .values()
-        .find(|group| group.state.irqsave_lock().allocations.contains(&address))
+        .find(|group| {
+            group
+                .state
+                .irqsave_lock()
+                .allocations
+                .iter()
+                .any(|block| block.address == address)
+        })
         .cloned()
 }
 
@@ -57,7 +110,7 @@ impl Group {
         }
         let block = allocator::malloc_align(size, align);
         if !block.is_null() {
-            state.allocations.push(block.expose_provenance());
+            state.allocations.push(HeapBlock::new(block));
         }
         block
     }
@@ -75,15 +128,20 @@ pub(crate) fn free_heap(block: *mut u8) {
         return;
     }
     if let Some(group) = allocation_owner(block.addr()) {
-        let mut state = group.state.irqsave_lock();
-        let index = state
-            .allocations
-            .iter()
-            .position(|&a| a == block.addr())
-            .unwrap();
-        state.allocations.swap_remove(index);
+        let owned = {
+            let mut state = group.state.irqsave_lock();
+            let index = state
+                .allocations
+                .iter()
+                .position(|owned| owned.address == block.addr())
+                .unwrap();
+            state.allocations.swap_remove(index)
+        };
+        // Heap and test-observer cleanup run outside the group lock.
+        drop(owned);
+    } else {
+        allocator::free(block);
     }
-    allocator::free(block);
 }
 
 pub(crate) fn reallocate_heap(old: *mut u8, size: usize, align: usize) -> *mut u8 {
@@ -98,15 +156,18 @@ pub(crate) fn reallocate_heap(old: *mut u8, size: usize, align: usize) -> *mut u
     let index = state
         .allocations
         .iter()
-        .position(|&a| a == old.addr())
+        .position(|owned| owned.address == old.addr())
         .unwrap();
     // Hold the owner lock through resizing: a moved old address may immediately
     // be reused by another member. Failure preserves both the block and record.
     let block = allocator::realloc_align(old, size, align);
     if size == 0 {
-        state.allocations.swap_remove(index);
+        let mut owned = state.allocations.swap_remove(index);
+        owned.address = 0;
+        drop(state);
+        drop(owned);
     } else if !block.is_null() {
-        state.allocations[index] = block.expose_provenance();
+        state.allocations[index].address = block.expose_provenance();
     }
     block
 }
