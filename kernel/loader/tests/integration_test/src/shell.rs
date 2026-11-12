@@ -67,11 +67,26 @@ fn test_run_loads_shell_as_bare_thread_group() {
         argv: &[c"shell"],
         ..Default::default()
     };
-    // SAFETY: the staged shell is trusted native code using the standard ELF
-    // initial-stack entry; QEMU's coherent test execution publishes its code.
-    let status = unsafe { blueos::loader::run(IMAGE_PATH, &request) }.unwrap();
-    // The shell's main returns after its service thread exits; libc fini runs.
-    assert_eq!(status, ApplicationExit::Code(0));
+    let mut baseline = None;
+    for _ in 0..5 {
+        // SAFETY: the staged shell is trusted native code using the standard ELF
+        // initial-stack entry; QEMU's coherent test execution publishes its code.
+        let status = unsafe { blueos::loader::run(IMAGE_PATH, &request) }.unwrap();
+        // The shell's main returns after its service thread exits; libc fini runs.
+        assert_eq!(status, ApplicationExit::Code(0));
+        // wait() has reclaimed group resources. Let the worker also drop the
+        // callback storage and any other retirement bookkeeping before sampling.
+        let start = blueos::time::now();
+        while blueos::time::now().saturating_sub(start) < core::time::Duration::from_millis(20) {
+            blueos::scheduler::yield_me();
+        }
+        let used = blueos::allocator::memory_info().used;
+        // Warm up the worker and registry once, then require stable heap usage.
+        match baseline {
+            None => baseline = Some(used),
+            Some(expected) => assert_eq!(used, expected, "repeated shell load leaked heap"),
+        }
+    }
 
     assert_eq!(vfs::syscalls::unlink(c"/shell.elf".as_ptr()), 0);
 }
