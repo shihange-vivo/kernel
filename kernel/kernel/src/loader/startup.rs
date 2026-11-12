@@ -199,7 +199,9 @@ impl<A: ImageMapping> StartupStorage<A> {
     /// executable backing in the kernel's flat address space. The caller must
     /// satisfy code publication on every CPU where it may run. All image users
     /// must be application members created through CreateThread; pointers must
-    /// not escape this lifetime. Normal exit is coordinated by the main thread,
+    /// not escape this lifetime. Malloc-family allocations made by members are
+    /// group-owned and are reclaimed after the last member cleanup; they must
+    /// not be retained by outside threads. Normal exit is coordinated by main,
     /// after children have joined or detached and can finish cooperatively.
     pub unsafe fn into_application(self) -> Result<Application, StartupError>
     where
