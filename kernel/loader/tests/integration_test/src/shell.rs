@@ -18,18 +18,27 @@
 //! and exit. No Process or descriptor table is created; the application runs
 //! as a bare RTOS thread group.
 
+use alloc::{boxed::Box, sync::Arc};
 use blueos::{
     loader::{ApplicationExit, RunRequest},
+    scheduler,
+    thread::{Builder, DeferredCleanup, Entry, Stack, IDLE},
     vfs::{self, FileOps},
 };
 use blueos_test_macro::test;
-use core::ffi::{c_char, CStr};
+use core::{
+    ffi::{c_char, CStr},
+    sync::atomic::{AtomicUsize, Ordering},
+};
 
 unsafe extern "C" {
     static SHELL_TEST_ELF_PATH: *const c_char;
 }
 
 const IMAGE_PATH: &str = "/shell.elf";
+const LOADER_STACK_SIZE: usize = 12 * 1024;
+const STACK_GUARD_SIZE: usize = 1024;
+const STACK_GUARD_BYTE: u8 = 0xa5;
 
 /// Copy a host fixture into the target VFS so the run entry opens it by path.
 fn stage_image(path: &str, host: &CStr) {
@@ -59,6 +68,47 @@ fn stage_image(path: &str, host: &CStr) {
 
 #[test]
 fn test_run_loads_shell_as_bare_thread_group() {
+    // Exercise loading within an explicit caller-stack budget. The guard sits
+    // below the execution stack; its owning storage stays here through cleanup.
+    // RunRequest::stack_size controls the application's stack independently.
+    let done = Arc::new(AtomicUsize::new(0));
+    let completed = done.clone();
+    let storage = Stack::from_size(LOADER_STACK_SIZE + STACK_GUARD_SIZE)
+        .expect("shell loader test stack storage");
+    // SAFETY: this fresh allocation is exclusively owned and unpublished. Only
+    // the range above the initialized guard is handed to the execution thread.
+    let base = unsafe {
+        storage
+            .base()
+            .write_bytes(STACK_GUARD_BYTE, STACK_GUARD_SIZE);
+        storage.base().add(STACK_GUARD_SIZE)
+    };
+    let stack = Stack::from_raw(base, LOADER_STACK_SIZE).expect("shell loader execution stack");
+    let thread = Builder::new(Entry::Closure(Box::new(run_shell_repeatedly)))
+        .set_stack(stack)
+        .build();
+    assert!(thread.process().is_none());
+    // Publish completion after the entry has returned and dropped its captures.
+    thread.lock().set_deferred_cleanup(
+        DeferredCleanup::new(move || {
+            completed.store(1, Ordering::Release);
+            blueos::sync::wake(&completed);
+        })
+        .expect("shell loader test cleanup"),
+    );
+    assert_eq!(scheduler::queue_ready_thread(IDLE, thread.clone()), Ok(()));
+    blueos::sync::wait_until(1, &done);
+    // SAFETY: deferred cleanup runs after the entry returns. The node retains
+    // its borrowed stack descriptor, storage owns the allocation, and the guard
+    // lies outside the execution range so it has no concurrent accesses.
+    let guard = unsafe { core::slice::from_raw_parts(storage.base(), STACK_GUARD_SIZE) };
+    assert!(
+        guard.iter().all(|&byte| byte == STACK_GUARD_BYTE),
+        "shell loading exceeded its caller-stack budget"
+    );
+}
+
+fn run_shell_repeatedly() {
     // SAFETY: the linker provides this live host fixture path.
     let host = unsafe { CStr::from_ptr(SHELL_TEST_ELF_PATH) };
     stage_image(IMAGE_PATH, host);
@@ -80,12 +130,27 @@ fn test_run_loads_shell_as_bare_thread_group() {
         while blueos::time::now().saturating_sub(start) < core::time::Duration::from_millis(20) {
             blueos::scheduler::yield_me();
         }
-        let used = blueos::allocator::memory_info().used;
-        // Warm up the worker and registry once, then require stable heap usage.
-        match baseline {
-            None => baseline = Some(used),
-            Some(expected) => assert_eq!(used, expected, "repeated shell load leaked heap"),
+        // The cleanup worker allocates a wait entry while parked and frees it
+        // on each poll. Sample across a poll interval so its brief active state
+        // does not become an artificially low baseline for the next launch.
+        let start = blueos::time::now();
+        let mut used = 0;
+        loop {
+            used = used.max(blueos::allocator::memory_info().used);
+            if blueos::time::now().saturating_sub(start) >= core::time::Duration::from_millis(20) {
+                break;
+            }
+            blueos::scheduler::yield_me();
         }
+        // Warm up once, then reject growth. Deferred retirement may still
+        // reduce usage, which is not a leak; keep the new, tighter baseline.
+        if let Some(previous) = baseline {
+            assert!(
+                used <= previous,
+                "repeated shell load grew heap: {previous} -> {used}"
+            );
+        }
+        baseline = Some(used);
     }
 
     assert_eq!(vfs::syscalls::unlink(c"/shell.elf".as_ptr()), 0);
