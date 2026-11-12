@@ -78,6 +78,10 @@ impl LoadRequest {
 /// The host supplies initial read/write backing, permission changes and code
 /// cache synchronization. Successful loading does not initialize the application
 /// runtime or authorize calls from a context incompatible with that backend.
+///
+/// Stack usage depends on concrete reader, allocator and mapping types as well
+/// as backend calls; keep large backend state behind small owning or borrowed
+/// handles.
 pub fn load_elf<R, M, C>(
     reader: R,
     request: LoadRequest,
@@ -89,21 +93,24 @@ where
     M: ImageAllocator,
     C: CodeCache + ?Sized,
 {
-    let planned = ImageLoader::new(reader, request)
-        .admit()?
-        .inspect()?
-        .plan()?;
-    if let Some(dynamic) = planned.dynamic() {
-        request
-            .profile()
-            .check_standalone_dynamic(dynamic)
-            .map_err(|error| error.at_stage(LoadStage::Plan))?;
-    }
-    let sealed = planned
-        .allocate(allocator)?
-        .map()?
-        .decode()?
-        .relocate()?
-        .seal(cache)?;
-    Ok(LoadedImage::from_sealed(sealed))
+    // Forward Result between stages instead of unwrapping each large stage into
+    // an intermediate ControlFlow payload. This keeps the pipeline's stack small.
+    ImageLoader::new(reader, request)
+        .admit()
+        .and_then(|image| image.inspect())
+        .and_then(|image| image.plan())
+        .and_then(|image| {
+            if let Some(dynamic) = image.dynamic() {
+                request
+                    .profile()
+                    .check_standalone_dynamic(dynamic)
+                    .map_err(|error| error.at_stage(LoadStage::Plan))?;
+            }
+            image.allocate(allocator)
+        })
+        .and_then(|image| image.map())
+        .and_then(|image| image.decode())
+        .and_then(|image| image.relocate())
+        .and_then(|image| image.seal(cache))
+        .map(LoadedImage::from_sealed)
 }

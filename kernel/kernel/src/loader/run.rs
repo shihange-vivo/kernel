@@ -34,7 +34,8 @@ use core::ffi::CStr;
 
 /// Default stack for the application's main thread, in bytes. Runtime
 /// services a program spawns itself use their own stacks; this one carries
-/// the startup frame and libc bootstrap.
+/// the startup frame and libc bootstrap. It does not set the loader caller's
+/// stack size.
 const DEFAULT_STACK_SIZE: usize = 64 * 1024;
 /// ELF ABI page granularity reported through AT_PAGESZ.
 const ABI_PAGE_SIZE: usize = 4096;
@@ -99,6 +100,10 @@ impl From<ApplicationError> for RunError {
 /// publication is current-context only, as documented on `load_image`;
 /// callers on platforms without coherent instruction fetches must keep
 /// execution on the loading context.
+///
+/// Loading and startup preparation execute synchronously on the caller's stack;
+/// the caller must provide sufficient stack for the loader and interrupt handling.
+/// `request.stack_size` configures only the application's main thread.
 ///
 /// # Safety
 /// The file at `path` must be trusted native code using the standard ELF
