@@ -67,7 +67,7 @@ struct State {
     fini_complete: bool,
     outcome: Option<ApplicationExit>,
     // malloc-family blocks belong to the whole application, not one thread.
-    allocations: Vec<usize>,
+    allocations: Vec<heap::HeapBlock>,
 }
 
 #[must_use = "retain application resources until all member cleanups finish"]
@@ -266,9 +266,6 @@ impl Group {
             None
         };
         // Resource release may block. No group or registry lock survives here.
-        for address in allocations.iter().copied() {
-            crate::allocator::free(core::ptr::with_exposed_provenance_mut(address));
-        }
         drop(allocations);
         drop(owner);
         drop(main);
@@ -342,8 +339,10 @@ mod tests {
         child_entered: AtomicBool,
         child_cleaned: AtomicBool,
         dropped: AtomicBool,
+        normal_exit: AtomicBool,
         heap_block: AtomicUsize,
         untracked_block: AtomicUsize,
+        heap_released: Arc<AtomicUsize>,
     }
 
     #[must_use]
@@ -364,6 +363,41 @@ mod tests {
             scheduler::yield_me();
         }
     }
+
+    fn alloc_via_syscall(size: usize, align: usize) -> *mut u8 {
+        let mut block = core::ptr::null_mut();
+        assert_eq!(
+            crate::syscalls::alloc_mem::handle(&raw mut block, size, align),
+            0
+        );
+        block.cast()
+    }
+
+    fn realloc_via_syscall(old: *mut u8, size: usize, align: usize) -> *mut u8 {
+        let mut block = core::ptr::null_mut();
+        let status = crate::syscalls::realloc_mem::handle(&raw mut block, old.cast(), size, align);
+        if status != 0 {
+            assert_eq!(status, -1);
+            assert!(block.is_null());
+        }
+        block.cast()
+    }
+
+    fn free_via_syscall(block: *mut u8) {
+        assert_eq!(crate::syscalls::free_mem::handle(block.cast()), 0);
+    }
+
+    fn observe_release(block: *mut u8, observed: &Observed) {
+        let group = for_thread(scheduler::current_thread_id()).unwrap();
+        group
+            .state
+            .irqsave_lock()
+            .allocations
+            .iter_mut()
+            .find(|owned| owned.address() == block.addr())
+            .expect("allocation syscall must register its block")
+            .observe_release(observed.heap_released.clone());
+    }
     extern "C" fn empty() {}
     extern "C" fn main_entry(argument: *mut c_void) {
         // The owner and the test retain Observed through all callbacks.
@@ -372,8 +406,9 @@ mod tests {
     }
     extern "C" fn child_entry(argument: *mut c_void) {
         let observed = unsafe { &*argument.cast::<Observed>() };
-        let block = allocate_heap(128, 16);
+        let block = alloc_via_syscall(128, 16);
         assert!(!block.is_null());
+        observe_release(block, observed);
         unsafe { block.write(41) };
         observed
             .heap_block
@@ -391,36 +426,42 @@ mod tests {
         );
         assert_eq!(unsafe { block.read() }, 41);
         // This callback runs outside the application on the cleanup worker.
-        let block = reallocate_heap(block, 512, 16);
+        let block = realloc_via_syscall(block, 512, 16);
         assert!(!block.is_null());
         assert_eq!(unsafe { block.read() }, 41);
-        free_heap(block);
+        free_via_syscall(block);
         observed.child_cleaned.store(true, Ordering::Release);
     }
 
     extern "C" fn heap_entry(argument: *mut c_void) {
         let observed = unsafe { &*argument.cast::<Observed>() };
         let group = for_thread(scheduler::current_thread_id()).unwrap();
-        let block = allocate_heap(64, 64);
+        let block = alloc_via_syscall(64, 64);
         assert!(!block.is_null());
+        observe_release(block, observed);
         unsafe { block.write_bytes(0x5a, 64) };
-        let failed = reallocate_heap(block, isize::MAX as usize - 63, 64);
+        let failed = realloc_via_syscall(block, isize::MAX as usize - 63, 64);
         assert!(failed.is_null());
         assert!(group
             .state
             .irqsave_lock()
             .allocations
-            .contains(&block.addr()));
+            .iter()
+            .any(|owned| owned.address() == block.addr()));
         assert_eq!(unsafe { block.read() }, 0x5a);
-        let moved = reallocate_heap(block, 4096, 64);
+        let moved = realloc_via_syscall(block, 4096, 64);
         assert!(!moved.is_null());
         assert_ne!(moved, block);
         assert_eq!(moved.addr() % 64, 0);
         assert_eq!(unsafe { moved.add(63).read() }, 0x5a);
-        free_heap(moved);
-        let zeroed = reallocate_heap(core::ptr::null_mut(), 128, 16);
+        assert_eq!(observed.heap_released.load(Ordering::Acquire), 0);
+        free_via_syscall(moved);
+        assert_eq!(observed.heap_released.load(Ordering::Acquire), 1);
+        let zeroed = realloc_via_syscall(core::ptr::null_mut(), 128, 16);
         assert!(!zeroed.is_null());
-        assert!(reallocate_heap(zeroed, 0, 16).is_null());
+        observe_release(zeroed, observed);
+        assert!(realloc_via_syscall(zeroed, 0, 16).is_null());
+        assert_eq!(observed.heap_released.load(Ordering::Acquire), 2);
         assert!(group.state.irqsave_lock().allocations.is_empty());
 
         // An incoming kernel-owned block remains independent even if resized
@@ -428,7 +469,7 @@ mod tests {
         let external = core::ptr::with_exposed_provenance_mut::<u8>(
             observed.untracked_block.load(Ordering::Acquire),
         );
-        let external = reallocate_heap(external, 8192, 16);
+        let external = realloc_via_syscall(external, 8192, 16);
         assert!(!external.is_null());
         assert_eq!(unsafe { external.read() }, 23);
         observed
@@ -437,18 +478,34 @@ mod tests {
         assert!(group.state.irqsave_lock().allocations.is_empty());
 
         // Deliberately leave one block as a static std object would do.
-        let remaining = allocate_heap(512, 16);
+        let remaining = alloc_via_syscall(512, 16);
         assert!(!remaining.is_null());
+        observe_release(remaining, observed);
         observed
             .heap_block
             .store(remaining.expose_provenance(), Ordering::Release);
+        assert_eq!(observed.heap_released.load(Ordering::Acquire), 2);
         // Do not retain a strong group reference on a retiring thread's stack.
         drop(group);
+        if observed.normal_exit.load(Ordering::Acquire) {
+            assert_eq!(crate::syscalls::application_begin_exit::handle(0), 0);
+            let status = crate::syscalls::application_finish_exit::handle();
+            panic!("normal application exit returned: {status}");
+        }
     }
 
     #[test]
     fn application_reclaims_heap_without_adopting_incoming_blocks() {
+        for normal_exit in [false, true] {
+            for _ in 0..5 {
+                check_heap_reclamation(normal_exit);
+            }
+        }
+    }
+
+    fn check_heap_reclamation(normal_exit: bool) {
         let observed = Arc::new(Observed::default());
+        observed.normal_exit.store(normal_exit, Ordering::Release);
         let external = crate::allocator::malloc_align(64, 16);
         assert!(!external.is_null());
         unsafe { external.write(23) };
@@ -466,7 +523,17 @@ mod tests {
             .set_deferred_cleanup(group.main_cleanup().unwrap());
         let mut application = group.install(thread);
         application.start(None).unwrap();
-        assert_eq!(application.wait(), Ok(ApplicationExit::Aborted));
+        assert_eq!(
+            application.wait(),
+            Ok(if normal_exit {
+                ApplicationExit::Code(0)
+            } else {
+                ApplicationExit::Aborted
+            })
+        );
+        // Explicit free and realloc(0) release two owners. Group exit must
+        // release the deliberately retained third owner before wait returns.
+        assert_eq!(observed.heap_released.load(Ordering::Acquire), 3);
         assert_ne!(observed.heap_block.load(Ordering::Acquire), 0);
         assert!(group.state.irqsave_lock().allocations.is_empty());
         let external = core::ptr::with_exposed_provenance_mut::<u8>(
@@ -478,8 +545,9 @@ mod tests {
 
     extern "C" fn allocating_child(argument: *mut c_void) {
         let observed = unsafe { &*argument.cast::<Observed>() };
-        let block = allocate_heap(512, 16);
+        let block = alloc_via_syscall(512, 16);
         assert!(!block.is_null());
+        observe_release(block, observed);
         unsafe { block.write(41) };
         observed
             .heap_block
@@ -514,9 +582,12 @@ mod tests {
             .state
             .irqsave_lock()
             .allocations
-            .contains(&block.addr()));
+            .iter()
+            .any(|owned| owned.address() == block.addr()));
+        assert_eq!(observed.heap_released.load(Ordering::Acquire), 0);
         observed.release_main.store(true, Ordering::Release);
         assert_eq!(application.wait(), Ok(ApplicationExit::Aborted));
+        assert_eq!(observed.heap_released.load(Ordering::Acquire), 1);
         assert!(application
             .group
             .state
@@ -577,7 +648,8 @@ mod tests {
             .state
             .irqsave_lock()
             .allocations
-            .contains(&observed.heap_block.load(Ordering::Acquire)));
+            .iter()
+            .any(|owned| owned.address() == observed.heap_block.load(Ordering::Acquire)));
         // New members cannot extend an application after its main exits.
         let mut rejected = Builder::new(Entry::C(empty)).build();
         assert!(application.group.attach(rejected.clone()).is_err());
@@ -585,6 +657,7 @@ mod tests {
         observed.release_child.store(true, Ordering::Release);
         assert_eq!(application.wait(), Ok(ApplicationExit::Aborted));
         assert!(observed.child_cleaned.load(Ordering::Acquire));
+        assert_eq!(observed.heap_released.load(Ordering::Acquire), 1);
         assert!(observed.dropped.load(Ordering::Acquire));
         assert!(for_thread(id).is_none());
         assert!(application
