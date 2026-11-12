@@ -32,6 +32,9 @@ use alloc::{
 use core::sync::atomic::{AtomicUsize, Ordering};
 use spin::Mutex;
 
+mod heap;
+pub(crate) use heap::{allocate_heap, free_heap, reallocate_heap};
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ApplicationState {
     Prepared,
@@ -63,6 +66,8 @@ struct State {
     status: Option<i32>,
     fini_complete: bool,
     outcome: Option<ApplicationExit>,
+    // malloc-family blocks belong to the whole application, not one thread.
+    allocations: Vec<usize>,
 }
 
 #[must_use = "retain application resources until all member cleanups finish"]
@@ -124,7 +129,7 @@ impl Application {
         Ok(())
     }
 
-    /// Wait until every member cleanup and image release have finished.
+    /// Wait until every member cleanup, heap reclamation and image release finish.
     pub fn wait(&self) -> Result<ApplicationExit, ApplicationError> {
         if self.state() == ApplicationState::Prepared {
             return Err(ApplicationError::NotStarted);
@@ -167,6 +172,7 @@ impl Group {
                 status: None,
                 fini_complete: false,
                 outcome: None,
+                allocations: Vec::new(),
             }),
             owner: Mutex::new(Some(owner)),
             changed: AtomicUsize::new(0),
@@ -233,7 +239,7 @@ impl Group {
 
     pub(crate) fn finish(self: &Arc<Self>, id: usize) {
         let registered = { MEMBERS.irqsave_lock().remove(&id) };
-        let (member, main, complete) = {
+        let (member, main, allocations, complete) = {
             let mut state = self.state.irqsave_lock();
             let Some(index) = state.members.iter().position(|t| Thread::id(t) == id) else {
                 return;
@@ -244,9 +250,14 @@ impl Group {
             }
             if state.members.is_empty() {
                 state.phase = ApplicationState::Exiting;
-                (member, state.main.take(), true)
+                (
+                    member,
+                    state.main.take(),
+                    core::mem::take(&mut state.allocations),
+                    true,
+                )
             } else {
-                (member, None, false)
+                (member, None, Vec::new(), false)
             }
         };
         let owner = if complete {
@@ -255,6 +266,10 @@ impl Group {
             None
         };
         // Resource release may block. No group or registry lock survives here.
+        for address in allocations.iter().copied() {
+            crate::allocator::free(core::ptr::with_exposed_provenance_mut(address));
+        }
+        drop(allocations);
         drop(owner);
         drop(main);
         drop(member);
@@ -327,6 +342,8 @@ mod tests {
         child_entered: AtomicBool,
         child_cleaned: AtomicBool,
         dropped: AtomicBool,
+        heap_block: AtomicUsize,
+        untracked_block: AtomicUsize,
     }
 
     #[must_use]
@@ -355,6 +372,12 @@ mod tests {
     }
     extern "C" fn child_entry(argument: *mut c_void) {
         let observed = unsafe { &*argument.cast::<Observed>() };
+        let block = allocate_heap(128, 16);
+        assert!(!block.is_null());
+        unsafe { block.write(41) };
+        observed
+            .heap_block
+            .store(block.expose_provenance(), Ordering::Release);
         observed.child_entered.store(true, Ordering::Release);
         wait_for(|| observed.release_child.load(Ordering::Acquire));
         assert!(!observed.dropped.load(Ordering::Acquire));
@@ -363,8 +386,145 @@ mod tests {
         let observed = unsafe { &*argument.cast::<Observed>() };
         assert!(arch::local_irq_enabled());
         assert!(!observed.dropped.load(Ordering::Acquire));
+        let block = core::ptr::with_exposed_provenance_mut::<u8>(
+            observed.heap_block.swap(0, Ordering::AcqRel),
+        );
+        assert_eq!(unsafe { block.read() }, 41);
+        // This callback runs outside the application on the cleanup worker.
+        let block = reallocate_heap(block, 512, 16);
+        assert!(!block.is_null());
+        assert_eq!(unsafe { block.read() }, 41);
+        free_heap(block);
         observed.child_cleaned.store(true, Ordering::Release);
     }
+
+    extern "C" fn heap_entry(argument: *mut c_void) {
+        let observed = unsafe { &*argument.cast::<Observed>() };
+        let group = for_thread(scheduler::current_thread_id()).unwrap();
+        let block = allocate_heap(64, 64);
+        assert!(!block.is_null());
+        unsafe { block.write_bytes(0x5a, 64) };
+        let failed = reallocate_heap(block, isize::MAX as usize - 63, 64);
+        assert!(failed.is_null());
+        assert!(group
+            .state
+            .irqsave_lock()
+            .allocations
+            .contains(&block.addr()));
+        assert_eq!(unsafe { block.read() }, 0x5a);
+        let moved = reallocate_heap(block, 4096, 64);
+        assert!(!moved.is_null());
+        assert_ne!(moved, block);
+        assert_eq!(moved.addr() % 64, 0);
+        assert_eq!(unsafe { moved.add(63).read() }, 0x5a);
+        free_heap(moved);
+        let zeroed = reallocate_heap(core::ptr::null_mut(), 128, 16);
+        assert!(!zeroed.is_null());
+        assert!(reallocate_heap(zeroed, 0, 16).is_null());
+        assert!(group.state.irqsave_lock().allocations.is_empty());
+
+        // An incoming kernel-owned block remains independent even if resized
+        // by a member. It must survive application completion.
+        let external = core::ptr::with_exposed_provenance_mut::<u8>(
+            observed.untracked_block.load(Ordering::Acquire),
+        );
+        let external = reallocate_heap(external, 8192, 16);
+        assert!(!external.is_null());
+        assert_eq!(unsafe { external.read() }, 23);
+        observed
+            .untracked_block
+            .store(external.expose_provenance(), Ordering::Release);
+        assert!(group.state.irqsave_lock().allocations.is_empty());
+
+        // Deliberately leave one block as a static std object would do.
+        let remaining = allocate_heap(512, 16);
+        assert!(!remaining.is_null());
+        observed
+            .heap_block
+            .store(remaining.expose_provenance(), Ordering::Release);
+        // Do not retain a strong group reference on a retiring thread's stack.
+        drop(group);
+    }
+
+    #[test]
+    fn application_reclaims_heap_without_adopting_incoming_blocks() {
+        let observed = Arc::new(Observed::default());
+        let external = crate::allocator::malloc_align(64, 16);
+        assert!(!external.is_null());
+        unsafe { external.write(23) };
+        observed
+            .untracked_block
+            .store(external.expose_provenance(), Ordering::Release);
+        let group = Group::prepare(Box::new(Owner(observed.clone())));
+        let thread = Builder::new(Entry::Posix(
+            heap_entry,
+            Arc::as_ptr(&observed).cast_mut().cast(),
+        ))
+        .build();
+        thread
+            .lock()
+            .set_deferred_cleanup(group.main_cleanup().unwrap());
+        let mut application = group.install(thread);
+        application.start(None).unwrap();
+        assert_eq!(application.wait(), Ok(ApplicationExit::Aborted));
+        assert_ne!(observed.heap_block.load(Ordering::Acquire), 0);
+        assert!(group.state.irqsave_lock().allocations.is_empty());
+        let external = core::ptr::with_exposed_provenance_mut::<u8>(
+            observed.untracked_block.load(Ordering::Acquire),
+        );
+        assert_eq!(unsafe { external.read() }, 23);
+        crate::allocator::free(external);
+    }
+
+    extern "C" fn allocating_child(argument: *mut c_void) {
+        let observed = unsafe { &*argument.cast::<Observed>() };
+        let block = allocate_heap(512, 16);
+        assert!(!block.is_null());
+        unsafe { block.write(41) };
+        observed
+            .heap_block
+            .store(block.expose_provenance(), Ordering::Release);
+    }
+
+    #[test]
+    fn child_heap_allocation_survives_its_allocating_thread() {
+        let (mut application, observed) = prepare();
+        application.start(None).unwrap();
+        let child = Builder::new(Entry::Posix(
+            allocating_child,
+            Arc::as_ptr(&observed).cast_mut().cast(),
+        ))
+        .build();
+        let id = Thread::id(&child);
+        child
+            .lock()
+            .set_deferred_cleanup(application.group.child_cleanup(id, None, 0).unwrap());
+        application.group.attach(child.clone()).unwrap();
+        assert_eq!(scheduler::queue_ready_thread(thread::IDLE, child), Ok(()));
+        wait_for(|| {
+            observed.heap_block.load(Ordering::Acquire) != 0 && application.member_count() == 1
+        });
+        assert!(for_thread(id).is_none());
+        let block = core::ptr::with_exposed_provenance_mut::<u8>(
+            observed.heap_block.load(Ordering::Acquire),
+        );
+        assert_eq!(unsafe { block.read() }, 41);
+        assert!(application
+            .group
+            .state
+            .irqsave_lock()
+            .allocations
+            .contains(&block.addr()));
+        observed.release_main.store(true, Ordering::Release);
+        assert_eq!(application.wait(), Ok(ApplicationExit::Aborted));
+        assert!(application
+            .group
+            .state
+            .irqsave_lock()
+            .allocations
+            .is_empty());
+    }
+
     fn prepare() -> (Application, Arc<Observed>) {
         let observed = Arc::new(Observed::default());
         let group = Group::prepare(Box::new(Owner(observed.clone())));
@@ -412,6 +572,12 @@ mod tests {
         assert_eq!(application.thread.state(), thread::RETIRED);
         assert!(!observed.dropped.load(Ordering::Acquire));
         assert_eq!(application.exit_status(), None);
+        assert!(application
+            .group
+            .state
+            .irqsave_lock()
+            .allocations
+            .contains(&observed.heap_block.load(Ordering::Acquire)));
         // New members cannot extend an application after its main exits.
         let mut rejected = Builder::new(Entry::C(empty)).build();
         assert!(application.group.attach(rejected.clone()).is_err());
@@ -421,6 +587,12 @@ mod tests {
         assert!(observed.child_cleaned.load(Ordering::Acquire));
         assert!(observed.dropped.load(Ordering::Acquire));
         assert!(for_thread(id).is_none());
+        assert!(application
+            .group
+            .state
+            .irqsave_lock()
+            .allocations
+            .is_empty());
     }
 
     #[test]
