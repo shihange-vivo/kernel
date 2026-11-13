@@ -44,17 +44,28 @@ own allocator and panic handler. The existing firmware `rsrt` and
 ## Load and finish
 
 The kernel loads the file through `loader::load_image`, constructs
-`StartupStorage` and converts it using unsafe `into_thread_group()`. That
-operation requires trusted native code and all image users to remain within
+`StartupStorage` and converts it using unsafe `into_thread_group(None)` when
+VFS is enabled, or `into_thread_group()` otherwise. The operation requires
+trusted native code and all image users to remain within
 the thread group's lifetime. `ThreadGroup::start()` schedules its main thread.
-Members share the group's descriptor table without requiring a Process;
-`set_standard_io()` can replace the default console streams before startup.
+Members share the group's descriptor table without requiring a Process.
+Pass `Some(&stdio)` at creation to supply standard streams instead of opening
+the default console. The table is initialized before the main thread is
+registered; `start()` only schedules it.
 
 Libc initializes the image, calls Rust's generated C `main` wrapper, waits for
 cooperative child cleanup and executes `atexit`/finalizers. The thread group's
 owner releases the image after all member cleanup. `ThreadGroup::wait()` then
 reports normal status or aborted execution. Child threads must join or detach
 and be able to finish without the main thread running.
+
+Post-retirement callbacks only release resources, such as thread stack storage.
+They run on a shared kernel worker without the retired member's identity, TLS
+or descriptor table. Pass any required resource handles explicitly; do not wait
+for group members or run application finalizers in these callbacks.
+
+Applications and libraries must release their malloc-family allocations
+explicitly. Thread-group exit does not track or reclaim those allocations.
 
 `std_app` exercises this production CRT with a normal Rust `fn main`, environment
 access, heap growth/zeroing, a std thread and its TLS destructor, finalization

@@ -125,6 +125,8 @@ extern "C" fn posix_start_routine(arg: *mut c_void) {
 // This routine will be executed on another stack by kernel.
 // The PosixRoutineInfo is stored between [storage_start, storage_start + storage_size),
 // that doesn't matter, after the `system_dealloc`, we don't use it anymore.
+// Only release the passed storage here; pthread_exit already ran this thread's
+// destructors, and this callback does not inherit its identity or TLS.
 extern "C" fn posix_cleanup_routine(arg: *mut c_void) {
     assert_ne!(arg, core::ptr::null_mut());
     let routine = unsafe { &*arg.cast::<PosixRoutineInfo>() };

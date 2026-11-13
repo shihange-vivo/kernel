@@ -40,6 +40,8 @@ pub enum StartupError {
     TooManyArguments,
     StackTooSmall,
     CleanupUnavailable(CleanupError),
+    #[cfg(enable_vfs)]
+    FileTable(crate::error::Error),
 }
 
 /// Platform values and strings copied into the new application's stack.
@@ -192,23 +194,41 @@ impl<A: ImageMapping> StartupStorage<A> {
     /// through ThreadGroup::thread(), then call ThreadGroup::start(). The image
     /// and initial stack survive all member threads and their deferred cleanup.
     /// Dropping a prepared group cancels startup and releases its resources.
-    /// With VFS enabled the group owns a descriptor table: startup opens the
-    /// console unless ThreadGroup::set_standard_io supplies replacement streams.
+    /// With VFS enabled, `stdio` selects the standard streams at creation;
+    /// `None` opens the system console. File I/O completes before the table is
+    /// placed behind its lock or the main thread is registered.
+    /// Applications and libraries must explicitly release their malloc-family
+    /// allocations; the group does not reclaim them on exit.
     ///
     /// # Safety
     /// The image must be trusted native code using the ELF initial-stack entry
     /// convention and must never return from its entry. Its mapping must expose
     /// executable backing in the kernel's flat address space. The caller must
     /// satisfy code publication on every CPU where it may run. All image users
-    /// must be group members created through CreateThread; pointers must
-    /// not escape this lifetime. Malloc-family allocations made by members are
-    /// group-owned and are reclaimed after the last member cleanup; they must
-    /// not be retained by outside threads. Normal exit is coordinated by main,
-    /// after children have joined or detached and can finish cooperatively.
-    pub unsafe fn into_thread_group(self) -> Result<ThreadGroup, StartupError>
+    /// must be group members created through CreateThread; pointers into the
+    /// image or startup storage must not escape this lifetime. Normal exit is
+    /// coordinated by main, after children have joined or detached and can finish
+    /// cooperatively.
+    pub unsafe fn into_thread_group(
+        self,
+        #[cfg(enable_vfs)] stdio: Option<&super::StandardIo>,
+    ) -> Result<ThreadGroup, StartupError>
     where
         A: Send + 'static,
     {
+        #[cfg(enable_vfs)]
+        let table = match stdio {
+            Some(stdio) => crate::vfs::fd_manager::FdManager::from_stdio([
+                stdio.stdin.clone(),
+                stdio.stdout.clone(),
+                stdio.stderr.clone(),
+            ]),
+            None => {
+                let mut table = crate::vfs::fd_manager::FdManager::new();
+                table.init_stdio().map_err(StartupError::FileTable)?;
+                table
+            }
+        };
         let data = Box::new(EntryData {
             sp: self.stack.top() as usize,
             image: self.image,
@@ -216,7 +236,11 @@ impl<A: ImageMapping> StartupStorage<A> {
         let pointer = ptr::from_ref(data.as_ref()).cast_mut().cast::<c_void>();
         // Prepare before registering a thread, so failure drops the image and
         // stack in the caller's context without leaving a global queue entry.
-        let group = ThreadGroupInner::prepare(data);
+        let group = ThreadGroupInner::prepare(
+            data,
+            #[cfg(enable_vfs)]
+            table,
+        );
         let cleanup = group
             .main_cleanup()
             .map_err(StartupError::CleanupUnavailable)?;
