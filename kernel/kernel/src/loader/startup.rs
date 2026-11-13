@@ -16,7 +16,7 @@
 
 use super::{
     adapters::KernelCodeCache,
-    application::{Application, Group},
+    application::{Application, ApplicationGroup},
 };
 use crate::{
     scheduler,
@@ -192,6 +192,8 @@ impl<A: ImageMapping> StartupStorage<A> {
     /// through Application::thread(), then call Application::start(). The image
     /// and initial stack survive all member threads and their deferred cleanup.
     /// Dropping a prepared application cancels startup and releases its resources.
+    /// With VFS enabled the group owns a descriptor table: startup opens the
+    /// console unless Application::set_standard_io supplies replacement streams.
     ///
     /// # Safety
     /// The image must be trusted native code using the ELF initial-stack entry
@@ -214,7 +216,7 @@ impl<A: ImageMapping> StartupStorage<A> {
         let pointer = ptr::from_ref(data.as_ref()).cast_mut().cast::<c_void>();
         // Prepare before registering a thread, so failure drops the image and
         // stack in the caller's context without leaving a global queue entry.
-        let group = Group::prepare(data);
+        let group = ApplicationGroup::prepare(data);
         let cleanup = group
             .main_cleanup()
             .map_err(StartupError::CleanupUnavailable)?;

@@ -20,12 +20,12 @@
 //! exit. The public stages (`load_image`, `StartupStorage`, `Application`)
 //! remain available when a caller needs to observe or configure between them;
 //! this helper covers the common "start this file now" flow without a
-//! syscall. Applications run as bare RTOS thread groups; no Process or file
-//! descriptor table is involved yet.
+//! syscall. Applications run as RTOS thread groups with their own descriptors;
+//! no Process or private address space is required.
 
 use super::{
-    adapters::VfsElfReader, load_image, ApplicationError, ApplicationExit, StartupArguments,
-    StartupError, StartupStorage,
+    adapters::VfsElfReader, load_image, ApplicationError, ApplicationExit, StandardIo,
+    StartupArguments, StartupError, StartupStorage,
 };
 use crate::{thread::Stack, vfs};
 use alloc::{ffi::CString, string::String};
@@ -45,6 +45,8 @@ pub struct RunRequest<'a> {
     pub argv: &'a [&'a CStr],
     pub envp: &'a [&'a CStr],
     pub stack_size: usize,
+    /// Redirect descriptors 0/1/2; None opens the system console for each stream.
+    pub stdio: Option<&'a StandardIo>,
 }
 
 impl<'a> Default for RunRequest<'a> {
@@ -53,6 +55,7 @@ impl<'a> Default for RunRequest<'a> {
             argv: &[],
             envp: &[],
             stack_size: DEFAULT_STACK_SIZE,
+            stdio: None,
         }
     }
 }
@@ -63,6 +66,7 @@ impl<'a> core::fmt::Debug for RunRequest<'a> {
             .field("argv", &self.argv.len())
             .field("envp", &self.envp.len())
             .field("stack_size", &self.stack_size)
+            .field("redirected_stdio", &self.stdio.is_some())
             .finish()
     }
 }
@@ -128,6 +132,9 @@ pub unsafe fn run(path: &str, request: &RunRequest<'_>) -> Result<ApplicationExi
     // SAFETY: the caller guarantees trusted native code; the group retains
     // the image and stack through all member cleanups.
     let mut application = unsafe { storage.into_application()? };
-    application.start(None)?;
+    if let Some(stdio) = request.stdio {
+        application.set_standard_io(stdio)?;
+    }
+    application.start()?;
     application.wait().map_err(Into::into)
 }

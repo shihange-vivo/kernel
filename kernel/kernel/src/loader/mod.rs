@@ -28,6 +28,8 @@ mod run;
 mod startup;
 
 pub use adapters::flat_memory::init_fixed_regions;
+#[cfg(enable_vfs)]
+pub use application::StandardIo;
 pub use application::{Application, ApplicationError, ApplicationExit, ApplicationState};
 pub use load::{board_load_profile, load_image, load_request};
 #[cfg(enable_vfs)]

@@ -35,7 +35,8 @@ use core::{
 };
 use log::{debug, error, warn};
 
-/// Acquire the current process's per-process fd table.
+/// Acquire the current application's fd table, or the existing process table
+/// for threads that do not belong to a loaded application.
 ///
 /// Usage (statement form — see the lifetime note below for why this can't be
 /// an expression):
@@ -45,31 +46,27 @@ use log::{debug, error, warn};
 /// current_fd!(mut fd_manager, err: -libc::EBADF);
 /// ```
 ///
-/// `err:` gives the early-return value used when there is no current process
+/// `err:` gives the early-return value used when there is no descriptor context
 /// (e.g. an unlinked kernel/idle thread); callers type-match it to their
 /// function's return type (a negative errno, or `Err(code::…)`).
 ///
 /// Why a statement macro, not `let g = current_fd!(err: …)`: the guard
-/// borrows from the `Arc<Process>` returned by `current_process()`. An
-/// expression-form macro returning the guard from a block would drop that
-/// `Arc` at the block's end, dangling the borrow — rustc rejects it with
-/// E0597 (verified). Emitting two sibling `let`s in the caller's scope keeps
-/// the `Arc` (`_fd_proc`) alive for the guard's whole scope, so the borrow is
-/// sound.
+/// borrows the table owner. Keep the owner and guard as sibling bindings so
+/// the owner outlives the guard. File I/O must run after releasing the guard.
 macro_rules! current_fd {
     ($guard:ident, err: $err:expr_2021) => {
-        let _fd_proc = match crate::process::current_process() {
-            Some(p) => p,
+        let _fd_owner = match crate::vfs::fd_manager::CurrentFiles::get() {
+            Some(owner) => owner,
             None => return $err,
         };
-        let $guard = _fd_proc.fd_manager().irqsave_lock();
+        let $guard = _fd_owner.table().irqsave_lock();
     };
     (mut $guard:ident, err: $err:expr_2021) => {
-        let _fd_proc = match crate::process::current_process() {
-            Some(p) => p,
+        let _fd_owner = match crate::vfs::fd_manager::CurrentFiles::get() {
+            Some(owner) => owner,
             None => return $err,
         };
-        let mut $guard = _fd_proc.fd_manager().irqsave_lock();
+        let mut $guard = _fd_owner.table().irqsave_lock();
     };
 }
 pub(crate) use current_fd;

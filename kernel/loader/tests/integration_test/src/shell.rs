@@ -16,11 +16,11 @@
 //! The test stages the shell ELF in the target VFS, then `loader::run`
 //! performs the complete flow: open, load, startup frame, thread scheduling
 //! and exit. No Process or descriptor table is created; the application runs
-//! as a bare RTOS thread group.
+//! as an RTOS thread group with its own descriptor table.
 
-use alloc::{boxed::Box, sync::Arc};
+use alloc::{boxed::Box, sync::Arc, vec, vec::Vec};
 use blueos::{
-    loader::{ApplicationExit, RunRequest},
+    loader::{ApplicationExit, RunRequest, StandardIo},
     scheduler,
     thread::{Builder, DeferredCleanup, Entry, Stack, IDLE},
     vfs::{self, FileOps},
@@ -36,6 +36,12 @@ unsafe extern "C" {
 }
 
 const IMAGE_PATH: &str = "/shell.elf";
+const INPUT_PATH: &str = "/shell-input";
+const OUTPUT_PATH: &str = "/shell-output";
+const ERROR_PATH: &str = "/shell-error";
+const CREATED_PATH: &str = "/shell-created";
+const SCRIPT: &[u8] =
+    b"echo shell-group-ready\necho persisted-by-shell > /shell-created\ncat /shell-created\nexit\n";
 const LOADER_STACK_SIZE: usize = 12 * 1024;
 const STACK_GUARD_SIZE: usize = 1024;
 const STACK_GUARD_BYTE: u8 = 0xa5;
@@ -113,16 +119,62 @@ fn run_shell_repeatedly() {
     let host = unsafe { CStr::from_ptr(SHELL_TEST_ELF_PATH) };
     stage_image(IMAGE_PATH, host);
 
-    let request = RunRequest {
-        argv: &[c"shell"],
-        ..Default::default()
-    };
     for _ in 0..5 {
+        assert!(blueos::process::current_process().is_none());
+        let input = vfs::open_path(
+            INPUT_PATH,
+            libc::O_CREAT | libc::O_TRUNC | libc::O_WRONLY,
+            0o600,
+        )
+        .unwrap();
+        assert_eq!(input.write(SCRIPT).unwrap(), SCRIPT.len());
+        input.close().unwrap();
+        let stdio = StandardIo {
+            stdin: Arc::new(vfs::open_path(INPUT_PATH, libc::O_RDONLY, 0).unwrap()),
+            stdout: Arc::new(
+                vfs::open_path(
+                    OUTPUT_PATH,
+                    libc::O_CREAT | libc::O_TRUNC | libc::O_WRONLY,
+                    0o600,
+                )
+                .unwrap(),
+            ),
+            stderr: Arc::new(
+                vfs::open_path(
+                    ERROR_PATH,
+                    libc::O_CREAT | libc::O_TRUNC | libc::O_WRONLY,
+                    0o600,
+                )
+                .unwrap(),
+            ),
+        };
+        let request = RunRequest {
+            argv: &[c"shell"],
+            stdio: Some(&stdio),
+            ..Default::default()
+        };
         // SAFETY: the staged shell is trusted native code using the standard ELF
         // initial-stack entry; QEMU's coherent test execution publishes its code.
         let status = unsafe { blueos::loader::run(IMAGE_PATH, &request) }.unwrap();
         // The shell's main returns after its service thread exits; libc fini runs.
         assert_eq!(status, ApplicationExit::Code(0));
+        assert_eq!(read_file(CREATED_PATH), b"persisted-by-shell\n");
+        let output = read_file(OUTPUT_PATH);
+        for expected in [
+            b"Hello, shell!".as_slice(),
+            b"shell-group-ready",
+            b"persisted-by-shell",
+        ] {
+            assert!(
+                output
+                    .windows(expected.len())
+                    .any(|bytes| bytes == expected),
+                "loaded shell did not produce expected output"
+            );
+        }
+        assert!(read_file(ERROR_PATH).is_empty());
+        // Removing it forces the next run to create the file again.
+        assert_eq!(vfs::syscalls::unlink(c"/shell-created".as_ptr()), 0);
     }
 
     // Global heap usage also includes network and cleanup-worker allocations,
@@ -130,4 +182,15 @@ fn run_shell_repeatedly() {
     // tests observe owned-block release directly, including repeated launches.
 
     assert_eq!(vfs::syscalls::unlink(c"/shell.elf".as_ptr()), 0);
+    assert_eq!(vfs::syscalls::unlink(c"/shell-input".as_ptr()), 0);
+    assert_eq!(vfs::syscalls::unlink(c"/shell-output".as_ptr()), 0);
+    assert_eq!(vfs::syscalls::unlink(c"/shell-error".as_ptr()), 0);
+}
+
+fn read_file(path: &str) -> Vec<u8> {
+    let file = vfs::open_path(path, libc::O_RDONLY, 0).unwrap();
+    let mut bytes = vec![0; usize::try_from(file.file_len().unwrap()).unwrap()];
+    file.read_exact_at(0, &mut bytes).unwrap();
+    file.close().unwrap();
+    bytes
 }

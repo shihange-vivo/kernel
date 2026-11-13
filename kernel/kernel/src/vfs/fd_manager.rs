@@ -30,6 +30,7 @@ pub const STDERR_FILENO: c_int = 2;
 pub const FIRST_FD: usize = 3;
 
 /// File descriptor manager
+#[must_use = "retain the table while its descriptors are in use"]
 pub struct FdManager {
     /// File descriptor table
     fds: Vec<Option<Arc<dyn FileOps>>>,
@@ -47,15 +48,65 @@ impl FdManager {
     }
 
     pub fn init_stdio(&mut self) -> Result<(), Error> {
-        let stdin = path::open_path("/dev/console", libc::O_RDONLY, 0o666)?;
-        let stdout = path::open_path("/dev/console", libc::O_WRONLY, 0o666)?;
-        let stderr = path::open_path("/dev/console", libc::O_WRONLY, 0o666)?;
+        self.init_stdio_with(|flags| Ok(Arc::new(path::open_path("/dev/console", flags, 0o666)?)))
+    }
 
-        self.fds[STDIN_FILENO as usize] = Some(Arc::new(stdin));
-        self.fds[STDOUT_FILENO as usize] = Some(Arc::new(stdout));
-        self.fds[STDERR_FILENO as usize] = Some(Arc::new(stderr));
-
+    fn init_stdio_with(
+        &mut self,
+        mut open: impl FnMut(i32) -> Result<Arc<dyn FileOps>, Error>,
+    ) -> Result<(), Error> {
+        for (fd, flags) in [libc::O_RDONLY, libc::O_WRONLY, libc::O_WRONLY]
+            .into_iter()
+            .enumerate()
+        {
+            match open(flags) {
+                Ok(file) => self.fds[fd] = Some(file),
+                Err(error) => {
+                    self.take_all().close_all();
+                    return Err(error);
+                }
+            }
+        }
         Ok(())
+    }
+
+    pub(crate) fn has_stdio(&self) -> bool {
+        self.fds
+            .get(..FIRST_FD)
+            .is_some_and(|stdio| stdio.iter().all(Option::is_some))
+    }
+
+    /// Detach descriptors without invoking file operations under a table lock.
+    pub(crate) fn take_all(&mut self) -> Self {
+        core::mem::replace(
+            self,
+            Self {
+                fds: Vec::new(),
+                next_fd: FIRST_FD,
+            },
+        )
+    }
+
+    /// Close every detached descriptor, continuing after individual errors.
+    /// The caller must hold no fd-table lock and use ordinary thread context.
+    pub(crate) fn close_all(self) {
+        for file in self.fds.into_iter().flatten() {
+            if let Err(error) = file.close() {
+                warn!("closing application descriptor failed: {:?}", error);
+            }
+        }
+    }
+
+    pub(crate) fn replace_stdio(
+        &mut self,
+        files: [Arc<dyn FileOps>; 3],
+    ) -> [Option<Arc<dyn FileOps>>; 3] {
+        let [stdin, stdout, stderr] = files;
+        [
+            self.fds[0].replace(stdin),
+            self.fds[1].replace(stdout),
+            self.fds[2].replace(stderr),
+        ]
     }
 
     /// Allocate new file descriptor
@@ -154,5 +205,90 @@ impl FdManager {
         }
 
         self.next_fd = next_fd;
+    }
+}
+
+/// Keeps the selected table owner alive while a syscall borrows its lock.
+#[must_use = "retain the owner while accessing its descriptor table"]
+pub(crate) enum CurrentFiles {
+    #[cfg(loader_backend)]
+    Application(Arc<crate::loader::application::ApplicationGroup>),
+    Process(Arc<crate::process::Process>),
+}
+
+impl CurrentFiles {
+    pub(crate) fn table(&self) -> &crate::sync::SpinLock<FdManager> {
+        match self {
+            #[cfg(loader_backend)]
+            Self::Application(group) => group.fd_manager(),
+            Self::Process(process) => process.fd_manager(),
+        }
+    }
+
+    pub(crate) fn get() -> Option<Self> {
+        #[cfg(loader_backend)]
+        if let Some(group) =
+            crate::loader::application::for_thread(crate::scheduler::current_thread_id())
+        {
+            return Some(Self::Application(group));
+        }
+        crate::process::current_process().map(Self::Process)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::vfs::{FileAttr, OpenFlags};
+    use blueos_test_macro::test;
+    use core::sync::atomic::{AtomicUsize, Ordering};
+
+    #[must_use]
+    struct CloseProbe(Arc<AtomicUsize>);
+    impl FileOps for CloseProbe {
+        fn close(&self) -> Result<(), Error> {
+            assert!(crate::arch::local_irq_enabled());
+            assert!(!crate::irq::is_in_irq());
+            crate::scheduler::yield_me();
+            self.0.fetch_add(1, Ordering::Release);
+            Ok(())
+        }
+        fn stat(&self) -> FileAttr {
+            FileAttr::default()
+        }
+        fn flags(&self) -> OpenFlags {
+            OpenFlags::empty()
+        }
+        fn set_flags(&self, _: OpenFlags) {}
+    }
+
+    #[test]
+    fn stdio_open_failure_closes_partial_and_prepared_descriptors() {
+        for fail_at in 0..3 {
+            let closed = Arc::new(AtomicUsize::new(0));
+            let mut table = FdManager::new();
+            assert_eq!(table.alloc_fd(Arc::new(CloseProbe(closed.clone()))), 3);
+            let mut opened = 0;
+            let result = table.init_stdio_with(|flags| {
+                assert_eq!(
+                    flags,
+                    if opened == 0 {
+                        libc::O_RDONLY
+                    } else {
+                        libc::O_WRONLY
+                    }
+                );
+                if opened == fail_at {
+                    return Err(code::EIO);
+                }
+                opened += 1;
+                Ok(Arc::new(CloseProbe(closed.clone())))
+            });
+            assert_eq!(result, Err(code::EIO));
+            assert_eq!(table.count(), 0);
+            assert_eq!(closed.load(Ordering::Acquire), fail_at + 1);
+            table.close_all();
+            assert_eq!(closed.load(Ordering::Acquire), fail_at + 1);
+        }
     }
 }

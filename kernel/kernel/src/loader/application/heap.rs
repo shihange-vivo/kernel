@@ -17,7 +17,7 @@
 //! their remaining blocks only after every member and deferred C cleanup finishes.
 //! Kernel allocations and malloc calls outside an application remain independent.
 
-use super::{Group, MEMBERS};
+use super::{ApplicationGroup, MEMBERS};
 use crate::{allocator, scheduler};
 use alloc::sync::Arc;
 use core::ptr;
@@ -63,7 +63,7 @@ impl Drop for HeapBlock {
     }
 }
 
-fn current_group() -> Option<Arc<Group>> {
+fn current_group() -> Option<Arc<ApplicationGroup>> {
     let members = MEMBERS.irqsave_lock();
     // malloc is also used before scheduler initialization, when no group exists.
     if members.is_empty() {
@@ -72,7 +72,7 @@ fn current_group() -> Option<Arc<Group>> {
     members.get(&scheduler::current_thread_id()).cloned()
 }
 
-fn allocation_owner(address: usize) -> Option<Arc<Group>> {
+fn allocation_owner(address: usize) -> Option<Arc<ApplicationGroup>> {
     if let Some(group) = current_group()
         && group
             .state
@@ -83,9 +83,9 @@ fn allocation_owner(address: usize) -> Option<Arc<Group>> {
     {
         return Some(group);
     }
-    // Deferred pthread cleanup runs on a kernel worker outside the group. Its
-    // member remains registered until the callback returns, so it can free or
-    // resize the original group's blocks without a second global registry.
+    // Ownership does not change when a different context releases a block.
+    // Search live groups if the caller does not have its owner's context;
+    // callers must keep the owning application alive through the operation.
     MEMBERS
         .irqsave_lock()
         .values()
@@ -100,7 +100,7 @@ fn allocation_owner(address: usize) -> Option<Arc<Group>> {
         .cloned()
 }
 
-impl Group {
+impl ApplicationGroup {
     fn allocate_heap(&self, size: usize, align: usize) -> *mut u8 {
         let mut state = self.state.irqsave_lock();
         // Reserve bookkeeping first: allocation failure must not leak a block

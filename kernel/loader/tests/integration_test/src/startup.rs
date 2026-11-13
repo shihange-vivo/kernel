@@ -203,7 +203,7 @@ fn run_storage_with(
     .unwrap();
     thread.lock().set_deferred_cleanup(cleanup);
     assert_eq!(application.state(), ApplicationState::Prepared);
-    assert_eq!(application.start(None), Ok(()));
+    assert_eq!(application.start(), Ok(()));
     before_wait(&application);
     let status = application.wait().unwrap();
     assert_eq!(application.member_count(), 0);
