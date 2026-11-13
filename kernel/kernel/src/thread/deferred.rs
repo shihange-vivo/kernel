@@ -18,7 +18,10 @@
 //! It only posts preallocated tasks here. A worker polls with a bounded wait
 //! because waking it while retiring would reenter scheduler/wait-list locks.
 //! Callbacks own Send captures and run without the queue lock or an IRQ guard.
-//! They do not inherit the retired thread's Process or file descriptor context.
+//! They do not inherit the retired thread's identity, TLS, Process or file table.
+//! Resource release uses explicitly captured handles; thread-specific runtime
+//! finalization must finish before retirement. Callbacks share one worker and
+//! must not wait for other queued callbacks or retiring members to finish.
 
 use super::{Builder, Entry, GlobalQueueVisitor, Stack, IDLE};
 use crate::{config, scheduler, support::DisableInterruptGuard, time::Tick};

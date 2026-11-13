@@ -15,15 +15,14 @@
 //! Thread-group descriptors, shared by its members without a Process.
 
 use crate::{
-    error::Error,
     sync::SpinLock,
     vfs::{fd_manager::FdManager, FileOps},
 };
 use alloc::sync::Arc;
 
 /// File handles installed as descriptors 0, 1 and 2 for a new thread group.
-/// Each installed descriptor is closed when replaced or when the group
-/// finishes. Keep the underlying file objects valid through those close calls.
+/// Each installed descriptor is closed when the group finishes. Keep the
+/// underlying file objects valid through those close calls.
 /// Installation shares the supplied objects and offsets; it does not reopen them.
 #[must_use = "install the streams when preparing the thread group"]
 pub struct StandardIo {
@@ -38,36 +37,9 @@ pub(super) struct ThreadGroupFiles {
 }
 
 impl ThreadGroupFiles {
-    pub(super) fn new() -> Self {
+    pub(super) fn new(table: FdManager) -> Self {
         Self {
-            table: SpinLock::new(FdManager::new()),
-        }
-    }
-
-    pub(super) fn prepare_stdio(&self) -> Result<(), Error> {
-        // Only the prepared group's start path calls this; no member is
-        // runnable yet. Custom streams need no access to the system console.
-        let mut table = self.table.irqsave_lock().take_all();
-        if !table.has_stdio() {
-            // On error init_stdio closes all descriptors, including any that
-            // were installed before start. No table lock survives the call.
-            table.init_stdio()?;
-        }
-        *self.table.irqsave_lock() = table;
-        Ok(())
-    }
-
-    pub(super) fn set_stdio(&self, stdio: &StandardIo) {
-        let previous = self.table.irqsave_lock().replace_stdio([
-            stdio.stdin.clone(),
-            stdio.stdout.clone(),
-            stdio.stderr.clone(),
-        ]);
-        // The table is unlocked before close callbacks, which may block.
-        for file in previous.into_iter().flatten() {
-            if let Err(error) = file.close() {
-                log::warn!("closing replaced standard descriptor failed: {:?}", error);
-            }
+            table: SpinLock::new(table),
         }
     }
 
@@ -91,7 +63,9 @@ mod tests {
         *,
     };
     use crate::{
-        arch, scheduler,
+        arch,
+        error::Error,
+        scheduler,
         thread::{Builder, Entry, Stack},
         vfs::{self, FileAttr, OpenFlags},
     };
@@ -183,29 +157,22 @@ mod tests {
             writes: AtomicUsize::new(0),
             group: Mutex::new(alloc::sync::Weak::new()),
         });
-        let group = ThreadGroupInner::prepare(Box::new(Owner(observed.clone())));
-        *observed.group.lock() = Arc::downgrade(&group);
-        let thread =
-            Builder::new(Entry::Posix(main, Arc::as_ptr(&observed).cast_mut().cast())).build();
-        thread
-            .lock()
-            .set_deferred_cleanup(group.main_cleanup().unwrap());
-        let mut thread_group = group.install(thread);
         let file = |fail_close| -> Arc<dyn FileOps> {
             Arc::new(ProbeFile {
                 observed: observed.clone(),
                 fail_close,
             })
         };
-        thread_group
-            .set_standard_io(&StandardIo {
-                stdin: file(false),
-                stdout: file(false),
-                stderr: file(true),
-            })
-            .unwrap();
-        assert_eq!(group.fd_manager().irqsave_lock().alloc_fd(file(false)), 3);
-        (thread_group, observed)
+        let mut table = FdManager::from_stdio([file(false), file(false), file(true)]);
+        assert_eq!(table.alloc_fd(file(false)), 3);
+        let group = ThreadGroupInner::prepare(Box::new(Owner(observed.clone())), table);
+        *observed.group.lock() = Arc::downgrade(&group);
+        let thread =
+            Builder::new(Entry::Posix(main, Arc::as_ptr(&observed).cast_mut().cast())).build();
+        thread
+            .lock()
+            .set_deferred_cleanup(group.main_cleanup().unwrap());
+        (group.install(thread), observed)
     }
 
     fn write(fd: i32, bytes: &[u8]) {
@@ -231,18 +198,22 @@ mod tests {
         write(1, b"child");
         // This descriptor belongs to the group, so its removal is visible to main.
         assert_eq!(crate::syscalls::close::handle(3), 0);
-    }
-
-    extern "C" fn cleanup(pointer: *mut c_void) {
-        let observed = unsafe { &*pointer.cast::<Observed>() };
-        assert!(crate::process::current_process().is_none());
-        let mut byte = 0;
+        // Finish I/O before retirement, while this group's table is current.
         assert_eq!(
             crate::syscalls::read::handle(0, (&raw mut byte).cast(), 1),
             1
         );
         assert_eq!(byte, observed.byte);
-        write(2, b"cleanup");
+        write(2, b"leaving");
+    }
+
+    extern "C" fn cleanup(pointer: *mut c_void) {
+        let observed = unsafe { &*pointer.cast::<Observed>() };
+        assert!(arch::local_irq_enabled());
+        assert!(!crate::irq::is_in_irq());
+        assert!(crate::process::current_process().is_none());
+        assert!(super::super::for_thread(scheduler::current_thread_id()).is_none());
+        assert!(!observed.owner_dropped.load(Ordering::Acquire));
         observed.cleaned.store(true, Ordering::Release);
     }
 

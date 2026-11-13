@@ -120,6 +120,13 @@ pub mod thread {
         pub stack_size: usize,
         pub entry: extern "C" fn(*mut core::ffi::c_void),
         pub arg: *mut core::ffi::c_void,
+        /// Release thread resources, such as stack storage, after retirement.
+        /// The callback runs on another stack in a kernel-defined context,
+        /// without the retired thread's identity, TLS or descriptor table.
+        /// Use resources passed through `arg`; keep it valid until cleanup.
+        /// Complete application/TLS finalization before the thread retires.
+        /// Loaded thread groups use a shared worker: do not wait for group
+        /// members here. A failed CreateThread does not invoke this callback.
         pub cleanup: Option<extern "C" fn(*mut core::ffi::c_void)>,
     }
 }
