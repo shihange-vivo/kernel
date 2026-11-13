@@ -17,15 +17,15 @@
 //! This is the kernel-side convenience entry above the loader pipeline: it
 //! opens the image through the VFS, loads it, builds the ELF startup frame,
 //! schedules the application's main thread and waits for every member to
-//! exit. The public stages (`load_image`, `StartupStorage`, `Application`)
+//! exit. The public stages (`load_image`, `StartupStorage`, `ThreadGroup`)
 //! remain available when a caller needs to observe or configure between them;
 //! this helper covers the common "start this file now" flow without a
 //! syscall. Applications run as RTOS thread groups with their own descriptors;
 //! no Process or private address space is required.
 
 use super::{
-    adapters::VfsElfReader, load_image, ApplicationError, ApplicationExit, StandardIo,
-    StartupArguments, StartupError, StartupStorage,
+    adapters::VfsElfReader, load_image, StandardIo, StartupArguments, StartupError, StartupStorage,
+    ThreadGroupError, ThreadGroupExit,
 };
 use crate::{thread::Stack, vfs};
 use alloc::{ffi::CString, string::String};
@@ -77,7 +77,7 @@ pub enum RunError {
     Load(LoadError),
     Startup(StartupError),
     StackUnavailable,
-    Start(ApplicationError),
+    Start(ThreadGroupError),
     /// The path is not representable as AT_EXECFN.
     ExecPath,
 }
@@ -92,8 +92,8 @@ impl From<StartupError> for RunError {
         Self::Startup(error)
     }
 }
-impl From<ApplicationError> for RunError {
-    fn from(error: ApplicationError) -> Self {
+impl From<ThreadGroupError> for RunError {
+    fn from(error: ThreadGroupError) -> Self {
         Self::Start(error)
     }
 }
@@ -111,9 +111,9 @@ impl From<ApplicationError> for RunError {
 ///
 /// # Safety
 /// The file at `path` must be trusted native code using the standard ELF
-/// initial-stack entry convention. Its users must remain application members;
-/// see `StartupStorage::into_application`.
-pub unsafe fn run(path: &str, request: &RunRequest<'_>) -> Result<ApplicationExit, RunError> {
+/// initial-stack entry convention. Its users must remain thread group members;
+/// see `StartupStorage::into_thread_group`.
+pub unsafe fn run(path: &str, request: &RunRequest<'_>) -> Result<ThreadGroupExit, RunError> {
     let file = vfs::open_path(path, libc::O_RDONLY, 0).map_err(RunError::OpenImage)?;
     let image = load_image(VfsElfReader::new(file)?)?;
     let stack = Stack::from_size(request.stack_size).ok_or(RunError::StackUnavailable)?;
@@ -131,10 +131,10 @@ pub unsafe fn run(path: &str, request: &RunRequest<'_>) -> Result<ApplicationExi
     )?;
     // SAFETY: the caller guarantees trusted native code; the group retains
     // the image and stack through all member cleanups.
-    let mut application = unsafe { storage.into_application()? };
+    let mut thread_group = unsafe { storage.into_thread_group()? };
     if let Some(stdio) = request.stdio {
-        application.set_standard_io(stdio)?;
+        thread_group.set_standard_io(stdio)?;
     }
-    application.start()?;
-    application.wait().map_err(Into::into)
+    thread_group.start()?;
+    thread_group.wait().map_err(Into::into)
 }

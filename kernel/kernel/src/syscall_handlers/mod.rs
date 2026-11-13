@@ -395,7 +395,7 @@ create_thread(spawn_args_ptr: *const SpawnArgs) -> c_long {
                 .build();
     let handle = Thread::id(&t);
     #[cfg(loader_backend)]
-    let group = crate::loader::application::for_thread(scheduler::current_thread_id());
+    let group = crate::loader::thread_group::for_thread(scheduler::current_thread_id());
     #[cfg(loader_backend)]
     if let Some(group) = &group {
         // Prepare before installing membership. A failed create leaves the
@@ -516,7 +516,7 @@ alloc_mem(ptr: *mut *mut c_void, size: usize, align: usize) -> c_long {
         return -1;
     }
     #[cfg(loader_backend)]
-    let addr = crate::loader::application::allocate_heap(size, align);
+    let addr = crate::loader::thread_group::allocate_heap(size, align);
     #[cfg(not(loader_backend))]
     let addr = crate::allocator::malloc_align(size, align);
     if addr.is_null() {
@@ -529,7 +529,7 @@ alloc_mem(ptr: *mut *mut c_void, size: usize, align: usize) -> c_long {
 define_syscall_handler!(
 free_mem(ptr: *mut c_void) -> c_long {
     #[cfg(loader_backend)]
-    crate::loader::application::free_heap(ptr.cast());
+    crate::loader::thread_group::free_heap(ptr.cast());
     #[cfg(not(loader_backend))]
     crate::allocator::free(ptr as *mut u8);
     0
@@ -544,7 +544,7 @@ realloc_mem(output: *mut *mut c_void, old: *mut c_void, size: usize, align: usiz
         return -1;
     }
     #[cfg(loader_backend)]
-    let moved = crate::loader::application::reallocate_heap(old.cast(), size, align);
+    let moved = crate::loader::thread_group::reallocate_heap(old.cast(), size, align);
     #[cfg(not(loader_backend))]
     let moved = crate::allocator::realloc_align(old.cast(), size, align);
     if moved.is_null() && size != 0 { return -1; }
@@ -589,13 +589,13 @@ define_syscall_handler!(exit_thread() -> c_long {
     -1
 });
 
-// These operations coordinate this kernel's standalone application runtime;
+// These operations coordinate cooperative thread-group exit;
 // they are not Linux exit/exit_group syscall numbers or forced cancellation.
-define_syscall_handler!(application_begin_exit(status: c_int) -> c_long {
+define_syscall_handler!(thread_group_begin_exit(status: c_int) -> c_long {
     #[cfg(loader_backend)]
     {
         let id = scheduler::current_thread_id();
-        let Some(group) = crate::loader::application::for_thread(id) else {
+        let Some(group) = crate::loader::thread_group::for_thread(id) else {
             return -(ESRCH as c_long);
         };
         group.begin_exit(id, status).map_or(-(EBUSY as c_long), |()| 0)
@@ -604,11 +604,11 @@ define_syscall_handler!(application_begin_exit(status: c_int) -> c_long {
     { -(libc::ENOSYS as c_long) }
 });
 
-define_syscall_handler!(application_finish_exit() -> c_long {
+define_syscall_handler!(thread_group_finish_exit() -> c_long {
     #[cfg(loader_backend)]
     {
         let id = scheduler::current_thread_id();
-        let Some(group) = crate::loader::application::for_thread(id) else {
+        let Some(group) = crate::loader::thread_group::for_thread(id) else {
             return -(ESRCH as c_long);
         };
         let result = group.finish_exit(id);
@@ -935,8 +935,8 @@ syscall_table! {
     (SetSchedParam, set_sched_param),
     (CreateThread, create_thread),
     (ExitThread, exit_thread),
-    (ApplicationBeginExit, application_begin_exit),
-    (ApplicationFinishExit, application_finish_exit),
+    (ThreadGroupBeginExit, thread_group_begin_exit),
+    (ThreadGroupFinishExit, thread_group_finish_exit),
     (AtomicWake, atomic_wake),
     (AtomicWait, atomic_wait),
     // For test only

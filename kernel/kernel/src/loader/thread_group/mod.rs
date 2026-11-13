@@ -12,9 +12,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Single-image application ownership, membership and cooperative main-thread exit.
+//! Thread-group resources, membership and cooperative main-thread exit.
 //! Registered members retain their group; retirement callbacks hold weak handles.
-//! ApplicationGroup therefore survives a dropped Application without an Arc cycle.
+//! ThreadGroupInner therefore survives a dropped ThreadGroup without an Arc cycle.
 
 use crate::{
     scheduler,
@@ -39,21 +39,21 @@ mod files;
 pub use files::StandardIo;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum ApplicationState {
+pub enum ThreadGroupState {
     Prepared,
     Running,
     Exiting,
     Exited,
 }
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum ApplicationExit {
+pub enum ThreadGroupExit {
     /// Main return or exit completed libc finalization before retirement.
     Code(i32),
     /// Startup was cancelled or main retired without completing finalization.
     Aborted,
 }
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum ApplicationError {
+pub enum ThreadGroupError {
     AlreadyStarted,
     NotStarted,
     #[cfg(enable_vfs)]
@@ -61,23 +61,23 @@ pub enum ApplicationError {
     QueueFailed,
 }
 
-/// Observe and start an application. Dropping a prepared handle cancels startup;
+/// Observe and start a thread group. Dropping a prepared handle cancels startup;
 /// dropping a running handle leaves its members owning the image through exit.
-#[must_use = "start the application or drop it to cancel its prepared resources"]
-pub struct Application {
-    group: Arc<ApplicationGroup>,
-    // Configuration handle; retained until this Application is dropped, even
+#[must_use = "start the thread group or drop it to cancel its prepared resources"]
+pub struct ThreadGroup {
+    group: Arc<ThreadGroupInner>,
+    // Configuration handle; retained until this ThreadGroup is dropped, even
     // after wait() returns. Cloning a ThreadNode shares the same thread and stack.
     main_thread: ThreadNode,
 }
 
-/// Shared application lifetime, retained by registered members independently of
-/// the public Application handle. Retirement callbacks only hold weak references.
-#[must_use = "retain application resources until all member cleanups finish"]
-pub(crate) struct ApplicationGroup {
+/// Shared group lifetime, retained by registered members independently of
+/// the public ThreadGroup handle. Retirement callbacks only hold weak references.
+#[must_use = "retain group resources until all member cleanups finish"]
+pub(crate) struct ThreadGroupInner {
     state: SpinLock<GroupState>,
     #[cfg(enable_vfs)]
-    files: files::ApplicationFiles,
+    files: files::ThreadGroupFiles,
     // Exclusive ownership transfer needs Send, not shared access to the image.
     // Only the last member takes this value, outside the state lock.
     image_owner: Mutex<Option<Box<dyn Send>>>,
@@ -87,33 +87,33 @@ pub(crate) struct ApplicationGroup {
 /// Membership, exit progress and heap ownership coordinated by one state lock.
 #[must_use = "retain member threads and heap blocks until group cleanup"]
 struct GroupState {
-    phase: ApplicationState,
+    phase: ThreadGroupState,
     exit_code: Option<i32>,
     fini_complete: bool,
-    outcome: Option<ApplicationExit>,
+    outcome: Option<ThreadGroupExit>,
     // Includes retired threads until their deferred cleanup completes.
     members: Vec<ThreadNode>,
     main_id: usize,
     // Keep the main stack (argv/envp/auxv backing) through the last member's
-    // cleanup, even after main leaves members and Application has been dropped.
+    // cleanup, even after main leaves members and ThreadGroup has been dropped.
     retained_main: Option<ThreadNode>,
-    // malloc-family blocks belong to the whole application, not one thread.
+    // malloc-family blocks belong to the whole group, not one thread.
     allocations: Vec<heap::HeapBlock>,
 }
 
 // Each registered thread retains its group until its deferred cleanup finishes.
-static MEMBERS: SpinLock<BTreeMap<usize, Arc<ApplicationGroup>>> = SpinLock::new(BTreeMap::new());
+static MEMBERS: SpinLock<BTreeMap<usize, Arc<ThreadGroupInner>>> = SpinLock::new(BTreeMap::new());
 
-/// Borrow application resources while a retired member's C cleanup runs on a
+/// Borrow group resources while a retired member's C cleanup runs on a
 /// kernel worker. This does not make the worker a member or affect exit counts.
 #[must_use = "retain the resource context until the cleanup callback returns"]
 struct CleanupContext {
     thread_id: usize,
-    previous: Option<Arc<ApplicationGroup>>,
+    previous: Option<Arc<ThreadGroupInner>>,
 }
 
 impl CleanupContext {
-    fn enter(group: &Arc<ApplicationGroup>) -> Self {
+    fn enter(group: &Arc<ThreadGroupInner>) -> Self {
         let thread_id = scheduler::current_thread_id();
         let previous = MEMBERS.irqsave_lock().insert(thread_id, group.clone());
         Self {
@@ -137,60 +137,60 @@ impl Drop for CleanupContext {
     }
 }
 
-impl Application {
+impl ThreadGroup {
     /// Access the main thread for configuration. Use start() to schedule it;
-    /// queuing this node separately bypasses application state transitions.
-    /// This handle retains the thread and its stack until Application is dropped.
+    /// queuing this node separately bypasses group state transitions.
+    /// This handle retains the thread and its stack until ThreadGroup is dropped.
     pub fn thread(&self) -> &ThreadNode {
         &self.main_thread
     }
-    pub fn state(&self) -> ApplicationState {
+    pub fn state(&self) -> ThreadGroupState {
         self.group.state.irqsave_lock().phase
     }
     /// Includes retired members until their deferred cleanup has completed.
     pub fn member_count(&self) -> usize {
         self.group.state.irqsave_lock().members.len()
     }
-    pub fn exit_status(&self) -> Option<ApplicationExit> {
+    pub fn exit_status(&self) -> Option<ThreadGroupExit> {
         self.group.state.irqsave_lock().outcome
     }
 
     /// Replace standard descriptors before scheduling. Other descriptors and
-    /// streams belong to this application's group, independently of Process.
+    /// streams belong to this group, independently of Process.
     #[cfg(enable_vfs)]
-    pub fn set_standard_io(&mut self, stdio: &StandardIo) -> Result<(), ApplicationError> {
-        if self.state() != ApplicationState::Prepared {
-            return Err(ApplicationError::AlreadyStarted);
+    pub fn set_standard_io(&mut self, stdio: &StandardIo) -> Result<(), ThreadGroupError> {
+        if self.state() != ThreadGroupState::Prepared {
+            return Err(ThreadGroupError::AlreadyStarted);
         }
         self.group.files.set_stdio(stdio);
         Ok(())
     }
 
     /// Schedule the main thread once. Child threads share this group's resources.
-    pub fn start(&mut self) -> Result<(), ApplicationError> {
-        if self.state() != ApplicationState::Prepared || self.main_thread.state() != thread::IDLE {
-            return Err(ApplicationError::AlreadyStarted);
+    pub fn start(&mut self) -> Result<(), ThreadGroupError> {
+        if self.state() != ThreadGroupState::Prepared || self.main_thread.state() != thread::IDLE {
+            return Err(ThreadGroupError::AlreadyStarted);
         }
         #[cfg(enable_vfs)]
         if let Err(error) = self.group.files.prepare_stdio() {
             self.cancel();
-            return Err(ApplicationError::FileTable(error));
+            return Err(ThreadGroupError::FileTable(error));
         }
-        self.group.state.irqsave_lock().phase = ApplicationState::Running;
+        self.group.state.irqsave_lock().phase = ThreadGroupState::Running;
         if scheduler::queue_ready_thread(thread::IDLE, self.main_thread.clone()).is_err() {
-            self.group.state.irqsave_lock().phase = ApplicationState::Prepared;
+            self.group.state.irqsave_lock().phase = ThreadGroupState::Prepared;
             self.cancel();
-            return Err(ApplicationError::QueueFailed);
+            return Err(ThreadGroupError::QueueFailed);
         }
         Ok(())
     }
 
     /// Wait until member cleanup, descriptor closing, heap reclamation and image
     /// release finish.
-    /// The main thread and its stack remain retained by this Application handle.
-    pub fn wait(&self) -> Result<ApplicationExit, ApplicationError> {
-        if self.state() == ApplicationState::Prepared {
-            return Err(ApplicationError::NotStarted);
+    /// The main thread and its stack remain retained by this ThreadGroup handle.
+    pub fn wait(&self) -> Result<ThreadGroupExit, ThreadGroupError> {
+        if self.state() == ThreadGroupState::Prepared {
+            return Err(ThreadGroupError::NotStarted);
         }
         loop {
             let epoch = self.group.changed.load(Ordering::Acquire);
@@ -211,21 +211,21 @@ impl Application {
         self.group.finish(Thread::id(&self.main_thread));
     }
 }
-impl Drop for Application {
+impl Drop for ThreadGroup {
     fn drop(&mut self) {
-        if self.state() == ApplicationState::Prepared {
+        if self.state() == ThreadGroupState::Prepared {
             self.cancel();
         }
     }
 }
 
-impl ApplicationGroup {
+impl ThreadGroupInner {
     pub(super) fn prepare(image_owner: Box<dyn Send>) -> Arc<Self> {
         #[cfg(enable_vfs)]
-        let files = files::ApplicationFiles::new();
+        let files = files::ThreadGroupFiles::new();
         Arc::new(Self {
             state: SpinLock::new(GroupState {
-                phase: ApplicationState::Prepared,
+                phase: ThreadGroupState::Prepared,
                 exit_code: None,
                 fini_complete: false,
                 outcome: None,
@@ -256,7 +256,7 @@ impl ApplicationGroup {
         })
     }
 
-    pub(super) fn install(self: &Arc<Self>, main_thread: ThreadNode) -> Application {
+    pub(super) fn install(self: &Arc<Self>, main_thread: ThreadNode) -> ThreadGroup {
         let id = Thread::id(&main_thread);
         {
             let mut state = self.state.irqsave_lock();
@@ -265,7 +265,7 @@ impl ApplicationGroup {
             state.members.push(main_thread.clone());
         }
         assert!(MEMBERS.irqsave_lock().insert(id, self.clone()).is_none());
-        Application {
+        ThreadGroup {
             group: self.clone(),
             main_thread,
         }
@@ -275,7 +275,7 @@ impl ApplicationGroup {
         let id = Thread::id(&thread);
         {
             let mut state = self.state.irqsave_lock();
-            if state.phase != ApplicationState::Running {
+            if state.phase != ThreadGroupState::Running {
                 return Err(());
             }
             state.members.push(thread);
@@ -316,10 +316,10 @@ impl ApplicationGroup {
             };
             let member = state.members.swap_remove(index);
             if id == state.main_id {
-                state.phase = ApplicationState::Exiting;
+                state.phase = ThreadGroupState::Exiting;
             }
             if state.members.is_empty() {
-                state.phase = ApplicationState::Exiting;
+                state.phase = ThreadGroupState::Exiting;
                 (
                     member,
                     state.retained_main.take(),
@@ -348,11 +348,11 @@ impl ApplicationGroup {
         if complete {
             let mut state = self.state.irqsave_lock();
             state.outcome = Some(if state.fini_complete {
-                ApplicationExit::Code(state.exit_code.expect("normal exit status"))
+                ThreadGroupExit::Code(state.exit_code.expect("normal exit status"))
             } else {
-                ApplicationExit::Aborted
+                ThreadGroupExit::Aborted
             });
-            state.phase = ApplicationState::Exited;
+            state.phase = ThreadGroupState::Exited;
         }
         self.changed.fetch_add(1, Ordering::Release);
         let _result = crate::sync::atomic_wake(&self.changed, usize::MAX);
@@ -363,11 +363,11 @@ impl ApplicationGroup {
             let mut state = self.state.irqsave_lock();
             // First delivery coordinates normal exit from the main thread.
             // It waits for children to finish cooperatively; it does not kill them.
-            if id != state.main_id || state.phase != ApplicationState::Running {
+            if id != state.main_id || state.phase != ThreadGroupState::Running {
                 return Err(());
             }
             state.exit_code = Some(status);
-            state.phase = ApplicationState::Exiting;
+            state.phase = ThreadGroupState::Exiting;
         }
         loop {
             let epoch = self.changed.load(Ordering::Acquire);
@@ -381,7 +381,7 @@ impl ApplicationGroup {
     pub(crate) fn finish_exit(&self, id: usize) -> Result<(), ()> {
         let mut state = self.state.irqsave_lock();
         if id != state.main_id
-            || state.phase != ApplicationState::Exiting
+            || state.phase != ThreadGroupState::Exiting
             || state.members.len() != 1
         {
             return Err(());
@@ -391,7 +391,7 @@ impl ApplicationGroup {
     }
 }
 
-pub(crate) fn for_thread(id: usize) -> Option<Arc<ApplicationGroup>> {
+pub(crate) fn for_thread(id: usize) -> Option<Arc<ThreadGroupInner>> {
     MEMBERS.irqsave_lock().get(&id).cloned()
 }
 
@@ -498,7 +498,7 @@ mod tests {
             observed.heap_block.swap(0, Ordering::AcqRel),
         );
         assert_eq!(unsafe { block.read() }, 41);
-        // This callback runs outside the application on the cleanup worker.
+        // This callback runs outside the group on the cleanup worker.
         let block = realloc_via_syscall(block, 512, 16);
         assert!(!block.is_null());
         assert_eq!(unsafe { block.read() }, 41);
@@ -538,7 +538,7 @@ mod tests {
         assert!(group.state.irqsave_lock().allocations.is_empty());
 
         // An incoming kernel-owned block remains independent even if resized
-        // by a member. It must survive application completion.
+        // by a member. It must survive group completion.
         let external = core::ptr::with_exposed_provenance_mut::<u8>(
             observed.untracked_block.load(Ordering::Acquire),
         );
@@ -561,14 +561,14 @@ mod tests {
         // Do not retain a strong group reference on a retiring thread's stack.
         drop(group);
         if observed.normal_exit.load(Ordering::Acquire) {
-            assert_eq!(crate::syscalls::application_begin_exit::handle(0), 0);
-            let status = crate::syscalls::application_finish_exit::handle();
-            panic!("normal application exit returned: {status}");
+            assert_eq!(crate::syscalls::thread_group_begin_exit::handle(0), 0);
+            let status = crate::syscalls::thread_group_finish_exit::handle();
+            panic!("normal thread group exit returned: {status}");
         }
     }
 
     #[test]
-    fn application_reclaims_heap_without_adopting_incoming_blocks() {
+    fn thread_group_reclaims_heap_without_adopting_incoming_blocks() {
         for normal_exit in [false, true] {
             for _ in 0..5 {
                 check_heap_reclamation(normal_exit);
@@ -585,7 +585,7 @@ mod tests {
         observed
             .untracked_block
             .store(external.expose_provenance(), Ordering::Release);
-        let group = ApplicationGroup::prepare(Box::new(Owner(observed.clone())));
+        let group = ThreadGroupInner::prepare(Box::new(Owner(observed.clone())));
         let thread = Builder::new(Entry::Posix(
             heap_entry,
             Arc::as_ptr(&observed).cast_mut().cast(),
@@ -594,14 +594,14 @@ mod tests {
         thread
             .lock()
             .set_deferred_cleanup(group.main_cleanup().unwrap());
-        let mut application = group.install(thread);
-        application.start().unwrap();
+        let mut thread_group = group.install(thread);
+        thread_group.start().unwrap();
         assert_eq!(
-            application.wait(),
+            thread_group.wait(),
             Ok(if normal_exit {
-                ApplicationExit::Code(0)
+                ThreadGroupExit::Code(0)
             } else {
-                ApplicationExit::Aborted
+                ThreadGroupExit::Aborted
             })
         );
         // Explicit free and realloc(0) release two owners. Group exit must
@@ -629,8 +629,8 @@ mod tests {
 
     #[test]
     fn child_heap_allocation_survives_its_allocating_thread() {
-        let (mut application, observed) = prepare();
-        application.start().unwrap();
+        let (mut thread_group, observed) = prepare();
+        thread_group.start().unwrap();
         let child = Builder::new(Entry::Posix(
             allocating_child,
             Arc::as_ptr(&observed).cast_mut().cast(),
@@ -639,18 +639,18 @@ mod tests {
         let id = Thread::id(&child);
         child
             .lock()
-            .set_deferred_cleanup(application.group.child_cleanup(id, None, 0).unwrap());
-        application.group.attach(child.clone()).unwrap();
+            .set_deferred_cleanup(thread_group.group.child_cleanup(id, None, 0).unwrap());
+        thread_group.group.attach(child.clone()).unwrap();
         assert_eq!(scheduler::queue_ready_thread(thread::IDLE, child), Ok(()));
         wait_for(|| {
-            observed.heap_block.load(Ordering::Acquire) != 0 && application.member_count() == 1
+            observed.heap_block.load(Ordering::Acquire) != 0 && thread_group.member_count() == 1
         });
         assert!(for_thread(id).is_none());
         let block = core::ptr::with_exposed_provenance_mut::<u8>(
             observed.heap_block.load(Ordering::Acquire),
         );
         assert_eq!(unsafe { block.read() }, 41);
-        assert!(application
+        assert!(thread_group
             .group
             .state
             .irqsave_lock()
@@ -659,9 +659,9 @@ mod tests {
             .any(|owned| owned.address() == block.addr()));
         assert_eq!(observed.heap_released.load(Ordering::Acquire), 0);
         observed.release_main.store(true, Ordering::Release);
-        assert_eq!(application.wait(), Ok(ApplicationExit::Aborted));
+        assert_eq!(thread_group.wait(), Ok(ThreadGroupExit::Aborted));
         assert_eq!(observed.heap_released.load(Ordering::Acquire), 1);
-        assert!(application
+        assert!(thread_group
             .group
             .state
             .irqsave_lock()
@@ -669,9 +669,9 @@ mod tests {
             .is_empty());
     }
 
-    fn prepare() -> (Application, Arc<Observed>) {
+    fn prepare() -> (ThreadGroup, Arc<Observed>) {
         let observed = Arc::new(Observed::default());
-        let group = ApplicationGroup::prepare(Box::new(Owner(observed.clone())));
+        let group = ThreadGroupInner::prepare(Box::new(Owner(observed.clone())));
         let cleanup = group.main_cleanup().unwrap();
         let thread = Builder::new(Entry::Posix(
             main_entry,
@@ -683,57 +683,57 @@ mod tests {
     }
 
     #[test]
-    fn dropping_prepared_application_cancels_registration() {
-        let (application, observed) = prepare();
-        let id = Thread::id(application.thread());
+    fn dropping_prepared_thread_group_cancels_registration() {
+        let (thread_group, observed) = prepare();
+        let id = Thread::id(thread_group.thread());
         assert!(for_thread(id).is_some());
-        assert_eq!(application.wait(), Err(ApplicationError::NotStarted));
-        drop(application);
+        assert_eq!(thread_group.wait(), Err(ThreadGroupError::NotStarted));
+        drop(thread_group);
         assert!(observed.dropped.load(Ordering::Acquire));
         assert!(for_thread(id).is_none());
         assert!(GlobalQueueVisitor::find_if(|t| Thread::id(t) == id).is_none());
     }
 
     #[test]
-    fn application_retains_image_after_abnormal_main_exit() {
-        let (mut application, observed) = prepare();
-        application.start().unwrap();
+    fn thread_group_retains_image_after_abnormal_main_exit() {
+        let (mut thread_group, observed) = prepare();
+        thread_group.start().unwrap();
         let pointer = Arc::as_ptr(&observed).cast_mut().cast();
         let child = Builder::new(Entry::Posix(child_entry, pointer)).build();
         let id = Thread::id(&child);
-        let cleanup = application
+        let cleanup = thread_group
             .group
             .child_cleanup(id, Some(child_cleanup), pointer as usize)
             .unwrap();
-        application.group.attach(child.clone()).unwrap();
+        thread_group.group.attach(child.clone()).unwrap();
         child.lock().set_deferred_cleanup(cleanup);
         assert_eq!(scheduler::queue_ready_thread(thread::IDLE, child), Ok(()));
         wait_for(|| observed.child_entered.load(Ordering::Acquire));
         observed.release_main.store(true, Ordering::Release);
         wait_for(|| {
-            application.state() == ApplicationState::Exiting && application.member_count() == 1
+            thread_group.state() == ThreadGroupState::Exiting && thread_group.member_count() == 1
         });
-        assert_eq!(application.thread().state(), thread::RETIRED);
+        assert_eq!(thread_group.thread().state(), thread::RETIRED);
         assert!(!observed.dropped.load(Ordering::Acquire));
-        assert_eq!(application.exit_status(), None);
-        assert!(application
+        assert_eq!(thread_group.exit_status(), None);
+        assert!(thread_group
             .group
             .state
             .irqsave_lock()
             .allocations
             .iter()
             .any(|owned| owned.address() == observed.heap_block.load(Ordering::Acquire)));
-        // New members cannot extend an application after its main exits.
+        // New members cannot extend a group after its main exits.
         let mut rejected = Builder::new(Entry::C(empty)).build();
-        assert!(application.group.attach(rejected.clone()).is_err());
+        assert!(thread_group.group.attach(rejected.clone()).is_err());
         GlobalQueueVisitor::remove(&mut rejected);
         observed.release_child.store(true, Ordering::Release);
-        assert_eq!(application.wait(), Ok(ApplicationExit::Aborted));
+        assert_eq!(thread_group.wait(), Ok(ThreadGroupExit::Aborted));
         assert!(observed.child_cleaned.load(Ordering::Acquire));
         assert_eq!(observed.heap_released.load(Ordering::Acquire), 1);
         assert!(observed.dropped.load(Ordering::Acquire));
         assert!(for_thread(id).is_none());
-        assert!(application
+        assert!(thread_group
             .group
             .state
             .irqsave_lock()
@@ -742,11 +742,11 @@ mod tests {
     }
 
     #[test]
-    fn running_application_survives_dropped_observer() {
-        let (mut application, observed) = prepare();
-        application.start().unwrap();
-        let group = Arc::downgrade(&application.group);
-        drop(application);
+    fn running_thread_group_survives_dropped_observer() {
+        let (mut thread_group, observed) = prepare();
+        thread_group.start().unwrap();
+        let group = Arc::downgrade(&thread_group.group);
+        drop(thread_group);
         assert!(group.upgrade().is_some());
         assert!(!observed.dropped.load(Ordering::Acquire));
         observed.release_main.store(true, Ordering::Release);

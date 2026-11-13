@@ -13,7 +13,7 @@
 // limitations under the License.
 
 //! Startup for a self-contained ELF with its own statically linked librs.
-//! This copy of libc and its globals belong to one application thread group.
+//! This copy of libc and its globals belong to one thread group.
 //! The main thread closes admission and waits for cooperative child cleanup
 //! before touching shared libc state. Shared libc, interpreters and forced
 //! process-wide cancellation are separate integration work.
@@ -23,7 +23,7 @@ use crate::{errno::ERRNO, sync::GenericMutex};
 use alloc::vec::Vec;
 use blueos_header::{
     startup::auxv,
-    syscalls::NR::{ApplicationBeginExit, ApplicationFinishExit, ExitThread},
+    syscalls::NR::{ExitThread, ThreadGroupBeginExit, ThreadGroupFinishExit},
 };
 use blueos_scal::bk_syscall;
 use core::{
@@ -172,16 +172,16 @@ pub extern "C" fn getauxval(key: c_ulong) -> c_ulong {
 /// # Safety
 /// The caller must be the main thread started by __libc_start_main. Children
 /// must have joined or detached and be able to finish without main running.
-/// No users of the image or this libc may exist outside the application group.
+/// No users of the image or this libc may exist outside the thread group.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn exit(status: c_int) -> ! {
     if EXITING.swap(true, Ordering::AcqRel) {
         retire();
     }
     assert_eq!(
-        bk_syscall!(ApplicationBeginExit, status),
+        bk_syscall!(ThreadGroupBeginExit, status),
         0,
-        "application exit requires its main thread"
+        "thread group exit requires its main thread"
     );
     loop {
         let callback = CALLBACKS.lock().pop();
@@ -197,8 +197,8 @@ pub unsafe extern "C" fn exit(status: c_int) -> ! {
     crate::pthread::cleanup_my_tcb();
     AUXV.store(ptr::null_mut(), Ordering::Release);
     unsafe { environ = ptr::null_mut() };
-    bk_syscall!(ApplicationFinishExit);
-    unreachable!("ApplicationFinishExit returned")
+    bk_syscall!(ThreadGroupFinishExit);
+    unreachable!("ThreadGroupFinishExit returned")
 }
 
 unsafe fn run_init_array(

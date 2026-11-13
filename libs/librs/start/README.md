@@ -44,15 +44,15 @@ own allocator and panic handler. The existing firmware `rsrt` and
 ## Load and finish
 
 The kernel loads the file through `loader::load_image`, constructs
-`StartupStorage` and converts it using unsafe `into_application()`. That
+`StartupStorage` and converts it using unsafe `into_thread_group()`. That
 operation requires trusted native code and all image users to remain within
-the application lifetime. `Application::start(None)` starts a direct RTOS
-application; `Some(existing_process)` associates its threads with an existing
-Process and its file descriptors.
+the thread group's lifetime. `ThreadGroup::start()` schedules its main thread.
+Members share the group's descriptor table without requiring a Process;
+`set_standard_io()` can replace the default console streams before startup.
 
 Libc initializes the image, calls Rust's generated C `main` wrapper, waits for
-cooperative child cleanup and executes `atexit`/finalizers. The application
-owner releases the image after all member cleanup. `Application::wait()` then
+cooperative child cleanup and executes `atexit`/finalizers. The thread group's
+owner releases the image after all member cleanup. `ThreadGroup::wait()` then
 reports normal status or aborted execution. Child threads must join or detach
 and be able to finish without the main thread running.
 

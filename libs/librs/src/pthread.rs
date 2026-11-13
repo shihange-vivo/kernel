@@ -445,7 +445,7 @@ pub(crate) fn cleanup_my_tcb() {
     // A final stdio error may have recreated errno/emutls storage. Free it
     // directly; user destructors must not run after standard streams close.
     crate::tls::release_my_storage();
-    // Application exit has waited for all child cleanup. Clear also releases the
+    // Thread group exit has waited for all child cleanup. Clear also releases the
     // empty root node that BTreeMap may retain after removing its last entry.
     TCBS.write().clear();
     KEYS.write().clear();
