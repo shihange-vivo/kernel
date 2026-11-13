@@ -57,7 +57,7 @@ impl GlobalFile {
     unsafe fn finish(&self) {
         // SAFETY: the standalone runtime excludes all stream users at exit.
         if let Some(mut stream) = unsafe { (*self.0.get()).take() } {
-            // The application group owns the descriptors through retirement.
+            // The thread group owns the descriptors through retirement.
             // Release libc buffers here; group cleanup closes the table later.
             stream.file.reference = true;
             drop(stream);

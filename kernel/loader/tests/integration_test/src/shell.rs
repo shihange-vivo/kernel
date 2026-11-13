@@ -15,12 +15,12 @@
 //! Run the production Rust shell through the kernel's one-call loader entry.
 //! The test stages the shell ELF in the target VFS, then `loader::run`
 //! performs the complete flow: open, load, startup frame, thread scheduling
-//! and exit. No Process or descriptor table is created; the application runs
-//! as an RTOS thread group with its own descriptor table.
+//! and exit. The application runs as an RTOS thread group with its own
+//! descriptor table, without requiring a Process.
 
 use alloc::{boxed::Box, sync::Arc, vec, vec::Vec};
 use blueos::{
-    loader::{ApplicationExit, RunRequest, StandardIo},
+    loader::{RunRequest, StandardIo, ThreadGroupExit},
     scheduler,
     thread::{Builder, DeferredCleanup, Entry, Stack, IDLE},
     vfs::{self, FileOps},
@@ -157,7 +157,7 @@ fn run_shell_repeatedly() {
         // initial-stack entry; QEMU's coherent test execution publishes its code.
         let status = unsafe { blueos::loader::run(IMAGE_PATH, &request) }.unwrap();
         // The shell's main returns after its service thread exits; libc fini runs.
-        assert_eq!(status, ApplicationExit::Code(0));
+        assert_eq!(status, ThreadGroupExit::Code(0));
         assert_eq!(read_file(CREATED_PATH), b"persisted-by-shell\n");
         let output = read_file(OUTPUT_PATH);
         for expected in [
