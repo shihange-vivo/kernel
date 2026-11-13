@@ -92,7 +92,7 @@ impl FdManager {
     pub(crate) fn close_all(self) {
         for file in self.fds.into_iter().flatten() {
             if let Err(error) = file.close() {
-                warn!("closing application descriptor failed: {:?}", error);
+                warn!("closing descriptor failed: {:?}", error);
             }
         }
     }
@@ -212,7 +212,7 @@ impl FdManager {
 #[must_use = "retain the owner while accessing its descriptor table"]
 pub(crate) enum CurrentFiles {
     #[cfg(loader_backend)]
-    Application(Arc<crate::loader::application::ApplicationGroup>),
+    ThreadGroup(Arc<crate::loader::thread_group::ThreadGroupInner>),
     Process(Arc<crate::process::Process>),
 }
 
@@ -220,7 +220,7 @@ impl CurrentFiles {
     pub(crate) fn table(&self) -> &crate::sync::SpinLock<FdManager> {
         match self {
             #[cfg(loader_backend)]
-            Self::Application(group) => group.fd_manager(),
+            Self::ThreadGroup(group) => group.fd_manager(),
             Self::Process(process) => process.fd_manager(),
         }
     }
@@ -228,9 +228,9 @@ impl CurrentFiles {
     pub(crate) fn get() -> Option<Self> {
         #[cfg(loader_backend)]
         if let Some(group) =
-            crate::loader::application::for_thread(crate::scheduler::current_thread_id())
+            crate::loader::thread_group::for_thread(crate::scheduler::current_thread_id())
         {
-            return Some(Self::Application(group));
+            return Some(Self::ThreadGroup(group));
         }
         crate::process::current_process().map(Self::Process)
     }

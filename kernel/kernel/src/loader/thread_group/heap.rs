@@ -12,12 +12,12 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Track application malloc-family blocks without changing the heap's pointer ABI.
+//! Track group malloc-family blocks without changing the heap's pointer ABI.
 //! Static libc/std objects do not run Rust Drop when their ELF is unmapped. Free
 //! their remaining blocks only after every member and deferred C cleanup finishes.
-//! Kernel allocations and malloc calls outside an application remain independent.
+//! Kernel allocations and malloc calls outside a thread group remain independent.
 
-use super::{ApplicationGroup, MEMBERS};
+use super::{ThreadGroupInner, MEMBERS};
 use crate::{allocator, scheduler};
 use alloc::sync::Arc;
 use core::ptr;
@@ -63,7 +63,7 @@ impl Drop for HeapBlock {
     }
 }
 
-fn current_group() -> Option<Arc<ApplicationGroup>> {
+fn current_group() -> Option<Arc<ThreadGroupInner>> {
     let members = MEMBERS.irqsave_lock();
     // malloc is also used before scheduler initialization, when no group exists.
     if members.is_empty() {
@@ -72,7 +72,7 @@ fn current_group() -> Option<Arc<ApplicationGroup>> {
     members.get(&scheduler::current_thread_id()).cloned()
 }
 
-fn allocation_owner(address: usize) -> Option<Arc<ApplicationGroup>> {
+fn allocation_owner(address: usize) -> Option<Arc<ThreadGroupInner>> {
     if let Some(group) = current_group()
         && group
             .state
@@ -85,7 +85,7 @@ fn allocation_owner(address: usize) -> Option<Arc<ApplicationGroup>> {
     }
     // Ownership does not change when a different context releases a block.
     // Search live groups if the caller does not have its owner's context;
-    // callers must keep the owning application alive through the operation.
+    // callers must keep the owning group alive through the operation.
     MEMBERS
         .irqsave_lock()
         .values()
@@ -100,7 +100,7 @@ fn allocation_owner(address: usize) -> Option<Arc<ApplicationGroup>> {
         .cloned()
 }
 
-impl ApplicationGroup {
+impl ThreadGroupInner {
     fn allocate_heap(&self, size: usize, align: usize) -> *mut u8 {
         let mut state = self.state.irqsave_lock();
         // Reserve bookkeeping first: allocation failure must not leak a block

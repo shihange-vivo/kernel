@@ -16,7 +16,7 @@
 
 use super::{
     adapters::KernelCodeCache,
-    application::{Application, ApplicationGroup},
+    thread_group::{ThreadGroup, ThreadGroupInner},
 };
 use crate::{
     scheduler,
@@ -188,24 +188,24 @@ impl<A: ImageMapping> StartupStorage<A> {
         unsafe { slice::from_raw_parts(self.initial_sp(), self.words) }
     }
 
-    /// Prepare an application without scheduling it. Configure the main thread
-    /// through Application::thread(), then call Application::start(). The image
+    /// Prepare a thread group without scheduling it. Configure the main thread
+    /// through ThreadGroup::thread(), then call ThreadGroup::start(). The image
     /// and initial stack survive all member threads and their deferred cleanup.
-    /// Dropping a prepared application cancels startup and releases its resources.
+    /// Dropping a prepared group cancels startup and releases its resources.
     /// With VFS enabled the group owns a descriptor table: startup opens the
-    /// console unless Application::set_standard_io supplies replacement streams.
+    /// console unless ThreadGroup::set_standard_io supplies replacement streams.
     ///
     /// # Safety
     /// The image must be trusted native code using the ELF initial-stack entry
     /// convention and must never return from its entry. Its mapping must expose
     /// executable backing in the kernel's flat address space. The caller must
     /// satisfy code publication on every CPU where it may run. All image users
-    /// must be application members created through CreateThread; pointers must
+    /// must be group members created through CreateThread; pointers must
     /// not escape this lifetime. Malloc-family allocations made by members are
     /// group-owned and are reclaimed after the last member cleanup; they must
     /// not be retained by outside threads. Normal exit is coordinated by main,
     /// after children have joined or detached and can finish cooperatively.
-    pub unsafe fn into_application(self) -> Result<Application, StartupError>
+    pub unsafe fn into_thread_group(self) -> Result<ThreadGroup, StartupError>
     where
         A: Send + 'static,
     {
@@ -216,7 +216,7 @@ impl<A: ImageMapping> StartupStorage<A> {
         let pointer = ptr::from_ref(data.as_ref()).cast_mut().cast::<c_void>();
         // Prepare before registering a thread, so failure drops the image and
         // stack in the caller's context without leaving a global queue entry.
-        let group = ApplicationGroup::prepare(data);
+        let group = ThreadGroupInner::prepare(data);
         let cleanup = group
             .main_cleanup()
             .map_err(StartupError::CleanupUnavailable)?;
@@ -228,15 +228,15 @@ impl<A: ImageMapping> StartupStorage<A> {
     }
 }
 
-// Held by the application group, not by an abandoned bootstrap stack frame.
-#[must_use = "the application group retains this image through all member cleanups"]
+// Held by the thread group, not by an abandoned bootstrap stack frame.
+#[must_use = "the thread group retains this image through all member cleanups"]
 struct EntryData<A: ImageMapping> {
     image: LoadedImage<A>,
     sp: usize,
 }
 
 extern "C" fn bootstrap<A: ImageMapping>(pointer: *mut c_void) {
-    // SAFETY: into_application retains this immutable owner through member cleanup.
+    // SAFETY: into_thread_group retains this immutable owner through member cleanup.
     let data = unsafe { &*pointer.cast::<EntryData<A>>() };
     let allocation = data.image.allocation();
     // Refresh the current CPU after scheduling as well. This does not replace
