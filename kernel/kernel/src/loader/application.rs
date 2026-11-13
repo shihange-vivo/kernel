@@ -13,11 +13,10 @@
 // limitations under the License.
 
 //! Single-image application ownership, membership and cooperative main-thread exit.
-//! The live-thread registry owns groups; retirement callbacks hold weak handles.
-//! Group ownership therefore survives a dropped observer without an Arc cycle.
+//! Registered members retain their group; retirement callbacks hold weak handles.
+//! ApplicationGroup therefore survives a dropped Application without an Arc cycle.
 
 use crate::{
-    process::Process,
     scheduler,
     sync::SpinLock,
     thread::{self, DeferredCleanup, GlobalQueueVisitor, Thread, ThreadNode},
@@ -34,6 +33,10 @@ use spin::Mutex;
 
 mod heap;
 pub(crate) use heap::{allocate_heap, free_heap, reallocate_heap};
+#[cfg(enable_vfs)]
+mod files;
+#[cfg(enable_vfs)]
+pub use files::StandardIo;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ApplicationState {
@@ -53,46 +56,93 @@ pub enum ApplicationExit {
 pub enum ApplicationError {
     AlreadyStarted,
     NotStarted,
-    ProcessUnavailable,
+    #[cfg(enable_vfs)]
+    FileTable(crate::error::Error),
     QueueFailed,
 }
-
-struct State {
-    phase: ApplicationState,
-    members: Vec<ThreadNode>,
-    // Keep the main stack (argv/envp/auxv backing) after main retires abnormally.
-    main: Option<ThreadNode>,
-    main_id: usize,
-    status: Option<i32>,
-    fini_complete: bool,
-    outcome: Option<ApplicationExit>,
-    // malloc-family blocks belong to the whole application, not one thread.
-    allocations: Vec<heap::HeapBlock>,
-}
-
-#[must_use = "retain application resources until all member cleanups finish"]
-pub(crate) struct Group {
-    state: SpinLock<State>,
-    // Exclusive ownership transfer needs Send, not shared access to the image.
-    // Only the last member takes this value, outside the state lock.
-    owner: Mutex<Option<Box<dyn Send>>>,
-    changed: AtomicUsize,
-}
-static MEMBERS: SpinLock<BTreeMap<usize, Arc<Group>>> = SpinLock::new(BTreeMap::new());
 
 /// Observe and start an application. Dropping a prepared handle cancels startup;
 /// dropping a running handle leaves its members owning the image through exit.
 #[must_use = "start the application or drop it to cancel its prepared resources"]
 pub struct Application {
-    group: Arc<Group>,
-    thread: ThreadNode,
+    group: Arc<ApplicationGroup>,
+    // Configuration handle; retained until this Application is dropped, even
+    // after wait() returns. Cloning a ThreadNode shares the same thread and stack.
+    main_thread: ThreadNode,
+}
+
+/// Shared application lifetime, retained by registered members independently of
+/// the public Application handle. Retirement callbacks only hold weak references.
+#[must_use = "retain application resources until all member cleanups finish"]
+pub(crate) struct ApplicationGroup {
+    state: SpinLock<GroupState>,
+    #[cfg(enable_vfs)]
+    files: files::ApplicationFiles,
+    // Exclusive ownership transfer needs Send, not shared access to the image.
+    // Only the last member takes this value, outside the state lock.
+    image_owner: Mutex<Option<Box<dyn Send>>>,
+    changed: AtomicUsize,
+}
+
+/// Membership, exit progress and heap ownership coordinated by one state lock.
+#[must_use = "retain member threads and heap blocks until group cleanup"]
+struct GroupState {
+    phase: ApplicationState,
+    exit_code: Option<i32>,
+    fini_complete: bool,
+    outcome: Option<ApplicationExit>,
+    // Includes retired threads until their deferred cleanup completes.
+    members: Vec<ThreadNode>,
+    main_id: usize,
+    // Keep the main stack (argv/envp/auxv backing) through the last member's
+    // cleanup, even after main leaves members and Application has been dropped.
+    retained_main: Option<ThreadNode>,
+    // malloc-family blocks belong to the whole application, not one thread.
+    allocations: Vec<heap::HeapBlock>,
+}
+
+// Each registered thread retains its group until its deferred cleanup finishes.
+static MEMBERS: SpinLock<BTreeMap<usize, Arc<ApplicationGroup>>> = SpinLock::new(BTreeMap::new());
+
+/// Borrow application resources while a retired member's C cleanup runs on a
+/// kernel worker. This does not make the worker a member or affect exit counts.
+#[must_use = "retain the resource context until the cleanup callback returns"]
+struct CleanupContext {
+    thread_id: usize,
+    previous: Option<Arc<ApplicationGroup>>,
+}
+
+impl CleanupContext {
+    fn enter(group: &Arc<ApplicationGroup>) -> Self {
+        let thread_id = scheduler::current_thread_id();
+        let previous = MEMBERS.irqsave_lock().insert(thread_id, group.clone());
+        Self {
+            thread_id,
+            previous,
+        }
+    }
+}
+
+impl Drop for CleanupContext {
+    fn drop(&mut self) {
+        let current = {
+            let mut members = MEMBERS.irqsave_lock();
+            if let Some(previous) = self.previous.take() {
+                members.insert(self.thread_id, previous)
+            } else {
+                members.remove(&self.thread_id)
+            }
+        };
+        drop(current);
+    }
 }
 
 impl Application {
     /// Access the main thread for configuration. Use start() to schedule it;
     /// queuing this node separately bypasses application state transitions.
+    /// This handle retains the thread and its stack until Application is dropped.
     pub fn thread(&self) -> &ThreadNode {
-        &self.thread
+        &self.main_thread
     }
     pub fn state(&self) -> ApplicationState {
         self.group.state.irqsave_lock().phase
@@ -105,23 +155,29 @@ impl Application {
         self.group.state.irqsave_lock().outcome
     }
 
-    /// Schedule once, optionally associating the main thread with an existing
-    /// Process. No Process is needed for a direct RTOS application.
-    pub fn start(&mut self, process: Option<&Arc<Process>>) -> Result<(), ApplicationError> {
-        if self.state() != ApplicationState::Prepared || self.thread.state() != thread::IDLE {
+    /// Replace standard descriptors before scheduling. Other descriptors and
+    /// streams belong to this application's group, independently of Process.
+    #[cfg(enable_vfs)]
+    pub fn set_standard_io(&mut self, stdio: &StandardIo) -> Result<(), ApplicationError> {
+        if self.state() != ApplicationState::Prepared {
             return Err(ApplicationError::AlreadyStarted);
         }
-        if let Some(process) = process
-            && !process.add_thread(self.thread.clone())
-        {
+        self.group.files.set_stdio(stdio);
+        Ok(())
+    }
+
+    /// Schedule the main thread once. Child threads share this group's resources.
+    pub fn start(&mut self) -> Result<(), ApplicationError> {
+        if self.state() != ApplicationState::Prepared || self.main_thread.state() != thread::IDLE {
+            return Err(ApplicationError::AlreadyStarted);
+        }
+        #[cfg(enable_vfs)]
+        if let Err(error) = self.group.files.prepare_stdio() {
             self.cancel();
-            return Err(ApplicationError::ProcessUnavailable);
+            return Err(ApplicationError::FileTable(error));
         }
         self.group.state.irqsave_lock().phase = ApplicationState::Running;
-        if scheduler::queue_ready_thread(thread::IDLE, self.thread.clone()).is_err() {
-            if let Some(process) = process {
-                process.remove_thread(&mut self.thread);
-            }
+        if scheduler::queue_ready_thread(thread::IDLE, self.main_thread.clone()).is_err() {
             self.group.state.irqsave_lock().phase = ApplicationState::Prepared;
             self.cancel();
             return Err(ApplicationError::QueueFailed);
@@ -129,7 +185,9 @@ impl Application {
         Ok(())
     }
 
-    /// Wait until every member cleanup, heap reclamation and image release finish.
+    /// Wait until member cleanup, descriptor closing, heap reclamation and image
+    /// release finish.
+    /// The main thread and its stack remain retained by this Application handle.
     pub fn wait(&self) -> Result<ApplicationExit, ApplicationError> {
         if self.state() == ApplicationState::Prepared {
             return Err(ApplicationError::NotStarted);
@@ -144,13 +202,13 @@ impl Application {
     }
 
     fn cancel(&mut self) {
-        if self.thread.state() != thread::IDLE {
+        if self.main_thread.state() != thread::IDLE {
             return;
         }
-        GlobalQueueVisitor::remove(&mut self.thread);
-        let cleanup = self.thread.lock().take_cleanup();
+        GlobalQueueVisitor::remove(&mut self.main_thread);
+        let cleanup = self.main_thread.lock().take_cleanup();
         drop(cleanup);
-        self.group.finish(Thread::id(&self.thread));
+        self.group.finish(Thread::id(&self.main_thread));
     }
 }
 impl Drop for Application {
@@ -161,22 +219,31 @@ impl Drop for Application {
     }
 }
 
-impl Group {
-    pub(super) fn prepare(owner: Box<dyn Send>) -> Arc<Self> {
+impl ApplicationGroup {
+    pub(super) fn prepare(image_owner: Box<dyn Send>) -> Arc<Self> {
+        #[cfg(enable_vfs)]
+        let files = files::ApplicationFiles::new();
         Arc::new(Self {
-            state: SpinLock::new(State {
+            state: SpinLock::new(GroupState {
                 phase: ApplicationState::Prepared,
-                members: Vec::new(),
-                main: None,
-                main_id: 0,
-                status: None,
+                exit_code: None,
                 fini_complete: false,
                 outcome: None,
+                members: Vec::new(),
+                main_id: 0,
+                retained_main: None,
                 allocations: Vec::new(),
             }),
-            owner: Mutex::new(Some(owner)),
+            #[cfg(enable_vfs)]
+            files,
+            image_owner: Mutex::new(Some(image_owner)),
             changed: AtomicUsize::new(0),
         })
+    }
+
+    #[cfg(enable_vfs)]
+    pub(crate) fn fd_manager(&self) -> &SpinLock<crate::vfs::fd_manager::FdManager> {
+        &self.files.table
     }
 
     pub(super) fn main_cleanup(self: &Arc<Self>) -> Result<DeferredCleanup, thread::CleanupError> {
@@ -189,18 +256,18 @@ impl Group {
         })
     }
 
-    pub(super) fn install(self: &Arc<Self>, thread: ThreadNode) -> Application {
-        let id = Thread::id(&thread);
+    pub(super) fn install(self: &Arc<Self>, main_thread: ThreadNode) -> Application {
+        let id = Thread::id(&main_thread);
         {
             let mut state = self.state.irqsave_lock();
             state.main_id = id;
-            state.main = Some(thread.clone());
-            state.members.push(thread.clone());
+            state.retained_main = Some(main_thread.clone());
+            state.members.push(main_thread.clone());
         }
         assert!(MEMBERS.irqsave_lock().insert(id, self.clone()).is_none());
         Application {
             group: self.clone(),
-            thread,
+            main_thread,
         }
     }
 
@@ -228,10 +295,13 @@ impl Group {
         DeferredCleanup::new(move || {
             // The C SpawnArgs contract retains argument storage until cleanup;
             // membership keeps the callback's image mapped through this call.
-            if let Some(callback) = callback {
-                callback(argument as *mut core::ffi::c_void);
-            }
             if let Some(group) = group.upgrade() {
+                {
+                    let _context = CleanupContext::enter(&group);
+                    if let Some(callback) = callback {
+                        callback(argument as *mut core::ffi::c_void);
+                    }
+                }
                 group.finish(id);
             }
         })
@@ -239,7 +309,7 @@ impl Group {
 
     pub(crate) fn finish(self: &Arc<Self>, id: usize) {
         let registered = { MEMBERS.irqsave_lock().remove(&id) };
-        let (member, main, allocations, complete) = {
+        let (member, retained_main, allocations, complete) = {
             let mut state = self.state.irqsave_lock();
             let Some(index) = state.members.iter().position(|t| Thread::id(t) == id) else {
                 return;
@@ -252,7 +322,7 @@ impl Group {
                 state.phase = ApplicationState::Exiting;
                 (
                     member,
-                    state.main.take(),
+                    state.retained_main.take(),
                     core::mem::take(&mut state.allocations),
                     true,
                 )
@@ -260,21 +330,25 @@ impl Group {
                 (member, None, Vec::new(), false)
             }
         };
-        let owner = if complete {
-            self.owner.lock().take()
+        let image_owner = if complete {
+            self.image_owner.lock().take()
         } else {
             None
         };
         // Resource release may block. No group or registry lock survives here.
+        #[cfg(enable_vfs)]
+        if complete {
+            self.files.close_all();
+        }
         drop(allocations);
-        drop(owner);
-        drop(main);
+        drop(image_owner);
+        drop(retained_main);
         drop(member);
         drop(registered);
         if complete {
             let mut state = self.state.irqsave_lock();
             state.outcome = Some(if state.fini_complete {
-                ApplicationExit::Code(state.status.expect("normal exit status"))
+                ApplicationExit::Code(state.exit_code.expect("normal exit status"))
             } else {
                 ApplicationExit::Aborted
             });
@@ -292,7 +366,7 @@ impl Group {
             if id != state.main_id || state.phase != ApplicationState::Running {
                 return Err(());
             }
-            state.status = Some(status);
+            state.exit_code = Some(status);
             state.phase = ApplicationState::Exiting;
         }
         loop {
@@ -317,7 +391,7 @@ impl Group {
     }
 }
 
-pub(crate) fn for_thread(id: usize) -> Option<Arc<Group>> {
+pub(crate) fn for_thread(id: usize) -> Option<Arc<ApplicationGroup>> {
     MEMBERS.irqsave_lock().get(&id).cloned()
 }
 
@@ -326,7 +400,6 @@ mod tests {
     use super::*;
     use crate::{
         arch,
-        process::ProcessManager,
         thread::{Builder, Entry},
     };
     use blueos_test_macro::test;
@@ -512,7 +585,7 @@ mod tests {
         observed
             .untracked_block
             .store(external.expose_provenance(), Ordering::Release);
-        let group = Group::prepare(Box::new(Owner(observed.clone())));
+        let group = ApplicationGroup::prepare(Box::new(Owner(observed.clone())));
         let thread = Builder::new(Entry::Posix(
             heap_entry,
             Arc::as_ptr(&observed).cast_mut().cast(),
@@ -522,7 +595,7 @@ mod tests {
             .lock()
             .set_deferred_cleanup(group.main_cleanup().unwrap());
         let mut application = group.install(thread);
-        application.start(None).unwrap();
+        application.start().unwrap();
         assert_eq!(
             application.wait(),
             Ok(if normal_exit {
@@ -557,7 +630,7 @@ mod tests {
     #[test]
     fn child_heap_allocation_survives_its_allocating_thread() {
         let (mut application, observed) = prepare();
-        application.start(None).unwrap();
+        application.start().unwrap();
         let child = Builder::new(Entry::Posix(
             allocating_child,
             Arc::as_ptr(&observed).cast_mut().cast(),
@@ -598,7 +671,7 @@ mod tests {
 
     fn prepare() -> (Application, Arc<Observed>) {
         let observed = Arc::new(Observed::default());
-        let group = Group::prepare(Box::new(Owner(observed.clone())));
+        let group = ApplicationGroup::prepare(Box::new(Owner(observed.clone())));
         let cleanup = group.main_cleanup().unwrap();
         let thread = Builder::new(Entry::Posix(
             main_entry,
@@ -624,7 +697,7 @@ mod tests {
     #[test]
     fn application_retains_image_after_abnormal_main_exit() {
         let (mut application, observed) = prepare();
-        application.start(None).unwrap();
+        application.start().unwrap();
         let pointer = Arc::as_ptr(&observed).cast_mut().cast();
         let child = Builder::new(Entry::Posix(child_entry, pointer)).build();
         let id = Thread::id(&child);
@@ -640,7 +713,7 @@ mod tests {
         wait_for(|| {
             application.state() == ApplicationState::Exiting && application.member_count() == 1
         });
-        assert_eq!(application.thread.state(), thread::RETIRED);
+        assert_eq!(application.thread().state(), thread::RETIRED);
         assert!(!observed.dropped.load(Ordering::Acquire));
         assert_eq!(application.exit_status(), None);
         assert!(application
@@ -671,7 +744,7 @@ mod tests {
     #[test]
     fn running_application_survives_dropped_observer() {
         let (mut application, observed) = prepare();
-        application.start(None).unwrap();
+        application.start().unwrap();
         let group = Arc::downgrade(&application.group);
         drop(application);
         assert!(group.upgrade().is_some());
@@ -679,40 +752,5 @@ mod tests {
         observed.release_main.store(true, Ordering::Release);
         wait_for(|| group.upgrade().is_none());
         assert!(observed.dropped.load(Ordering::Acquire));
-    }
-
-    #[test]
-    fn application_can_use_an_existing_process() {
-        let manager = ProcessManager::get();
-        let process = manager
-            .create_process(Arc::downgrade(manager.root_process()))
-            .unwrap();
-        let (mut application, observed) = prepare();
-        application.start(Some(&process)).unwrap();
-        assert_eq!(application.thread.process().unwrap().pid(), process.pid());
-        assert_eq!(process.thread_count(), 1);
-        observed.release_main.store(true, Ordering::Release);
-        assert_eq!(application.wait(), Ok(ApplicationExit::Aborted));
-        assert_eq!(process.thread_count(), 0);
-        assert!(manager.process_table().get(process.pid()).is_none());
-    }
-
-    #[test]
-    fn application_rejects_dead_process_without_leaking_thread() {
-        let manager = ProcessManager::get();
-        let process = manager
-            .create_process(Arc::downgrade(manager.root_process()))
-            .unwrap();
-        drop(manager.destroy_process(process.pid()).unwrap());
-        let (mut application, observed) = prepare();
-        let id = Thread::id(application.thread());
-        assert_eq!(
-            application.start(Some(&process)),
-            Err(ApplicationError::ProcessUnavailable)
-        );
-        assert_eq!(application.wait(), Ok(ApplicationExit::Aborted));
-        assert!(observed.dropped.load(Ordering::Acquire));
-        assert!(for_thread(id).is_none());
-        assert!(GlobalQueueVisitor::find_if(|t| Thread::id(t) == id).is_none());
     }
 }
