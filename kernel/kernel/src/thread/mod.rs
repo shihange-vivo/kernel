@@ -486,7 +486,9 @@ impl Thread {
 
     /// Install a prepared callback for ordinary worker execution at retirement.
     /// Prepare it with DeferredCleanup::new outside this thread's lock. The
-    /// worker does not inherit this thread's Process or fd table.
+    /// worker does not inherit this thread's identity, TLS, Process or fd table.
+    /// Capture resources explicitly and complete thread-specific runtime
+    /// finalization before retirement.
     pub fn set_deferred_cleanup(&mut self, cleanup: DeferredCleanup) {
         self.cleanup = Some(Cleanup::Deferred(cleanup));
     }

@@ -185,7 +185,13 @@ fn run_storage_with(
 ) -> (blueos::thread::ThreadNode, ThreadGroupExit) {
     // SAFETY: trusted fixtures keep all code/data users in thread group members;
     // native code and initial-stack storage survive every member cleanup.
-    let mut thread_group = unsafe { storage.into_thread_group() }.unwrap();
+    let mut thread_group = unsafe {
+        storage.into_thread_group(
+            #[cfg(enable_vfs)]
+            None,
+        )
+    }
+    .unwrap();
     let thread = thread_group.thread().clone();
     assert!(thread.process().is_none());
     let Cleanup::Deferred(cleanup) = thread.lock().take_cleanup().unwrap() else {

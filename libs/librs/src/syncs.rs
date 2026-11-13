@@ -641,6 +641,8 @@ extern "C" fn posix_start_routine(arg: *mut c_void) {
     pthread_exit(retval);
 }
 
+// Release only the passed stack storage; the kernel may run this callback on
+// another thread, without the retired thread's identity, TLS or file table.
 extern "C" fn posix_cleanup_routine(arg: *mut c_void) {
     assert_ne!(arg, core::ptr::null_mut());
     let routine = unsafe { &*arg.cast::<PosixRoutineInfo>() };

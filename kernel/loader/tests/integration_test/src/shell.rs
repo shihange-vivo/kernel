@@ -177,10 +177,6 @@ fn run_shell_repeatedly() {
         assert_eq!(vfs::syscalls::unlink(c"/shell-created".as_ptr()), 0);
     }
 
-    // Global heap usage also includes network and cleanup-worker allocations,
-    // so it cannot establish per-application leak freedom. Kernel application
-    // tests observe owned-block release directly, including repeated launches.
-
     assert_eq!(vfs::syscalls::unlink(c"/shell.elf".as_ptr()), 0);
     assert_eq!(vfs::syscalls::unlink(c"/shell-input".as_ptr()), 0);
     assert_eq!(vfs::syscalls::unlink(c"/shell-output".as_ptr()), 0);

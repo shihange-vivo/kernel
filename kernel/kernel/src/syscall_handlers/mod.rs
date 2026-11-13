@@ -515,9 +515,6 @@ alloc_mem(ptr: *mut *mut c_void, size: usize, align: usize) -> c_long {
     {
         return -1;
     }
-    #[cfg(loader_backend)]
-    let addr = crate::loader::thread_group::allocate_heap(size, align);
-    #[cfg(not(loader_backend))]
     let addr = crate::allocator::malloc_align(size, align);
     if addr.is_null() {
         return -1;
@@ -528,9 +525,6 @@ alloc_mem(ptr: *mut *mut c_void, size: usize, align: usize) -> c_long {
 
 define_syscall_handler!(
 free_mem(ptr: *mut c_void) -> c_long {
-    #[cfg(loader_backend)]
-    crate::loader::thread_group::free_heap(ptr.cast());
-    #[cfg(not(loader_backend))]
     crate::allocator::free(ptr as *mut u8);
     0
 });
@@ -543,9 +537,6 @@ realloc_mem(output: *mut *mut c_void, old: *mut c_void, size: usize, align: usiz
     {
         return -1;
     }
-    #[cfg(loader_backend)]
-    let moved = crate::loader::thread_group::reallocate_heap(old.cast(), size, align);
-    #[cfg(not(loader_backend))]
     let moved = crate::allocator::realloc_align(old.cast(), size, align);
     if moved.is_null() && size != 0 { return -1; }
     // The flat syscall ABI requires an exclusive output slot valid throughout

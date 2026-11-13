@@ -131,10 +131,7 @@ pub unsafe fn run(path: &str, request: &RunRequest<'_>) -> Result<ThreadGroupExi
     )?;
     // SAFETY: the caller guarantees trusted native code; the group retains
     // the image and stack through all member cleanups.
-    let mut thread_group = unsafe { storage.into_thread_group()? };
-    if let Some(stdio) = request.stdio {
-        thread_group.set_standard_io(stdio)?;
-    }
+    let mut thread_group = unsafe { storage.into_thread_group(request.stdio)? };
     thread_group.start()?;
     thread_group.wait().map_err(Into::into)
 }
