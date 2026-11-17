@@ -19,13 +19,14 @@
 use crate::{
     scheduler,
     sync::SpinLock,
-    thread::{self, DeferredCleanup, GlobalQueueVisitor, Thread, ThreadNode},
+    thread::{self, CleanupError, DeferredCleanup, GlobalQueueVisitor, Thread, ThreadNode},
     time::Tick,
 };
 use alloc::{
     boxed::Box,
     collections::BTreeMap,
     sync::{Arc, Weak},
+    vec,
     vec::Vec,
 };
 use core::sync::atomic::{AtomicUsize, Ordering};
@@ -62,15 +63,15 @@ pub enum ThreadGroupError {
 #[must_use = "start the thread group or drop it to cancel its prepared resources"]
 pub struct ThreadGroup {
     group: Arc<ThreadGroupInner>,
-    // Configuration handle; retained until this ThreadGroup is dropped, even
-    // after wait() returns. Cloning a ThreadNode shares the same thread and stack.
-    main_thread: ThreadNode,
 }
 
 /// Shared group lifetime, retained by registered members independently of
 /// the public ThreadGroup handle. Retirement callbacks only hold weak references.
 #[must_use = "retain group resources until all member cleanups finish"]
 pub(crate) struct ThreadGroupInner {
+    // Keep the main thread and its startup stack through every member cleanup,
+    // and through wait() while the public observer still retains this group.
+    main_thread: ThreadNode,
     state: SpinLock<GroupState>,
     #[cfg(enable_vfs)]
     files: files::ThreadGroupFiles,
@@ -89,21 +90,57 @@ struct GroupState {
     outcome: Option<ThreadGroupExit>,
     // Includes retired threads until their deferred cleanup completes.
     members: Vec<ThreadNode>,
-    main_id: usize,
-    // Keep the main stack (argv/envp/auxv backing) through the last member's
-    // cleanup, even after main leaves members and ThreadGroup has been dropped.
-    retained_main: Option<ThreadNode>,
 }
 
 // Each registered thread retains its group until its deferred cleanup finishes.
 static MEMBERS: SpinLock<BTreeMap<usize, Arc<ThreadGroupInner>>> = SpinLock::new(BTreeMap::new());
 
 impl ThreadGroup {
+    /// Take ownership of an unscheduled main thread and its image resources.
+    /// A failed cleanup preparation removes the thread's global registration
+    /// before releasing its stack or image in the caller's context.
+    pub(super) fn prepare(
+        mut main_thread: ThreadNode,
+        image_owner: Box<dyn Send>,
+        #[cfg(enable_vfs)] table: crate::vfs::fd_manager::FdManager,
+    ) -> Result<Self, CleanupError> {
+        let group = Arc::new(ThreadGroupInner {
+            main_thread: main_thread.clone(),
+            state: SpinLock::new(GroupState {
+                phase: ThreadGroupState::Prepared,
+                exit_code: None,
+                fini_complete: false,
+                outcome: None,
+                members: vec![main_thread.clone()],
+            }),
+            #[cfg(enable_vfs)]
+            files: files::ThreadGroupFiles::new(table),
+            image_owner: Mutex::new(Some(image_owner)),
+            changed: AtomicUsize::new(0),
+        });
+        let weak = Arc::downgrade(&group);
+        let cleanup = match DeferredCleanup::new(move || {
+            if let Some(group) = weak.upgrade() {
+                group.finish(Thread::id(&group.main_thread));
+            }
+        }) {
+            Ok(cleanup) => cleanup,
+            Err(error) => {
+                GlobalQueueVisitor::remove(&mut main_thread);
+                return Err(error);
+            }
+        };
+        main_thread.lock().set_deferred_cleanup(cleanup);
+        let id = Thread::id(&main_thread);
+        assert!(MEMBERS.irqsave_lock().insert(id, group.clone()).is_none());
+        Ok(Self { group })
+    }
+
     /// Access the main thread for configuration. Use start() to schedule it;
     /// queuing this node separately bypasses group state transitions.
     /// This handle retains the thread and its stack until ThreadGroup is dropped.
     pub fn thread(&self) -> &ThreadNode {
-        &self.main_thread
+        &self.group.main_thread
     }
     pub fn state(&self) -> ThreadGroupState {
         self.group.state.irqsave_lock().phase
@@ -118,11 +155,11 @@ impl ThreadGroup {
 
     /// Schedule the main thread once. Child threads share this group's resources.
     pub fn start(&mut self) -> Result<(), ThreadGroupError> {
-        if self.state() != ThreadGroupState::Prepared || self.main_thread.state() != thread::IDLE {
+        if self.state() != ThreadGroupState::Prepared || self.thread().state() != thread::IDLE {
             return Err(ThreadGroupError::AlreadyStarted);
         }
         self.group.state.irqsave_lock().phase = ThreadGroupState::Running;
-        if scheduler::queue_ready_thread(thread::IDLE, self.main_thread.clone()).is_err() {
+        if scheduler::queue_ready_thread(thread::IDLE, self.thread().clone()).is_err() {
             self.group.state.irqsave_lock().phase = ThreadGroupState::Prepared;
             self.cancel();
             return Err(ThreadGroupError::QueueFailed);
@@ -146,13 +183,14 @@ impl ThreadGroup {
     }
 
     fn cancel(&mut self) {
-        if self.main_thread.state() != thread::IDLE {
+        let mut main_thread = self.thread().clone();
+        if main_thread.state() != thread::IDLE {
             return;
         }
-        GlobalQueueVisitor::remove(&mut self.main_thread);
-        let cleanup = self.main_thread.lock().take_cleanup();
+        GlobalQueueVisitor::remove(&mut main_thread);
+        let cleanup = main_thread.lock().take_cleanup();
         drop(cleanup);
-        self.group.finish(Thread::id(&self.main_thread));
+        self.group.finish(Thread::id(&main_thread));
     }
 }
 impl Drop for ThreadGroup {
@@ -164,57 +202,9 @@ impl Drop for ThreadGroup {
 }
 
 impl ThreadGroupInner {
-    pub(super) fn prepare(
-        image_owner: Box<dyn Send>,
-        #[cfg(enable_vfs)] table: crate::vfs::fd_manager::FdManager,
-    ) -> Arc<Self> {
-        #[cfg(enable_vfs)]
-        let files = files::ThreadGroupFiles::new(table);
-        Arc::new(Self {
-            state: SpinLock::new(GroupState {
-                phase: ThreadGroupState::Prepared,
-                exit_code: None,
-                fini_complete: false,
-                outcome: None,
-                members: Vec::new(),
-                main_id: 0,
-                retained_main: None,
-            }),
-            #[cfg(enable_vfs)]
-            files,
-            image_owner: Mutex::new(Some(image_owner)),
-            changed: AtomicUsize::new(0),
-        })
-    }
-
     #[cfg(enable_vfs)]
     pub(crate) fn fd_manager(&self) -> &SpinLock<crate::vfs::fd_manager::FdManager> {
         &self.files.table
-    }
-
-    pub(super) fn main_cleanup(self: &Arc<Self>) -> Result<DeferredCleanup, thread::CleanupError> {
-        let group = Arc::downgrade(self);
-        DeferredCleanup::new(move || {
-            if let Some(group) = group.upgrade() {
-                let id = group.state.irqsave_lock().main_id;
-                group.finish(id);
-            }
-        })
-    }
-
-    pub(super) fn install(self: &Arc<Self>, main_thread: ThreadNode) -> ThreadGroup {
-        let id = Thread::id(&main_thread);
-        {
-            let mut state = self.state.irqsave_lock();
-            state.main_id = id;
-            state.retained_main = Some(main_thread.clone());
-            state.members.push(main_thread.clone());
-        }
-        assert!(MEMBERS.irqsave_lock().insert(id, self.clone()).is_none());
-        ThreadGroup {
-            group: self.clone(),
-            main_thread,
-        }
     }
 
     pub(crate) fn attach(self: &Arc<Self>, thread: ThreadNode) -> Result<(), ()> {
@@ -256,21 +246,17 @@ impl ThreadGroupInner {
 
     pub(crate) fn finish(self: &Arc<Self>, id: usize) {
         let registered = { MEMBERS.irqsave_lock().remove(&id) };
-        let (member, retained_main, complete) = {
+        let (member, complete) = {
             let mut state = self.state.irqsave_lock();
             let Some(index) = state.members.iter().position(|t| Thread::id(t) == id) else {
                 return;
             };
             let member = state.members.swap_remove(index);
-            if id == state.main_id {
+            let complete = state.members.is_empty();
+            if id == Thread::id(&self.main_thread) || complete {
                 state.phase = ThreadGroupState::Exiting;
             }
-            if state.members.is_empty() {
-                state.phase = ThreadGroupState::Exiting;
-                (member, state.retained_main.take(), true)
-            } else {
-                (member, None, false)
-            }
+            (member, complete)
         };
         let image_owner = if complete {
             self.image_owner.lock().take()
@@ -283,7 +269,6 @@ impl ThreadGroupInner {
             self.files.close_all();
         }
         drop(image_owner);
-        drop(retained_main);
         drop(member);
         drop(registered);
         if complete {
@@ -304,7 +289,7 @@ impl ThreadGroupInner {
             let mut state = self.state.irqsave_lock();
             // First delivery coordinates normal exit from the main thread.
             // It waits for children to finish cooperatively; it does not kill them.
-            if id != state.main_id || state.phase != ThreadGroupState::Running {
+            if id != Thread::id(&self.main_thread) || state.phase != ThreadGroupState::Running {
                 return Err(());
             }
             state.exit_code = Some(status);
@@ -321,7 +306,7 @@ impl ThreadGroupInner {
 
     pub(crate) fn finish_exit(&self, id: usize) -> Result<(), ()> {
         let mut state = self.state.irqsave_lock();
-        if id != state.main_id
+        if id != Thread::id(&self.main_thread)
             || state.phase != ThreadGroupState::Exiting
             || state.members.len() != 1
         {
@@ -478,19 +463,19 @@ mod tests {
 
     fn prepare() -> (ThreadGroup, Arc<Observed>) {
         let observed = Arc::new(Observed::default());
-        let group = ThreadGroupInner::prepare(
-            Box::new(Owner(observed.clone())),
-            #[cfg(enable_vfs)]
-            crate::vfs::fd_manager::FdManager::new(),
-        );
-        let cleanup = group.main_cleanup().unwrap();
         let thread = Builder::new(Entry::Posix(
             main_entry,
             Arc::as_ptr(&observed).cast_mut().cast(),
         ))
         .build();
-        thread.lock().set_deferred_cleanup(cleanup);
-        (group.install(thread), observed)
+        let group = ThreadGroup::prepare(
+            thread,
+            Box::new(Owner(observed.clone())),
+            #[cfg(enable_vfs)]
+            crate::vfs::fd_manager::FdManager::new(),
+        )
+        .unwrap();
+        (group, observed)
     }
 
     #[test]
@@ -542,12 +527,32 @@ mod tests {
     fn running_thread_group_survives_dropped_observer() {
         let (mut thread_group, observed) = prepare();
         thread_group.start().unwrap();
+        let pointer = Arc::as_ptr(&observed).cast_mut().cast();
+        let child = Builder::new(Entry::Posix(child_entry, pointer)).build();
+        let id = Thread::id(&child);
+        let cleanup = thread_group
+            .group
+            .child_cleanup(id, Some(child_cleanup), pointer as usize)
+            .unwrap();
+        thread_group.group.attach(child.clone()).unwrap();
+        child.lock().set_deferred_cleanup(cleanup);
+        assert_eq!(scheduler::queue_ready_thread(thread::IDLE, child), Ok(()));
+        wait_for(|| observed.child_entered.load(Ordering::Acquire));
         let group = Arc::downgrade(&thread_group.group);
         drop(thread_group);
         assert!(group.upgrade().is_some());
         assert!(!observed.dropped.load(Ordering::Acquire));
         observed.release_main.store(true, Ordering::Release);
+        wait_for(|| {
+            let group = group.upgrade().expect("child must retain the group");
+            let state = group.state.irqsave_lock();
+            state.phase == ThreadGroupState::Exiting && state.members.len() == 1
+        });
+        assert!(!observed.dropped.load(Ordering::Acquire));
+        assert!(!observed.child_cleaned.load(Ordering::Acquire));
+        observed.release_child.store(true, Ordering::Release);
         wait_for(|| group.upgrade().is_none());
+        assert!(observed.child_cleaned.load(Ordering::Acquire));
         assert!(observed.dropped.load(Ordering::Acquire));
     }
 }
