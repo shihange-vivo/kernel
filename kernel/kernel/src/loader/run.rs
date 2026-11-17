@@ -27,16 +27,11 @@ use super::{
     adapters::VfsElfReader, load_image, StandardIo, StartupArguments, StartupError, StartupStorage,
     ThreadGroupError, ThreadGroupExit,
 };
-use crate::{thread::Stack, vfs};
+use crate::{config, thread::Stack, vfs};
 use alloc::{ffi::CString, string::String};
 use blueos_loader::LoadError;
 use core::ffi::CStr;
 
-/// Default stack for the application's main thread, in bytes. Runtime
-/// services a program spawns itself use their own stacks; this one carries
-/// the startup frame and libc bootstrap. It does not set the loader caller's
-/// stack size.
-const DEFAULT_STACK_SIZE: usize = 64 * 1024;
 /// ELF ABI page granularity reported through AT_PAGESZ.
 const ABI_PAGE_SIZE: usize = 4096;
 
@@ -44,6 +39,8 @@ const ABI_PAGE_SIZE: usize = 4096;
 pub struct RunRequest<'a> {
     pub argv: &'a [&'a CStr],
     pub envp: &'a [&'a CStr],
+    /// Application main-thread stack size in bytes; defaults to
+    /// [`config::DEFAULT_STACK_SIZE`].
     pub stack_size: usize,
     /// Redirect descriptors 0/1/2; None opens the system console for each stream.
     pub stdio: Option<&'a StandardIo>,
@@ -54,7 +51,7 @@ impl<'a> Default for RunRequest<'a> {
         Self {
             argv: &[],
             envp: &[],
-            stack_size: DEFAULT_STACK_SIZE,
+            stack_size: config::DEFAULT_STACK_SIZE,
             stdio: None,
         }
     }
