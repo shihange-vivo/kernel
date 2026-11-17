@@ -14,10 +14,7 @@
 
 //! Standard ELF initial-stack construction for standalone native images.
 
-use super::{
-    adapters::KernelCodeCache,
-    thread_group::{ThreadGroup, ThreadGroupInner},
-};
+use super::{adapters::KernelCodeCache, thread_group::ThreadGroup};
 use crate::{
     scheduler,
     thread::{Builder, CleanupError, Entry, Stack},
@@ -234,21 +231,16 @@ impl<A: ImageMapping> StartupStorage<A> {
             image: self.image,
         });
         let pointer = ptr::from_ref(data.as_ref()).cast_mut().cast::<c_void>();
-        // Prepare before registering a thread, so failure drops the image and
-        // stack in the caller's context without leaving a global queue entry.
-        let group = ThreadGroupInner::prepare(
-            data,
-            #[cfg(enable_vfs)]
-            table,
-        );
-        let cleanup = group
-            .main_cleanup()
-            .map_err(StartupError::CleanupUnavailable)?;
         let thread = Builder::new(Entry::Posix(bootstrap::<A>, pointer))
             .set_stack(self.stack)
             .build();
-        thread.lock().set_deferred_cleanup(cleanup);
-        Ok(group.install(thread))
+        ThreadGroup::prepare(
+            thread,
+            data,
+            #[cfg(enable_vfs)]
+            table,
+        )
+        .map_err(StartupError::CleanupUnavailable)
     }
 }
 

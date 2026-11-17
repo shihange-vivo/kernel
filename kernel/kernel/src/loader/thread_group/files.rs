@@ -165,14 +165,11 @@ mod tests {
         };
         let mut table = FdManager::from_stdio([file(false), file(false), file(true)]);
         assert_eq!(table.alloc_fd(file(false)), 3);
-        let group = ThreadGroupInner::prepare(Box::new(Owner(observed.clone())), table);
-        *observed.group.lock() = Arc::downgrade(&group);
         let thread =
             Builder::new(Entry::Posix(main, Arc::as_ptr(&observed).cast_mut().cast())).build();
-        thread
-            .lock()
-            .set_deferred_cleanup(group.main_cleanup().unwrap());
-        (group.install(thread), observed)
+        let group = ThreadGroup::prepare(thread, Box::new(Owner(observed.clone())), table).unwrap();
+        *observed.group.lock() = Arc::downgrade(&group.group);
+        (group, observed)
     }
 
     fn write(fd: i32, bytes: &[u8]) {
