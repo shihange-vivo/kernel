@@ -86,20 +86,18 @@ pub enum ThreadKind {
 
 #[derive(Debug)]
 #[must_use = "retain the stack until its execution and payload accesses finish"]
-pub struct Stack {
-    storage: Storage,
-}
+pub struct Stack(Storage);
 
 impl Stack {
     /// End of the complete stack allocation, including any startup data.
     #[inline]
     pub fn top(&self) -> *mut u8 {
-        unsafe { self.storage.base().add(self.size()) }
+        unsafe { self.0.base().add(self.size()) }
     }
 
     #[inline]
     pub fn base(&self) -> *mut u8 {
-        self.storage.base()
+        self.0.base()
     }
 
     #[inline]
@@ -113,13 +111,11 @@ impl Stack {
         if storage.base().is_null() {
             return None;
         }
-        Some(Self { storage })
+        Some(Self(storage))
     }
 
     pub const fn new() -> Self {
-        Self {
-            storage: Storage::new(),
-        }
+        Self(Storage::new())
     }
 
     #[inline]
@@ -134,14 +130,12 @@ impl Stack {
         if !(base as usize).is_multiple_of(ALIGN) {
             return None;
         }
-        Some(Self {
-            storage: unsafe { Storage::from_raw(base, size) },
-        })
+        Some(Self(unsafe { Storage::from_raw(base, size) }))
     }
 
     /// Complete stack allocation length, including any startup data.
     pub fn size(&self) -> usize {
-        self.storage.size()
+        self.0.size()
     }
 
     /// Whether an aligned initial SP leaves room for the initial context below it.
@@ -674,18 +668,26 @@ impl Thread {
         saved_sp - core::mem::size_of::<Context>()
     }
 
+    /// Initial stack layout; A is align_of::<Context>().
+    ///
     /// High address
-    /// ------------------------------ <--- stack.top() (below any reserved payload)
-    /// | optional align gap (0..A)  |
+    /// ------------------------------ <--- stack.top() (complete allocation end)
+    /// | optional startup payload   |
+    /// ------------------------------ <--- initial_sp (defaults to stack.top())
+    /// | alignment gap (<= A)       |
     /// ------------------------------
-    /// | Context for current thread |
-    /// ------------------------------ <--- saved_sp (initial SP)
+    /// | initial Context            |
+    /// ------------------------------ <--- saved_sp (initial Context address)
     /// |       stack region         |     (stack grows down)
     /// |           ...              |
     /// ------------------------------ <--- guard upper bound (if enabled)
     /// | stack guard region         |     (optional, usually no-access)
     /// ------------------------------ <--- stack.base()
     /// Low address
+    ///
+    /// The optional payload is above initial_sp and remains part of the stack
+    /// allocation. Context setup and bootstrap execution take place below it.
+    ///
     /// FIXME: If an exception happens when SP is very close to (or already inside)
     /// the guard, hardware exception stacking (cortex-m) may touch this no-access region
     /// and trigger MemManage (for example DACCVIOL/MSTKERR); if fault handling
