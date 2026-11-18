@@ -101,8 +101,10 @@ where
     None
 }
 
+#[must_use = "build or start the configured thread"]
 pub struct Builder {
     stack: Option<Stack>,
+    initial_sp: Option<usize>,
     entry: Entry,
     priority: ThreadPriority,
 }
@@ -111,6 +113,7 @@ impl Builder {
     pub fn new(entry: Entry) -> Self {
         Self {
             stack: None,
+            initial_sp: None,
             entry,
             priority: config::MAX_THREAD_PRIORITY / 2,
         }
@@ -128,6 +131,17 @@ impl Builder {
         self
     }
 
+    /// Start below this SP, leaving the bytes above it untouched. Defaults to
+    /// Stack::top(). The initial context is placed below this pointer.
+    ///
+    /// Building panics if the pointer is outside the stack, misaligned, or
+    /// leaves insufficient room for the initial context.
+    #[inline]
+    pub fn set_initial_sp(mut self, sp: usize) -> Self {
+        self.initial_sp = Some(sp);
+        self
+    }
+
     pub fn build(mut self) -> ThreadNode {
         let thread = ThreadNode::new(Thread::new(ThreadKind::Normal));
         let mut w = thread.lock();
@@ -138,7 +152,7 @@ impl Builder {
                     Some(s) => s,
                     None => panic!("thread stack allocation failed (OOM)"),
                 });
-        w.init(stack, self.entry);
+        w.init(stack, self.entry, self.initial_sp);
         w.set_origin_priority(self.priority);
         w.set_priority(self.priority);
         drop(w);
@@ -205,7 +219,7 @@ pub(crate) fn build_static_thread(
     let Some(stack) = Stack::from_raw(stack.rep.as_mut_ptr(), stack.rep.len()) else {
         panic!("Invalid stack");
     };
-    w.init(stack, entry);
+    w.init(stack, entry, None);
     w.set_origin_priority(p);
     w.set_priority(p);
     w.set_kind(kind);
@@ -230,7 +244,7 @@ mod tests {
     use super::*;
     use crate::sync::ConstBarrier;
     use blueos_test_macro::test;
-    use core::alloc::Layout;
+    use core::{ptr, slice};
 
     #[test]
     fn test_use_alloc_stack() {
@@ -246,5 +260,51 @@ mod tests {
         .set_stack(stack)
         .start();
         sync_me.wait();
+    }
+
+    #[test]
+    fn test_initial_sp_preserves_stack_payload() {
+        const SIZE: usize = DEFAULT_STACK_SIZE;
+        const RESERVED: usize = 256;
+        const MARKER: u8 = 0xa5;
+        let stack = Stack::from_size(SIZE).unwrap();
+        let base = stack.base() as usize;
+        let top = stack.top() as usize;
+        let initial_sp = top - RESERVED;
+        assert!(stack.can_init_at(initial_sp));
+        assert!(!stack.can_init_at(base - core::mem::align_of::<Context>()));
+        assert!(!stack.can_init_at(base));
+        assert!(!stack.can_init_at(base + core::mem::align_of::<Context>()));
+        assert!(!stack.can_init_at(top + core::mem::align_of::<Context>()));
+        assert!(!stack.can_init_at(initial_sp + 1));
+        // SAFETY: these bytes are inside the owned allocation and will remain
+        // above the initial SP throughout context setup and thread execution.
+        let payload = unsafe { stack.top().sub(RESERVED) };
+        unsafe { ptr::write_bytes(payload, MARKER, RESERVED) };
+        let sync_me = Arc::new(ConstBarrier::<2>::new());
+        let sync_other = sync_me.clone();
+        let other = Builder::new(Entry::Closure(Box::new(move || {
+            let current = scheduler::current_thread();
+            assert_eq!(current.stack_base(), base);
+            assert_eq!(current.stack_size(), SIZE);
+            assert!(current.validate_sp());
+            assert!(arch::current_sp() < initial_sp);
+            sync_other.wait();
+        })))
+        .set_stack(stack)
+        .set_initial_sp(initial_sp)
+        .build();
+        assert!(other.saved_sp() >= base && other.saved_sp() < initial_sp);
+        // SAFETY: other owns the allocation; no context or running stack may
+        // touch the initialized payload above initial_sp.
+        assert!(unsafe { slice::from_raw_parts(payload, RESERVED) }
+            .iter()
+            .all(|&byte| byte == MARKER));
+        assert!(scheduler::queue_ready_thread(thread::IDLE, other.clone()).is_ok());
+        sync_me.wait();
+        // SAFETY: retaining other keeps the allocation live after retirement.
+        assert!(unsafe { slice::from_raw_parts(payload, RESERVED) }
+            .iter()
+            .all(|&byte| byte == MARKER));
     }
 }

@@ -179,7 +179,7 @@ mod tests {
             else {
                 panic!("Invalid stack");
             };
-            w.init(stack, thread::Entry::C(entry));
+            w.init(stack, thread::Entry::C(entry), None);
             if let Some(cleanup) = cleanup {
                 w.set_cleanup(Entry::C(cleanup));
             };

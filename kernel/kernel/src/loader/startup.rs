@@ -61,13 +61,14 @@ pub struct StartupArguments<'a> {
 pub struct StartupStorage<A: ImageMapping> {
     image: LoadedImage<A>,
     stack: Stack,
+    initial_sp: usize,
     words: usize,
 }
 
 impl<A: ImageMapping> StartupStorage<A> {
     pub fn new(
         image: LoadedImage<A>,
-        mut stack: Stack,
+        stack: Stack,
         args: StartupArguments<'_>,
     ) -> Result<Self, StartupError> {
         let entry = image.entry().ok_or(StartupError::MissingEntry)?;
@@ -116,14 +117,15 @@ impl<A: ImageMapping> StartupStorage<A> {
         }
         let top = stack.top();
         let sp = top.addr().checked_sub(bytes).ok_or_else(overflow)? & !(STACK_ALIGNMENT - 1);
-        let reserved = top.addr().checked_sub(sp).ok_or_else(overflow)?;
-        let frame = stack
-            .reserve_top(reserved)
-            .ok_or_else(overflow)?
-            .cast::<usize>();
-        // SAFETY: reserve_top retains the allocation and guarantees the complete
-        // payload lies above the reduced execution-stack top. Every word is
-        // initialized below before any shared view or application can read it.
+        if !stack.can_init_at(sp) {
+            return Err(overflow());
+        }
+        // SAFETY: the checked SP is inside the allocation, with room for the
+        // context below it and the complete startup payload above it.
+        let frame = unsafe { top.sub(top.addr() - sp).cast::<usize>() };
+        let initial_sp = frame as usize;
+        // SAFETY: every word is initialized before any shared view or
+        // application can read it. The original allocation stays owned by stack.
         let frame = unsafe {
             ptr::write_bytes(frame, 0, words);
             slice::from_raw_parts_mut(frame, words)
@@ -172,6 +174,7 @@ impl<A: ImageMapping> StartupStorage<A> {
         Ok(Self {
             image,
             stack,
+            initial_sp,
             words,
         })
     }
@@ -180,7 +183,7 @@ impl<A: ImageMapping> StartupStorage<A> {
         &self.image
     }
     pub fn initial_sp(&self) -> *const usize {
-        self.stack.top().cast()
+        self.initial_sp as *const usize
     }
     pub fn initial_words(&self) -> &[usize] {
         // SAFETY: construction initialized this exact frame, retained by self.
@@ -227,12 +230,13 @@ impl<A: ImageMapping> StartupStorage<A> {
             }
         };
         let data = Box::new(EntryData {
-            sp: self.stack.top() as usize,
+            sp: self.initial_sp,
             image: self.image,
         });
         let pointer = ptr::from_ref(data.as_ref()).cast_mut().cast::<c_void>();
         let thread = Builder::new(Entry::Posix(bootstrap::<A>, pointer))
             .set_stack(self.stack)
+            .set_initial_sp(self.initial_sp)
             .build();
         ThreadGroup::prepare(
             thread,
