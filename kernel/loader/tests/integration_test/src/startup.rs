@@ -169,6 +169,7 @@ fn test_startup_enters_independent_elf_in_rtos_thread() {
     // QEMU's coherent test execution and bootstrap refresh publish its code.
     let (thread, status) = run_storage(storage);
     assert_eq!(status, ThreadGroupExit::Aborted);
+    assert_eq!(thread.stack_size(), 16 * 1024);
     // SAFETY: cleanup published completion and this node still owns its stack.
     assert_eq!(unsafe { CStr::from_ptr(result) }, c"passed!");
 }
