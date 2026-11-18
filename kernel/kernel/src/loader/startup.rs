@@ -14,14 +14,23 @@
 
 //! Standard ELF initial-stack construction for standalone native images.
 
-use super::{adapters::KernelCodeCache, thread_group::ThreadGroup};
+#[cfg(thread_group)]
+use super::adapters::KernelCodeCache;
+use crate::thread::Stack;
+#[cfg(all(enable_vfs, thread_group))]
+use crate::thread_group::StandardIo;
+#[cfg(thread_group)]
 use crate::{
     scheduler,
-    thread::{Builder, CleanupError, Entry, Stack},
+    thread::{Builder, CleanupError, Entry},
+    thread_group::ThreadGroup,
 };
+#[cfg(thread_group)]
 use alloc::boxed::Box;
 use blueos_header::startup::{auxv, STACK_ALIGNMENT};
-use blueos_loader::{memory::TargetRange, CodeCache, ImageMapping, LoadedImage};
+#[cfg(thread_group)]
+use blueos_loader::{memory::TargetRange, CodeCache};
+use blueos_loader::{ImageMapping, LoadedImage};
 use core::{
     ffi::{c_int, c_void, CStr},
     mem::size_of,
@@ -36,8 +45,9 @@ pub enum StartupError {
     InvalidPageSize,
     TooManyArguments,
     StackTooSmall,
+    #[cfg(thread_group)]
     CleanupUnavailable(CleanupError),
-    #[cfg(enable_vfs)]
+    #[cfg(all(enable_vfs, thread_group))]
     FileTable(crate::error::Error),
 }
 
@@ -209,9 +219,10 @@ impl<A: ImageMapping> StartupStorage<A> {
     /// image or startup storage must not escape this lifetime. Normal exit is
     /// coordinated by main, after children have joined or detached and can finish
     /// cooperatively.
+    #[cfg(thread_group)]
     pub unsafe fn into_thread_group(
         self,
-        #[cfg(enable_vfs)] stdio: Option<&super::StandardIo>,
+        #[cfg(enable_vfs)] stdio: Option<&StandardIo>,
     ) -> Result<ThreadGroup, StartupError>
     where
         A: Send + 'static,
@@ -250,11 +261,13 @@ impl<A: ImageMapping> StartupStorage<A> {
 
 // Held by the thread group, not by an abandoned bootstrap stack frame.
 #[must_use = "the thread group retains this image through all member cleanups"]
+#[cfg(thread_group)]
 struct EntryData<A: ImageMapping> {
     image: LoadedImage<A>,
     sp: usize,
 }
 
+#[cfg(thread_group)]
 extern "C" fn bootstrap<A: ImageMapping>(pointer: *mut c_void) {
     // SAFETY: into_thread_group retains this immutable owner through member cleanup.
     let data = unsafe { &*pointer.cast::<EntryData<A>>() };
@@ -283,13 +296,13 @@ unsafe fn copy_string(cursor: &mut *mut u8, string: &CStr) -> usize {
     *cursor as usize
 }
 
-#[cfg(any(target_arch = "riscv32", target_arch = "riscv64"))]
+#[cfg(all(thread_group, any(target_arch = "riscv32", target_arch = "riscv64")))]
 #[unsafe(naked)]
 unsafe extern "C" fn enter_elf(_entry: usize, _sp: usize) -> ! {
     core::arch::naked_asm!("mv t0, a0", "mv sp, a1", "li a0, 0", "li ra, 0", "jr t0");
 }
 
-#[cfg(target_arch = "aarch64")]
+#[cfg(all(thread_group, target_arch = "aarch64"))]
 #[unsafe(naked)]
 unsafe extern "C" fn enter_elf(_entry: usize, _sp: usize) -> ! {
     core::arch::naked_asm!(

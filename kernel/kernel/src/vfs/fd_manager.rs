@@ -189,29 +189,34 @@ impl FdManager {
 }
 
 /// Keeps the selected table owner alive while a syscall borrows its lock.
+/// Exactly one variant is compiled; an unowned thread has no descriptor table.
 #[must_use = "retain the owner while accessing its descriptor table"]
 pub(crate) enum CurrentFiles {
-    #[cfg(loader_backend)]
-    ThreadGroup(Arc<crate::loader::thread_group::ThreadGroupInner>),
+    #[cfg(thread_group)]
+    ThreadGroup(Arc<crate::thread_group::ThreadGroupInner>),
+    #[cfg(not(thread_group))]
     Process(Arc<crate::process::Process>),
 }
 
 impl CurrentFiles {
     pub(crate) fn table(&self) -> &crate::sync::SpinLock<FdManager> {
         match self {
-            #[cfg(loader_backend)]
+            #[cfg(thread_group)]
             Self::ThreadGroup(group) => group.fd_manager(),
+            #[cfg(not(thread_group))]
             Self::Process(process) => process.fd_manager(),
         }
     }
 
     pub(crate) fn get() -> Option<Self> {
-        #[cfg(loader_backend)]
-        if let Some(group) =
-            crate::loader::thread_group::for_thread(crate::scheduler::current_thread_id())
+        #[cfg(thread_group)]
         {
-            return Some(Self::ThreadGroup(group));
+            crate::thread_group::for_thread(crate::scheduler::current_thread_id())
+                .map(Self::ThreadGroup)
         }
-        crate::process::current_process().map(Self::Process)
+        #[cfg(not(thread_group))]
+        {
+            crate::process::current_process().map(Self::Process)
+        }
     }
 }

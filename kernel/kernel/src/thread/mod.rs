@@ -13,6 +13,8 @@
 // limitations under the License.
 
 extern crate alloc;
+#[cfg(not(thread_group))]
+use crate::process::Process;
 #[cfg(event_flags)]
 use crate::sync::event_flags::EventFlagsMode;
 use crate::{
@@ -20,9 +22,7 @@ use crate::{
     arch::Context,
     config,
     config::DEFAULT_STACK_SIZE,
-    debug,
-    process::Process,
-    scheduler,
+    debug, scheduler,
     support::{Region, RegionalObjectBuilder, Storage},
     sync::{
         mutex::{MutexList, MutexListIterator},
@@ -35,7 +35,9 @@ use crate::{
         GenericList, IlistHead, ThreadPriority, Uint, UniqueListHead,
     },
 };
-use alloc::{boxed::Box, sync::Weak};
+use alloc::boxed::Box;
+#[cfg(not(thread_group))]
+use alloc::sync::Weak;
 use core::{
     alloc::Layout,
     cell::Cell,
@@ -151,11 +153,15 @@ impl Stack {
 impl_simple_intrusive_adapter!(OffsetOfSchedNode, Thread, sched_node);
 impl_simple_intrusive_adapter!(OffsetOfGlobal, Thread, global);
 impl_simple_intrusive_adapter!(OffsetOfLock, Thread, lock);
+#[cfg(not(thread_group))]
 impl_simple_intrusive_adapter!(OffsetOfProcessNode, Thread, process_node);
 
 // Intrusive list of the threads owned by a process.
+#[cfg(not(thread_group))]
 pub(crate) type ThreadList = ArcList<Thread, OffsetOfProcessNode>;
+#[cfg(not(thread_group))]
 pub(crate) type ThreadListIterator<'a> = ArcListIterator<'a, Thread, OffsetOfProcessNode>;
+#[cfg(not(thread_group))]
 pub(crate) type ThreadListNode = <ThreadList as GenericList>::Node;
 
 // When a thread is created or is removed from the RQ.
@@ -276,9 +282,11 @@ pub struct Thread {
     // A weak reference to the process this thread belongs to. Kernel/system
     // threads that are not owned by any process carry a dangling `Weak`
     // (constructed via `Weak::new()`, whose `upgrade()` returns `None`).
+    #[cfg(not(thread_group))]
     process: Weak<Process>,
     // Intrusive node linking this thread into its owning process's thread
     // list. Protected by the process's `threads` spinlock.
+    #[cfg(not(thread_group))]
     process_node: ThreadListNode,
     // Error code injected by a sync object's reset()/delete() so a blocked
     // waiter bails out instead of touching freed memory. 0 = normal wake.
@@ -500,12 +508,14 @@ impl Thread {
         self.pending_on_mutex.swap(mu, Ordering::Release)
     }
 
+    #[cfg(not(thread_group))]
     pub fn process(&self) -> Option<alloc::sync::Arc<Process>> {
         self.process.upgrade()
     }
 
     /// Set the owning process. Called by `Process::add_thread`/
     /// `Process::remove_thread` while holding the thread's spinlock.
+    #[cfg(not(thread_group))]
     pub fn set_process(&mut self, process: Weak<Process>) {
         self.process = process;
     }
@@ -533,7 +543,9 @@ impl Thread {
             pending_on_mutex: ArcCas::new(None),
             acquired_mutexes: SpinLock::new(MutexList::new()),
             signal_context: None,
+            #[cfg(not(thread_group))]
             process: Weak::new(),
+            #[cfg(not(thread_group))]
             process_node: ThreadListNode::new(),
             wait_error: AtomicI32::new(0),
             #[cfg(round_robin)]
@@ -991,6 +1003,7 @@ impl Drop for Thread {
         // The thread must have been detached from its owning process's
         // thread list before it is dropped; otherwise the process would
         // still hold a dangling strong reference to this thread.
+        #[cfg(not(thread_group))]
         debug_assert!(self.process_node.is_detached());
     }
 }

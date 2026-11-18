@@ -14,11 +14,9 @@
 
 use alloc::{boxed::Box, sync::Arc};
 use blueos::{
-    loader::{
-        StartupArguments, StartupError, StartupStorage, ThreadGroup, ThreadGroupExit,
-        ThreadGroupState,
-    },
+    loader::{RunRequest, StartupArguments, StartupError, StartupStorage},
     thread::{Cleanup, DeferredCleanup, Stack},
+    thread_group::{ThreadGroup, ThreadGroupExit, ThreadGroupState},
 };
 use blueos_header::startup::{auxv, STACK_ALIGNMENT};
 use blueos_test_macro::test;
@@ -194,7 +192,6 @@ fn run_storage_with(
     }
     .unwrap();
     let thread = thread_group.thread().clone();
-    assert!(thread.process().is_none());
     let Cleanup::Deferred(cleanup) = thread.lock().take_cleanup().unwrap() else {
         panic!("startup image must use deferred cleanup");
     };
@@ -323,4 +320,39 @@ fn test_static_pie_crt_runs_rust_std_main_and_thread() {
     // Real Rust lang_start/main, a std thread's TLS destructor, then libc fini.
     assert_eq!(unsafe { CStr::from_ptr(result) }, c"IMTDRF");
     drop(thread);
+}
+
+fn run_std_probe(reader: impl blueos_loader::ElfReader, execfn: Option<&CStr>) {
+    let envp = [c"MODE=rust-std", c"EXPECTED_EXECFN=/reader-probe"];
+    let request = RunRequest {
+        argv: &[c"rust-std-probe", c"..............................."],
+        envp: &envp[..if execfn.is_some() { 2 } else { 1 }],
+        execfn,
+        stack_size: 64 * 1024,
+        #[cfg(enable_vfs)]
+        stdio: None,
+    };
+    // SAFETY: the trusted native fixture uses the production CRT, joins its
+    // child and checks arguments, environment and AT_EXECFN before returning.
+    let status = unsafe { blueos::loader::run(reader, &request) }.unwrap();
+    assert_eq!(status, ThreadGroupExit::Code(37));
+}
+
+#[test]
+fn test_run_reader_with_optional_execfn() {
+    let path = unsafe { CStr::from_ptr(STD_TEST_ELF_PATH) };
+    for execfn in [None, Some(c"/reader-probe")] {
+        // Semihosting reads do not use the target's VFS or descriptor table.
+        let reader = super::runner::FileReader::open(path).unwrap();
+        run_std_probe(reader, execfn);
+    }
+}
+
+// Debug std fixtures include large debug sections; use positional reads there
+// and exercise whole-file memory input in release, like the basic loader tests.
+#[cfg(not(debug_assertions))]
+#[test]
+fn test_run_memory_reader() {
+    let bytes = super::read_all(unsafe { STD_TEST_ELF_PATH }).unwrap();
+    run_std_probe(blueos::loader::adapters::SliceElfReader::new(&bytes), None);
 }

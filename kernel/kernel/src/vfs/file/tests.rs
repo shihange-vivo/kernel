@@ -16,6 +16,64 @@ use super::*;
 use crate::vfs::{fs::FileSystem, inode::InodeOps, inode_mode::InodeMode, tmpfs::TmpFileSystem};
 use blueos_test_macro::test;
 
+#[test]
+fn closing_one_device_file_preserves_other_opens() {
+    use crate::devices::{Device, DeviceClass, DeviceId};
+    use alloc::string::String;
+    use core::sync::atomic::{AtomicUsize, Ordering};
+    use embedded_io::ErrorKind;
+
+    struct OpenCount(AtomicUsize);
+    impl Device for OpenCount {
+        fn name(&self) -> String {
+            String::from("open-count")
+        }
+        fn class(&self) -> DeviceClass {
+            DeviceClass::Char
+        }
+        fn id(&self) -> DeviceId {
+            DeviceId::new(0, 0)
+        }
+        fn open(&self) -> Result<(), ErrorKind> {
+            self.0.fetch_add(1, Ordering::Relaxed);
+            Ok(())
+        }
+        fn close(&self) -> Result<(), ErrorKind> {
+            assert!(self.0.fetch_sub(1, Ordering::Relaxed) > 0);
+            Ok(())
+        }
+        fn read(&self, _: u64, _: &mut [u8], _: bool) -> Result<usize, ErrorKind> {
+            Err(ErrorKind::Unsupported)
+        }
+        fn write(&self, _: u64, bytes: &[u8], _: bool) -> Result<usize, ErrorKind> {
+            assert!(self.0.load(Ordering::Relaxed) > 1);
+            Ok(bytes.len())
+        }
+    }
+
+    let device = Arc::new(OpenCount(AtomicUsize::new(0)));
+    let fs = TmpFileSystem::new();
+    let inode = fs
+        .root_inode()
+        .create_device(
+            "device",
+            InodeMode::from_bits_truncate(0o600),
+            device.clone(),
+        )
+        .unwrap();
+    // Device registration retains its existing open independently of files.
+    assert_eq!(device.0.load(Ordering::Relaxed), 1);
+    let dcache = Dcache::new_root(inode);
+    let first = File::new(dcache.clone(), AccessMode::O_RDWR, OpenFlags::empty()).unwrap();
+    let second = File::new(dcache, AccessMode::O_RDWR, OpenFlags::empty()).unwrap();
+    assert_eq!(device.0.load(Ordering::Relaxed), 3);
+    first.close().unwrap();
+    assert_eq!(device.0.load(Ordering::Relaxed), 2);
+    assert_eq!(second.write(b"still open").unwrap(), 10);
+    second.close().unwrap();
+    assert_eq!(device.0.load(Ordering::Relaxed), 1);
+}
+
 fn tmp_file(data: &[u8], access: AccessMode) -> (Arc<TmpFileSystem>, File) {
     let fs = TmpFileSystem::new();
     let inode = fs

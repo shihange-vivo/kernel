@@ -196,6 +196,7 @@ pub(crate) fn run_init_array() {
 
 #[inline(never)]
 fn init_apps() {
+    #[cfg(not(thread_group))]
     let root = crate::process::ProcessManager::get().root_process();
 
     unsafe {
@@ -206,17 +207,33 @@ fn init_apps() {
                     .expect("Invalid main thread stack size");
             let node = thread::Builder::new(thread::Entry::C(*app))
                 .set_stack(stack)
-                .start();
-            let proc = crate::process::ProcessManager::get()
-                .create_process(alloc::sync::Arc::downgrade(root))
-                .unwrap_or_else(|e| {
-                    panic!("failed to create app process. app addr: {:p}: {}", app, e)
-                });
-            if !proc.add_thread(node) {
-                log::warn!(
-                    "app thread already linked to a process. app addr: {:p}",
-                    app
-                );
+                .build();
+            #[cfg(thread_group)]
+            {
+                #[cfg(enable_vfs)]
+                let table = {
+                    let mut table = crate::vfs::fd_manager::FdManager::new();
+                    table.init_stdio().expect("initialize app standard streams");
+                    table
+                };
+                let mut group = crate::thread_group::ThreadGroup::prepare(
+                    node,
+                    alloc::boxed::Box::new(()),
+                    #[cfg(enable_vfs)]
+                    table,
+                )
+                .expect("prepare app thread group");
+                group.start().expect("start app thread group");
+            }
+            #[cfg(not(thread_group))]
+            {
+                let proc = crate::process::ProcessManager::get()
+                    .create_process(alloc::sync::Arc::downgrade(root))
+                    .unwrap_or_else(|e| {
+                        panic!("failed to create app process. app addr: {:p}: {}", app, e)
+                    });
+                assert!(proc.add_thread(node.clone()), "associate app with process");
+                assert_eq!(scheduler::queue_ready_thread(thread::IDLE, node), Ok(()));
             }
             app = app.offset(1);
         }

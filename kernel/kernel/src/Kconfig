@@ -25,6 +25,15 @@ config ENABLE_SYSCALL
     default y
     bool "Enable support for syscall"
 
+config THREAD_GROUP
+    default y
+    bool "Use thread groups for application resources"
+    help
+        Manage application threads, descriptors and exit through thread groups.
+        This replaces the Process resource model at build time. Disable this
+        option to use the existing Process model instead. ELF architecture
+        support and VFS support are configured independently.
+
 config FDT
     default n
     bool "Enable Flat Device Tree"

@@ -12,9 +12,9 @@ extern crate alloc;
 extern crate rsrt;
 
 mod runner;
-#[cfg(all(not(loader_test_exec), enable_vfs))]
+#[cfg(all(not(loader_test_exec), thread_group, enable_vfs))]
 mod shell;
-#[cfg(not(loader_test_exec))]
+#[cfg(all(not(loader_test_exec), thread_group))]
 mod startup;
 use blueos::loader::adapters::{FlatImageAllocation, SliceElfReader};
 #[cfg(enable_vfs)]
@@ -124,7 +124,13 @@ mod test_elf_loader {
         let stack = blueos::thread::Stack::from_size(16 << 10).expect("loader test stack");
         let mut t =
             blueos::thread::Builder::new(blueos::thread::Entry::Closure(Box::new(move || {
+                #[cfg(not(thread_group))]
                 assert!(blueos::process::current_process().is_none());
+                #[cfg(thread_group)]
+                assert_eq!(
+                    blueos::syscalls::thread_group_begin_exit::handle(0),
+                    -(libc::ESRCH as core::ffi::c_long),
+                );
                 work();
                 loaded_w.store(true, Ordering::Release);
                 // Return normally: run_closure releases this closure and its
@@ -132,6 +138,7 @@ mod test_elf_loader {
             })))
             .set_stack(stack)
             .build();
+        #[cfg(not(thread_group))]
         assert!(t.process().is_none());
         // This hook runs after the entry closure and its captures are dropped.
         t.lock()

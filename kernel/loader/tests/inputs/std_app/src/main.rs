@@ -46,6 +46,17 @@ unsafe extern "C" fn init(argc: c_int, argv: *mut *mut c_char, envp: *mut *mut c
         assert_eq!(envp, librs::startup::environ);
         RESULT.store(argv.add(1).read().cast(), Ordering::Release);
         assert_eq!(librs::startup::getauxval(auxv::AT_PAGESZ as _), 4096);
+        let expected = librs::stdlib::getenv(c"EXPECTED_EXECFN".as_ptr());
+        let execfn = librs::startup::getauxval(auxv::AT_EXECFN as _);
+        if expected.is_null() {
+            assert_eq!(execfn, 0);
+        } else {
+            assert_ne!(execfn, 0);
+            assert_eq!(
+                CStr::from_ptr(execfn as *const c_char),
+                CStr::from_ptr(expected)
+            );
+        }
     }
     event(b'I');
 }

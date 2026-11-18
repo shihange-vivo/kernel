@@ -212,6 +212,7 @@ impl File {
             return Err(code::EISDIR);
         }
 
+        inode.open()?;
         Ok(Self {
             dcache,
             open_flags: AtomicI32::new(access_mode as i32 | flags.bits()),

@@ -12,37 +12,46 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Run a standalone ELF from a VFS path in one call.
+//! Kernel launch parameters and execution from a caller-provided ELF reader.
 //!
-//! This is the kernel-side convenience entry above the loader pipeline: it
-//! opens the image through the VFS, loads it, builds the ELF startup frame,
-//! schedules the application's main thread and waits for every member to
-//! exit. The public stages (`load_image`, `StartupStorage`, `ThreadGroup`)
-//! remain available when a caller needs to observe or configure between them;
-//! this helper covers the common "start this file now" flow without a
-//! syscall. Applications run as RTOS thread groups with their own descriptors;
-//! no Process or private address space is required.
+//! The request and common errors are independent of the execution model. The
+//! current `run` entry uses thread groups to retain application resources,
+//! schedule the main thread and wait for every member's cleanup. It is compiled
+//! only with thread groups enabled; Process execution is not implemented yet.
+//! Callers supply a reader for memory, files or other storage, and can use
+//! `load_image` and `StartupStorage` separately in either resource model.
 
-use super::{
-    adapters::VfsElfReader, load_image, StandardIo, StartupArguments, StartupError, StartupStorage,
-    ThreadGroupError, ThreadGroupExit,
+use super::StartupError;
+#[cfg(thread_group)]
+use super::{load_image, StartupArguments, StartupStorage};
+use crate::config;
+#[cfg(all(enable_vfs, thread_group))]
+use crate::thread_group::StandardIo;
+#[cfg(thread_group)]
+use crate::{
+    thread::Stack,
+    thread_group::{ThreadGroupError, ThreadGroupExit},
 };
-use crate::{config, thread::Stack, vfs};
-use alloc::{ffi::CString, string::String};
+#[cfg(thread_group)]
+use blueos_loader::ElfReader;
 use blueos_loader::LoadError;
 use core::ffi::CStr;
 
 /// ELF ABI page granularity reported through AT_PAGESZ.
+#[cfg(thread_group)]
 const ABI_PAGE_SIZE: usize = 4096;
 
-/// One ELF launch from a VFS path.
+/// Startup parameters for one ELF launch, independent of its data source.
 pub struct RunRequest<'a> {
     pub argv: &'a [&'a CStr],
     pub envp: &'a [&'a CStr],
+    /// Optional program name copied into AT_EXECFN; not used to read the image.
+    pub execfn: Option<&'a CStr>,
     /// Application main-thread stack size in bytes; defaults to
     /// [`config::DEFAULT_STACK_SIZE`].
     pub stack_size: usize,
     /// Redirect descriptors 0/1/2; None opens the system console for each stream.
+    #[cfg(all(enable_vfs, thread_group))]
     pub stdio: Option<&'a StandardIo>,
 }
 
@@ -51,7 +60,9 @@ impl<'a> Default for RunRequest<'a> {
         Self {
             argv: &[],
             envp: &[],
+            execfn: None,
             stack_size: config::DEFAULT_STACK_SIZE,
+            #[cfg(all(enable_vfs, thread_group))]
             stdio: None,
         }
     }
@@ -59,24 +70,25 @@ impl<'a> Default for RunRequest<'a> {
 
 impl<'a> core::fmt::Debug for RunRequest<'a> {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        f.debug_struct("RunRequest")
+        let mut debug = f.debug_struct("RunRequest");
+        debug
             .field("argv", &self.argv.len())
             .field("envp", &self.envp.len())
-            .field("stack_size", &self.stack_size)
-            .field("redirected_stdio", &self.stdio.is_some())
-            .finish()
+            .field("execfn", &self.execfn)
+            .field("stack_size", &self.stack_size);
+        #[cfg(all(enable_vfs, thread_group))]
+        debug.field("redirected_stdio", &self.stdio.is_some());
+        debug.finish()
     }
 }
 
 #[derive(Debug)]
 pub enum RunError {
-    OpenImage(crate::error::Error),
     Load(LoadError),
     Startup(StartupError),
     StackUnavailable,
+    #[cfg(thread_group)]
     Start(ThreadGroupError),
-    /// The path is not representable as AT_EXECFN.
-    ExecPath,
 }
 
 impl From<LoadError> for RunError {
@@ -89,13 +101,14 @@ impl From<StartupError> for RunError {
         Self::Startup(error)
     }
 }
+#[cfg(thread_group)]
 impl From<ThreadGroupError> for RunError {
     fn from(error: ThreadGroupError) -> Self {
         Self::Start(error)
     }
 }
 
-/// Load `path` through the VFS and run it to completion on this thread's
+/// Load an ELF from `reader` and run it to completion on this thread's
 /// scheduler, returning its exit status. Blocks until every member thread of
 /// the application has finished cleanup; the image is then released. Code
 /// publication is current-context only, as documented on `load_image`;
@@ -107,14 +120,16 @@ impl From<ThreadGroupError> for RunError {
 /// `request.stack_size` configures only the application's main thread.
 ///
 /// # Safety
-/// The file at `path` must be trusted native code using the standard ELF
+/// The image supplied by `reader` must be trusted native code using the standard ELF
 /// initial-stack entry convention. Its users must remain thread group members;
 /// see `StartupStorage::into_thread_group`.
-pub unsafe fn run(path: &str, request: &RunRequest<'_>) -> Result<ThreadGroupExit, RunError> {
-    let file = vfs::open_path(path, libc::O_RDONLY, 0).map_err(RunError::OpenImage)?;
-    let image = load_image(VfsElfReader::new(file)?)?;
+#[cfg(thread_group)]
+pub unsafe fn run(
+    reader: impl ElfReader,
+    request: &RunRequest<'_>,
+) -> Result<ThreadGroupExit, RunError> {
+    let image = load_image(reader)?;
     let stack = Stack::from_size(request.stack_size).ok_or(RunError::StackUnavailable)?;
-    let execfn = CString::new(path).map_err(|_| RunError::ExecPath)?;
     let storage = StartupStorage::new(
         image,
         stack,
@@ -122,13 +137,18 @@ pub unsafe fn run(path: &str, request: &RunRequest<'_>) -> Result<ThreadGroupExi
             argv: request.argv,
             envp: request.envp,
             page_size: ABI_PAGE_SIZE,
-            execfn: Some(&execfn),
+            execfn: request.execfn,
             random: None,
         },
     )?;
     // SAFETY: the caller guarantees trusted native code; the group retains
     // the image and stack through all member cleanups.
-    let mut thread_group = unsafe { storage.into_thread_group(request.stdio)? };
+    let mut thread_group = unsafe {
+        storage.into_thread_group(
+            #[cfg(enable_vfs)]
+            request.stdio,
+        )?
+    };
     thread_group.start()?;
     thread_group.wait().map_err(Into::into)
 }

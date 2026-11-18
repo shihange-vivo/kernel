@@ -181,7 +181,7 @@ mod tests {
 
     extern "C" fn child(pointer: *mut c_void) {
         let observed = unsafe { &*pointer.cast::<Observed>() };
-        assert!(crate::process::current_process().is_none());
+        assert!(super::super::for_thread(scheduler::current_thread_id()).is_some());
         let mut byte = 0;
         assert_eq!(
             crate::syscalls::read::handle(
@@ -208,7 +208,6 @@ mod tests {
         let observed = unsafe { &*pointer.cast::<Observed>() };
         assert!(arch::local_irq_enabled());
         assert!(!crate::irq::is_in_irq());
-        assert!(crate::process::current_process().is_none());
         assert!(super::super::for_thread(scheduler::current_thread_id()).is_none());
         assert!(!observed.owner_dropped.load(Ordering::Acquire));
         observed.cleaned.store(true, Ordering::Release);
@@ -216,7 +215,7 @@ mod tests {
 
     extern "C" fn main(pointer: *mut c_void) {
         let observed = unsafe { &*pointer.cast::<Observed>() };
-        assert!(crate::process::current_process().is_none());
+        assert!(super::super::for_thread(scheduler::current_thread_id()).is_some());
         while !observed.release.load(Ordering::Acquire) {
             scheduler::yield_me();
         }
@@ -291,7 +290,6 @@ mod tests {
                 assert_eq!(observed.closes.load(Ordering::Acquire), 4);
                 assert_eq!(observed.writes.load(Ordering::Acquire), 12);
                 assert!(observed.owner_dropped.load(Ordering::Acquire));
-                assert!(thread_group.thread().process().is_none());
             }
         }
         assert_eq!(vfs::syscalls::unlink(c"/application-files-a".as_ptr()), 0);

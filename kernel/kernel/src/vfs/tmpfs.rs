@@ -446,6 +446,14 @@ impl InodeOps for TmpInode {
         Ok(0)
     }
 
+    fn open(&self) -> Result<(), Error> {
+        let device = self.inner.read().as_device().cloned();
+        if let Some(device) = device {
+            device.open()?;
+        }
+        Ok(())
+    }
+
     fn close(&self) -> Result<(), Error> {
         let inner = self.inner.read();
         if let Some(device) = inner.as_device() {

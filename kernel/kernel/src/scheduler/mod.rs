@@ -247,6 +247,7 @@ fn switch_current_thread(next: ThreadNode, old_sp: usize) -> usize {
 fn cleanup_retired_thread(old: &mut ThreadNode) {
     // Keep the caller's ownership and finish cleanup before publishing saved_sp.
     GlobalQueueVisitor::remove(old);
+    #[cfg(not(thread_group))]
     if let Some(process) = old.process() {
         process.remove_thread(old);
         if process.has_no_threads() {
