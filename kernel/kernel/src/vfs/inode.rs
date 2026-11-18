@@ -198,6 +198,10 @@ pub trait InodeOps: Any + Sync + Send {
         warn!("create_socket is not implemented");
         Err(code::EINVAL)
     }
+    /// Acquire resources for one open file description.
+    fn open(&self) -> Result<(), Error> {
+        Ok(())
+    }
     fn close(&self) -> Result<(), Error> {
         Ok(())
     }

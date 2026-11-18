@@ -17,21 +17,19 @@
 //! The loader core stays independent of kernel types. This module supplies the
 //! flat memory mapping, instruction publication and native profile, then hands
 //! the owning `LoadedImage` back to the caller. Startup storage retains that
-//! image and its ABI buffers. `ThreadGroup` manages member threads and shared
+//! image and its ABI buffers. `crate::thread_group` manages member threads and shared
 //! resources, while the application libc executes initialization and finalization.
+//! Executing an image through a thread group requires `CONFIG_THREAD_GROUP=y`;
+//! loading images and building their initial stacks remain available without it.
 
 pub mod adapters;
 mod load;
-#[cfg(enable_vfs)]
 mod run;
 mod startup;
-pub(crate) mod thread_group;
 
 pub use adapters::flat_memory::init_fixed_regions;
 pub use load::{board_load_profile, load_image, load_request};
-#[cfg(enable_vfs)]
-pub use run::{run, RunError, RunRequest};
+#[cfg(thread_group)]
+pub use run::run;
+pub use run::{RunError, RunRequest};
 pub use startup::{StartupArguments, StartupError, StartupStorage};
-#[cfg(enable_vfs)]
-pub use thread_group::StandardIo;
-pub use thread_group::{ThreadGroup, ThreadGroupError, ThreadGroupExit, ThreadGroupState};

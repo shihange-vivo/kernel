@@ -35,8 +35,8 @@ use core::{
 };
 use log::{debug, error, warn};
 
-/// Acquire the current thread group's fd table, or the existing process table
-/// for threads that do not belong to a loader thread group.
+/// Acquire the fd table of the application resource model selected at build
+/// time: the current thread group or the current process.
 ///
 /// Usage (statement form — see the lifetime note below for why this can't be
 /// an expression):

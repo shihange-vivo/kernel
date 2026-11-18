@@ -13,16 +13,17 @@
 // limitations under the License.
 
 //! Run the production Rust shell through the kernel's one-call loader entry.
-//! The test stages the shell ELF in the target VFS, then `loader::run`
-//! performs the complete flow: open, load, startup frame, thread scheduling
+//! The test stages the shell ELF in the target VFS and opens a VfsElfReader.
+//! `loader::run` then performs loading, startup frame construction, thread scheduling
 //! and exit. The application runs as an RTOS thread group with its own
 //! descriptor table, without requiring a Process.
 
 use alloc::{boxed::Box, sync::Arc, vec, vec::Vec};
 use blueos::{
-    loader::{RunRequest, StandardIo, ThreadGroupExit},
+    loader::{adapters::VfsElfReader, RunRequest},
     scheduler,
     thread::{Builder, DeferredCleanup, Entry, Stack, IDLE},
+    thread_group::{StandardIo, ThreadGroupExit},
     vfs::{self, FileOps},
 };
 use blueos_test_macro::test;
@@ -46,7 +47,7 @@ const LOADER_STACK_SIZE: usize = 12 * 1024;
 const STACK_GUARD_SIZE: usize = 1024;
 const STACK_GUARD_BYTE: u8 = 0xa5;
 
-/// Copy a host fixture into the target VFS so the run entry opens it by path.
+/// Copy a host fixture into the target VFS for the caller-provided reader.
 fn stage_image(path: &str, host: &CStr) {
     use semihosting::io::Read;
     let mut source = semihosting::fs::File::open(host).expect("open host shell ELF");
@@ -93,7 +94,6 @@ fn test_run_loads_shell_as_bare_thread_group() {
     let thread = Builder::new(Entry::Closure(Box::new(run_shell_repeatedly)))
         .set_stack(stack)
         .build();
-    assert!(thread.process().is_none());
     // Publish completion after the entry has returned and dropped its captures.
     thread.lock().set_deferred_cleanup(
         DeferredCleanup::new(move || {
@@ -120,7 +120,6 @@ fn run_shell_repeatedly() {
     stage_image(IMAGE_PATH, host);
 
     for _ in 0..5 {
-        assert!(blueos::process::current_process().is_none());
         let input = vfs::open_path(
             INPUT_PATH,
             libc::O_CREAT | libc::O_TRUNC | libc::O_WRONLY,
@@ -150,12 +149,15 @@ fn run_shell_repeatedly() {
         };
         let request = RunRequest {
             argv: &[c"shell"],
+            execfn: Some(c"/shell.elf"),
             stdio: Some(&stdio),
             ..Default::default()
         };
+        let file = vfs::open_path(IMAGE_PATH, libc::O_RDONLY, 0).unwrap();
+        let reader = VfsElfReader::new(file).unwrap();
         // SAFETY: the staged shell is trusted native code using the standard ELF
         // initial-stack entry; QEMU's coherent test execution publishes its code.
-        let status = unsafe { blueos::loader::run(IMAGE_PATH, &request) }.unwrap();
+        let status = unsafe { blueos::loader::run(reader, &request) }.unwrap();
         // The shell's main returns after its service thread exits; libc fini runs.
         assert_eq!(status, ThreadGroupExit::Code(0));
         assert_eq!(read_file(CREATED_PATH), b"persisted-by-shell\n");

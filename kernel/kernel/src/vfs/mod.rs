@@ -92,9 +92,8 @@ pub fn vfs_init() -> Result<(), Error> {
     debug!("Mounted devfs at '/dev'");
     devfs::init()?;
 
-    // Stdio (fds 0/1/2 on the root process's fd table) is now initialized in
-    // the boot path after the root process is created, since it requires the
-    // per-process `Process::fd_manager` rather than a global singleton.
+    // Boot initializes stdio in each application's selected resource model
+    // after VFS setup; descriptor tables are not a global singleton.
 
     #[cfg(fatfs)]
     {

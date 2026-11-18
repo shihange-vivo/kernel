@@ -43,12 +43,34 @@ own allocator and panic handler. The existing firmware `rsrt` and
 
 ## Load and finish
 
+`CONFIG_THREAD_GROUP=y` (the default) selects thread groups as the kernel's
+application resource model. It excludes the Process module and per-thread
+process fields; boot applications and children created through `CreateThread`
+use thread-group resources. With `CONFIG_THREAD_GROUP=n`, the kernel instead
+uses the existing Process model. The two models are selected at build time.
+VFS remains optional, and `loader_backend` only selects native ELF support.
+Image loading and `StartupStorage` construction remain available in Process
+builds, but the current ELF execution bridge requires thread groups.
+Import `ThreadGroup`, its state/error/exit types and `StandardIo` directly from
+`blueos::thread_group`; the loader module exports its loading and startup APIs.
+
+For a complete launch, call unsafe `loader::run(reader, &request)` with any
+`ElfReader`. This entry requires thread groups and works with or without VFS.
+The caller opens files and constructs a `VfsElfReader`, or supplies memory
+through `SliceElfReader`; there is no separate path-based run entry.
+`RunRequest::execfn` optionally supplies the program name for `AT_EXECFN` and
+does not select the image source. `RunRequest` and `RunError` remain available
+in either resource model; the current `run` function and its thread-group
+dependencies are conditionally compiled. The current `RunRequest::stdio`
+field requires both thread groups and VFS.
+
 The kernel loads the file through `loader::load_image`, constructs
 `StartupStorage` and converts it using unsafe `into_thread_group(None)` when
 VFS is enabled, or `into_thread_group()` otherwise. The operation requires
 trusted native code and all image users to remain within
 the thread group's lifetime. `ThreadGroup::start()` schedules its main thread.
-Members share the group's descriptor table without requiring a Process.
+With VFS enabled, members share the group's descriptor table. Unowned kernel
+threads have no application descriptor table.
 Pass `Some(&stdio)` at creation to supply standard streams instead of opening
 the default console. The table is initialized before the main thread is
 registered; `start()` only schedules it.

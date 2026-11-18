@@ -13,6 +13,8 @@
 // limitations under the License.
 
 //! Thread-group resources, membership and cooperative main-thread exit.
+//! `CONFIG_THREAD_GROUP=y` selects this model instead of `crate::process`.
+//! It is independent of ELF architecture support and optional VFS services.
 //! Registered members retain their group; retirement callbacks hold weak handles.
 //! ThreadGroupInner therefore survives a dropped ThreadGroup without an Arc cycle.
 
@@ -99,7 +101,7 @@ impl ThreadGroup {
     /// Take ownership of an unscheduled main thread and its image resources.
     /// A failed cleanup preparation removes the thread's global registration
     /// before releasing its stack or image in the caller's context.
-    pub(super) fn prepare(
+    pub(crate) fn prepare(
         mut main_thread: ThreadNode,
         image_owner: Box<dyn Send>,
         #[cfg(enable_vfs)] table: crate::vfs::fd_manager::FdManager,
@@ -384,6 +386,21 @@ mod tests {
     }
 
     extern "C" fn empty() {}
+
+    #[test]
+    fn static_application_uses_thread_group_resources() {
+        let group = for_thread(scheduler::current_thread_id())
+            .expect("the static test application must have a thread group");
+        assert_eq!(group.state.irqsave_lock().phase, ThreadGroupState::Running);
+        #[cfg(enable_vfs)]
+        {
+            let table = group.fd_manager().irqsave_lock();
+            for fd in 0..3 {
+                assert!(table.is_valid_fd(fd));
+            }
+        }
+    }
+
     extern "C" fn main_entry(argument: *mut c_void) {
         // The owner and the test retain Observed through all callbacks.
         let observed = unsafe { &*argument.cast::<Observed>() };

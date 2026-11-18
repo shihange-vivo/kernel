@@ -70,12 +70,15 @@ pub mod logger;
 pub mod mm;
 #[cfg(enable_net)]
 pub mod net;
+#[cfg(not(thread_group))]
 pub mod process;
 pub mod scheduler;
 pub mod support;
 pub mod sync;
 pub mod syscall_handlers;
 pub mod thread;
+#[cfg(thread_group)]
+pub mod thread_group;
 pub mod time;
 pub mod types;
 #[cfg(enable_vfs)]
@@ -205,6 +208,7 @@ mod tests {
             Entry::C(test_main),
             ThreadKind::Normal,
         );
+        #[cfg(not(thread_group))]
         // `build_static_thread` does not link the thread to a process, so without
         // this the test thread's `current_process()` would return `None`. Link it
         // to the root process (created at boot) so the thread has an owning
@@ -230,14 +234,36 @@ mod tests {
             Entry::C(test_main),
             ThreadKind::Normal,
         );
-        if !crate::process::ProcessManager::get()
-            .root_process()
-            .add_thread(t.clone())
+        #[cfg(not(thread_group))]
         {
-            log::warn!("main test thread already linked to a process");
+            if !crate::process::ProcessManager::get()
+                .root_process()
+                .add_thread(t.clone())
+            {
+                log::warn!("main test thread already linked to a process");
+            }
+            let ok = scheduler::queue_ready_thread(thread::IDLE, t.clone());
+            assert_eq!(ok, Ok(()));
         }
-        let ok = scheduler::queue_ready_thread(thread::IDLE, t.clone());
-        assert_eq!(ok, Ok(()));
+        #[cfg(thread_group)]
+        {
+            #[cfg(enable_vfs)]
+            let table = {
+                let mut table = crate::vfs::fd_manager::FdManager::new();
+                table
+                    .init_stdio()
+                    .expect("initialize test standard streams");
+                table
+            };
+            let mut group = crate::thread_group::ThreadGroup::prepare(
+                t,
+                alloc::boxed::Box::new(()),
+                #[cfg(enable_vfs)]
+                table,
+            )
+            .expect("prepare test thread group");
+            group.start().expect("start test thread group");
+        }
     }
 
     #[cfg(target_pointer_width = "64")]

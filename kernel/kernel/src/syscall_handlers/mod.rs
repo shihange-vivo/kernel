@@ -120,7 +120,7 @@ mod vfs_syscalls {
     pub fn umount(_target: *const c_char) -> i32 {
         -libc::ENOTSUP
     }
-    pub fn ioctl(_fd: c_int, _request: c_ulong, _arg: *mut core::ffi::c_void) -> c_int {
+    pub fn ioctl(_fd: c_int, _request: core::ffi::c_ulong, _arg: *mut core::ffi::c_void) -> c_int {
         -libc::ENOTSUP
     }
 }
@@ -413,9 +413,9 @@ create_thread(spawn_args_ptr: *const SpawnArgs) -> c_long {
                 .set_stack(stack)
                 .build();
     let handle = Thread::id(&t);
-    #[cfg(loader_backend)]
-    let group = crate::loader::thread_group::for_thread(scheduler::current_thread_id());
-    #[cfg(loader_backend)]
+    #[cfg(thread_group)]
+    let group = crate::thread_group::for_thread(scheduler::current_thread_id());
+    #[cfg(thread_group)]
     if let Some(group) = &group {
         // Prepare before installing membership. A failed create leaves the
         // caller owning its stack; never invoke its C cleanup on this path.
@@ -431,20 +431,18 @@ create_thread(spawn_args_ptr: *const SpawnArgs) -> c_long {
     } else if let Some(cleanup) = spawn_args.cleanup {
         t.lock().set_cleanup(Entry::Posix(cleanup, spawn_args.arg));
     }
-    #[cfg(not(loader_backend))]
+    #[cfg(not(thread_group))]
     if let Some(cleanup) = spawn_args.cleanup {
         t.lock().set_cleanup(Entry::Posix(cleanup, spawn_args.arg));
     }
-    // Process association is optional for direct RTOS applications. When one
-    // exists, inherit its fd table before publishing the runnable thread.
+    // The process model is compiled only when thread groups are disabled.
+    #[cfg(not(thread_group))]
     if let Some(process) = crate::process::current_process()
         && !process.add_thread(t.clone())
     {
         thread::GlobalQueueVisitor::remove(&mut t);
         let cleanup = t.lock().take_cleanup();
         drop(cleanup);
-        #[cfg(loader_backend)]
-        if let Some(group) = &group { group.finish(handle); }
         return -1;
     }
     if let Some(f) = spawn_args.spawn_hook { f(handle, spawn_args_ptr as *mut _); }
@@ -602,23 +600,23 @@ define_syscall_handler!(exit_thread() -> c_long {
 // These operations coordinate cooperative thread-group exit;
 // they are not Linux exit/exit_group syscall numbers or forced cancellation.
 define_syscall_handler!(thread_group_begin_exit(status: c_int) -> c_long {
-    #[cfg(loader_backend)]
+    #[cfg(thread_group)]
     {
         let id = scheduler::current_thread_id();
-        let Some(group) = crate::loader::thread_group::for_thread(id) else {
+        let Some(group) = crate::thread_group::for_thread(id) else {
             return -(ESRCH as c_long);
         };
         group.begin_exit(id, status).map_or(-(EBUSY as c_long), |()| 0)
     }
-    #[cfg(not(loader_backend))]
+    #[cfg(not(thread_group))]
     { -(libc::ENOSYS as c_long) }
 });
 
 define_syscall_handler!(thread_group_finish_exit() -> c_long {
-    #[cfg(loader_backend)]
+    #[cfg(thread_group)]
     {
         let id = scheduler::current_thread_id();
-        let Some(group) = crate::loader::thread_group::for_thread(id) else {
+        let Some(group) = crate::thread_group::for_thread(id) else {
             return -(ESRCH as c_long);
         };
         let result = group.finish_exit(id);
@@ -628,7 +626,7 @@ define_syscall_handler!(thread_group_finish_exit() -> c_long {
         scheduler::retire_me();
         -1
     }
-    #[cfg(not(loader_backend))]
+    #[cfg(not(thread_group))]
     { -(libc::ENOSYS as c_long) }
 });
 
@@ -1033,3 +1031,21 @@ pub mod echo;
 pub(crate) mod linux_abi;
 pub mod posix_timers;
 // End syscall modules.
+
+#[cfg(all(test, not(thread_group)))]
+mod resource_model_tests {
+    use super::*;
+    use blueos_test_macro::test;
+
+    #[test]
+    fn process_model_has_no_thread_group_exit_operations() {
+        assert_eq!(
+            thread_group_begin_exit::handle(0),
+            -(libc::ENOSYS as core::ffi::c_long)
+        );
+        assert_eq!(
+            thread_group_finish_exit::handle(),
+            -(libc::ENOSYS as core::ffi::c_long)
+        );
+    }
+}
