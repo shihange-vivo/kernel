@@ -248,13 +248,8 @@ mod tests {
         #[cfg(thread_group)]
         {
             #[cfg(enable_vfs)]
-            let table = {
-                let mut table = crate::vfs::fd_manager::FdManager::new();
-                table
-                    .init_stdio()
-                    .expect("initialize test standard streams");
-                table
-            };
+            let table = crate::vfs::fd_manager::FdManager::with_console()
+                .expect("initialize test standard streams");
             let mut group = crate::thread_group::ThreadGroup::prepare(
                 t,
                 alloc::boxed::Box::new(()),

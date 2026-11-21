@@ -47,16 +47,29 @@ impl FdManager {
         }
     }
 
-    pub fn init_stdio(&mut self) -> Result<(), Error> {
-        let stdin = path::open_path("/dev/console", libc::O_RDONLY, 0o666)?;
-        let stdout = path::open_path("/dev/console", libc::O_WRONLY, 0o666)?;
-        let stderr = path::open_path("/dev/console", libc::O_WRONLY, 0o666)?;
+    /// Open all standard streams before publishing the table.
+    pub fn with_console() -> Result<Self, Error> {
+        Self::open_stdio(|flags| Ok(Arc::new(path::open_path("/dev/console", flags, 0o666)?)))
+    }
 
-        self.fds[STDIN_FILENO as usize] = Some(Arc::new(stdin));
-        self.fds[STDOUT_FILENO as usize] = Some(Arc::new(stdout));
-        self.fds[STDERR_FILENO as usize] = Some(Arc::new(stderr));
-
-        Ok(())
+    fn open_stdio(
+        mut open: impl FnMut(c_int) -> Result<Arc<dyn FileOps>, Error>,
+    ) -> Result<Self, Error> {
+        let mut table = Self::new();
+        for (fd, flags) in [
+            (STDIN_FILENO, libc::O_RDONLY),
+            (STDOUT_FILENO, libc::O_WRONLY),
+            (STDERR_FILENO, libc::O_WRONLY),
+        ] {
+            match open(flags) {
+                Ok(file) => table.fds[fd as usize] = Some(file),
+                Err(error) => {
+                    table.close_all();
+                    return Err(error);
+                }
+            }
+        }
+        Ok(table)
     }
 
     /// Create a table with the supplied standard streams and a free first slot.
@@ -218,5 +231,47 @@ impl CurrentFiles {
         {
             crate::process::current_process().map(Self::Process)
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::vfs::{FileAttr, OpenFlags};
+    use blueos_test_macro::test;
+    use core::sync::atomic::{AtomicUsize, Ordering};
+
+    struct ConsoleStream(Arc<AtomicUsize>);
+
+    impl FileOps for ConsoleStream {
+        fn close(&self) -> Result<(), Error> {
+            self.0.fetch_add(1, Ordering::Relaxed);
+            Err(code::EIO)
+        }
+
+        fn stat(&self) -> FileAttr {
+            FileAttr::default()
+        }
+
+        fn flags(&self) -> OpenFlags {
+            OpenFlags::empty()
+        }
+
+        fn set_flags(&self, _: OpenFlags) {}
+    }
+
+    #[test]
+    fn failed_console_open_closes_all_previously_opened_streams() {
+        let closes = Arc::new(AtomicUsize::new(0));
+        let mut attempts = 0;
+        let result = FdManager::open_stdio(|_| {
+            attempts += 1;
+            if attempts == 3 {
+                return Err(code::EACCES);
+            }
+            Ok(Arc::new(ConsoleStream(closes.clone())))
+        });
+        assert!(matches!(result, Err(code::EACCES)));
+        assert_eq!(closes.load(Ordering::Relaxed), 2);
     }
 }
