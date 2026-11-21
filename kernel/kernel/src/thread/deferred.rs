@@ -76,6 +76,12 @@ impl DeferredCleanup {
         );
         let Task { callback, next } = *self.0;
         debug_assert!(next.is_none());
+        #[cfg(smp)]
+        {
+            // Callbacks can arrive while the worker is already running.
+            let _irq = DisableInterruptGuard::new();
+            crate::arch::instruction_cache::synchronize_pending();
+        }
         callback();
     }
 }

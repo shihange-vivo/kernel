@@ -52,9 +52,10 @@ pub fn load_request() -> LoadRequest {
 /// a regular file through `vfs::open_path()`. This also works on direct RTOS
 /// threads without a Process or a file descriptor table.
 ///
-/// Code publication is current-execution-context only. The caller must keep
-/// the image's execution on this context until a host-wide rendezvous is used;
-/// otherwise it must provide a different `CodeCache` backend.
+/// During loading, executable ranges are synchronized on the calling CPU and
+/// marked for other CPUs to synchronize before restoring a thread or running a
+/// deferred callback. Callers invoking an entry directly must execute it in a
+/// context that has completed this synchronization.
 pub fn load_image<R: ElfReader>(reader: R) -> LoadResult<LoadedImage<FlatImageAllocation>> {
     let mut allocator = MemoryMapper::new();
     let mut cache = KernelCodeCache::new();

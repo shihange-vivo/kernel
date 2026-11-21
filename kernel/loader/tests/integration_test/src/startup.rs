@@ -164,7 +164,7 @@ fn test_startup_enters_independent_elf_in_rtos_thread() {
     let result = storage.initial_words()[2] as *const c_char;
     // SAFETY: this trusted, single-thread probe implements native ELF entry,
     // checks the frame independently, and exits using BlueKernel's syscall.
-    // QEMU's coherent test execution and bootstrap refresh publish its code.
+    // The loader publishes the code before scheduling the probe.
     let (thread, status) = run_storage(storage);
     assert_eq!(status, ThreadGroupExit::Aborted);
     assert_eq!(thread.stack_size(), 16 * 1024);

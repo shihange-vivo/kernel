@@ -12,6 +12,14 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+#[cfg(any(
+    smp,
+    target_arch = "aarch64",
+    target_arch = "riscv32",
+    target_arch = "riscv64"
+))]
+pub(crate) mod instruction_cache;
+
 #[cfg(target_arch = "arm")]
 pub mod arm;
 #[cfg(target_arch = "arm")]

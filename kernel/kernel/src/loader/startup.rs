@@ -14,12 +14,9 @@
 
 //! Standard ELF initial-stack construction for standalone native images.
 
-#[cfg(thread_group)]
-use super::adapters::KernelCodeCache;
 use crate::thread::Stack;
 #[cfg(thread_group)]
 use crate::{
-    scheduler,
     thread::{Builder, CleanupError, Entry},
     thread_group::ThreadGroup,
 };
@@ -31,8 +28,6 @@ use crate::{
 #[cfg(thread_group)]
 use alloc::boxed::Box;
 use blueos_header::startup::{auxv, STACK_ALIGNMENT};
-#[cfg(thread_group)]
-use blueos_loader::{memory::TargetRange, CodeCache};
 use blueos_loader::{ImageMapping, LoadedImage};
 use core::{
     ffi::{c_int, c_void, CStr},
@@ -215,13 +210,13 @@ impl<A: ImageMapping> StartupStorage<A> {
     ///
     /// # Safety
     /// The image must be trusted native code using the ELF initial-stack entry
-    /// convention and must never return from its entry. Its mapping must expose
-    /// executable backing in the kernel's flat address space. The caller must
-    /// satisfy code publication on every CPU where it may run. All image users
-    /// must be group members created through CreateThread; pointers into the
-    /// image or startup storage must not escape this lifetime. Normal exit is
-    /// coordinated by main, after children have joined or detached and can finish
-    /// cooperatively.
+    /// convention, reside in the kernel's address space and never return from
+    /// its entry. The cache backend used to load the image must publish its
+    /// code for all CPUs that can run its threads or cleanup callbacks.
+    /// Additional threads must join the group through CreateThread. Pointers
+    /// into the image or startup storage must stay within this lifetime.
+    /// Normal exit is coordinated by main after children have joined or
+    /// detached and can finish cooperatively.
     #[cfg(thread_group)]
     pub unsafe fn into_thread_group(
         self,
@@ -273,15 +268,6 @@ struct EntryData<A: ImageMapping> {
 extern "C" fn bootstrap<A: ImageMapping>(pointer: *mut c_void) {
     // SAFETY: into_thread_group retains this immutable owner through member cleanup.
     let data = unsafe { &*pointer.cast::<EntryData<A>>() };
-    let allocation = data.image.allocation();
-    // Refresh the current CPU after scheduling as well. This does not replace
-    // the caller's host-wide publication duty for subsequent migration.
-    if KernelCodeCache::new()
-        .synchronize(TargetRange::new(allocation.base(), allocation.len()))
-        .is_err()
-    {
-        scheduler::retire_me();
-    }
     let entry = data.image.entry().unwrap().get() as usize;
     // SAFETY: the caller authorizes native execution; the image and the
     // original stack allocation are retained through thread retirement.

@@ -156,7 +156,7 @@ fn run_shell_repeatedly() {
         let file = vfs::open_path(IMAGE_PATH, libc::O_RDONLY, 0).unwrap();
         let reader = VfsElfReader::new(file).unwrap();
         // SAFETY: the staged shell is trusted native code using the standard ELF
-        // initial-stack entry; QEMU's coherent test execution publishes its code.
+        // initial-stack entry and keeps its code users inside the thread group.
         let status = unsafe { blueos::loader::run(reader, &request) };
         for stream in [&stdio.stdin, &stdio.stdout, &stdio.stderr] {
             stream.close().unwrap();
