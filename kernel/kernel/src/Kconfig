@@ -26,7 +26,7 @@ config ENABLE_SYSCALL
     bool "Enable support for syscall"
 
 config THREAD_GROUP
-    default y
+    default n
     bool "Use thread groups for application resources"
     help
         Manage application threads, descriptors and exit through thread groups.

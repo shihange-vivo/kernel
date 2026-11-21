@@ -21,88 +21,129 @@ _startup_test_enabled = !defined(loader_test_relocation) &&
                          board_toolchain_info.current_cpu == "riscv64" ||
                          board_toolchain_info.current_cpu == "aarch64")
 
-build_rust("loader_integration_test") {
-  testonly = true
-  crate_type = "bin"
-  edition = "2024"
-  sources = [ "src/test.rs" ]
-  deps = [
-    "//external/rust:semihosting",
-    "//kernel/header:blueos_header",
-    "//kernel/kernel:blueos",
-    "//kernel/loader:blueos_loader",
-    "//kernel/loader/tests/inputs",
-    "//kernel/rsrt",
-    "//libs/libc",
-    "//libs/librs",
-  ]
-  linker_script = default_linker_script
-  if (coverage || profile) {
-    deps += [
-      "//kernel/kernel:atomic",
-      "//kernel/loader:common_cov",
-    ]
-  }
-  proc_macro_deps = [ "//kernel/test_harness:blueos_test_macro" ]
-  rustflags = [ "--test" ]
+# Keep the kernel configuration local to the tests that start ELF thread groups.
+if (_startup_test_enabled && current_toolchain == default_toolchain) {
+  _defconfigs = defconfig_files + "," + rebase_path("thread_group.conf")
 
-  if (defined(loader_test_relocation)) {
-    rustenv = [
-      "LOADER_TEST_RELOCATION_ORIGIN=${loader_test_relocation.origin}",
-      "LOADER_TEST_RELOCATION_LENGTH=${loader_test_relocation.length}",
-      "LOADER_TEST_RELOCATION_PERMISSIONS=${loader_test_relocation.permissions}",
-    ]
-    cfgs = [ "loader_test_exec" ]
+  blueos_toolchain("loader_test_toolchain") {
+    _info = board_toolchain_info
+    llvm_target = _info.llvm_target
+    target_triple = _info.target_triple
+    cc = _info.cc
+    cxx = _info.cxx
+    ld = _info.ld
+    ar = _info.ar
+    if (defined(_info.arflags)) {
+      arflags = _info.arflags
+    }
+    objcopy = _info.objcopy
+    rustc = _info.rustc
+    clippy_driver = _info.clippy_driver
+    toolchain_args = {
+      current_cpu = _info.current_cpu
+      current_os = _info.current_os
+      defconfig_files = _defconfigs
+    }
   }
-}
 
-run_clippy("loader_integration_test_clippy") {
-  testonly = true
-  deps = [ ":loader_integration_test" ]
-  if (_startup_test_enabled) {
-    deps += [
-      "//kernel/loader/tests/inputs/runtime_app:runtime_test_app_clippy",
-      "//kernel/loader/tests/inputs/startup_app:startup_test_app_clippy",
-      "//kernel/loader/tests/inputs/std_app:std_test_app_clippy",
-      "//shell:shell_elf_clippy",
-    ]
-  }
-}
-
-if (defined(qemu_use_esp32_loader) && qemu_use_esp32_loader) {
-  gen_esp32_qemu_runner("loader_integration_test_runner") {
-    testonly = true
-    elf = ":loader_integration_test"
-    chip = "${chip}"
-    bootloader = qemu_esp32_bootloader_bin
-    partition_table = qemu_esp32_partition_table_bin
-    qemu = qemu_exe
-    machine = qemu_machine
-    qemu_args = qemu_extra_args
-    net_args = qemu_net_args
-    block_args = qemu_block_args
-    semihosting = true
+  _test_toolchain =
+      get_label_info(":loader_test_toolchain", "label_no_toolchain")
+  foreach(_target,
+          [
+            "loader_integration_test",
+            "loader_integration_test_clippy",
+            "loader_integration_test_runner",
+            "run_loader_integration_test",
+          ]) {
+    group(_target) {
+      testonly = true
+      deps = [ ":$_target($_test_toolchain)" ]
+    }
   }
 } else {
-  gen_qemu_runner("loader_integration_test_runner") {
+  build_rust("loader_integration_test") {
     testonly = true
-    img = ":loader_integration_test"
-    qemu = qemu_exe
-    machine = qemu_machine
-    semihosting = true
-    qemu_args = qemu_extra_args
-    block_img = "loader_integration_test_block.img"
-    block_args = qemu_block_args
-  }
-}
+    crate_type = "bin"
+    edition = "2024"
+    sources = [ "src/test.rs" ]
+    deps = [
+      "//external/rust:semihosting",
+      "//kernel/header:blueos_header",
+      "//kernel/kernel:blueos",
+      "//kernel/loader:blueos_loader",
+      "//kernel/loader/tests/inputs",
+      "//kernel/rsrt",
+      "//libs/libc",
+      "//libs/librs",
+    ]
+    linker_script = default_linker_script
+    if (coverage || profile) {
+      deps += [
+        "//kernel/kernel:atomic",
+        "//kernel/loader:common_cov",
+      ]
+    }
+    proc_macro_deps = [ "//kernel/test_harness:blueos_test_macro" ]
+    rustflags = [ "--test" ]
 
-run_qemu_check("run_loader_integration_test") {
-  testonly = true
-  runner = ":loader_integration_test_runner"
-  if (coverage) {
-    img = ":loader_integration_test"
-    checker = "//kernel/loader/tests/cov/lib.rs"
+    if (defined(loader_test_relocation)) {
+      rustenv = [
+        "LOADER_TEST_RELOCATION_ORIGIN=${loader_test_relocation.origin}",
+        "LOADER_TEST_RELOCATION_LENGTH=${loader_test_relocation.length}",
+        "LOADER_TEST_RELOCATION_PERMISSIONS=${loader_test_relocation.permissions}",
+      ]
+      cfgs = [ "loader_test_exec" ]
+    }
+  }
+
+  run_clippy("loader_integration_test_clippy") {
+    testonly = true
+    deps = [ ":loader_integration_test" ]
+    if (_startup_test_enabled) {
+      deps += [
+        "//kernel/loader/tests/inputs/runtime_app:runtime_test_app_clippy",
+        "//kernel/loader/tests/inputs/startup_app:startup_test_app_clippy",
+        "//kernel/loader/tests/inputs/std_app:std_test_app_clippy",
+        "//shell:shell_elf_clippy",
+      ]
+    }
+  }
+
+  if (defined(qemu_use_esp32_loader) && qemu_use_esp32_loader) {
+    gen_esp32_qemu_runner("loader_integration_test_runner") {
+      testonly = true
+      elf = ":loader_integration_test"
+      chip = "${chip}"
+      bootloader = qemu_esp32_bootloader_bin
+      partition_table = qemu_esp32_partition_table_bin
+      qemu = qemu_exe
+      machine = qemu_machine
+      qemu_args = qemu_extra_args
+      net_args = qemu_net_args
+      block_args = qemu_block_args
+      semihosting = true
+    }
   } else {
-    checker = "src/test.rs"
+    gen_qemu_runner("loader_integration_test_runner") {
+      testonly = true
+      img = ":loader_integration_test"
+      qemu = qemu_exe
+      machine = qemu_machine
+      semihosting = true
+      qemu_args = qemu_extra_args
+      block_img = "loader_integration_test_block.img"
+      block_args = qemu_block_args
+    }
+  }
+
+  run_qemu_check("run_loader_integration_test") {
+    testonly = true
+    runner = ":loader_integration_test_runner"
+    if (coverage) {
+      img = ":loader_integration_test"
+      checker = "//kernel/loader/tests/cov/lib.rs"
+    } else {
+      checker = "src/test.rs"
+    }
   }
 }

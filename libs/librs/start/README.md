@@ -45,11 +45,10 @@ and `getauxval`. Firmware links `librs` and enters through
 
 ## Load and finish
 
-`CONFIG_THREAD_GROUP=y` (the default) selects thread groups as the kernel's
-application resource model. It excludes the Process module and per-thread
-process fields; boot applications and children created through `CreateThread`
-use thread-group resources. With `CONFIG_THREAD_GROUP=n`, the kernel instead
-uses the existing Process model. The two models are selected at build time.
+`CONFIG_THREAD_GROUP` defaults to `n`, which selects the Process resource model.
+Setting it to `y` selects thread groups for boot applications and children
+created through `CreateThread`. Loader integration tests that start standalone
+ELFs enable thread groups in their own GN toolchain configuration.
 VFS remains optional, and `loader_backend` only selects native ELF support.
 Image loading and `StartupStorage` construction remain available in Process
 builds, but the current ELF execution bridge requires thread groups.

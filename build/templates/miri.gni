@@ -16,22 +16,20 @@ import("//build/templates/rust.gni")
 
 # Build and interpret a Rust test through the dedicated Miri toolchain.
 #
-# The default-toolchain target is a forwarding group. The actual Rust target is
+# Targets in other toolchains are forwarding groups. The actual Rust target is
 # instantiated under //build/toolchain:miri, so all of its Rust dependencies
 # are rebuilt by Miri with complete MIR instead of reusing normal target rlibs.
 # Optional test_filter selects tests through libtest's name substring filter.
 
 template("miri_test") {
-  if (current_toolchain == default_toolchain) {
+  if (current_toolchain != "//build/toolchain:miri") {
     not_needed(invoker, "*")
+
     group(target_name) {
       testonly = true
       deps = [ ":${target_name}(//build/toolchain:miri)" ]
     }
   } else {
-    assert(current_toolchain == "//build/toolchain:miri",
-           "miri_test may only use the default or Miri toolchain")
-
     build_rust(target_name) {
       forward_variables_from(invoker,
                              [
