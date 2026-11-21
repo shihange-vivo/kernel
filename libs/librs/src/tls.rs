@@ -54,6 +54,7 @@ extern "C" fn emutls_key_destructor(arg: *mut c_void) {
 
 /// Release any emutls storage recreated by the runtime's final stdio flush.
 /// Called only after application callbacks and key destructors have finished.
+#[cfg(feature = "standalone_elf")]
 pub(crate) fn release_my_storage() {
     if let Some(&key) = EMUTLS_PTHREAD_KEY.get() {
         let pointer = pthread_getspecific(key);

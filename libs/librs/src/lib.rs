@@ -64,6 +64,7 @@ pub mod tls;
 pub mod types;
 pub mod unistd;
 
+#[cfg(not(feature = "standalone_elf"))]
 #[unsafe(no_mangle)]
 pub extern "C" fn __librs_start_main() {
     crate::stdio::init();
