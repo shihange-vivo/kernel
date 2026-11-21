@@ -211,11 +211,8 @@ fn init_apps() {
             #[cfg(thread_group)]
             {
                 #[cfg(enable_vfs)]
-                let table = {
-                    let mut table = crate::vfs::fd_manager::FdManager::new();
-                    table.init_stdio().expect("initialize app standard streams");
-                    table
-                };
+                let table = crate::vfs::fd_manager::FdManager::with_console()
+                    .expect("initialize app standard streams");
                 let mut group = crate::thread_group::ThreadGroup::prepare(
                     node,
                     alloc::boxed::Box::new(()),

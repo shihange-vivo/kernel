@@ -263,15 +263,11 @@ impl Process {
             threads: SpinLock::new(ThreadList::new()),
 
             #[cfg(enable_vfs)]
-            fd_manager: SpinLock::new(FdManager::new()),
+            fd_manager: SpinLock::new(FdManager::with_console()?),
         });
         // SAFETY: `arc` is the sole strong ref and is not yet observable by any
         // other thread, so this `&mut Process` aliases no live reference.
         let p = unsafe { Arc::as_ptr(&arc).cast_mut().as_mut().unwrap() };
-        #[cfg(enable_vfs)]
-        {
-            p.fd_manager.irqsave_lock().init_stdio()?;
-        }
         p.threads.irqsave_lock().init();
         Ok(arc)
     }

@@ -18,6 +18,7 @@ use crate::{
     vfs::{
         dcache::Dcache,
         dirent::DirBufferReader,
+        fd_manager::CurrentFiles,
         file::{File, FileAttr, FileOps, OpenFlags},
         fs::FileSystemInfo,
         inode_mode::{InodeFileType, InodeMode},
@@ -180,16 +181,15 @@ pub fn open(path: *const c_char, flags: c_int, mode: libc::mode_t) -> c_int {
         mode
     );
 
-    let file = {
-        match path::open_path(file_path, flags, mode) {
-            Ok(file) => Arc::new(file),
-            Err(e) => return e.to_errno(),
-        }
+    let Some(owner) = CurrentFiles::get() else {
+        return -libc::EBADF;
+    };
+    let file = match path::open_path(file_path, flags, mode) {
+        Ok(file) => Arc::new(file),
+        Err(error) => return error.to_errno(),
     };
 
-    current_fd!(mut fd_manager, err: -libc::EBADF);
-    let fd = fd_manager.alloc_fd(file);
-    fd as i32
+    owner.table().irqsave_lock().alloc_fd(file)
 }
 
 pub fn creat(path: *const c_char, mode: libc::mode_t) -> c_int {
@@ -905,6 +905,32 @@ mod tests {
         // Test with null pointer
         let result = open(core::ptr::null(), libc::O_RDONLY, 0o644);
         assert_eq!(result, code::EINVAL.to_errno());
+    }
+
+    #[test]
+    fn test_open_without_file_table_leaves_path_unchanged() {
+        use crate::{
+            sync,
+            thread::{Builder, Entry},
+        };
+        use alloc::boxed::Box;
+        use core::sync::atomic::{AtomicUsize, Ordering};
+
+        let done = Arc::new(AtomicUsize::new(0));
+        let done_on_thread = done.clone();
+        let _thread = Builder::new(Entry::Closure(Box::new(move || {
+            assert!(CurrentFiles::get().is_none());
+            let file_path = c"/open-without-file-table";
+            assert_eq!(
+                open(file_path.as_ptr(), libc::O_CREAT | libc::O_WRONLY, 0o600),
+                -libc::EBADF
+            );
+            assert!(path::lookup_path(file_path.to_str().unwrap()).is_none());
+            done_on_thread.store(1, Ordering::Release);
+            sync::wake(&done_on_thread);
+        })))
+        .start();
+        sync::wait_until(1, &done);
     }
 
     #[test]

@@ -234,11 +234,8 @@ impl<A: ImageMapping> StartupStorage<A> {
                 stdio.stdout.clone(),
                 stdio.stderr.clone(),
             ]),
-            None => {
-                let mut table = crate::vfs::fd_manager::FdManager::new();
-                table.init_stdio().map_err(StartupError::FileTable)?;
-                table
-            }
+            None => crate::vfs::fd_manager::FdManager::with_console()
+                .map_err(StartupError::FileTable)?,
         };
         let data = Box::new(EntryData {
             sp: self.initial_sp,
