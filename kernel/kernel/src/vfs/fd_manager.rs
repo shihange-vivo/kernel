@@ -29,11 +29,33 @@ pub const STDERR_FILENO: c_int = 2;
 /// First available file descriptor
 pub const FIRST_FD: usize = 3;
 
+#[must_use = "retain the descriptor or close it after removing it from the table"]
+pub(crate) enum FileDescriptor {
+    Owned(Arc<dyn FileOps>),
+    Borrowed(Arc<dyn FileOps>),
+}
+
+impl FileDescriptor {
+    fn file(&self) -> &Arc<dyn FileOps> {
+        match self {
+            Self::Owned(file) | Self::Borrowed(file) => file,
+        }
+    }
+
+    /// Release the descriptor in ordinary thread context, outside the table lock.
+    pub(crate) fn close(self) -> Result<(), Error> {
+        match self {
+            Self::Owned(file) => file.close(),
+            Self::Borrowed(_) => Ok(()),
+        }
+    }
+}
+
 /// File descriptor manager
 #[must_use = "retain the table while its descriptors are in use"]
 pub struct FdManager {
     /// File descriptor table
-    fds: Vec<Option<Arc<dyn FileOps>>>,
+    fds: Vec<Option<FileDescriptor>>,
     /// Next available file descriptor
     next_fd: usize,
 }
@@ -42,7 +64,7 @@ impl FdManager {
     /// Create new file descriptor manager
     pub fn new() -> Self {
         Self {
-            fds: vec![None; FIRST_FD + 1],
+            fds: (0..=FIRST_FD).map(|_| None).collect(),
             next_fd: FIRST_FD,
         }
     }
@@ -62,7 +84,7 @@ impl FdManager {
             (STDERR_FILENO, libc::O_WRONLY),
         ] {
             match open(flags) {
-                Ok(file) => table.fds[fd as usize] = Some(file),
+                Ok(file) => table.fds[fd as usize] = Some(FileDescriptor::Owned(file)),
                 Err(error) => {
                     table.close_all();
                     return Err(error);
@@ -73,7 +95,7 @@ impl FdManager {
     }
 
     /// Create a table with the supplied standard streams and a free first slot.
-    pub(crate) fn from_stdio(files: [Arc<dyn FileOps>; 3]) -> Self {
+    pub(crate) fn from_stdio(files: [FileDescriptor; 3]) -> Self {
         let [stdin, stdout, stderr] = files;
         Self {
             fds: vec![Some(stdin), Some(stdout), Some(stderr), None],
@@ -105,7 +127,7 @@ impl FdManager {
     /// Allocate new file descriptor
     pub fn alloc_fd(&mut self, file: Arc<dyn FileOps>) -> c_int {
         let fd = self.next_fd;
-        self.fds[fd] = Some(file);
+        self.fds[fd] = Some(FileDescriptor::Owned(file));
         self.update_next_fd(fd);
         fd as c_int
     }
@@ -127,30 +149,28 @@ impl FdManager {
         }
         if new_fd >= len {
             // add capacity by std Vec, so we just +1
-            self.fds.resize(new_fd + 1, None);
+            self.fds.resize_with(new_fd + 1, || None);
         }
 
         // do dup
         let file2 = file.dup(close_on_exec)?;
-        self.fds[new_fd] = Some(file2);
+        self.fds[new_fd] = Some(FileDescriptor::Owned(file2));
         self.update_next_fd(new_fd);
         Ok(new_fd as c_int)
     }
 
-    /// Free file descriptor
+    /// Remove a descriptor so it can be closed outside the table lock.
+    pub(crate) fn take_fd(&mut self, fd: c_int) -> Result<FileDescriptor, Error> {
+        let Some(descriptor) = self.fds.get_mut(fd as usize).and_then(Option::take) else {
+            warn!("[fd] take_fd: Invalid or unused fd: {}", fd);
+            return Err(code::EBADF);
+        };
+        Ok(descriptor)
+    }
+
+    /// Discard a descriptor during socket setup rollback.
     pub fn free_fd(&mut self, fd: c_int) -> Result<(), Error> {
-        // close stdio is allowed
-        if fd as usize >= self.fds.len() {
-            warn!("[fd] free_fd: Invalid fd: {}", fd);
-            return Err(code::EBADF);
-        }
-
-        if self.fds[fd as usize].is_none() {
-            warn!("[fd] free_fd: Fd {} not in use", fd);
-            return Err(code::EBADF);
-        }
-
-        self.fds[fd as usize] = None;
+        drop(self.take_fd(fd)?);
         Ok(())
     }
 
@@ -162,7 +182,7 @@ impl FdManager {
         }
 
         match self.fds[fd as usize].as_ref() {
-            Some(file) => Some(file.clone()),
+            Some(descriptor) => Some(descriptor.file().clone()),
             None => {
                 warn!("[fd] get_file_ops: Fd {} not found", fd);
                 None
@@ -194,7 +214,7 @@ impl FdManager {
 
         // Extend array if needed
         if next_fd >= fds_len {
-            self.fds.resize(next_fd + 1, None);
+            self.fds.resize_with(next_fd + 1, || None);
         }
 
         self.next_fd = next_fd;
@@ -273,5 +293,33 @@ mod tests {
         });
         assert!(matches!(result, Err(code::EACCES)));
         assert_eq!(closes.load(Ordering::Relaxed), 2);
+    }
+
+    #[cfg(thread_group)]
+    #[test]
+    fn redirected_stream_stays_open_until_the_caller_closes_it() {
+        let closes = Arc::new(AtomicUsize::new(0));
+        let stream: Arc<dyn FileOps> = Arc::new(ConsoleStream(closes.clone()));
+        let redirected_table = || {
+            FdManager::from_stdio(core::array::from_fn(|_| {
+                FileDescriptor::Borrowed(stream.clone())
+            }))
+        };
+        let mut first = redirected_table();
+        let second = redirected_table();
+
+        first.take_fd(STDOUT_FILENO).unwrap().close().unwrap();
+        assert!(!first.is_valid_fd(STDOUT_FILENO));
+        assert!(Arc::ptr_eq(
+            &first.get_file_ops(STDERR_FILENO).unwrap(),
+            &stream
+        ));
+        first.close_all();
+        assert!(second.is_valid_fd(STDOUT_FILENO));
+        second.close_all();
+        assert_eq!(closes.load(Ordering::Relaxed), 0);
+
+        assert_eq!(stream.close(), Err(code::EIO));
+        assert_eq!(closes.load(Ordering::Relaxed), 1);
     }
 }

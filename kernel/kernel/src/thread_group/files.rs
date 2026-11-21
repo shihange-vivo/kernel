@@ -20,10 +20,10 @@ use crate::{
 };
 use alloc::sync::Arc;
 
-/// File handles installed as descriptors 0, 1 and 2 for a new thread group.
-/// Each installed descriptor is closed when the group finishes. Keep the
-/// underlying file objects valid through those close calls.
-/// Installation shares the supplied objects and offsets; it does not reopen them.
+/// Caller-owned streams shared with a thread group as descriptors 0, 1 and 2.
+/// The group shares their offsets and releases its references when the
+/// descriptors close. The caller owns the underlying opens and must keep them
+/// open until all groups using them have finished.
 #[must_use = "install the streams when preparing the thread group"]
 pub struct StandardIo {
     pub stdin: Arc<dyn FileOps>,
@@ -67,7 +67,7 @@ mod tests {
         error::Error,
         scheduler,
         thread::{Builder, Entry, Stack},
-        vfs::{self, FileAttr, OpenFlags},
+        vfs::{self, fd_manager::FileDescriptor, FileAttr, OpenFlags},
     };
     use alloc::boxed::Box;
     use blueos_header::thread::SpawnArgs;
@@ -163,7 +163,9 @@ mod tests {
                 fail_close,
             })
         };
-        let mut table = FdManager::from_stdio([file(false), file(false), file(true)]);
+        let mut table = FdManager::from_stdio(
+            [file(false), file(false), file(true)].map(FileDescriptor::Owned),
+        );
         assert_eq!(table.alloc_fd(file(false)), 3);
         let thread =
             Builder::new(Entry::Posix(main, Arc::as_ptr(&observed).cast_mut().cast())).build();

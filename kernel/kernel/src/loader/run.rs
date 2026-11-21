@@ -50,7 +50,7 @@ pub struct RunRequest<'a> {
     /// Application main-thread stack size in bytes; defaults to
     /// [`config::DEFAULT_STACK_SIZE`].
     pub stack_size: usize,
-    /// Redirect descriptors 0/1/2; None opens the system console for each stream.
+    /// Borrow streams for descriptors 0/1/2. None opens the system console.
     #[cfg(all(enable_vfs, thread_group))]
     pub stdio: Option<&'a StandardIo>,
 }
