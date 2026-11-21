@@ -17,13 +17,16 @@
 #[cfg(thread_group)]
 use super::adapters::KernelCodeCache;
 use crate::thread::Stack;
-#[cfg(all(enable_vfs, thread_group))]
-use crate::thread_group::StandardIo;
 #[cfg(thread_group)]
 use crate::{
     scheduler,
     thread::{Builder, CleanupError, Entry},
     thread_group::ThreadGroup,
+};
+#[cfg(all(enable_vfs, thread_group))]
+use crate::{
+    thread_group::StandardIo,
+    vfs::fd_manager::{FdManager, FileDescriptor},
 };
 #[cfg(thread_group)]
 use alloc::boxed::Box;
@@ -229,13 +232,15 @@ impl<A: ImageMapping> StartupStorage<A> {
     {
         #[cfg(enable_vfs)]
         let table = match stdio {
-            Some(stdio) => crate::vfs::fd_manager::FdManager::from_stdio([
-                stdio.stdin.clone(),
-                stdio.stdout.clone(),
-                stdio.stderr.clone(),
-            ]),
-            None => crate::vfs::fd_manager::FdManager::with_console()
-                .map_err(StartupError::FileTable)?,
+            Some(stdio) => FdManager::from_stdio(
+                [
+                    stdio.stdin.clone(),
+                    stdio.stdout.clone(),
+                    stdio.stderr.clone(),
+                ]
+                .map(FileDescriptor::Borrowed),
+            ),
+            None => FdManager::with_console().map_err(StartupError::FileTable)?,
         };
         let data = Box::new(EntryData {
             sp: self.initial_sp,

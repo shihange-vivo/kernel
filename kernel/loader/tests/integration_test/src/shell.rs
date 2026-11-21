@@ -157,9 +157,12 @@ fn run_shell_repeatedly() {
         let reader = VfsElfReader::new(file).unwrap();
         // SAFETY: the staged shell is trusted native code using the standard ELF
         // initial-stack entry; QEMU's coherent test execution publishes its code.
-        let status = unsafe { blueos::loader::run(reader, &request) }.unwrap();
+        let status = unsafe { blueos::loader::run(reader, &request) };
+        for stream in [&stdio.stdin, &stdio.stdout, &stdio.stderr] {
+            stream.close().unwrap();
+        }
         // The shell's main returns after its service thread exits; libc fini runs.
-        assert_eq!(status, ThreadGroupExit::Code(0));
+        assert_eq!(status.unwrap(), ThreadGroupExit::Code(0));
         assert_eq!(read_file(CREATED_PATH), b"persisted-by-shell\n");
         let output = read_file(OUTPUT_PATH);
         for expected in [

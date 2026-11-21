@@ -199,17 +199,15 @@ pub fn creat(path: *const c_char, mode: libc::mode_t) -> c_int {
 
 /// Close a file descriptor
 pub fn close(fd: i32) -> i32 {
-    let file_ops = {
+    let descriptor = {
         current_fd!(mut fd_manager, err: -libc::EBADF);
-        let entry = match fd_manager.get_file_ops(fd) {
-            Some(entry) => entry,
-            None => return -libc::EBADF,
-        };
-        fd_manager.free_fd(fd).ignore_result();
-        entry
+        match fd_manager.take_fd(fd) {
+            Ok(descriptor) => descriptor,
+            Err(error) => return error.to_errno(),
+        }
     };
 
-    match file_ops.close() {
+    match descriptor.close() {
         Ok(_) => 0,
         Err(e) => e.to_errno(),
     }

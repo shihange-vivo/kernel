@@ -72,8 +72,9 @@ the thread group's lifetime. `ThreadGroup::start()` schedules its main thread.
 With VFS enabled, members share the group's descriptor table. Unowned kernel
 threads have no application descriptor table.
 Pass `Some(&stdio)` at creation to supply standard streams instead of opening
-the default console. The table is initialized before the main thread is
-registered; `start()` only schedules it.
+the default console. Keep the supplied streams open until all groups using
+them have finished, then close them as their owner. The table is initialized
+before the main thread is registered. `start()` schedules the thread.
 
 Libc initializes the image, calls Rust's generated C `main` wrapper, waits for
 cooperative child cleanup and executes `atexit`/finalizers. The thread group's
