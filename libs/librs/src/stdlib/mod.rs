@@ -18,6 +18,7 @@
 
 // ffi CStr is unstable yet,
 pub mod malloc;
+#[cfg(feature = "standalone_elf")]
 pub use crate::startup::{atexit, exit};
 use crate::{c_str::CStr, ctype, errno::ERRNO, types::c_int};
 use core::{
@@ -26,6 +27,14 @@ use core::{
 };
 use libc::{EINVAL, ERANGE};
 
+#[cfg(not(feature = "standalone_elf"))]
+#[linkage = "weak"]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn getenv(_key: *const i8) -> *mut i8 {
+    ptr::null_mut()
+}
+
+#[cfg(feature = "standalone_elf")]
 #[linkage = "weak"]
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn getenv(key: *const i8) -> *mut i8 {

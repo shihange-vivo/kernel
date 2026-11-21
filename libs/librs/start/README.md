@@ -37,9 +37,11 @@ The template supplies `crt1` and `librs_swi`, PIC code, static PIE linking and
 an explicit `_start` entry. The CRT archive is retained through `-u _start`.
 It uses the board's application linker configuration, without its kernel
 linker script or `rsrt`. Additional dependencies must also support PIC.
-`std` supplies Rust allocation and panic support; a `no_std` root supplies its
-own allocator and panic handler. The existing firmware `rsrt` and
-`__librs_start_main()` path remains separate.
+`std` supplies Rust allocation and panic support. A `no_std` root supplies its
+own allocator and panic handler. The `librs_swi` target enables the
+`standalone_elf` feature for `__libc_start_main`, `exit`, `atexit`, `environ`
+and `getauxval`. Firmware links `librs` and enters through
+`rsrt` and `__librs_start_main()`.
 
 ## Load and finish
 

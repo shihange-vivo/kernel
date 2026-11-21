@@ -435,6 +435,7 @@ fn run_key_destructors(tcb: &PthreadTcb) {
 }
 
 /// Run main-thread key destructors while its TCB and standard streams live.
+#[cfg(feature = "standalone_elf")]
 pub(crate) fn run_my_key_destructors() {
     if let Some(tcb) = get_my_tcb() {
         run_key_destructors(&tcb);
@@ -443,6 +444,7 @@ pub(crate) fn run_my_key_destructors() {
 
 /// Discard metadata after destructors and stdio have finished. Only used by
 /// a standalone application with its own libc and no remaining pthread users.
+#[cfg(feature = "standalone_elf")]
 pub(crate) fn cleanup_my_tcb() {
     // A final stdio error may have recreated errno/emutls storage. Free it
     // directly; user destructors must not run after standard streams close.

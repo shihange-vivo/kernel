@@ -54,6 +54,7 @@ impl GlobalFile {
         }
     }
 
+    #[cfg(feature = "standalone_elf")]
     unsafe fn finish(&self) {
         // SAFETY: the standalone runtime excludes all stream users at exit.
         if let Some(mut stream) = unsafe { (*self.0.get()).take() } {
@@ -93,6 +94,7 @@ pub static mut stderr: *mut FILE = ptr::null_mut();
 /// # Safety
 /// No code may access these streams again, including through default_*().
 /// The caller must exclude all concurrent users and finish TLS destructors first.
+#[cfg(feature = "standalone_elf")]
 pub(crate) unsafe fn finish() {
     // SAFETY: runtime initialized the streams and has finished all callbacks.
     unsafe {

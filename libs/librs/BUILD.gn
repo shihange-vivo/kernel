@@ -48,7 +48,8 @@ build_rust("librs_swi") {
     "//libs/libc",
   ]
 
-  # librs_swi will be used in apps dynamically loaded.
+  # Loaded ELF applications link their own copy of librs and its runtime.
+  features = [ "standalone_elf" ]
   configs += [ "//build/boards/${board}:app_config" ]
   if (board_toolchain_info.current_cpu == "riscv32") {
     deps += [ ":app_atomic" ]
