@@ -238,6 +238,8 @@ fn switch_current_thread(next: ThreadNode, old_sp: usize) -> usize {
         cleanup_retired_thread(&mut old);
     }
     old.set_saved_sp(old_sp);
+    #[cfg(smp)]
+    arch::instruction_cache::synchronize_pending();
     next_saved_sp
 }
 

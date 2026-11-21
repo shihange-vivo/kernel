@@ -110,10 +110,8 @@ impl From<ThreadGroupError> for RunError {
 
 /// Load an ELF from `reader` and run it to completion on this thread's
 /// scheduler, returning its exit status. Blocks until every member thread of
-/// the application has finished cleanup; the image is then released. Code
-/// publication is current-context only, as documented on `load_image`;
-/// callers on platforms without coherent instruction fetches must keep
-/// execution on the loading context.
+/// the application has finished cleanup, then releases the image. Each CPU
+/// completes instruction publication before running members or deferred cleanup.
 ///
 /// Loading and startup preparation execute synchronously on the caller's stack;
 /// the caller must provide sufficient stack for the loader and interrupt handling.
