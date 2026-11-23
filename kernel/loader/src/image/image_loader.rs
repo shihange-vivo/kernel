@@ -31,13 +31,12 @@ pub(crate) struct ImageLoader<R: ElfReader> {
 }
 
 impl<R: ElfReader> ImageLoader<R> {
-    #[inline]
-    pub const fn new(reader: R, request: LoadRequest) -> Self {
+    pub(crate) const fn new(reader: R, request: LoadRequest) -> Self {
         Self { reader, request }
     }
 
     /// Validate the ELF header and bound the program-header table before inspection.
-    pub fn admit(self) -> LoadResult<AdmittedImage<R>> {
+    pub(crate) fn admit(self) -> LoadResult<AdmittedImage<R>> {
         self.admit_inner()
             .map_err(|error| error.at_stage(LoadStage::Admit))
     }

@@ -16,11 +16,12 @@
 
 use super::map::MappedImage;
 use crate::{
-    elf::{DynamicInfo, ElfHeaderInfo, LoadSegmentInfo},
+    elf::{DynamicInfo, LoadSegmentInfo},
     error::{ErrorContext, LoadErrorKind, LoadStage},
     memory::{AllocationOffset, ImageMapping, MemoryPermissions, TargetAddress, TargetRange},
+    profile::LoadProfile,
     reader::ElfReader,
-    LoadError, LoadRequest, LoadResult, ProgramHeaderTable,
+    LoadError, LoadResult, ProgramHeaderTable,
 };
 use alloc::vec::Vec;
 
@@ -30,12 +31,16 @@ const COPY_BUFFER_SIZE: usize = 512;
 pub(crate) struct AllocatedImage<R: ElfReader, A: ImageMapping> {
     pub(super) reader: R,
     pub(super) allocation: A,
-    pub(super) request: LoadRequest,
-    pub(super) header: ElfHeaderInfo,
+    pub(super) profile: LoadProfile,
+    pub(super) entry: TargetAddress,
+    pub(super) program_header_offset: u64,
+    pub(super) program_header_entry_size: u16,
+    pub(super) program_header_count: u16,
     pub(super) segments: Vec<LoadSegmentInfo>,
     pub(super) dynamic: Option<DynamicInfo>,
     pub(super) relro: Option<TargetRange>,
-    pub(super) image_range: TargetRange,
+    /// Start of the planned span in the ELF virtual address space.
+    pub(super) image_start: TargetAddress,
 }
 
 impl<R: ElfReader, A: ImageMapping> AllocatedImage<R, A> {
@@ -46,44 +51,41 @@ impl<R: ElfReader, A: ImageMapping> AllocatedImage<R, A> {
 
     fn map_inner(mut self) -> LoadResult<MappedImage<A>> {
         let base = self.allocation.base();
-        // Retain only the actual table descriptor, not all decoded headers.
         // Some embedded images leave the table outside their PT_LOAD ranges;
         // loading them remains valid, but a standard startup cannot use AT_PHDR.
         let mut program_headers = None;
-        let table_start = self.header.program_header_offset();
-        let table_len = u64::from(self.header.program_header_entry_size())
-            * u64::from(self.header.program_header_count());
+        let table_len =
+            u64::from(self.program_header_entry_size) * u64::from(self.program_header_count);
         if table_len != 0 {
             for segment in &self.segments {
                 let file = segment.file_range();
                 if segment.permissions().contains(MemoryPermissions::READ)
-                    && let Some(offset) = table_start.checked_sub(file.offset())
+                    && let Some(offset) = self.program_header_offset.checked_sub(file.offset())
                     && offset <= file.len()
                     && table_len <= file.len() - offset
                 {
                     let offset = segment
                         .vaddr()
-                        .checked_sub(self.image_range.start())?
+                        .checked_sub(self.image_start)?
                         .checked_add(offset)
                         .ok_or_else(|| {
                             LoadError::new(LoadErrorKind::IntegerOverflow, ErrorContext::None)
                         })?;
                     program_headers = Some(ProgramHeaderTable::new(
                         base.checked_add(offset)?,
-                        self.header.program_header_entry_size(),
-                        self.header.program_header_count(),
+                        self.program_header_entry_size,
+                        self.program_header_count,
                     ));
                     break;
                 }
             }
         }
-        let entry = if self.header.entry() == 0 {
+        let entry = if self.entry.get() == 0 {
             None
         } else {
-            let entry_offset =
-                TargetAddress::new(self.header.entry()).checked_sub(self.image_range.start())?;
+            let entry_offset = self.entry.checked_sub(self.image_start)?;
             let entry = base.checked_add(entry_offset)?;
-            let entry_mode = self.request.profile().entry_mode();
+            let entry_mode = self.profile.entry_mode();
             let instruction_alignment = u64::from(entry_mode.instruction_alignment());
             // p_align may be weaker than instruction alignment. Check the actual
             // relocated entry before any bytes are read or destinations modified.
@@ -105,8 +107,7 @@ impl<R: ElfReader, A: ImageMapping> AllocatedImage<R, A> {
         };
         let mut scratch = [0; COPY_BUFFER_SIZE];
         for segment in &self.segments {
-            let offset =
-                AllocationOffset::new(segment.vaddr().checked_sub(self.image_range.start())?);
+            let offset = AllocationOffset::new(segment.vaddr().checked_sub(self.image_start)?);
             let file = segment.file_range();
             let mut copied = 0;
             while copied < file.len() {
@@ -163,8 +164,7 @@ impl<R: ElfReader, A: ImageMapping> AllocatedImage<R, A> {
                 })
             })?;
         for segment in &self.segments {
-            let offset =
-                AllocationOffset::new(segment.vaddr().checked_sub(self.image_range.start())?);
+            let offset = AllocationOffset::new(segment.vaddr().checked_sub(self.image_start)?);
             self.allocation
                 .set_permissions(offset, segment.memory_size(), segment.permissions())
                 .map_err(|error| {
@@ -180,12 +180,11 @@ impl<R: ElfReader, A: ImageMapping> AllocatedImage<R, A> {
         Ok(MappedImage {
             program_headers,
             allocation: self.allocation,
-            request: self.request,
-            header: self.header,
+            profile: self.profile,
             segments: self.segments,
             dynamic: self.dynamic,
             relro: self.relro,
-            image_range: self.image_range,
+            image_start: self.image_start,
             entry,
         })
     }

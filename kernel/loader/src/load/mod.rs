@@ -112,5 +112,4 @@ where
         .and_then(|image| image.decode())
         .and_then(|image| image.relocate())
         .and_then(|image| image.seal(cache))
-        .map(LoadedImage::from_sealed)
 }

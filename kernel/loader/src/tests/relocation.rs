@@ -132,6 +132,8 @@ fn relative_relocation_supports_all_profiles_and_byte_orders() {
             let fixture = fixture(profile, DT_RELA, 2);
             let state = Rc::new(State::default());
             let decoded = decode(&fixture, state.clone(), 0x8000);
+            assert!(decoded.dynamic().is_some());
+            assert_eq!(decoded.relocations().len(), 2);
             let reads = state.reads.get();
             let image = decoded.relocate().unwrap();
             assert_eq!(state.reads.get(), reads);
@@ -139,8 +141,6 @@ fn relative_relocation_supports_all_profiles_and_byte_orders() {
             assert_eq!(state.live.get(), 1);
             assert_eq!(state.drops.get(), 0);
             assert_eq!(image.entry(), Some(TargetAddress::new(0x8000)));
-            assert!(image.dynamic().is_some());
-            assert_eq!(image.relocations().len(), 2);
             assert_eq!(value(image.allocation(), profile, TARGET), 0x8000);
             assert_eq!(value(image.allocation(), profile, TARGET + 8), 0x8008);
             drop(image);
@@ -197,9 +197,11 @@ fn relative_relocation_ignores_none_records_for_rel_and_rela() {
             let mut fixture = fixture(profile, kind, 1);
             fixture.relocation(RELVA, kind, u64::from(u32::MAX), 37, 0, -1);
             let state = Rc::new(State::default());
-            let image = decode(&fixture, state.clone(), 0x8000).relocate().unwrap();
+            let decoded = decode(&fixture, state.clone(), 0x8000);
+            assert_eq!(decoded.relocations().len(), 1);
+            let image = decoded.relocate().unwrap();
             assert_eq!(state.writes.get(), 0);
-            assert_eq!(image.relocations().len(), 1);
+            drop(image);
         }
     }
 }
@@ -217,11 +219,12 @@ fn relative_relocation_accepts_static_images_without_dynamic_metadata() {
             state.clone(),
         )
         .unwrap();
+        assert!(decoded.dynamic().is_none());
+        assert!(decoded.relocations().is_empty());
         state.writes.set(0);
         let image = decoded.relocate().unwrap();
-        assert!(image.dynamic().is_none());
-        assert!(image.relocations().is_empty());
         assert_eq!(state.writes.get(), 0);
+        drop(image);
     }
 }
 

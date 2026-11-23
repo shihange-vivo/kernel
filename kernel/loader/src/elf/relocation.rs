@@ -29,7 +29,6 @@ pub(crate) enum RelocationFormat {
 }
 
 impl RelocationFormat {
-    #[inline]
     pub(crate) const fn entry_size(self, class: ElfClass) -> u64 {
         match (class, self) {
             (ElfClass::Elf32, Self::Rel) => 8,
@@ -47,17 +46,14 @@ pub(crate) struct RelocationTable {
 }
 
 impl RelocationTable {
-    #[inline]
-    pub(crate) const fn new(range: TargetRange, format: RelocationFormat) -> Self {
+    pub(super) const fn new(range: TargetRange, format: RelocationFormat) -> Self {
         Self { range, format }
     }
 
-    #[inline]
     pub(crate) const fn range(&self) -> TargetRange {
         self.range
     }
 
-    #[inline]
     pub(crate) const fn format(&self) -> RelocationFormat {
         self.format
     }
@@ -78,22 +74,18 @@ pub(crate) struct RelocationRecord {
 }
 
 impl RelocationRecord {
-    #[inline]
     pub(crate) const fn offset(&self) -> TargetAddress {
         self.offset
     }
 
-    #[inline]
     pub(crate) const fn raw_type(&self) -> u32 {
         self.raw_type
     }
 
-    #[inline]
     pub(crate) const fn symbol_index(&self) -> u32 {
         self.symbol_index
     }
 
-    #[inline]
     pub(crate) const fn addend(&self) -> RelocationAddend {
         self.addend
     }

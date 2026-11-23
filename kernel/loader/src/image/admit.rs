@@ -37,7 +37,7 @@ pub(crate) struct AdmittedImage<R: ElfReader> {
 }
 
 impl<R: ElfReader> AdmittedImage<R> {
-    pub(crate) const fn new(
+    pub(super) const fn new(
         reader: R,
         header: ElfHeaderInfo,
         request: LoadRequest,
@@ -55,7 +55,7 @@ impl<R: ElfReader> AdmittedImage<R> {
         &self.header
     }
 
-    pub fn inspect(self) -> LoadResult<InspectedImage<R>> {
+    pub(crate) fn inspect(self) -> LoadResult<InspectedImage<R>> {
         self.inspect_inner()
             .map_err(|error| error.at_stage(LoadStage::Inspect))
     }

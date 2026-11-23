@@ -21,17 +21,18 @@ use crate::{
     elf::{DynamicInfo, LoadSegmentInfo, RelocationRecord},
     error::LoadStage,
     memory::{ImageMapping, TargetAddress, TargetRange},
-    relocation, LoadRequest, LoadResult, ProgramHeaderTable,
+    profile::LoadProfile,
+    relocation, LoadResult, ProgramHeaderTable,
 };
 
 #[must_use = "retain the decoded image to keep its allocation alive"]
 pub(crate) struct DecodedImage<A: ImageMapping> {
     pub(super) program_headers: Option<ProgramHeaderTable>,
     pub(super) allocation: A,
-    pub(super) request: LoadRequest,
+    pub(super) profile: LoadProfile,
     pub(super) segments: Vec<LoadSegmentInfo>,
     pub(super) relro: Option<TargetRange>,
-    pub(super) image_range: TargetRange,
+    pub(super) image_start: TargetAddress,
     pub(super) entry: Option<TargetAddress>,
     pub(super) dynamic: Option<DynamicInfo>,
     pub(super) relocations: Vec<RelocationRecord>,
@@ -46,21 +47,20 @@ impl<A: ImageMapping> DecodedImage<A> {
     fn relocate_inner(mut self) -> LoadResult<RelocatedImage<A>> {
         relocation::apply(
             &mut self.allocation,
-            self.request.profile(),
+            &self.profile,
             &self.segments,
-            self.image_range,
+            self.image_start,
             &self.relocations,
         )?;
         Ok(RelocatedImage {
             program_headers: self.program_headers,
             allocation: self.allocation,
-            request: self.request,
+            profile: self.profile,
             segments: self.segments,
             relro: self.relro,
-            image_range: self.image_range,
+            image_start: self.image_start,
             entry: self.entry,
             dynamic: self.dynamic,
-            relocations: self.relocations,
         })
     }
 

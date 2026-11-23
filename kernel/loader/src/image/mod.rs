@@ -21,6 +21,8 @@
 //! ELF table parsing and record formats are implemented in `crate::elf`.
 //! Shared relocation and lifecycle algorithms live in `crate::relocation` and
 //! `crate::lifecycle`; this module owns their placement in the loading stages.
+//! Fields shared by the stage modules are used to construct the next state.
+//! Other modules use stage methods to advance or inspect an image.
 
 mod admit;
 mod allocate;
@@ -30,11 +32,8 @@ mod inspect;
 mod map;
 mod plan;
 mod relocate;
-mod seal;
 
 pub(crate) use decode::DecodedImage;
 pub(crate) use image_loader::ImageLoader;
-pub(crate) use map::MappedImage;
 pub(crate) use plan::PlannedImage;
 pub(crate) use relocate::RelocatedImage;
-pub(crate) use seal::SealedImage;
