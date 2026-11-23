@@ -45,7 +45,7 @@ impl<A: ImageMapping> DecodedImage<A> {
     }
 
     fn relocate_inner(mut self) -> LoadResult<RelocatedImage<A>> {
-        relocation::apply(
+        relocation::apply_relative(
             &mut self.allocation,
             &self.profile,
             &self.segments,

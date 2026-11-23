@@ -401,8 +401,12 @@ fn relative_relocation_checks_later_records_before_writing_earlier_ones() {
 #[test]
 fn relative_relocation_backend_failure_drops_partially_modified_mapping_once() {
     for profile in PROFILES {
+        let mut fixture = fixture(profile, DT_RELA, 2);
+        let second = RELVA + relocation_size(profile.class(), DT_RELA);
+        let kind = relative_type(profile);
+        fixture.relocation(RELVA, DT_RELA, TARGET + 8, 0, kind, (BASE + 8) as i64);
+        fixture.relocation(second, DT_RELA, TARGET, 0, kind, BASE as i64);
         for failing_write in [1, 2] {
-            let fixture = fixture(profile, DT_RELA, 2);
             let state = Rc::new(State::default());
             let decoded = decode(&fixture, state.clone(), 0x8000);
             state.fail_write.set(Some(failing_write));
