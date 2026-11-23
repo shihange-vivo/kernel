@@ -27,6 +27,7 @@ use goblin::elf::dynamic::{
 use super::{
     read_u32, read_u64,
     relocation::{RelocationFormat, RelocationTable},
+    symbol::symbol_entry_size,
     ElfClass, FileRange, LoadSegmentInfo, ProgramHeaderInfo,
 };
 use crate::{
@@ -210,11 +211,7 @@ fn validate_metadata(
     match (info.value(DT_SYMTAB), info.value(DT_SYMENT)) {
         (None, None) => {}
         (Some(address), Some(size)) => {
-            let expected = match class {
-                ElfClass::Elf32 => 16,
-                ElfClass::Elf64 => 24,
-            };
-            if size != expected {
+            if size != symbol_entry_size(class) {
                 return Err(dynamic_error(DT_SYMENT, size));
             }
             vaddr_to_file_range(segments, TargetAddress::new(address), size)
