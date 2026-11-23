@@ -142,8 +142,6 @@ fn sealing_synchronizes_code_without_reapplying_segment_permissions() {
         assert_eq!(state.live.get(), 1);
         assert_eq!(state.drops.get(), 0);
         assert_eq!(image.entry(), Some(TargetAddress::new(0x8000)));
-        assert!(image.dynamic().is_some());
-        assert!(image.relro().is_none());
         assert_eq!(image.protection_level(), ProtectionLevel::LogicalOnly);
         assert_eq!(
             permission_updates(&state),
@@ -183,6 +181,8 @@ fn sealing_relro_removes_only_write_after_relative_relocation() {
         fixture.relocation(RELVA, DT_RELA, TARGET, 0, kind, BASE as i64);
         let state = Rc::new(State::default());
         let image = relocated(&fixture, state.clone(), 0x8000, LoadPurpose::Executable);
+        let initial = state.protects.get();
+        let image = image.seal(&mut Cache::new(state.clone())).unwrap();
         let mut word = [0; 8];
         let width = if profile.class() == ElfClass::Elf32 {
             4
@@ -194,12 +194,6 @@ fn sealing_relro_removes_only_write_after_relative_relocation() {
             .read(AllocationOffset::new(TARGET - BASE), &mut word[..width])
             .unwrap();
         assert_eq!(u64::from_le_bytes(word), 0x8000);
-        let initial = state.protects.get();
-        let image = image.seal(&mut Cache::new(state.clone())).unwrap();
-        assert_eq!(
-            image.relro(),
-            Some(TargetRange::new(TargetAddress::new(TARGET), 16))
-        );
         assert_eq!(state.protects.get(), initial + 1);
         assert_eq!(
             permission_updates(&state).last(),
@@ -218,10 +212,6 @@ fn sealing_handles_relro_at_segment_boundaries_and_empty_relro() {
             let image = relocated(&fixture, state.clone(), 0x8000, LoadPurpose::Executable);
             let initial = state.protects.get();
             let image = image.seal(&mut Cache::new(state.clone())).unwrap();
-            assert_eq!(
-                image.relro(),
-                Some(TargetRange::new(TargetAddress::new(start), len))
-            );
             assert_eq!(state.protects.get(), initial + usize::from(len != 0));
             if len != 0 {
                 assert_eq!(
@@ -229,6 +219,7 @@ fn sealing_handles_relro_at_segment_boundaries_and_empty_relro() {
                     Some(&(start - BASE, len, MemoryPermissions::READ))
                 );
             }
+            drop(image);
         }
     }
 }
@@ -246,7 +237,6 @@ fn mapping_resets_padding_and_holes_before_applying_segment_permissions() {
         let image = relocated(&fixture, state.clone(), 0x8000, LoadPurpose::Executable);
         let mut cache = Cache::new(state.clone());
         let image = image.seal(&mut cache).unwrap();
-        assert!(image.relro().is_none());
         assert_eq!(
             permission_updates(&state),
             vec![
@@ -267,6 +257,7 @@ fn mapping_resets_padding_and_holes_before_applying_segment_permissions() {
             cache.ranges,
             [TargetRange::new(TargetAddress::new(0x8004), 0x100)]
         );
+        drop(image);
     }
 }
 

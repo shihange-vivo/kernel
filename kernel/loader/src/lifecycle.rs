@@ -45,7 +45,7 @@ impl LifecyclePlan {
         allocation: &impl ImageMapping,
         profile: &LoadProfile,
         segments: &[LoadSegmentInfo],
-        image_range: TargetRange,
+        image_start: TargetAddress,
         dynamic: Option<&DynamicInfo>,
     ) -> LoadResult<Self> {
         let mut plan = Self::default();
@@ -56,7 +56,7 @@ impl LifecyclePlan {
             allocation,
             profile,
             segments,
-            image_range,
+            image_start,
         };
         reader.array(&mut plan.preinit, dynamic, DT_PREINIT_ARRAY, false)?;
         reader.direct(&mut plan.init, dynamic, DT_INIT)?;
@@ -86,7 +86,7 @@ struct LifecycleReader<'a, A> {
     allocation: &'a A,
     profile: &'a LoadProfile,
     segments: &'a [LoadSegmentInfo],
-    image_range: TargetRange,
+    image_start: TargetAddress,
 }
 
 impl<A: ImageMapping> LifecycleReader<'_, A> {
@@ -101,7 +101,7 @@ impl<A: ImageMapping> LifecycleReader<'_, A> {
         };
         // Dynamic tags hold ELF virtual addresses, unlike relocated array slots.
         let offset = value
-            .checked_sub(self.image_range.start().get())
+            .checked_sub(self.image_start.get())
             .ok_or_else(|| lifecycle_error(LoadErrorKind::OutOfBounds, tag, value))?;
         let function = self.allocation.base().checked_add(offset)?;
         self.push(functions, tag, function)
@@ -124,7 +124,7 @@ impl<A: ImageMapping> LifecycleReader<'_, A> {
             ElfClass::Elf32 => (4, u64::from(u32::MAX)),
             ElfClass::Elf64 => (8, u64::MAX),
         };
-        let offset = range.start().checked_sub(self.image_range.start())?;
+        let offset = range.start().checked_sub(self.image_start)?;
         let runtime = self.allocation.base().checked_add(offset)?;
         if !runtime.get().is_multiple_of(word_size) {
             return Err(lifecycle_error(
@@ -184,7 +184,7 @@ impl<A: ImageMapping> LifecycleReader<'_, A> {
         let vaddr = function
             .get()
             .checked_sub(self.allocation.base().get())
-            .and_then(|offset| self.image_range.start().get().checked_add(offset));
+            .and_then(|offset| self.image_start.get().checked_add(offset));
         if !self.segments.iter().any(|segment| {
             segment.permissions().contains(MemoryPermissions::EXECUTE)
                 && vaddr.is_some_and(|vaddr| {

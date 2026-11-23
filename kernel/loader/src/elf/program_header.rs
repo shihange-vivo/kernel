@@ -29,42 +29,35 @@ pub(crate) struct ProgramHeaderInfo {
 }
 
 impl ProgramHeaderInfo {
-    #[inline]
-    pub const fn r#type(&self) -> u32 {
+    pub(crate) const fn r#type(&self) -> u32 {
         self.r#type
     }
 
-    #[inline]
-    pub const fn flags(&self) -> u32 {
+    pub(crate) const fn flags(&self) -> u32 {
         self.flags
     }
 
-    #[inline]
-    pub const fn file_offset(&self) -> u64 {
+    pub(crate) const fn file_offset(&self) -> u64 {
         self.file_offset
     }
 
-    #[inline]
-    pub const fn vaddr(&self) -> TargetAddress {
+    pub(crate) const fn vaddr(&self) -> TargetAddress {
         self.vaddr
     }
 
-    #[inline]
-    pub const fn file_size(&self) -> u64 {
+    pub(crate) const fn file_size(&self) -> u64 {
         self.file_size
     }
 
-    #[inline]
-    pub const fn memory_size(&self) -> u64 {
+    pub(crate) const fn memory_size(&self) -> u64 {
         self.memory_size
     }
 
-    #[inline]
-    pub const fn align(&self) -> u64 {
+    pub(crate) const fn align(&self) -> u64 {
         self.align
     }
 
-    pub fn decode(bytes: &[u8], class: ElfClass, endian: ElfData) -> LoadResult<Self> {
+    pub(crate) fn decode(bytes: &[u8], class: ElfClass, endian: ElfData) -> LoadResult<Self> {
         Ok(match class {
             ElfClass::Elf32 => Self {
                 r#type: read_u32(bytes, 0, endian)?,

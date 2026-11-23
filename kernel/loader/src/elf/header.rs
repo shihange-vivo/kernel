@@ -218,7 +218,7 @@ impl ElfHeaderInfo {
             ));
         }
 
-        Ok(Self::new(
+        Ok(Self {
             class,
             endian,
             r#type,
@@ -228,76 +228,42 @@ impl ElfHeaderInfo {
             program_header_entry_size,
             program_header_count,
             flags,
-        ))
+        })
     }
 
-    #[inline]
-    pub const fn new(
-        class: ElfClass,
-        endian: ElfData,
-        r#type: ElfType,
-        machine: ElfMachine,
-        entry: u64,
-        program_header_offset: u64,
-        program_header_entry_size: u16,
-        program_header_count: u16,
-        flags: u32,
-    ) -> Self {
-        Self {
-            class,
-            endian,
-            r#type,
-            machine,
-            entry,
-            program_header_offset,
-            program_header_entry_size,
-            program_header_count,
-            flags,
-        }
-    }
-
-    #[inline]
-    pub const fn class(&self) -> ElfClass {
+    pub(crate) const fn class(&self) -> ElfClass {
         self.class
     }
 
-    #[inline]
-    pub const fn endian(&self) -> ElfData {
+    pub(crate) const fn endian(&self) -> ElfData {
         self.endian
     }
 
-    #[inline]
-    pub const fn r#type(&self) -> ElfType {
+    pub(crate) const fn r#type(&self) -> ElfType {
         self.r#type
     }
 
-    #[inline]
-    pub const fn machine(&self) -> ElfMachine {
+    pub(crate) const fn machine(&self) -> ElfMachine {
         self.machine
     }
 
-    #[inline]
-    pub const fn entry(&self) -> u64 {
+    pub(crate) const fn entry(&self) -> u64 {
         self.entry
     }
 
-    #[inline]
-    pub const fn program_header_offset(&self) -> u64 {
+    pub(crate) const fn program_header_offset(&self) -> u64 {
         self.program_header_offset
     }
 
-    #[inline]
-    pub const fn program_header_entry_size(&self) -> u16 {
+    pub(crate) const fn program_header_entry_size(&self) -> u16 {
         self.program_header_entry_size
     }
 
-    #[inline]
-    pub const fn program_header_count(&self) -> u16 {
+    pub(crate) const fn program_header_count(&self) -> u16 {
         self.program_header_count
     }
 
-    #[inline]
-    pub const fn flags(&self) -> u32 {
+    pub(crate) const fn flags(&self) -> u32 {
         self.flags
     }
 }

@@ -227,7 +227,6 @@ fn lifecycle_allows_empty_plans_and_unused_array_slots() {
         let image = relocated(&fixture, state.clone(), 0x8000, LoadPurpose::Executable)
             .seal(&mut Cache::default())
             .unwrap();
-        assert!(image.dynamic().is_none());
         assert!(image.lifecycle().preinit().is_empty());
         assert!(image.lifecycle().init().is_empty());
         assert!(image.lifecycle().fini().is_empty());

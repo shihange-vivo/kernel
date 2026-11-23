@@ -43,34 +43,26 @@ pub(crate) struct FileRange {
 }
 
 impl FileRange {
-    #[inline]
-    pub const fn new(offset: u64, len: u64) -> Self {
+    pub(crate) const fn new(offset: u64, len: u64) -> Self {
         Self { offset, len }
     }
 
-    #[inline]
-    pub const fn offset(self) -> u64 {
+    pub(crate) const fn offset(self) -> u64 {
         self.offset
     }
 
-    #[inline]
-    pub const fn len(self) -> u64 {
+    pub(crate) const fn len(self) -> u64 {
         self.len
-    }
-
-    #[inline]
-    pub const fn is_empty(self) -> bool {
-        self.len == 0
     }
 }
 
 pub(crate) const ELF_IDENT_SIZE: usize = 16;
 pub(crate) const ELF32_HEADER_SIZE: usize = elf32::header::SIZEOF_EHDR;
 pub(crate) const ELF64_HEADER_SIZE: usize = elf64::header::SIZEOF_EHDR;
-pub(crate) const ELF32_PROGRAM_HEADER_SIZE: usize = elf32::program_header::SIZEOF_PHDR;
+const ELF32_PROGRAM_HEADER_SIZE: usize = elf32::program_header::SIZEOF_PHDR;
 pub(crate) const ELF64_PROGRAM_HEADER_SIZE: usize = elf64::program_header::SIZEOF_PHDR;
 
-pub(crate) fn read_u16(bytes: &[u8], offset: usize, endian: ElfData) -> LoadResult<u16> {
+fn read_u16(bytes: &[u8], offset: usize, endian: ElfData) -> LoadResult<u16> {
     let raw = read_array::<2>(bytes, offset)?;
     Ok(match endian {
         ElfData::Little => u16::from_le_bytes(raw),

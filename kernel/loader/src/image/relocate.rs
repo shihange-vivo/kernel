@@ -14,13 +14,13 @@
 
 //! A relocated image awaiting cache synchronization and final protection.
 
-use super::seal::SealedImage;
 use crate::{
-    elf::{DynamicInfo, LoadSegmentInfo, RelocationRecord},
+    elf::{DynamicInfo, LoadSegmentInfo},
     error::{ErrorContext, LoadErrorKind, LoadStage},
     lifecycle::LifecyclePlan,
     memory::{AllocationOffset, ImageMapping, MemoryPermissions, TargetAddress, TargetRange},
-    CodeCache, LoadError, LoadRequest, LoadResult, ProgramHeaderTable,
+    profile::LoadProfile,
+    CodeCache, LoadError, LoadResult, LoadedImage, ProgramHeaderTable,
 };
 use alloc::vec::Vec;
 
@@ -28,41 +28,37 @@ use alloc::vec::Vec;
 pub(crate) struct RelocatedImage<A: ImageMapping> {
     pub(super) program_headers: Option<ProgramHeaderTable>,
     pub(super) allocation: A,
-    pub(super) request: LoadRequest,
+    pub(super) profile: LoadProfile,
     pub(super) segments: Vec<LoadSegmentInfo>,
     pub(super) relro: Option<TargetRange>,
-    pub(super) image_range: TargetRange,
+    pub(super) image_start: TargetAddress,
     pub(super) entry: Option<TargetAddress>,
     pub(super) dynamic: Option<DynamicInfo>,
-    pub(super) relocations: Vec<RelocationRecord>,
 }
 
 impl<A: ImageMapping> RelocatedImage<A> {
-    pub(crate) fn seal<C: CodeCache + ?Sized>(self, cache: &mut C) -> LoadResult<SealedImage<A>> {
+    pub(crate) fn seal<C: CodeCache + ?Sized>(self, cache: &mut C) -> LoadResult<LoadedImage<A>> {
         self.seal_inner(cache)
             .map_err(|error| error.at_stage(LoadStage::Seal))
     }
 
-    fn seal_inner<C: CodeCache + ?Sized>(mut self, cache: &mut C) -> LoadResult<SealedImage<A>> {
-        let protection_level = self.allocation.protection_level();
-        self.request
-            .profile()
-            .check_protection_level(protection_level)?;
+    fn seal_inner<C: CodeCache + ?Sized>(mut self, cache: &mut C) -> LoadResult<LoadedImage<A>> {
+        self.profile
+            .check_protection_level(self.allocation.protection_level())?;
         let base = self.allocation.base();
         base.checked_add(self.allocation.len())?;
         let lifecycle = LifecyclePlan::build(
             &self.allocation,
-            self.request.profile(),
+            &self.profile,
             &self.segments,
-            self.image_range,
+            self.image_start,
             self.dynamic.as_ref(),
         )?;
         // Ordinary segment permissions are already active. Publish completed
         // code writes before execution and before closing writable RELRO.
         for segment in &self.segments {
             if segment.permissions().contains(MemoryPermissions::EXECUTE) {
-                let start =
-                    base.checked_add(segment.vaddr().checked_sub(self.image_range.start())?)?;
+                let start = base.checked_add(segment.vaddr().checked_sub(self.image_start)?)?;
                 cache
                     .synchronize(TargetRange::new(start, segment.memory_size()))
                     .map_err(|error| {
@@ -92,8 +88,7 @@ impl<A: ImageMapping> RelocatedImage<A> {
                         },
                     )
                 })?;
-            let offset =
-                AllocationOffset::new(relro.start().checked_sub(self.image_range.start())?);
+            let offset = AllocationOffset::new(relro.start().checked_sub(self.image_start)?);
             self.allocation
                 .set_permissions(
                     offset,
@@ -110,18 +105,12 @@ impl<A: ImageMapping> RelocatedImage<A> {
                     })
                 })?;
         }
-        Ok(SealedImage {
-            program_headers: self.program_headers,
-            allocation: self.allocation,
-            request: self.request,
-            segments: self.segments,
-            image_range: self.image_range,
-            entry: self.entry,
-            dynamic: self.dynamic,
-            relro: self.relro,
-            protection_level,
+        Ok(LoadedImage::new(
+            self.allocation,
+            self.entry,
+            self.program_headers,
             lifecycle,
-        })
+        ))
     }
 
     pub(crate) const fn allocation(&self) -> &A {
@@ -129,11 +118,5 @@ impl<A: ImageMapping> RelocatedImage<A> {
     }
     pub(crate) const fn entry(&self) -> Option<TargetAddress> {
         self.entry
-    }
-    pub(crate) fn dynamic(&self) -> Option<&DynamicInfo> {
-        self.dynamic.as_ref()
-    }
-    pub(crate) fn relocations(&self) -> &[RelocationRecord] {
-        &self.relocations
     }
 }

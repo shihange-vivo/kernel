@@ -17,10 +17,11 @@
 
 use super::decode::DecodedImage;
 use crate::{
-    elf::{DynamicInfo, ElfHeaderInfo, LoadSegmentInfo, RelocationRecord},
+    elf::{DynamicInfo, LoadSegmentInfo, RelocationRecord},
     error::{ErrorContext, LimitKind, LoadErrorKind, LoadStage},
     memory::{AllocationOffset, ImageMapping, TargetAddress, TargetRange},
-    LoadError, LoadRequest, LoadResult, ProgramHeaderTable,
+    profile::LoadProfile,
+    LoadError, LoadResult, ProgramHeaderTable,
 };
 use alloc::vec::Vec;
 
@@ -28,28 +29,23 @@ use alloc::vec::Vec;
 pub(crate) struct MappedImage<A: ImageMapping> {
     pub(super) program_headers: Option<ProgramHeaderTable>,
     pub(super) allocation: A,
-    pub(super) request: LoadRequest,
-    pub(super) header: ElfHeaderInfo,
+    pub(super) profile: LoadProfile,
     pub(super) segments: Vec<LoadSegmentInfo>,
     pub(super) dynamic: Option<DynamicInfo>,
     /// Original ELF virtual range, retained for protection after relocation.
     pub(super) relro: Option<TargetRange>,
-    pub(super) image_range: TargetRange,
+    pub(super) image_start: TargetAddress,
     pub(super) entry: Option<TargetAddress>,
 }
 
 impl<A: ImageMapping> MappedImage<A> {
-    pub(crate) const fn allocation(&self) -> &A {
-        &self.allocation
-    }
-
     pub(crate) const fn entry(&self) -> Option<TargetAddress> {
         self.entry
     }
 
     /// Signed displacement, including allocations below the ELF's link address.
     pub(crate) fn load_bias(&self) -> i128 {
-        i128::from(self.allocation.base().get()) - i128::from(self.image_range.start().get())
+        i128::from(self.allocation.base().get()) - i128::from(self.image_start.get())
     }
 
     pub(crate) fn read(&self, offset: AllocationOffset, dst: &mut [u8]) -> LoadResult<()> {
@@ -64,7 +60,7 @@ impl<A: ImageMapping> MappedImage<A> {
     fn decode_inner(self) -> LoadResult<DecodedImage<A>> {
         let mut relocations = Vec::new();
         if let Some(dynamic) = &self.dynamic {
-            let class = self.header.class();
+            let class = self.profile.class();
             let mut total = 0u64;
             for table in dynamic.relocation_tables() {
                 total = total
@@ -94,15 +90,14 @@ impl<A: ImageMapping> MappedImage<A> {
                 }
                 let format = table.format();
                 let size = format.entry_size(class);
-                let offset =
-                    AllocationOffset::new(range.start().checked_sub(self.image_range.start())?);
+                let offset = AllocationOffset::new(range.start().checked_sub(self.image_start)?);
                 for index in 0..range.len() / size {
                     self.allocation
                         .read(offset.checked_add(index * size)?, &mut raw[..size as usize])?;
                     relocations.push(RelocationRecord::decode(
                         &raw[..size as usize],
                         class,
-                        self.header.endian(),
+                        self.profile.endian(),
                         format,
                     )?);
                 }
@@ -111,10 +106,10 @@ impl<A: ImageMapping> MappedImage<A> {
         Ok(DecodedImage {
             program_headers: self.program_headers,
             allocation: self.allocation,
-            request: self.request,
+            profile: self.profile,
             segments: self.segments,
             relro: self.relro,
-            image_range: self.image_range,
+            image_start: self.image_start,
             entry: self.entry,
             dynamic: self.dynamic,
             relocations,

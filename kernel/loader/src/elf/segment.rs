@@ -26,8 +26,7 @@ pub(crate) struct LoadSegmentInfo {
 }
 
 impl LoadSegmentInfo {
-    #[inline]
-    pub const fn new(
+    pub(crate) const fn new(
         index: u16,
         file_range: FileRange,
         vaddr: TargetAddress,
@@ -45,33 +44,27 @@ impl LoadSegmentInfo {
         }
     }
 
-    #[inline]
-    pub const fn index(&self) -> u16 {
+    pub(crate) const fn index(&self) -> u16 {
         self.index
     }
 
-    #[inline]
-    pub const fn file_range(&self) -> FileRange {
+    pub(crate) const fn file_range(&self) -> FileRange {
         self.file_range
     }
 
-    #[inline]
-    pub const fn vaddr(&self) -> TargetAddress {
+    pub(crate) const fn vaddr(&self) -> TargetAddress {
         self.vaddr
     }
 
-    #[inline]
-    pub const fn memory_size(&self) -> u64 {
+    pub(crate) const fn memory_size(&self) -> u64 {
         self.memory_size
     }
 
-    #[inline]
-    pub const fn align(&self) -> u64 {
+    pub(crate) const fn align(&self) -> u64 {
         self.align
     }
 
-    #[inline]
-    pub const fn permissions(&self) -> MemoryPermissions {
+    pub(crate) const fn permissions(&self) -> MemoryPermissions {
         self.permissions
     }
 }

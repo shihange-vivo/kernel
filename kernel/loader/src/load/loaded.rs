@@ -12,10 +12,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! The public owner of a fully finalized standalone image.
+//! The public owner of a fully finalized ELF image.
 
 use crate::{
-    image::SealedImage,
     memory::{ProtectionLevel, TargetAddress},
     ImageMapping, LifecyclePlan, ProgramHeaderTable,
 };
@@ -35,12 +34,17 @@ pub struct LoadedImage<A: ImageMapping> {
 }
 
 impl<A: ImageMapping> LoadedImage<A> {
-    pub(crate) fn from_sealed(image: SealedImage<A>) -> Self {
+    pub(crate) fn new(
+        allocation: A,
+        entry: Option<TargetAddress>,
+        program_headers: Option<ProgramHeaderTable>,
+        lifecycle: LifecyclePlan,
+    ) -> Self {
         Self {
-            program_headers: image.program_headers,
-            allocation: image.allocation,
-            entry: image.entry,
-            lifecycle: image.lifecycle,
+            program_headers,
+            allocation,
+            entry,
+            lifecycle,
         }
     }
 

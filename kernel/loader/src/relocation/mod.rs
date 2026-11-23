@@ -18,7 +18,7 @@
 use crate::{
     elf::{ElfClass, ElfData, LoadSegmentInfo, RelocationRecord},
     error::{ErrorContext, LoadErrorKind},
-    memory::{AllocationOffset, ImageMapping, MemoryPermissions, TargetRange},
+    memory::{AllocationOffset, ImageMapping, MemoryPermissions, TargetAddress, TargetRange},
     profile::LoadProfile,
     LoadError, LoadResult,
 };
@@ -34,7 +34,7 @@ pub(crate) fn apply(
     allocation: &mut impl ImageMapping,
     profile: &LoadProfile,
     segments: &[LoadSegmentInfo],
-    image_range: TargetRange,
+    image_start: TargetAddress,
     records: &[RelocationRecord],
 ) -> LoadResult<()> {
     let width = match profile.class() {
@@ -42,7 +42,7 @@ pub(crate) fn apply(
         ElfClass::Elf64 => 8,
     };
     let base = allocation.base();
-    let bias = i128::from(base.get()) - i128::from(image_range.start().get());
+    let bias = i128::from(base.get()) - i128::from(image_start.get());
     let mut writes: Vec<PlannedWrite> = Vec::new();
     for (index, record) in records.iter().enumerate() {
         let Some(addend) = profile.check_relative_relocation(record)? else {
@@ -67,7 +67,7 @@ pub(crate) fn apply(
         }
         let offset = record
             .offset()
-            .checked_sub(image_range.start())
+            .checked_sub(image_start)
             .map_err(|_| fail(LoadErrorKind::OutOfBounds))?;
         if offset
             .checked_add(width)

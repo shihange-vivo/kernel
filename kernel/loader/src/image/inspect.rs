@@ -45,7 +45,7 @@ impl<R: ElfReader> InspectedImage<R> {
     }
 
     /// Plan the layout and admit dynamic metadata without reserving image backing.
-    pub fn plan(self) -> LoadResult<PlannedImage<R>> {
+    pub(crate) fn plan(self) -> LoadResult<PlannedImage<R>> {
         self.plan_inner()
             .map_err(|error| error.at_stage(LoadStage::Plan))
     }
@@ -238,12 +238,15 @@ impl<R: ElfReader> InspectedImage<R> {
                 .profile()
                 .check_dynamic_image(self.request.purpose(), dynamic)?;
         }
-        // Layout validation is complete; the raw program-header table is no
-        // longer needed and is dropped rather than retained by later stages.
+        // Keep only the header facts still needed for allocation and mapping.
         Ok(PlannedImage {
             reader: self.reader,
-            request: self.request,
-            header: self.header,
+            profile: *self.request.profile(),
+            elf_type: self.header.r#type(),
+            entry,
+            program_header_offset: self.header.program_header_offset(),
+            program_header_entry_size: self.header.program_header_entry_size(),
+            program_header_count: self.header.program_header_count(),
             segments,
             dynamic,
             relro,
