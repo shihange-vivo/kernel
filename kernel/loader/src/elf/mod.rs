@@ -20,6 +20,7 @@ mod header;
 mod program_header;
 mod relocation;
 mod segment;
+mod symbol;
 
 use crate::{
     error::{ErrorContext, LoadErrorKind},
