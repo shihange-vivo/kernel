@@ -539,11 +539,11 @@ fn dynamic_decodes_rel_and_rela_for_both_classes_and_byte_orders() {
                 assert_eq!(image.entry().unwrap().get(), 0x8000);
                 assert_eq!(state.reader_drops.get(), 1);
                 assert_eq!(image.relocations().len(), 2);
-                assert_eq!(image.relocations()[0].offset.get(), TARGET);
-                assert_eq!(image.relocations()[0].symbol_index, 7);
-                assert_eq!(image.relocations()[0].raw_type, raw_type);
+                assert_eq!(image.relocations()[0].offset().get(), TARGET);
+                assert_eq!(image.relocations()[0].symbol_index(), 7);
+                assert_eq!(image.relocations()[0].raw_type(), raw_type);
                 assert_eq!(
-                    image.relocations()[0].addend,
+                    image.relocations()[0].addend(),
                     if kind == DT_REL {
                         RelocationAddend::Implicit
                     } else {
@@ -551,7 +551,7 @@ fn dynamic_decodes_rel_and_rela_for_both_classes_and_byte_orders() {
                     }
                 );
                 assert_eq!(
-                    image.relocations()[1].addend,
+                    image.relocations()[1].addend(),
                     if kind == DT_REL {
                         RelocationAddend::Implicit
                     } else {

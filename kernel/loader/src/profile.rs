@@ -317,9 +317,9 @@ impl LoadProfile {
     ) -> LoadResult<Option<i64>> {
         let unsupported = || {
             LoadError::relocation(
-                record.offset,
-                record.raw_type,
-                record.symbol_index,
+                record.offset(),
+                record.raw_type(),
+                record.symbol_index(),
                 LoadErrorKind::UnsupportedByProfile,
             )
         };
@@ -330,13 +330,13 @@ impl LoadProfile {
             (ElfMachine::Aarch64, ElfClass::Elf64) => (R_AARCH64_NONE, R_AARCH64_RELATIVE),
             _ => return Err(unsupported()),
         };
-        if record.raw_type == none {
+        if record.raw_type() == none {
             return Ok(None);
         }
-        if record.raw_type != relative {
+        if record.raw_type() != relative {
             return Err(unsupported());
         }
-        match record.addend {
+        match record.addend() {
             RelocationAddend::Explicit(addend) => Ok(Some(addend)),
             RelocationAddend::Implicit => Err(unsupported()),
         }
