@@ -174,10 +174,11 @@ pub(crate) fn read_dynamic(
     info.tables = relocation_tables(&info, segments, class)?;
     let mut total = 0u64;
     for table in info.relocation_tables() {
-        let len = table.range.len();
+        let range = table.range();
+        let len = range.len();
         total = total
-            .checked_add(len / table.format.entry_size(class))
-            .ok_or_else(|| dynamic_range_error(table.range.start(), len))?;
+            .checked_add(len / table.format().entry_size(class))
+            .ok_or_else(|| dynamic_range_error(range.start(), len))?;
         limits.check_relocation_count(total)?;
     }
     Ok(info)
@@ -291,7 +292,7 @@ fn table(
                 vaddr_to_file_range(segments, range.start(), len)
                     .map_err(|_| dynamic_error(tag, address))?;
             }
-            Ok(Some(RelocationTable { range, format }))
+            Ok(Some(RelocationTable::new(range, format)))
         }
         _ => Err(dynamic_error(tag, 0)),
     }
@@ -352,23 +353,22 @@ fn relocation_tables(
             continue;
         };
         let mut merged = false;
+        let range = current.range();
+        let format = current.format();
         for previous in tables[..i].iter_mut().flatten() {
-            if !current.range.overlaps(previous.range) {
+            let previous_range = previous.range();
+            if !range.overlaps(previous_range) {
                 continue;
             }
-            let start = current.range.start().min(previous.range.start());
-            let displacement = current
-                .range
-                .start()
-                .get()
-                .abs_diff(previous.range.start().get());
-            if current.format != previous.format
-                || !displacement.is_multiple_of(current.format.entry_size(class))
+            let start = range.start().min(previous_range.start());
+            let displacement = range.start().get().abs_diff(previous_range.start().get());
+            if format != previous.format() || !displacement.is_multiple_of(format.entry_size(class))
             {
-                return Err(dynamic_error(tag, current.range.start().get()));
+                return Err(dynamic_error(tag, range.start().get()));
             }
-            let end = current.range.end()?.max(previous.range.end()?);
-            previous.range = TargetRange::new(start, end.checked_sub(start)?);
+            let end = range.end()?.max(previous_range.end()?);
+            *previous =
+                RelocationTable::new(TargetRange::new(start, end.checked_sub(start)?), format);
             merged = true;
             break;
         }

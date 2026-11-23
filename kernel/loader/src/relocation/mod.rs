@@ -49,24 +49,24 @@ pub(crate) fn apply(
             continue;
         };
         let fail = |kind| record_error(record, kind);
-        if record.symbol_index != 0 {
+        if record.symbol_index() != 0 {
             return Err(fail(LoadErrorKind::BadElf));
         }
-        if !record.offset.get().is_multiple_of(width) {
+        if !record.offset().get().is_multiple_of(width) {
             return Err(fail(LoadErrorKind::InvalidAlignment));
         }
         let segment = segments
             .iter()
             .find(|segment| {
                 TargetRange::new(segment.vaddr(), segment.memory_size())
-                    .contains_span(record.offset, width)
+                    .contains_span(record.offset(), width)
             })
             .ok_or_else(|| fail(LoadErrorKind::OutOfBounds))?;
         if !segment.permissions().contains(MemoryPermissions::WRITE) {
             return Err(fail(LoadErrorKind::PermissionConflict));
         }
         let offset = record
-            .offset
+            .offset()
             .checked_sub(image_range.start())
             .map_err(|_| fail(LoadErrorKind::OutOfBounds))?;
         if offset
@@ -124,9 +124,9 @@ pub(crate) fn apply(
             .write(write.offset, &bytes[..width as usize])
             .map_err(|error| {
                 error.with_context(ErrorContext::Relocation {
-                    target: record.offset,
-                    raw_type: record.raw_type,
-                    symbol_index: record.symbol_index,
+                    target: record.offset(),
+                    raw_type: record.raw_type(),
+                    symbol_index: record.symbol_index(),
                 })
             })?;
     }
@@ -134,5 +134,10 @@ pub(crate) fn apply(
 }
 
 fn record_error(record: &RelocationRecord, kind: LoadErrorKind) -> LoadError {
-    LoadError::relocation(record.offset, record.raw_type, record.symbol_index, kind)
+    LoadError::relocation(
+        record.offset(),
+        record.raw_type(),
+        record.symbol_index(),
+        kind,
+    )
 }

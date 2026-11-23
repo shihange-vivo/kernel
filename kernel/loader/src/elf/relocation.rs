@@ -29,6 +29,7 @@ pub(crate) enum RelocationFormat {
 }
 
 impl RelocationFormat {
+    #[inline]
     pub(crate) const fn entry_size(self, class: ElfClass) -> u64 {
         match (class, self) {
             (ElfClass::Elf32, Self::Rel) => 8,
@@ -41,8 +42,25 @@ impl RelocationFormat {
 
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct RelocationTable {
-    pub(crate) range: TargetRange,
-    pub(crate) format: RelocationFormat,
+    range: TargetRange,
+    format: RelocationFormat,
+}
+
+impl RelocationTable {
+    #[inline]
+    pub(crate) const fn new(range: TargetRange, format: RelocationFormat) -> Self {
+        Self { range, format }
+    }
+
+    #[inline]
+    pub(crate) const fn range(&self) -> TargetRange {
+        self.range
+    }
+
+    #[inline]
+    pub(crate) const fn format(&self) -> RelocationFormat {
+        self.format
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -53,13 +71,33 @@ pub(crate) enum RelocationAddend {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct RelocationRecord {
-    pub(crate) offset: TargetAddress,
-    pub(crate) raw_type: u32,
-    pub(crate) symbol_index: u32,
-    pub(crate) addend: RelocationAddend,
+    offset: TargetAddress,
+    raw_type: u32,
+    symbol_index: u32,
+    addend: RelocationAddend,
 }
 
 impl RelocationRecord {
+    #[inline]
+    pub(crate) const fn offset(&self) -> TargetAddress {
+        self.offset
+    }
+
+    #[inline]
+    pub(crate) const fn raw_type(&self) -> u32 {
+        self.raw_type
+    }
+
+    #[inline]
+    pub(crate) const fn symbol_index(&self) -> u32 {
+        self.symbol_index
+    }
+
+    #[inline]
+    pub(crate) const fn addend(&self) -> RelocationAddend {
+        self.addend
+    }
+
     pub(crate) fn decode(
         bytes: &[u8],
         class: ElfClass,

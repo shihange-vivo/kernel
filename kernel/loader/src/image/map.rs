@@ -68,7 +68,7 @@ impl<A: ImageMapping> MappedImage<A> {
             let mut total = 0u64;
             for table in dynamic.relocation_tables() {
                 total = total
-                    .checked_add(table.range.len() / table.format.entry_size(class))
+                    .checked_add(table.range().len() / table.format().entry_size(class))
                     .ok_or_else(|| {
                         LoadError::new(LoadErrorKind::IntegerOverflow, ErrorContext::None)
                     })?;
@@ -88,21 +88,22 @@ impl<A: ImageMapping> MappedImage<A> {
                 .map_err(|_| LoadError::new(LoadErrorKind::OutOfMemory, ErrorContext::None))?;
             let mut raw = [0; 24];
             for table in dynamic.relocation_tables() {
-                if table.range.is_empty() {
+                let range = table.range();
+                if range.is_empty() {
                     continue;
                 }
-                let size = table.format.entry_size(class);
-                let offset = AllocationOffset::new(
-                    table.range.start().checked_sub(self.image_range.start())?,
-                );
-                for index in 0..table.range.len() / size {
+                let format = table.format();
+                let size = format.entry_size(class);
+                let offset =
+                    AllocationOffset::new(range.start().checked_sub(self.image_range.start())?);
+                for index in 0..range.len() / size {
                     self.allocation
                         .read(offset.checked_add(index * size)?, &mut raw[..size as usize])?;
                     relocations.push(RelocationRecord::decode(
                         &raw[..size as usize],
                         class,
                         self.header.endian(),
-                        table.format,
+                        format,
                     )?);
                 }
             }
