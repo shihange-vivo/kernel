@@ -46,6 +46,11 @@ pub(crate) struct PlannedImage<R: ElfReader> {
 }
 
 impl<R: ElfReader> PlannedImage<R> {
+    #[cfg(enable_dynamic_linker)]
+    pub(crate) const fn reader(&self) -> &R {
+        &self.reader
+    }
+
     pub(crate) fn dynamic(&self) -> Option<&DynamicInfo> {
         self.dynamic.as_ref()
     }

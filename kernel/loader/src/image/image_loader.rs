@@ -17,7 +17,7 @@ use goblin::elf::header::{EI_ABIVERSION, EI_OSABI};
 use crate::{
     elf::{ElfClass, ElfHeaderInfo, ELF32_HEADER_SIZE, ELF64_HEADER_SIZE, ELF_IDENT_SIZE},
     error::{ErrorContext, HeaderField, LoadErrorKind, LoadStage},
-    image::admit::AdmittedImage,
+    image::{admit::AdmittedImage, PlannedImage},
     profile::LoadLimits,
     reader::ElfReader,
     LoadError, LoadRequest, LoadResult,
@@ -33,6 +33,13 @@ pub(crate) struct ImageLoader<R: ElfReader> {
 impl<R: ElfReader> ImageLoader<R> {
     pub(crate) const fn new(reader: R, request: LoadRequest) -> Self {
         Self { reader, request }
+    }
+
+    /// Validate and plan an image while retaining its source for mapping.
+    pub(crate) fn prepare_layout(self) -> LoadResult<PlannedImage<R>> {
+        self.admit()
+            .and_then(|image| image.inspect())
+            .and_then(|image| image.plan())
     }
 
     /// Validate the ELF header and bound the program-header table before inspection.

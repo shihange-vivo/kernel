@@ -453,6 +453,18 @@ impl LoadProfile {
         Ok(())
     }
 
+    /// A root prepared to start an application cannot serve as a needed DSO.
+    #[cfg(enable_dynamic_linker)]
+    pub(crate) fn check_root_as_dependency(&self, purpose: LoadPurpose) -> LoadResult<()> {
+        if purpose == LoadPurpose::SharedObject {
+            return Ok(());
+        }
+        Err(LoadError::new(
+            LoadErrorKind::UnsupportedByProfile,
+            ErrorContext::None,
+        ))
+    }
+
     /// Reject runtime semantics not provided by the selected loading profile.
     pub(crate) fn check_dynamic_image(
         &self,
@@ -883,6 +895,83 @@ impl LoadLimits {
 }
 
 impl Default for LoadLimits {
+    fn default() -> Self {
+        Self::DEFAULT
+    }
+}
+
+/// Resource bounds across a dependency graph. [`LoadLimits`] bounds each image.
+#[cfg(enable_dynamic_linker)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct DependencyLimits {
+    max_images: u32,
+    max_edges: u32,
+    max_depth: u16,
+    max_name_len: u32,
+    max_input_bytes: u64,
+}
+
+#[cfg(enable_dynamic_linker)]
+impl DependencyLimits {
+    pub const DEFAULT: Self = Self::new(64, 1024, 32, 256, 256 * 1024 * 1024);
+
+    /// Image and input-byte limits include the root. Edge count includes all
+    /// DT_NEEDED occurrences. The root has depth zero and names exclude NUL.
+    pub const fn new(
+        max_images: u32,
+        max_edges: u32,
+        max_depth: u16,
+        max_name_len: u32,
+        max_input_bytes: u64,
+    ) -> Self {
+        Self {
+            max_images,
+            max_edges,
+            max_depth,
+            max_name_len,
+            max_input_bytes,
+        }
+    }
+
+    pub(crate) fn check_image_count(&self, actual: u64) -> LoadResult<()> {
+        check_limit(
+            LimitKind::DependencyImageCount,
+            actual,
+            u64::from(self.max_images),
+        )
+    }
+
+    pub(crate) fn check_edge_count(&self, actual: u64) -> LoadResult<()> {
+        check_limit(
+            LimitKind::DependencyEdgeCount,
+            actual,
+            u64::from(self.max_edges),
+        )
+    }
+
+    pub(crate) fn check_depth(&self, actual: u32) -> LoadResult<()> {
+        check_limit(
+            LimitKind::DependencyDepth,
+            u64::from(actual),
+            u64::from(self.max_depth),
+        )
+    }
+
+    pub(crate) const fn max_name_len(&self) -> u32 {
+        self.max_name_len
+    }
+
+    pub(crate) fn check_input_bytes(&self, actual: u64) -> LoadResult<()> {
+        check_limit(
+            LimitKind::DependencyInputBytes,
+            actual,
+            self.max_input_bytes,
+        )
+    }
+}
+
+#[cfg(enable_dynamic_linker)]
+impl Default for DependencyLimits {
     fn default() -> Self {
         Self::DEFAULT
     }

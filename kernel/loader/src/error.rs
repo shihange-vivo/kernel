@@ -25,6 +25,7 @@ pub enum LoadStage {
     Admit,
     Inspect,
     Plan,
+    Discover,
     Allocate,
     Map,
     Decode,
@@ -91,6 +92,10 @@ pub enum LimitKind {
     DynamicEntryCount,
     RelocationCount,
     LifecycleEntryCount,
+    DependencyImageCount,
+    DependencyEdgeCount,
+    DependencyDepth,
+    DependencyInputBytes,
 }
 
 #[non_exhaustive]
@@ -126,6 +131,10 @@ pub enum ErrorContext {
     DynamicTag {
         tag: u64,
         value: u64,
+    },
+    Dependency {
+        requester: usize,
+        needed_index: usize,
     },
     SymbolIndex {
         index: u32,
