@@ -70,6 +70,11 @@ impl<'a, R: ElfReader> SymbolTableReader<'a, R> {
         }
     }
 
+    #[cfg(enable_dynamic_linker)]
+    pub(crate) const fn count(&self) -> u32 {
+        self.count
+    }
+
     pub(crate) fn read(&self, index: u32) -> LoadResult<SymbolRecord> {
         let context = || ErrorContext::SymbolIndex {
             index,

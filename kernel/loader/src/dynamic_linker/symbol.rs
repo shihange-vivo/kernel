@@ -44,12 +44,14 @@ pub(crate) fn lookup_export(
     name: &[u8],
     max_name_len: u32,
 ) -> LoadResult<Option<SymbolRecord>> {
-    table.find_by_name(name, max_name_len, |symbol| {
-        symbol.name_offset() != 0
-            && u32::from(symbol.section_index()) != SHN_UNDEF
-            && matches!(symbol.binding(), STB_GLOBAL | STB_WEAK)
-            && matches!(symbol.visibility(), STV_DEFAULT | STV_PROTECTED)
-    })
+    table.find_by_name(name, max_name_len, is_export)
+}
+
+pub(super) fn is_export(symbol: &SymbolRecord) -> bool {
+    symbol.name_offset() != 0
+        && u32::from(symbol.section_index()) != SHN_UNDEF
+        && matches!(symbol.binding(), STB_GLOBAL | STB_WEAK)
+        && matches!(symbol.visibility(), STV_DEFAULT | STV_PROTECTED)
 }
 
 /// Resolve a record from this image's symbol table. Keep the image alive while

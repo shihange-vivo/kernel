@@ -103,6 +103,8 @@ pub enum LimitKind {
     DependencyInputBytes,
     LinkRelocationCount,
     LinkSymbolLookups,
+    LinkExportReads,
+    LinkExportNameBytes,
 }
 
 #[non_exhaustive]

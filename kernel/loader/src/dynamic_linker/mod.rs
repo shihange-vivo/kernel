@@ -15,6 +15,7 @@
 //! ELF dependency discovery, eager relocation and lifecycle ordering.
 
 mod dependency;
+mod exports;
 mod lifecycle;
 mod link;
 pub(crate) mod symbol;
@@ -29,6 +30,7 @@ use crate::{
 pub use dependency::{
     discover, DependencyEdge, DependencyImage, DependencyPlan, DependencyResolver,
 };
+pub use exports::ExportedSymbols;
 pub use lifecycle::LinkedLifecycle;
 pub use link::{link, LinkedImage, LinkedImages};
 

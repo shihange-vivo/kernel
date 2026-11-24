@@ -46,7 +46,8 @@ use crate::{
     load_and_link,
     memory::{AllocationOffset, ImageLayout, MemoryPermissions, TargetAddress, TargetRange},
     profile::{
-        DependencyLimits, ElfClass, ElfMachine, LinkLimits, LoadLimits, LoadProfile, LoadPurpose,
+        DependencyLimits, ElfClass, ElfMachine, ExportLimits, LinkLimits, LoadLimits, LoadProfile,
+        LoadPurpose,
     },
     CodeCache, ImageAllocator, ImageMapping, LoadAndLinkRequest, LoadError, LoadResult,
 };
@@ -388,6 +389,10 @@ fn load_and_link_finalizes_every_image_and_retains_the_graph() {
         .unwrap();
 
         assert_eq!(loaded.images().len(), 2);
+        assert!(loaded
+            .images()
+            .iter()
+            .all(|object| object.exports().is_none()));
         assert_eq!(loaded.images()[1].key(), &1);
         assert_eq!(loaded.edges().len(), 1);
         assert_eq!(loaded.edges()[0].provider(), 1);
@@ -420,6 +425,114 @@ fn load_and_link_finalizes_every_image_and_retains_the_graph() {
         drop(protection);
         drop(loaded);
         assert_eq!(state.drops.get(), 2);
+    }
+}
+
+#[test]
+fn retained_exports_match_elf_lookup_after_the_reader_closes() {
+    let profile = LoadProfile::riscv64();
+    let mut root = fixture(
+        profile,
+        LoadPurpose::Executable,
+        &[],
+        &[
+            (DATA, STB_GLOBAL, STT_OBJECT, STV_DEFAULT, 1, LIB_DATA),
+            (DATA, STB_WEAK, STT_OBJECT, STV_PROTECTED, 1, LIB_DATA + 8),
+            (FUNC, STB_GLOBAL, STT_FUNC, STV_HIDDEN, 1, BASE),
+            (WEAK, STB_WEAK, STT_OBJECT, STV_DEFAULT, SHN_UNDEF, 0),
+        ],
+        &[],
+        None,
+    );
+    let hash = root.file_offset(HASH);
+    // Search symbol 2 before symbol 1 although both names are the same.
+    root.number(hash + 8, 2, 4);
+    root.number(hash + 16, 3, 4);
+    root.number(hash + 20, 1, 4);
+
+    let fixtures = [root];
+    let mut catalog = Catalog::new(&fixtures, &[]);
+    let state = catalog.state.clone();
+    let config = LoadAndLinkRequest::new(request(
+        profile,
+        LoadPurpose::Executable,
+        LoadLimits::DEFAULT,
+    ))
+    .with_link_limits(LinkLimits::DEFAULT.with_export_limits(ExportLimits::DEFAULT));
+    let loaded = load_and_link(
+        0,
+        config,
+        &mut catalog,
+        DistinctAllocations(state.clone()),
+        &mut GraphCache::default(),
+    )
+    .unwrap();
+
+    assert_eq!(state.reader_drops.get(), 1);
+    assert_eq!(state.live.get(), 1);
+    let object = &loaded.images()[0];
+    let exports = object.exports().unwrap();
+    let address = object
+        .image()
+        .allocation()
+        .base()
+        .checked_add(LIB_DATA + 8 - BASE)
+        .unwrap();
+    assert_eq!(exports.find(b"data"), Some(address));
+    assert_eq!(exports.find(b"func"), None);
+    assert_eq!(exports.find(b"weak"), None);
+    assert_eq!(exports.find(b"missing"), None);
+}
+
+#[test]
+fn retained_exports_check_graph_limits_before_relocation_writes() {
+    let profile = LoadProfile::riscv64();
+    let symbols = [(DATA, STB_GLOBAL, STT_OBJECT, STV_DEFAULT, 1, LIB_DATA)];
+    let fixtures = [
+        fixture(
+            profile,
+            LoadPurpose::Executable,
+            &[A],
+            &symbols,
+            &[(TARGET, 0, R_RISCV_RELATIVE, BASE as i64)],
+            None,
+        ),
+        fixture(profile, LoadPurpose::SharedObject, &[], &symbols, &[], None),
+    ];
+
+    for (limits, name_bytes) in [
+        (ExportLimits::new(0, 256), false),
+        (ExportLimits::new(u64::MAX, 7), true),
+    ] {
+        let mut catalog = Catalog::new(&fixtures, ROUTES);
+        let error = failure(link_fixtures(
+            &mut catalog,
+            profile,
+            LinkLimits::DEFAULT.with_export_limits(limits),
+        ));
+        assert_eq!(error.stage(), Some(LoadStage::Relocate));
+        assert_eq!(error.kind(), LoadErrorKind::ResourceLimit);
+        assert!(matches!(
+            (name_bytes, error.context()),
+            (
+                false,
+                ErrorContext::Limit {
+                    resource: LimitKind::LinkExportReads,
+                    actual: 1,
+                    maximum: 0,
+                },
+            ) | (
+                true,
+                ErrorContext::Limit {
+                    resource: LimitKind::LinkExportNameBytes,
+                    actual: 8,
+                    maximum: 7,
+                },
+            )
+        ));
+        // Only the segment copies reached storage.
+        assert_eq!(catalog.state.writes.get(), 12);
+        assert_eq!(catalog.state.drops.get(), 2);
     }
 }
 
