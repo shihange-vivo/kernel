@@ -193,6 +193,14 @@ impl SymbolRecord {
         self.value
     }
 
+    pub(crate) const fn size(&self) -> u64 {
+        self.size
+    }
+
+    pub(crate) const fn section_index(&self) -> u16 {
+        self.section_index
+    }
+
     fn is_export(&self) -> bool {
         self.name_offset != 0
             && u32::from(self.section_index) != SHN_UNDEF
@@ -200,11 +208,11 @@ impl SymbolRecord {
             && matches!(st_visibility(self.other), STV_DEFAULT | STV_PROTECTED)
     }
 
-    fn binding(&self) -> u8 {
+    pub(crate) fn binding(&self) -> u8 {
         st_bind(self.info)
     }
 
-    fn kind(&self) -> u8 {
+    pub(crate) fn kind(&self) -> u8 {
         st_type(self.info)
     }
 }

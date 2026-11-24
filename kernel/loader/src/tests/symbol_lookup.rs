@@ -14,15 +14,21 @@
 
 //! Symbol name lookup within a file-backed image.
 
-use super::{failure, plan, Fixture, Input, GNU_HASH_VADDR, PROFILES, STRVA, SYSV_HASH_VADDR};
+use super::{
+    failure, plan, Allocator, Fixture, Input, BASE, GNU_HASH_VADDR, PROFILES, STRVA,
+    SYSV_HASH_VADDR, TARGET,
+};
 use crate::{
     error::{ErrorContext, LoadErrorKind},
+    memory::TargetAddress,
     profile::{ElfClass, ElfData, LoadLimits, LoadProfile, LoadPurpose},
 };
 use alloc::{rc::Rc, vec};
 use blueos_test_macro::test;
-use goblin::elf::dynamic::{
-    DT_GNU_HASH, DT_HASH, DT_NULL, DT_STRSZ, DT_STRTAB, DT_SYMENT, DT_SYMTAB,
+use goblin::elf::{
+    dynamic::{DT_GNU_HASH, DT_HASH, DT_NULL, DT_STRSZ, DT_STRTAB, DT_SYMENT, DT_SYMTAB},
+    section_header::SHN_ABS,
+    sym::{STB_WEAK, STT_TLS},
 };
 
 const SYMTAB: u64 = 0x2700;
@@ -250,4 +256,119 @@ fn dual_hash_lookup_uses_gnu_chain_order() {
     );
     // The first hit needs one read each for the bloom word, bucket, chain word, symbol and name.
     assert_eq!(reader.state.dynamic_reads.get() - reads_before_lookup, 5);
+}
+
+#[test]
+fn symbol_addresses_use_the_defining_images_mapping() {
+    let profile = LoadProfile::riscv64();
+    let mut fixture = fixture(profile, true, false);
+    let symbols = fixture.file_offset(SYMTAB);
+    fixture.ph(1, 4, 0xa00); // Extend the RW segment with BSS at 0x2900.
+    fixture.number(symbols + 3 * 24 + 8, 0x2908, 8); // bar in BSS
+    fixture.number(symbols + 4 * 24 + 8, BASE + 0x40, 8); // foo in text
+    fixture.number(symbols + 5 * 24 + 6, u64::from(SHN_ABS), 2); // absolute baz
+
+    let state = Rc::default();
+    let planned = plan(
+        &fixture,
+        LoadPurpose::Executable,
+        LoadLimits::DEFAULT,
+        Rc::clone(&state),
+    )
+    .unwrap();
+    let reader = Input {
+        fixture: &fixture,
+        state: Rc::clone(&state),
+    };
+    let table = planned
+        .dynamic()
+        .unwrap()
+        .symbol_table(
+            &reader,
+            planned.segments(),
+            profile.class(),
+            profile.endian(),
+        )
+        .unwrap()
+        .unwrap();
+    let base = 0x800; // Deliberately below the ELF link address.
+    let image = planned
+        .allocate(Allocator {
+            state: Rc::clone(&state),
+            base,
+        })
+        .unwrap()
+        .map()
+        .unwrap()
+        .decode()
+        .unwrap();
+    for (name, expected) in [(b"foo", base + 0x40), (b"bar", base + 0x1908), (b"baz", 80)] {
+        let symbol = table.lookup_export(name, 16).unwrap().unwrap();
+        assert_eq!(
+            image.symbol_address(&symbol).unwrap(),
+            Some(TargetAddress::new(expected))
+        );
+    }
+    assert_eq!(image.symbol_address(&table.read(1).unwrap()).unwrap(), None);
+    assert_eq!(state.live.get(), 1);
+    drop(image);
+    assert_eq!(state.live.get(), 0);
+}
+
+#[test]
+fn symbol_addresses_check_spans_permissions_and_profile() {
+    let profile = LoadProfile::riscv64();
+    let mut fixture = fixture(profile, false, true);
+    let symbols = fixture.file_offset(SYMTAB);
+    fixture.number(symbols + 2 * 24 + 8, TARGET, 8); // function in RW memory
+    fixture.number(symbols + 3 * 24 + 8, 0x28ff, 8);
+    fixture.number(symbols + 3 * 24 + 16, 2, 8); // object straddles segment end
+    fixture.number(symbols + 4 * 24 + 8, u64::MAX, 8); // symbol range overflows
+    fixture.number(
+        symbols + 5 * 24 + 4,
+        u64::from((STB_WEAK << 4) | STT_TLS),
+        1,
+    );
+
+    let planned = plan(
+        &fixture,
+        LoadPurpose::Executable,
+        LoadLimits::DEFAULT,
+        Rc::default(),
+    )
+    .unwrap();
+    let reader = Input {
+        fixture: &fixture,
+        state: Rc::default(),
+    };
+    let table = planned
+        .dynamic()
+        .unwrap()
+        .symbol_table(
+            &reader,
+            planned.segments(),
+            profile.class(),
+            profile.endian(),
+        )
+        .unwrap()
+        .unwrap();
+    let image = planned
+        .allocate(Allocator {
+            state: Rc::default(),
+            base: 0x8000,
+        })
+        .unwrap()
+        .map()
+        .unwrap()
+        .decode()
+        .unwrap();
+    for (index, kind) in [
+        (2, LoadErrorKind::PermissionConflict),
+        (3, LoadErrorKind::OutOfBounds),
+        (4, LoadErrorKind::IntegerOverflow),
+        (5, LoadErrorKind::UnsupportedByProfile),
+    ] {
+        let error = failure(image.symbol_address(&table.read(index).unwrap()));
+        assert_eq!(error.kind(), kind);
+    }
 }
