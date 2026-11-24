@@ -15,24 +15,15 @@
 //! Bounded access to on-disk ELF symbol records.
 
 use goblin::{
-    elf::{
-        dynamic::DT_HASH,
-        sym::{st_bind, st_type},
-    },
+    elf::sym::{st_bind, st_type},
     elf32, elf64,
 };
 
-use super::{
-    read_array, read_u16, read_u32, read_u64, segment::vaddr_to_file_range, ElfClass, ElfData,
-    FileRange, LoadSegmentInfo,
-};
+use super::{read_array, read_u16, read_u32, read_u64, ElfClass, ElfData, FileRange};
 use crate::{
     error::{ErrorContext, LoadErrorKind},
-    memory::TargetAddress,
     ElfReader, LoadError, LoadResult,
 };
-
-pub(super) const SYSV_HASH_HEADER_SIZE: u64 = 8;
 
 pub(super) const fn symbol_entry_size(class: ElfClass) -> u64 {
     match class {
@@ -85,36 +76,6 @@ impl<'a, R: ElfReader> SymbolTableReader<'a, R> {
         self.reader.read_exact_at(offset, entry)?;
         SymbolRecord::decode(entry, self.class, self.endian)
     }
-}
-
-/// SysV hash has one 32-bit chain entry per dynamic symbol in either ELF class.
-pub(super) fn read_sysv_symbol_count(
-    reader: &impl ElfReader,
-    segments: &[LoadSegmentInfo],
-    address: TargetAddress,
-    endian: ElfData,
-) -> LoadResult<u32> {
-    let bad_hash = || {
-        LoadError::new(
-            LoadErrorKind::BadElf,
-            ErrorContext::DynamicTag {
-                tag: DT_HASH,
-                value: address.get(),
-            },
-        )
-    };
-    let header =
-        vaddr_to_file_range(segments, address, SYSV_HASH_HEADER_SIZE).ok_or_else(bad_hash)?;
-    let mut raw = [0; SYSV_HASH_HEADER_SIZE as usize];
-    reader.read_exact_at(header.offset(), &mut raw)?;
-    let nbucket = read_u32(&raw, 0, endian)?;
-    let nchain = read_u32(&raw, 4, endian)?;
-    if nbucket == 0 || nchain == 0 {
-        return Err(bad_hash());
-    }
-    let len = SYSV_HASH_HEADER_SIZE + 4 * (u64::from(nbucket) + u64::from(nchain));
-    vaddr_to_file_range(segments, address, len).ok_or_else(bad_hash)?;
-    Ok(nchain)
 }
 
 pub(crate) struct SymbolRecord {

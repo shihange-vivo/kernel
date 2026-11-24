@@ -822,7 +822,7 @@ fn sysv_symbol_table_reads_only_counted_records() {
             let table = image
                 .dynamic()
                 .unwrap()
-                .sysv_symbol_table(&reader, image.segments(), profile.class(), endian)
+                .symbol_table(&reader, image.segments(), profile.class(), endian)
                 .unwrap()
                 .unwrap();
             assert_eq!(table.read(0).unwrap().name_offset(), 0);
@@ -864,7 +864,7 @@ fn sysv_symbol_table_checks_both_file_ranges() {
             fixture: &fixture,
             state: state.clone(),
         };
-        let error = failure(image.dynamic().unwrap().sysv_symbol_table(
+        let error = failure(image.dynamic().unwrap().symbol_table(
             &reader,
             image.segments(),
             profile.class(),
@@ -880,6 +880,179 @@ fn sysv_symbol_table_checks_both_file_ranges() {
             matches!(error.context(), ErrorContext::DynamicTag { tag, value } if *tag == expected_tag && *value == address)
         );
         assert_eq!(state.dynamic_reads.get(), 5); // Four tags and the SysV header.
+    }
+}
+
+const GNU_HASH_VADDR: u64 = 0x2650;
+
+fn gnu_symbols(profile: LoadProfile, sysv_count: Option<u64>) -> (Fixture, u64, usize) {
+    let (bloom_word, size) = match profile.class() {
+        ElfClass::Elf32 => (4, 16),
+        ElfClass::Elf64 => (8, 24),
+    };
+    let bucket_start = 16 + bloom_word;
+    let chain_start = bucket_start + 3 * 4;
+    let symbol_address = GNU_HASH_VADDR + chain_start as u64 + 3 * 4;
+    // The file can hold six symbols. The chain should establish a count of five.
+    let string_address = symbol_address + 6 * size;
+    let mut tags = vec![
+        (DT_GNU_HASH, GNU_HASH_VADDR),
+        (DT_SYMTAB, symbol_address),
+        (DT_SYMENT, size),
+        (DT_STRTAB, string_address),
+        (DT_STRSZ, 1),
+    ];
+    if sysv_count.is_some() {
+        tags.push((DT_HASH, SYSV_HASH_VADDR));
+    }
+    tags.push((DT_NULL, 0));
+    let mut fixture = Fixture::new(profile, &tags);
+    if let Some(count) = sysv_count {
+        let file = fixture.file_offset(SYSV_HASH_VADDR);
+        fixture.number(file, 1, 4);
+        fixture.number(file + 4, count, 4);
+    }
+    let hash = fixture.file_offset(GNU_HASH_VADDR);
+    for (index, word) in [3, 2, 1, 5].into_iter().enumerate() {
+        fixture.number(hash + index * 4, word, 4);
+    }
+    fixture.number(hash + 16, 0, bloom_word);
+    for (index, word) in [2, 0, 3, 3, 4, 5].into_iter().enumerate() {
+        fixture.number(hash + bucket_start + index * 4, word, 4);
+    }
+    let symbols = fixture.file_offset(symbol_address);
+    fixture.bytes[symbols..symbols + (6 * size + 1) as usize].fill(0);
+    fixture.number(symbols + (4 * size) as usize, 9, 4);
+    (fixture, symbol_address, hash + chain_start)
+}
+
+#[test]
+fn gnu_symbol_table_counts_through_the_last_bucket_chain() {
+    for base in PROFILES {
+        for endian in [ElfData::Little, ElfData::Big] {
+            let profile = LoadProfile::new(
+                base.class(),
+                endian,
+                base.machine(),
+                base.header_flags(),
+                base.entry_mode(),
+            );
+            let (fixture, _, _) = gnu_symbols(profile, None);
+            let state = Rc::new(State::default());
+            let image = plan(
+                &fixture,
+                LoadPurpose::Executable,
+                LoadLimits::DEFAULT,
+                state.clone(),
+            )
+            .unwrap();
+            let reader = Input {
+                fixture: &fixture,
+                state: state.clone(),
+            };
+            let table = image
+                .dynamic()
+                .unwrap()
+                .symbol_table(&reader, image.segments(), profile.class(), endian)
+                .unwrap()
+                .unwrap();
+            assert_eq!(table.read(4).unwrap().name_offset(), 9);
+            let reads = state.dynamic_reads.get();
+            let error = failure(table.read(5));
+            assert!(matches!(
+                error.context(),
+                ErrorContext::SymbolIndex { index: 5, count: 5 }
+            ));
+            assert_eq!(state.dynamic_reads.get(), reads);
+        }
+    }
+}
+
+#[test]
+fn gnu_symbol_table_rejects_invalid_geometry_and_unterminated_chains() {
+    let profile = LoadProfile::riscv64();
+    let (mut fixture, symbol_address, chain) = gnu_symbols(profile, None);
+    let hash = fixture.file_offset(GNU_HASH_VADDR);
+    let symbols = fixture.file_offset(symbol_address);
+    // An odd word in .dynsym must not terminate a chain that ran out of file bytes.
+    fixture.number(symbols, 1, 4);
+    for (offset, invalid) in [
+        (hash, u64::from(u32::MAX)),
+        (hash + 8, 3),
+        (hash + 12, 32),
+        (chain - 4, 1),
+        (chain - 4, 6),
+        (chain + 8, 4),
+    ] {
+        let saved: [u8; 4] = fixture.bytes[offset..offset + 4].try_into().unwrap();
+        fixture.number(offset, invalid, 4);
+        let image = plan(
+            &fixture,
+            LoadPurpose::Executable,
+            LoadLimits::DEFAULT,
+            Rc::default(),
+        )
+        .unwrap();
+        let reader = Input {
+            fixture: &fixture,
+            state: Rc::default(),
+        };
+        let error = failure(image.dynamic().unwrap().symbol_table(
+            &reader,
+            image.segments(),
+            profile.class(),
+            profile.endian(),
+        ));
+        assert_eq!(error.kind(), LoadErrorKind::BadElf);
+        assert!(matches!(
+            error.context(),
+            ErrorContext::DynamicTag {
+                tag: DT_GNU_HASH,
+                value: GNU_HASH_VADDR
+            }
+        ));
+        drop(reader);
+        drop(image);
+        fixture.bytes[offset..offset + 4].copy_from_slice(&saved);
+    }
+}
+
+#[test]
+fn dual_hash_symbol_tables_agree_and_empty_gnu_requires_another_count() {
+    let profile = LoadProfile::riscv64();
+    for (sysv_count, empty, expected) in [
+        (Some(5), false, Ok(())),
+        (Some(6), false, Err(LoadErrorKind::BadElf)),
+        (Some(5), true, Ok(())),
+        (None, true, Err(LoadErrorKind::UnsupportedByProfile)),
+    ] {
+        let (mut fixture, _, chain) = gnu_symbols(profile, sysv_count);
+        if empty {
+            let hash = fixture.file_offset(GNU_HASH_VADDR);
+            fixture.number(hash + 4, 1, 4); // GNU ld uses a fixed symoffset for an empty table.
+            fixture.bytes[chain - 12..chain].fill(0);
+        }
+        let image = plan(
+            &fixture,
+            LoadPurpose::Executable,
+            LoadLimits::DEFAULT,
+            Rc::default(),
+        )
+        .unwrap();
+        let reader = Input {
+            fixture: &fixture,
+            state: Rc::default(),
+        };
+        let result = image.dynamic().unwrap().symbol_table(
+            &reader,
+            image.segments(),
+            profile.class(),
+            profile.endian(),
+        );
+        match expected {
+            Ok(()) => assert_eq!(result.unwrap().unwrap().read(4).unwrap().name_offset(), 9),
+            Err(kind) => assert_eq!(failure(result).kind(), kind),
+        }
     }
 }
 

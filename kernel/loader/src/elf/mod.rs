@@ -16,6 +16,7 @@
 //! Loading stages and image ownership are implemented in `image`.
 
 mod dynamic;
+mod hash;
 mod header;
 mod program_header;
 mod relocation;
