@@ -15,11 +15,20 @@
 //! Bounded access to on-disk ELF symbol records.
 
 use goblin::{
-    elf::sym::{st_bind, st_type},
+    elf::{
+        dynamic::DT_STRTAB,
+        section_header::SHN_UNDEF,
+        sym::{st_bind, st_type, st_visibility, STB_GLOBAL, STB_WEAK, STV_DEFAULT, STV_PROTECTED},
+    },
     elf32, elf64,
 };
 
-use super::{read_array, read_u16, read_u32, read_u64, ElfClass, ElfData, FileRange};
+use super::{
+    hash::{GnuHash, SysvHash},
+    read_array, read_u16, read_u32, read_u64,
+    strings::read_string,
+    ElfClass, ElfData, FileRange,
+};
 use crate::{
     error::{ErrorContext, LoadErrorKind},
     ElfReader, LoadError, LoadResult,
@@ -39,6 +48,9 @@ pub(crate) struct SymbolTableReader<'a, R: ElfReader> {
     count: u32,
     class: ElfClass,
     endian: ElfData,
+    strings: Option<FileRange>,
+    sysv: Option<SysvHash>,
+    gnu: Option<GnuHash>,
 }
 
 impl<'a, R: ElfReader> SymbolTableReader<'a, R> {
@@ -48,6 +60,9 @@ impl<'a, R: ElfReader> SymbolTableReader<'a, R> {
         count: u32,
         class: ElfClass,
         endian: ElfData,
+        strings: Option<FileRange>,
+        sysv: Option<SysvHash>,
+        gnu: Option<GnuHash>,
     ) -> Self {
         Self {
             reader,
@@ -55,6 +70,9 @@ impl<'a, R: ElfReader> SymbolTableReader<'a, R> {
             count,
             class,
             endian,
+            strings,
+            sysv,
+            gnu,
         }
     }
 
@@ -75,6 +93,56 @@ impl<'a, R: ElfReader> SymbolTableReader<'a, R> {
         let entry = &mut bytes[..size as usize];
         self.reader.read_exact_at(offset, entry)?;
         SymbolRecord::decode(entry, self.class, self.endian)
+    }
+
+    /// Return the first defined, externally visible symbol matching the name.
+    /// Prefer GNU hash when present and use SysV hash for SysV-only images.
+    pub(crate) fn lookup_export(
+        &self,
+        name: &[u8],
+        max_name_len: u32,
+    ) -> LoadResult<Option<SymbolRecord>> {
+        if name.is_empty() {
+            return Ok(None);
+        }
+        let strings = self.strings.ok_or_else(|| {
+            LoadError::new(
+                LoadErrorKind::BadElf,
+                ErrorContext::DynamicTag {
+                    tag: DT_STRTAB,
+                    value: 0,
+                },
+            )
+        })?;
+
+        let match_candidate = |index| {
+            let candidate = self.read(index)?;
+            if candidate.is_export()
+                && read_string(
+                    self.reader,
+                    strings,
+                    u64::from(candidate.name_offset),
+                    max_name_len,
+                )? == name
+            {
+                return Ok(Some(candidate));
+            }
+            Ok(None)
+        };
+        if let Some(hash) = &self.gnu {
+            hash.find_candidate(
+                self.reader,
+                self.class,
+                self.endian,
+                self.count,
+                name,
+                match_candidate,
+            )
+        } else if let Some(hash) = &self.sysv {
+            hash.find_candidate(self.reader, self.endian, name, match_candidate)
+        } else {
+            Ok(None)
+        }
     }
 }
 
@@ -119,6 +187,17 @@ impl SymbolRecord {
 
     pub(crate) const fn name_offset(&self) -> u32 {
         self.name_offset
+    }
+
+    pub(crate) const fn value(&self) -> u64 {
+        self.value
+    }
+
+    fn is_export(&self) -> bool {
+        self.name_offset != 0
+            && u32::from(self.section_index) != SHN_UNDEF
+            && matches!(self.binding(), STB_GLOBAL | STB_WEAK)
+            && matches!(st_visibility(self.other), STV_DEFAULT | STV_PROTECTED)
     }
 
     fn binding(&self) -> u8 {
