@@ -22,8 +22,8 @@
 //!
 //! Call [`load_elf`] with a reader, [`LoadRequest`], allocator and code cache
 //! backend to obtain an owning [`LoadedImage`]. Loading prepares callback plans
-//! without executing the entry or init/fini. Internal `elf` and `image` stages
-//! remain crate-private; the complete dynamic linker will reuse those stages.
+//! without executing the entry or init/fini. Builds with `enable_dynamic_linker`
+//! also provide `dynamic_linker::discover` for read-only dependency planning.
 //! Host backends implement [`ElfReader`], [`ImageAllocator`], [`ImageMapping`] and [`CodeCache`],
 //! available directly from the crate root. Memory support types remain in [`memory`].
 
@@ -38,6 +38,8 @@ pub use memory::{ImageAllocator, ImageMapping, MemoryPermissions};
 pub use reader::ElfReader;
 
 extern crate alloc;
+#[cfg(enable_dynamic_linker)]
+pub mod dynamic_linker;
 mod elf;
 mod image;
 mod lifecycle;

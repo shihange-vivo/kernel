@@ -17,6 +17,15 @@ import("//build/templates/build_template.gni")
 import("//build/toolchain/blueos.gni")
 import("//kernel/scal/features.gni")
 
+declare_args() {
+  # Build the optional dynamic-linker API.
+  enable_dynamic_linker = false
+}
+
+config("dynamic_linker_cfg") {
+  rustflags = [ "--cfg=enable_dynamic_linker" ]
+}
+
 # Keep execution checks within the profiles published by this crate. Both the
 # integration test and the unit test image are booted under the board QEMU.
 _loader_execution_enabled = syscall_mode != "linux_abi" &&
@@ -55,6 +64,9 @@ build_rust("blueos_loader") {
   crate_type = "rlib"
   sources = [ "src/lib.rs" ]
   deps = [ "//external/rust:goblin" ]
+  if (enable_dynamic_linker) {
+    configs += [ ":dynamic_linker_cfg" ]
+  }
 }
 
 run_clippy("blueos_loader_clippy") {
@@ -79,6 +91,9 @@ if (_loader_execution_enabled) {
     deps += filter_include(board_deps,
                            [ "//build/boards/${board}:default_linker_script" ])
     configs += [ "//build/boards/${board}:kernel_config" ]
+    if (enable_dynamic_linker) {
+      configs += [ ":dynamic_linker_cfg" ]
+    }
     rustflags = [ "--test" ]
     linker_script = default_linker_script
     proc_macro_deps = [ "//kernel/test_harness:blueos_test_macro" ]

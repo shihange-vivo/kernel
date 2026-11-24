@@ -14,7 +14,10 @@
 
 //! Dynamic admission, bounded table scanning and relocation wire decoding.
 
-// Relocation tests reuse the same dynamic ELF fixture and observed mapping.
+// These tests share the dynamic ELF fixture and observed backends.
+#[cfg(enable_dynamic_linker)]
+#[path = "dependency.rs"]
+mod dependency;
 #[path = "lifecycle.rs"]
 mod lifecycle;
 #[path = "load.rs"]

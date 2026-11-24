@@ -96,9 +96,7 @@ where
     // Forward Result between stages instead of unwrapping each large stage into
     // an intermediate ControlFlow payload. This keeps the pipeline's stack small.
     ImageLoader::new(reader, request)
-        .admit()
-        .and_then(|image| image.inspect())
-        .and_then(|image| image.plan())
+        .prepare_layout()
         .and_then(|image| {
             if let Some(dynamic) = image.dynamic() {
                 request
