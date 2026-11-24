@@ -23,7 +23,8 @@
 //! Call [`load_elf`] with a reader, [`LoadRequest`], allocator and code cache
 //! backend to obtain an owning [`LoadedImage`]. Loading prepares callback plans
 //! without executing the entry or init/fini. Builds with `enable_dynamic_linker`
-//! also provide `dynamic_linker::discover` for read-only dependency planning.
+//! also provide `dynamic_linker::discover` and `dynamic_linker::link` for
+//! dependency planning and eager relocation of the resulting image graph.
 //! Host backends implement [`ElfReader`], [`ImageAllocator`], [`ImageMapping`] and [`CodeCache`],
 //! available directly from the crate root. Memory support types remain in [`memory`].
 

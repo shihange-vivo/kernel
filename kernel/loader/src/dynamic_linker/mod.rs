@@ -12,10 +12,13 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Dependency discovery for ELF dynamic linking.
+//! ELF dependency discovery and eager relocation.
 
 mod dependency;
+mod link;
+pub(crate) mod symbol;
 
 pub use dependency::{
     discover, DependencyEdge, DependencyImage, DependencyPlan, DependencyResolver,
 };
+pub use link::{link, LinkedImage, LinkedImages};

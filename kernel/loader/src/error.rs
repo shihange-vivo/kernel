@@ -14,7 +14,10 @@
 
 //! Structured errors shared by positional reads and loading stages.
 
-use crate::memory::{ProtectionLevel, TargetAddress};
+use crate::{
+    elf::RelocationRecord,
+    memory::{ProtectionLevel, TargetAddress},
+};
 use core::fmt::Debug;
 
 pub type LoadResult<T> = core::result::Result<T, LoadError>;
@@ -37,6 +40,7 @@ pub enum LoadStage {
 pub enum LoadErrorKind {
     BadElf,
     UnsupportedByProfile,
+    UnresolvedSymbol,
     InvalidAlignment,
     IncorrectLayout,
     PermissionConflict,
@@ -96,6 +100,8 @@ pub enum LimitKind {
     DependencyEdgeCount,
     DependencyDepth,
     DependencyInputBytes,
+    LinkRelocationCount,
+    LinkSymbolLookups,
 }
 
 #[non_exhaustive]
@@ -178,18 +184,13 @@ pub struct LoadError {
 
 impl LoadError {
     /// Identify a relocation record independently of its source table format.
-    pub(crate) fn relocation(
-        target: TargetAddress,
-        raw_type: u32,
-        symbol_index: u32,
-        kind: LoadErrorKind,
-    ) -> Self {
+    pub(crate) fn relocation(record: &RelocationRecord, kind: LoadErrorKind) -> Self {
         Self::new(
             kind,
             ErrorContext::Relocation {
-                target,
-                raw_type,
-                symbol_index,
+                target: record.offset(),
+                raw_type: record.raw_type(),
+                symbol_index: record.symbol_index(),
             },
         )
     }

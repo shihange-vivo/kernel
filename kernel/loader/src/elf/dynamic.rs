@@ -17,26 +17,31 @@
 
 use alloc::vec::Vec;
 use goblin::elf::dynamic::{
-    DF_1_NOW, DF_1_PIE, DF_BIND_NOW, DT_BIND_NOW, DT_FINI, DT_FINI_ARRAY, DT_FINI_ARRAYSZ,
-    DT_FLAGS, DT_FLAGS_1, DT_GNU_HASH, DT_HASH, DT_INIT, DT_INIT_ARRAY, DT_INIT_ARRAYSZ, DT_JMPREL,
-    DT_NEEDED, DT_NULL, DT_PLTREL, DT_PLTRELSZ, DT_PREINIT_ARRAY, DT_PREINIT_ARRAYSZ, DT_REL,
-    DT_RELA, DT_RELAENT, DT_RELASZ, DT_RELENT, DT_RELSZ, DT_SONAME, DT_STRSZ, DT_STRTAB, DT_SYMENT,
+    DF_1_NOW, DF_1_PIE, DF_BIND_NOW, DT_BIND_NOW, DT_FINI_ARRAY, DT_FINI_ARRAYSZ, DT_FLAGS,
+    DT_FLAGS_1, DT_GNU_HASH, DT_HASH, DT_INIT_ARRAY, DT_INIT_ARRAYSZ, DT_JMPREL, DT_NEEDED,
+    DT_NULL, DT_PLTREL, DT_PLTRELSZ, DT_PREINIT_ARRAY, DT_PREINIT_ARRAYSZ, DT_REL, DT_RELA,
+    DT_RELAENT, DT_RELASZ, DT_RELENT, DT_RELSZ, DT_SONAME, DT_STRSZ, DT_STRTAB, DT_SYMENT,
     DT_SYMTAB,
 };
 
+#[cfg(any(test, enable_dynamic_linker))]
 use super::{
-    hash::{GnuHash, SysvHash, GNU_HASH_HEADER_SIZE, SYSV_HASH_HEADER_SIZE},
+    hash::{GnuHash, SysvHash},
+    segment::vaddr_file_extent,
+    symbol::SymbolTableReader,
+    ElfData,
+};
+use super::{
     read_u32, read_u64,
     relocation::{RelocationFormat, RelocationTable},
-    segment::{vaddr_file_extent, vaddr_to_file_range},
+    segment::vaddr_to_file_range,
     strings::string_range,
-    symbol::{symbol_entry_size, SymbolTableReader},
-    ElfClass, ElfData, FileRange, LoadSegmentInfo, ProgramHeaderInfo,
+    symbol_entry_size, ElfClass, ElfHeaderInfo, FileRange, LoadSegmentInfo, ProgramHeaderInfo,
+    GNU_HASH_HEADER_SIZE, SYSV_HASH_HEADER_SIZE,
 };
 use crate::{
     error::{ErrorContext, LoadErrorKind},
-    memory::{MemoryPermissions, TargetAddress, TargetRange},
-    profile::{LoadLimits, LoadProfile},
+    memory::{TargetAddress, TargetRange},
     ElfReader, LoadError, LoadResult,
 };
 
@@ -46,7 +51,7 @@ struct DynamicEntry {
     value: u64,
 }
 
-const LIFECYCLE_ARRAYS: [(u64, u64); 3] = [
+pub(crate) const LIFECYCLE_ARRAYS: [(u64, u64); 3] = [
     (DT_PREINIT_ARRAY, DT_PREINIT_ARRAYSZ),
     (DT_INIT_ARRAY, DT_INIT_ARRAYSZ),
     (DT_FINI_ARRAY, DT_FINI_ARRAYSZ),
@@ -93,6 +98,7 @@ impl DynamicInfo {
     }
 
     /// Open the dynamic symbol table using a count established from its hash metadata.
+    #[cfg(any(test, enable_dynamic_linker))]
     pub(crate) fn symbol_table<'a, R: ElfReader>(
         &self,
         reader: &'a R,
@@ -131,6 +137,7 @@ impl DynamicInfo {
         )))
     }
 
+    #[cfg(any(test, enable_dynamic_linker))]
     fn read_gnu_hash(
         &self,
         reader: &impl ElfReader,
@@ -182,6 +189,7 @@ impl DynamicInfo {
     }
 
     /// Limit an inferred table extent at the next known symbol-related table.
+    #[cfg(any(test, enable_dynamic_linker))]
     fn symbol_metadata_file_extent(
         &self,
         segments: &[LoadSegmentInfo],
@@ -243,6 +251,17 @@ impl DynamicInfo {
         self.tables.iter().flatten()
     }
 
+    /// Count ELF records across the normalized relocation tables for one image.
+    pub(crate) fn relocation_count(&self, class: ElfClass) -> LoadResult<u64> {
+        self.relocation_tables().try_fold(0u64, |total, table| {
+            let range = table.range();
+            let count = range.len() / table.format().entry_size(class);
+            total
+                .checked_add(count)
+                .ok_or_else(|| dynamic_range_error(range.start(), range.len()))
+        })
+    }
+
     /// Array geometry is validated before allocation; pointers are read after relocation.
     pub(crate) fn lifecycle_arrays(&self) -> impl Iterator<Item = (u64, TargetRange)> + '_ {
         LIFECYCLE_ARRAYS.into_iter().filter_map(|(tag, size_tag)| {
@@ -254,14 +273,18 @@ impl DynamicInfo {
     }
 }
 
+/// Read PT_DYNAMIC and check its file-backed tables. The caller supplies entry
+/// budgets and tag admission rules.
 pub(crate) fn read_dynamic(
     reader: &impl ElfReader,
     header: &ProgramHeaderInfo,
     segments: &[LoadSegmentInfo],
-    profile: &LoadProfile,
-    limits: &LoadLimits,
+    elf_header: &ElfHeaderInfo,
+    check_entry_count: impl Fn(u64) -> LoadResult<()>,
+    mut check_tag: impl FnMut(u64, u64) -> LoadResult<()>,
 ) -> LoadResult<DynamicInfo> {
-    let class = profile.class();
+    let class = elf_header.class();
+    let endian = elf_header.endian();
     let entry_size = match class {
         ElfClass::Elf32 => 8,
         ElfClass::Elf64 => 16,
@@ -286,12 +309,11 @@ pub(crate) fn read_dynamic(
         entries: Vec::new(),
         tables: [None; 3],
     };
-    let mut seen = 0u64;
     let mut raw = [0; 16];
     let mut terminated = false;
     for index in 0..bytes / entry_size {
         // Check before reading or reserving: padding must not drive allocation.
-        limits.check_dynamic_entry_count(index + 1)?;
+        check_entry_count(index + 1)?;
         let offset = index
             .checked_mul(entry_size)
             .and_then(|n| file.offset().checked_add(n))
@@ -299,23 +321,16 @@ pub(crate) fn read_dynamic(
         reader.read_exact_at(offset, &mut raw[..entry_size as usize])?;
         let (tag, value) = match class {
             ElfClass::Elf32 => (
-                u64::from(read_u32(&raw, 0, profile.endian())?),
-                u64::from(read_u32(&raw, 4, profile.endian())?),
+                u64::from(read_u32(&raw, 0, endian)?),
+                u64::from(read_u32(&raw, 4, endian)?),
             ),
-            ElfClass::Elf64 => (
-                read_u64(&raw, 0, profile.endian())?,
-                read_u64(&raw, 8, profile.endian())?,
-            ),
+            ElfClass::Elf64 => (read_u64(&raw, 0, endian)?, read_u64(&raw, 8, endian)?),
         };
         if tag == DT_NULL {
             terminated = true;
             break;
         }
-        let bit = profile.check_dynamic_tag(tag, value)?;
-        if tag != DT_NEEDED && seen & bit != 0 {
-            return Err(dynamic_error(tag, value));
-        }
-        seen |= bit;
+        check_tag(tag, value)?;
         info.entries.try_reserve(1).map_err(|_| {
             LoadError::new(
                 LoadErrorKind::OutOfMemory,
@@ -327,25 +342,15 @@ pub(crate) fn read_dynamic(
     if !terminated {
         return Err(dynamic_error(DT_NULL, bytes));
     }
-    validate_metadata(&info, segments, class, limits)?;
+    validate_file_metadata(&info, segments, class)?;
     info.tables = relocation_tables(&info, segments, class)?;
-    let mut total = 0u64;
-    for table in info.relocation_tables() {
-        let range = table.range();
-        let len = range.len();
-        total = total
-            .checked_add(len / table.format().entry_size(class))
-            .ok_or_else(|| dynamic_range_error(range.start(), len))?;
-        limits.check_relocation_count(total)?;
-    }
     Ok(info)
 }
 
-fn validate_metadata(
+fn validate_file_metadata(
     info: &DynamicInfo,
     segments: &[LoadSegmentInfo],
     class: ElfClass,
-    limits: &LoadLimits,
 ) -> LoadResult<()> {
     let strings = info.string_file_range(segments)?;
     for offset in info.needed().chain(info.value(DT_SONAME)) {
@@ -367,44 +372,6 @@ fn validate_metadata(
                 .ok_or_else(|| dynamic_error(tag, address))?;
         }
     }
-    let word_size = match class {
-        ElfClass::Elf32 => 4,
-        ElfClass::Elf64 => 8,
-    };
-    let mut total = [DT_INIT, DT_FINI]
-        .into_iter()
-        .filter(|tag| info.value(*tag).is_some_and(|value| value != 0))
-        .count() as u64;
-    for (tag, size_tag) in LIFECYCLE_ARRAYS {
-        match (info.value(tag), info.value(size_tag)) {
-            (None, None) => continue,
-            (Some(address), Some(len)) => {
-                if !len.is_multiple_of(word_size) {
-                    return Err(dynamic_error(size_tag, len));
-                }
-                if len != 0 {
-                    if !address.is_multiple_of(word_size) {
-                        return Err(dynamic_error(tag, address));
-                    }
-                    // Zero-filled array slots in BSS are valid; file backing is
-                    // unnecessary, but the complete array must remain readable.
-                    if !segments.iter().any(|segment| {
-                        segment.permissions().contains(MemoryPermissions::READ)
-                            && TargetRange::new(segment.vaddr(), segment.memory_size())
-                                .contains_span(TargetAddress::new(address), len)
-                    }) {
-                        return Err(dynamic_error(tag, address));
-                    }
-                }
-                total = total
-                    .checked_add(len / word_size)
-                    .ok_or_else(|| dynamic_error(size_tag, len))?;
-            }
-            (Some(address), None) => return Err(dynamic_error(tag, address)),
-            (None, Some(len)) => return Err(dynamic_error(size_tag, len)),
-        }
-    }
-    limits.check_lifecycle_entry_count(total)?;
     Ok(())
 }
 

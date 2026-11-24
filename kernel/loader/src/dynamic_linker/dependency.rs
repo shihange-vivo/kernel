@@ -49,6 +49,17 @@ pub struct DependencyImage<K, R: ElfReader> {
 }
 
 impl<K, R: ElfReader> DependencyImage<K, R> {
+    pub(super) fn relocation_count(&self) -> LoadResult<u64> {
+        match self.image.dynamic() {
+            Some(dynamic) => dynamic.relocation_count(self.image.profile().class()),
+            None => Ok(0),
+        }
+    }
+
+    pub(super) fn into_parts(self) -> (K, Option<Vec<u8>>, PlannedImage<R>) {
+        (self.key, self.soname, self.image)
+    }
+
     pub const fn key(&self) -> &K {
         &self.key
     }
@@ -95,6 +106,10 @@ pub struct DependencyPlan<K, R: ElfReader> {
 }
 
 impl<K, R: ElfReader> DependencyPlan<K, R> {
+    pub(super) fn into_parts(self) -> (Vec<DependencyImage<K, R>>, Vec<DependencyEdge>) {
+        (self.images, self.edges)
+    }
+
     /// Breadth-first discovery order, starting with the root at index zero.
     pub fn images(&self) -> &[DependencyImage<K, R>] {
         &self.images

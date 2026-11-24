@@ -20,14 +20,61 @@
 //! traversal, execution state and actual callback invocation belong to callers.
 
 use crate::{
-    elf::{read_u32, read_u64, DynamicInfo, LoadSegmentInfo},
+    elf::{read_u32, read_u64, DynamicInfo, LoadSegmentInfo, LIFECYCLE_ARRAYS},
     error::{ErrorContext, LoadErrorKind},
     memory::{AllocationOffset, MemoryPermissions, TargetAddress, TargetRange},
-    profile::{ElfClass, LoadProfile},
+    profile::{ElfClass, LoadLimits, LoadProfile},
     ImageMapping, LoadError, LoadResult,
 };
 use alloc::vec::Vec;
 use goblin::elf::dynamic::{DT_FINI, DT_FINI_ARRAY, DT_INIT, DT_INIT_ARRAY, DT_PREINIT_ARRAY};
+
+/// Check callback metadata against the planned mapping and limit before allocation.
+pub(crate) fn check_table_layout(
+    dynamic: &DynamicInfo,
+    segments: &[LoadSegmentInfo],
+    class: ElfClass,
+    limits: &LoadLimits,
+) -> LoadResult<()> {
+    let word_size = match class {
+        ElfClass::Elf32 => 4,
+        ElfClass::Elf64 => 8,
+    };
+    let mut total = [DT_INIT, DT_FINI]
+        .into_iter()
+        .filter(|tag| dynamic.value(*tag).is_some_and(|value| value != 0))
+        .count() as u64;
+    let bad_entry = |tag, value| lifecycle_error(LoadErrorKind::BadElf, tag, value);
+    for (tag, size_tag) in LIFECYCLE_ARRAYS {
+        match (dynamic.value(tag), dynamic.value(size_tag)) {
+            (None, None) => continue,
+            (Some(address), Some(len)) => {
+                if !len.is_multiple_of(word_size) {
+                    return Err(bad_entry(size_tag, len));
+                }
+                if len != 0 {
+                    if !address.is_multiple_of(word_size) {
+                        return Err(bad_entry(tag, address));
+                    }
+                    // The complete array must be readable. Zero-filled BSS slots are valid.
+                    if !segments.iter().any(|segment| {
+                        segment.permissions().contains(MemoryPermissions::READ)
+                            && TargetRange::new(segment.vaddr(), segment.memory_size())
+                                .contains_span(TargetAddress::new(address), len)
+                    }) {
+                        return Err(bad_entry(tag, address));
+                    }
+                }
+                total = total
+                    .checked_add(len / word_size)
+                    .ok_or_else(|| bad_entry(size_tag, len))?;
+            }
+            (Some(address), None) => return Err(bad_entry(tag, address)),
+            (None, Some(len)) => return Err(bad_entry(size_tag, len)),
+        }
+    }
+    limits.check_lifecycle_entry_count(total)
+}
 
 /// Addresses are valid only while the owning image remains alive.
 /// These are target addresses, not typed host function pointers. The host

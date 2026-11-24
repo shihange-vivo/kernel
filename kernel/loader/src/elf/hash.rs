@@ -17,16 +17,14 @@
 use goblin::elf::dynamic::{DT_GNU_HASH, DT_HASH};
 
 use super::{
-    read_u32, read_u64, segment::vaddr_to_file_range, ElfClass, ElfData, FileRange, LoadSegmentInfo,
+    read_u32, read_u64, segment::vaddr_to_file_range, ElfClass, ElfData, FileRange,
+    LoadSegmentInfo, GNU_HASH_HEADER_SIZE, SYSV_HASH_HEADER_SIZE,
 };
 use crate::{
     error::{ErrorContext, LoadErrorKind},
     memory::TargetAddress,
     ElfReader, LoadError, LoadResult,
 };
-
-pub(super) const SYSV_HASH_HEADER_SIZE: u64 = 8;
-pub(super) const GNU_HASH_HEADER_SIZE: u64 = 16;
 
 pub(super) struct SysvHash {
     address: TargetAddress,

@@ -14,19 +14,26 @@
 
 //! Symbol name lookup within a file-backed image.
 
-use super::{
-    failure, plan, Allocator, Fixture, Input, BASE, GNU_HASH_VADDR, PROFILES, STRVA,
-    SYSV_HASH_VADDR, TARGET,
+use super::{failure, plan, Fixture, Input, GNU_HASH_VADDR, STRVA, SYSV_HASH_VADDR};
+#[cfg(enable_dynamic_linker)]
+use super::{Allocator, BASE, PROFILES, TARGET};
+#[cfg(enable_dynamic_linker)]
+use crate::{
+    dynamic_linker::symbol::{lookup_export, symbol_address},
+    memory::TargetAddress,
+    profile::ElfData,
 };
 use crate::{
     error::{ErrorContext, LoadErrorKind},
-    memory::TargetAddress,
-    profile::{ElfClass, ElfData, LoadLimits, LoadProfile, LoadPurpose},
+    profile::{ElfClass, LoadLimits, LoadProfile, LoadPurpose},
 };
 use alloc::{rc::Rc, vec};
 use blueos_test_macro::test;
+use goblin::elf::dynamic::{
+    DT_GNU_HASH, DT_HASH, DT_NULL, DT_STRSZ, DT_STRTAB, DT_SYMENT, DT_SYMTAB,
+};
+#[cfg(enable_dynamic_linker)]
 use goblin::elf::{
-    dynamic::{DT_GNU_HASH, DT_HASH, DT_NULL, DT_STRSZ, DT_STRTAB, DT_SYMENT, DT_SYMTAB},
     section_header::SHN_ABS,
     sym::{STB_WEAK, STT_TLS},
 };
@@ -107,6 +114,7 @@ fn fixture(profile: LoadProfile, sysv: bool, gnu: bool) -> Fixture {
     fixture
 }
 
+#[cfg(enable_dynamic_linker)]
 #[test]
 fn symbol_lookup_resolves_only_matching_visible_definitions() {
     for base in PROFILES {
@@ -139,12 +147,12 @@ fn symbol_lookup_resolves_only_matching_visible_definitions() {
                     .unwrap();
                 for (name, value) in [(b"bar", 48), (b"foo", 64), (b"baz", 80)] {
                     assert_eq!(
-                        table.lookup_export(name, 16).unwrap().unwrap().value(),
+                        lookup_export(&table, name, 16).unwrap().unwrap().value(),
                         value
                     );
                 }
                 // GNU hashes of bar and bas differ only in the low chain-end bit.
-                assert!(table.lookup_export(b"bas", 16).unwrap().is_none());
+                assert!(lookup_export(&table, b"bas", 16).unwrap().is_none());
             }
         }
     }
@@ -175,11 +183,15 @@ fn sysv_lookup_stops_at_the_match_and_bounds_a_miss() {
             .unwrap()
             .unwrap();
         assert_eq!(
-            table.lookup_export(b"foo", 16).unwrap().unwrap().value(),
+            table
+                .find_by_name(b"foo", 16, |symbol| symbol.value() == 64)
+                .unwrap()
+                .unwrap()
+                .value(),
             64
         );
         // A miss in the same bucket reaches the cycle or out-of-range index.
-        let error = failure(table.lookup_export(b"foq", 16));
+        let error = failure(table.find_by_name(b"foq", 16, |_| true));
         assert_eq!(error.kind(), LoadErrorKind::BadElf);
         assert!(matches!(
             error.context(),
@@ -214,7 +226,7 @@ fn dual_hash_lookup_does_not_fall_back_on_gnu_miss() {
         .symbol_table(&reader, image.segments(), profile.class(), profile.endian())
         .unwrap()
         .unwrap();
-    assert!(table.lookup_export(b"foo", 16).unwrap().is_none());
+    assert!(table.find_by_name(b"foo", 16, |_| true).unwrap().is_none());
 }
 
 #[test]
@@ -251,13 +263,18 @@ fn dual_hash_lookup_uses_gnu_chain_order() {
         .unwrap();
     let reads_before_lookup = reader.state.dynamic_reads.get();
     assert_eq!(
-        table.lookup_export(b"foo", 16).unwrap().unwrap().value(),
+        table
+            .find_by_name(b"foo", 16, |_| true)
+            .unwrap()
+            .unwrap()
+            .value(),
         48
     );
     // The first hit needs one read each for the bloom word, bucket, chain word, symbol and name.
     assert_eq!(reader.state.dynamic_reads.get() - reads_before_lookup, 5);
 }
 
+#[cfg(enable_dynamic_linker)]
 #[test]
 fn symbol_addresses_use_the_defining_images_mapping() {
     let profile = LoadProfile::riscv64();
@@ -303,18 +320,22 @@ fn symbol_addresses_use_the_defining_images_mapping() {
         .decode()
         .unwrap();
     for (name, expected) in [(b"foo", base + 0x40), (b"bar", base + 0x1908), (b"baz", 80)] {
-        let symbol = table.lookup_export(name, 16).unwrap().unwrap();
+        let symbol = lookup_export(&table, name, 16).unwrap().unwrap();
         assert_eq!(
-            image.symbol_address(&symbol).unwrap(),
+            symbol_address(&image, &symbol).unwrap(),
             Some(TargetAddress::new(expected))
         );
     }
-    assert_eq!(image.symbol_address(&table.read(1).unwrap()).unwrap(), None);
+    assert_eq!(
+        symbol_address(&image, &table.read(1).unwrap()).unwrap(),
+        None
+    );
     assert_eq!(state.live.get(), 1);
     drop(image);
     assert_eq!(state.live.get(), 0);
 }
 
+#[cfg(enable_dynamic_linker)]
 #[test]
 fn symbol_addresses_check_spans_permissions_and_profile() {
     let profile = LoadProfile::riscv64();
@@ -368,7 +389,7 @@ fn symbol_addresses_check_spans_permissions_and_profile() {
         (4, LoadErrorKind::IntegerOverflow),
         (5, LoadErrorKind::UnsupportedByProfile),
     ] {
-        let error = failure(image.symbol_address(&table.read(index).unwrap()));
+        let error = failure(symbol_address(&image, &table.read(index).unwrap()));
         assert_eq!(error.kind(), kind);
     }
 }

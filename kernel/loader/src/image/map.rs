@@ -61,14 +61,7 @@ impl<A: ImageMapping> MappedImage<A> {
         let mut relocations = Vec::new();
         if let Some(dynamic) = &self.dynamic {
             let class = self.profile.class();
-            let mut total = 0u64;
-            for table in dynamic.relocation_tables() {
-                total = total
-                    .checked_add(table.range().len() / table.format().entry_size(class))
-                    .ok_or_else(|| {
-                        LoadError::new(LoadErrorKind::IntegerOverflow, ErrorContext::None)
-                    })?;
-            }
+            let total = dynamic.relocation_count(class)?;
             let capacity = usize::try_from(total).map_err(|_| {
                 LoadError::new(
                     LoadErrorKind::ResourceLimit,
