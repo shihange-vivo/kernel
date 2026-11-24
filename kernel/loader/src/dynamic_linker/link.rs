@@ -20,7 +20,10 @@ use goblin::elf::{
     sym::{STB_LOCAL, STB_WEAK, STV_DEFAULT},
 };
 
-use super::{reserve, symbol, DependencyEdge, DependencyPlan, LinkedLifecycle};
+use super::{
+    exports::ExportBudget, reserve, symbol, DependencyEdge, DependencyPlan, ExportedSymbols,
+    LinkedLifecycle,
+};
 use crate::{
     elf::{RelocationRecord, SymbolTableReader},
     error::{ErrorContext, LoadErrorKind, LoadStage},
@@ -37,6 +40,7 @@ pub struct LinkedImage<K, A: ImageMapping> {
     key: K,
     soname: Option<Vec<u8>>,
     image: RelocatedImage<A>,
+    exports: Option<ExportedSymbols>,
 }
 
 impl<K, A: ImageMapping> LinkedImage<K, A> {
@@ -100,7 +104,12 @@ impl<K, A: ImageMapping> LinkedImages<K, A> {
             reserve(self.images.len()).map_err(|error| error.at_stage(LoadStage::Seal))?;
         for (linked, lifecycle) in self.images.into_iter().zip(plans) {
             let image = linked.image.seal_with_lifecycle(cache, lifecycle)?;
-            images.push(LoadedObject::new(linked.key, linked.soname, image));
+            images.push(LoadedObject::new(
+                linked.key,
+                linked.soname,
+                image,
+                linked.exports,
+            ));
         }
         Ok(LoadedImages::new(images, self.edges, init_order))
     }
@@ -175,12 +184,27 @@ fn link_inner<K, R: ElfReader, M: ImageAllocator>(
     }
 
     let writes = plan_writes(&mapped, &limits)?;
+    let mut exports = Vec::new();
+    if let Some(export_limits) = limits.export_limits() {
+        let budget = ExportBudget::new(export_limits);
+        exports = reserve(mapped.len())?;
+        for input in &mapped {
+            exports.push(ExportedSymbols::build(
+                &input.image,
+                &input.reader,
+                &budget,
+                limits.max_symbol_name_len(),
+            )?);
+        }
+    }
+    let mut exports = exports.into_iter();
     let mut images = reserve(mapped.len())?;
     for (input, writes) in mapped.into_iter().zip(writes) {
         images.push(LinkedImage {
             key: input.key,
             soname: input.soname,
             image: input.image.apply_relocation_writes(writes)?,
+            exports: exports.next(),
         });
     }
     Ok(LinkedImages { images, edges })

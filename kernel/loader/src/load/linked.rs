@@ -18,7 +18,7 @@ use alloc::vec::Vec;
 
 use super::{LoadAndLinkRequest, LoadedImage};
 use crate::{
-    dynamic_linker::{discover, link, DependencyEdge, DependencyResolver},
+    dynamic_linker::{discover, link, DependencyEdge, DependencyResolver, ExportedSymbols},
     memory::{ImageMapping, TargetAddress},
     CodeCache, ImageAllocator, LoadResult,
 };
@@ -29,11 +29,22 @@ pub struct LoadedObject<K, A: ImageMapping> {
     key: K,
     soname: Option<Vec<u8>>,
     image: LoadedImage<A>,
+    exports: Option<ExportedSymbols>,
 }
 
 impl<K, A: ImageMapping> LoadedObject<K, A> {
-    pub(crate) fn new(key: K, soname: Option<Vec<u8>>, image: LoadedImage<A>) -> Self {
-        Self { key, soname, image }
+    pub(crate) fn new(
+        key: K,
+        soname: Option<Vec<u8>>,
+        image: LoadedImage<A>,
+        exports: Option<ExportedSymbols>,
+    ) -> Self {
+        Self {
+            key,
+            soname,
+            image,
+            exports,
+        }
     }
 
     pub const fn key(&self) -> &K {
@@ -47,6 +58,11 @@ impl<K, A: ImageMapping> LoadedObject<K, A> {
     /// The finalized image. Its symbols can refer to other images in the graph.
     pub const fn image(&self) -> &LoadedImage<A> {
         &self.image
+    }
+
+    /// Export index captured when the request set an export budget.
+    pub fn exports(&self) -> Option<&ExportedSymbols> {
+        self.exports.as_ref()
     }
 }
 

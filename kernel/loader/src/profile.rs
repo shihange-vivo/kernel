@@ -1017,13 +1017,14 @@ impl Default for DependencyLimits {
     }
 }
 
-/// Bounds on relocation records, export-table probes and symbol names for one link.
+/// Resource bounds for one link, including optional export index construction.
 #[cfg(enable_dynamic_linker)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct LinkLimits {
     max_relocations: u64,
     max_symbol_lookups: u64,
     max_symbol_name_len: u32,
+    export_limits: Option<ExportLimits>,
 }
 
 #[cfg(enable_dynamic_linker)]
@@ -1039,7 +1040,18 @@ impl LinkLimits {
             max_relocations,
             max_symbol_lookups,
             max_symbol_name_len,
+            export_limits: None,
         }
+    }
+
+    /// Build a bounded export index for each image before releasing its reader.
+    pub const fn with_export_limits(mut self, limits: ExportLimits) -> Self {
+        self.export_limits = Some(limits);
+        self
+    }
+
+    pub(crate) const fn export_limits(&self) -> Option<ExportLimits> {
+        self.export_limits
     }
 
     pub(crate) fn check_relocations(&self, actual: u64) -> LoadResult<()> {
@@ -1063,6 +1075,35 @@ impl LinkLimits {
 impl Default for LinkLimits {
     fn default() -> Self {
         Self::DEFAULT
+    }
+}
+
+/// Whole-graph bounds for retaining a name index from the input symbol tables.
+#[cfg(enable_dynamic_linker)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ExportLimits {
+    max_reads: u64,
+    max_name_bytes: u64,
+}
+
+#[cfg(enable_dynamic_linker)]
+impl ExportLimits {
+    pub const DEFAULT: Self = Self::new(64 * 1024, 256 * 1024);
+
+    /// Count positional reads and candidate name bytes, including duplicates.
+    pub const fn new(max_reads: u64, max_name_bytes: u64) -> Self {
+        Self {
+            max_reads,
+            max_name_bytes,
+        }
+    }
+
+    pub(crate) fn check_reads(&self, actual: u64) -> LoadResult<()> {
+        check_limit(LimitKind::LinkExportReads, actual, self.max_reads)
+    }
+
+    pub(crate) fn check_name_bytes(&self, actual: u64) -> LoadResult<()> {
+        check_limit(LimitKind::LinkExportNameBytes, actual, self.max_name_bytes)
     }
 }
 
