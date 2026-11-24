@@ -12,13 +12,30 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! ELF dependency discovery and eager relocation.
+//! ELF dependency discovery, eager relocation and lifecycle ordering.
 
 mod dependency;
+mod lifecycle;
 mod link;
 pub(crate) mod symbol;
+
+use alloc::vec::Vec;
+
+use crate::{
+    error::{ErrorContext, LoadErrorKind},
+    LoadError, LoadResult,
+};
 
 pub use dependency::{
     discover, DependencyEdge, DependencyImage, DependencyPlan, DependencyResolver,
 };
+pub use lifecycle::LinkedLifecycle;
 pub use link::{link, LinkedImage, LinkedImages};
+
+fn reserve<T>(capacity: usize) -> LoadResult<Vec<T>> {
+    let mut values = Vec::new();
+    values
+        .try_reserve_exact(capacity)
+        .map_err(|_| LoadError::new(LoadErrorKind::OutOfMemory, ErrorContext::None))?;
+    Ok(values)
+}

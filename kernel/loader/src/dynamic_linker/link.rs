@@ -20,7 +20,7 @@ use goblin::elf::{
     sym::{STB_LOCAL, STB_WEAK, STV_DEFAULT},
 };
 
-use super::{symbol, DependencyEdge, DependencyPlan};
+use super::{reserve, symbol, DependencyEdge, DependencyPlan, LinkedLifecycle};
 use crate::{
     elf::{RelocationRecord, SymbolTableReader},
     error::{ErrorContext, LoadErrorKind, LoadStage},
@@ -74,6 +74,21 @@ impl<K, A: ImageMapping> LinkedImages<K, A> {
 
     pub fn edges(&self) -> &[DependencyEdge] {
         &self.edges
+    }
+
+    /// Read the relocated callbacks and order them by dependency. Keep this
+    /// group alive for as long as the returned target addresses are in use.
+    pub fn plan_lifecycle(&self) -> LoadResult<LinkedLifecycle> {
+        self.plan_lifecycle_inner()
+            .map_err(|error| error.at_stage(LoadStage::Lifecycle))
+    }
+
+    fn plan_lifecycle_inner(&self) -> LoadResult<LinkedLifecycle> {
+        let mut plans = reserve(self.images.len())?;
+        for linked in &self.images {
+            plans.push(linked.image.lifecycle()?);
+        }
+        LinkedLifecycle::build(&self.edges, plans)
     }
 }
 
@@ -266,12 +281,4 @@ fn lookup<'a, K, R: ElfReader, A: ImageMapping>(
         }
     }
     Ok(None)
-}
-
-fn reserve<T>(capacity: usize) -> LoadResult<Vec<T>> {
-    let mut values = Vec::new();
-    values
-        .try_reserve_exact(capacity)
-        .map_err(|_| LoadError::new(LoadErrorKind::OutOfMemory, ErrorContext::None))?;
-    Ok(values)
 }
