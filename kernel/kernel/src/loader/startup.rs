@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Standard ELF initial-stack construction for standalone native images.
+//! Native ELF initial-stack construction and thread-group handoff.
 
 use crate::thread::Stack;
 #[cfg(thread_group)]
@@ -43,6 +43,8 @@ pub enum StartupError {
     InvalidPageSize,
     TooManyArguments,
     StackTooSmall,
+    #[cfg(all(enable_dynamic_linker, thread_group))]
+    LifecycleUnavailable,
     #[cfg(thread_group)]
     CleanupUnavailable(CleanupError),
     #[cfg(all(enable_vfs, thread_group))]
@@ -68,7 +70,14 @@ pub struct StartupArguments<'a> {
 #[must_use = "retain the image and stack until application execution finishes"]
 pub struct StartupStorage<A: ImageMapping> {
     image: LoadedImage<A>,
+    frame: StartupFrame,
+}
+
+#[must_use = "retain the startup stack through application execution"]
+pub(super) struct StartupFrame {
     stack: Stack,
+    #[cfg(thread_group)]
+    entry: usize,
     initial_sp: usize,
     words: usize,
 }
@@ -78,6 +87,64 @@ impl<A: ImageMapping> StartupStorage<A> {
         image: LoadedImage<A>,
         stack: Stack,
         args: StartupArguments<'_>,
+    ) -> Result<Self, StartupError> {
+        let frame = StartupFrame::new(&image, stack, args, None)?;
+        Ok(Self { image, frame })
+    }
+
+    pub fn image(&self) -> &LoadedImage<A> {
+        &self.image
+    }
+
+    pub fn initial_sp(&self) -> *const usize {
+        self.frame.initial_sp as *const usize
+    }
+
+    pub fn initial_words(&self) -> &[usize] {
+        // SAFETY: construction initialized this exact frame, retained by self.
+        unsafe { slice::from_raw_parts(self.initial_sp(), self.frame.words) }
+    }
+
+    /// Prepare an unscheduled thread group. The group retains the image and
+    /// the stack through cleanup of every member. Dropping it before start
+    /// releases the prepared resources.
+    /// With VFS enabled, `stdio` selects the standard streams. None opens
+    /// the system console. Applications release their own malloc-family blocks.
+    ///
+    /// # Safety
+    /// The image must be trusted native code in the kernel's address space,
+    /// using the ELF initial-stack convention with a non-returning entry.
+    /// The cache backend must publish code for all CPUs that can execute it.
+    /// Additional threads must join the group through CreateThread, and
+    /// pointers into the image or stack must stay within the group's lifetime.
+    /// Main coordinates normal exit once children can finish cooperatively.
+    #[cfg(thread_group)]
+    pub unsafe fn into_thread_group(
+        self,
+        #[cfg(enable_vfs)] stdio: Option<&StandardIo>,
+    ) -> Result<ThreadGroup, StartupError>
+    where
+        A: Send + 'static,
+    {
+        // SAFETY: the caller authorizes execution; the group retains self.image.
+        unsafe {
+            self.frame.into_thread_group(
+                self.image,
+                #[cfg(enable_vfs)]
+                stdio,
+            )
+        }
+    }
+}
+
+impl StartupFrame {
+    /// A lifecycle payload, when present, must be retained by the owner passed
+    /// to `into_thread_group` along with the root and all its dependencies.
+    pub(super) fn new(
+        image: &LoadedImage<impl ImageMapping>,
+        stack: Stack,
+        args: StartupArguments<'_>,
+        lifecycle: Option<&[usize]>,
     ) -> Result<Self, StartupError> {
         let entry = image.entry().ok_or(StartupError::MissingEntry)?;
         let entry = usize::try_from(entry.get()).map_err(|_| StartupError::InvalidAddress)?;
@@ -101,7 +168,10 @@ impl<A: ImageMapping> StartupStorage<A> {
             return Err(StartupError::InvalidPageSize);
         }
         let overflow = || StartupError::StackTooSmall;
-        let pairs = 7 + usize::from(args.execfn.is_some()) + usize::from(args.random.is_some());
+        let pairs = 7
+            + usize::from(args.execfn.is_some())
+            + usize::from(args.random.is_some())
+            + usize::from(lifecycle.is_some());
         let words = args
             .argv
             .len()
@@ -162,7 +232,7 @@ impl<A: ImageMapping> StartupStorage<A> {
         push(auxv::AT_PHENT, usize::from(phdr.entry_size()));
         push(auxv::AT_PHNUM, usize::from(phdr.count()));
         push(auxv::AT_ENTRY, entry);
-        // This adapter starts a standalone image, without an ELF interpreter.
+        // The kernel enters the root image directly.
         push(auxv::AT_BASE, 0);
         push(auxv::AT_PAGESZ, args.page_size);
         if let Some(name) = args.execfn {
@@ -176,55 +246,27 @@ impl<A: ImageMapping> StartupStorage<A> {
             }
             push(auxv::AT_RANDOM, payload as usize);
         }
+        if let Some(lifecycle) = lifecycle {
+            push(auxv::AT_BLUEKERNEL_LIFECYCLE, lifecycle.as_ptr() as usize);
+        }
         push(auxv::AT_NULL, 0);
         debug_assert_eq!(index, words);
         debug_assert!(payload.addr() >= sp + words * size_of::<usize>());
         Ok(Self {
-            image,
             stack,
+            #[cfg(thread_group)]
+            entry,
             initial_sp,
             words,
         })
     }
 
-    pub fn image(&self) -> &LoadedImage<A> {
-        &self.image
-    }
-    pub fn initial_sp(&self) -> *const usize {
-        self.initial_sp as *const usize
-    }
-    pub fn initial_words(&self) -> &[usize] {
-        // SAFETY: construction initialized this exact frame, retained by self.
-        unsafe { slice::from_raw_parts(self.initial_sp(), self.words) }
-    }
-
-    /// Prepare a thread group without scheduling it. Configure the main thread
-    /// through ThreadGroup::thread(), then call ThreadGroup::start(). The image
-    /// and initial stack survive all member threads and their deferred cleanup.
-    /// Dropping a prepared group cancels startup and releases its resources.
-    /// With VFS enabled, `stdio` selects the standard streams at creation;
-    /// `None` opens the system console. File I/O completes before the table is
-    /// placed behind its lock or the main thread is registered.
-    /// Applications and libraries must explicitly release their malloc-family
-    /// allocations; the group does not reclaim them on exit.
-    ///
-    /// # Safety
-    /// The image must be trusted native code using the ELF initial-stack entry
-    /// convention, reside in the kernel's address space and never return from
-    /// its entry. The cache backend used to load the image must publish its
-    /// code for all CPUs that can run its threads or cleanup callbacks.
-    /// Additional threads must join the group through CreateThread. Pointers
-    /// into the image or startup storage must stay within this lifetime.
-    /// Normal exit is coordinated by main after children have joined or
-    /// detached and can finish cooperatively.
     #[cfg(thread_group)]
-    pub unsafe fn into_thread_group(
+    pub(super) unsafe fn into_thread_group<T: Send + 'static>(
         self,
+        owner: T,
         #[cfg(enable_vfs)] stdio: Option<&StandardIo>,
-    ) -> Result<ThreadGroup, StartupError>
-    where
-        A: Send + 'static,
-    {
+    ) -> Result<ThreadGroup, StartupError> {
         #[cfg(enable_vfs)]
         let table = match stdio {
             Some(stdio) => FdManager::from_stdio(
@@ -238,11 +280,12 @@ impl<A: ImageMapping> StartupStorage<A> {
             None => FdManager::with_console().map_err(StartupError::FileTable)?,
         };
         let data = Box::new(EntryData {
+            entry: self.entry,
             sp: self.initial_sp,
-            image: self.image,
+            _owner: owner,
         });
         let pointer = ptr::from_ref(data.as_ref()).cast_mut().cast::<c_void>();
-        let thread = Builder::new(Entry::Posix(bootstrap::<A>, pointer))
+        let thread = Builder::new(Entry::Posix(bootstrap::<T>, pointer))
             .set_stack(self.stack)
             .set_initial_sp(self.initial_sp)
             .build();
@@ -259,19 +302,19 @@ impl<A: ImageMapping> StartupStorage<A> {
 // Held by the thread group, not by an abandoned bootstrap stack frame.
 #[must_use = "the thread group retains this image through all member cleanups"]
 #[cfg(thread_group)]
-struct EntryData<A: ImageMapping> {
-    image: LoadedImage<A>,
+struct EntryData<T> {
+    _owner: T,
+    entry: usize,
     sp: usize,
 }
 
 #[cfg(thread_group)]
-extern "C" fn bootstrap<A: ImageMapping>(pointer: *mut c_void) {
+extern "C" fn bootstrap<T>(pointer: *mut c_void) {
     // SAFETY: into_thread_group retains this immutable owner through member cleanup.
-    let data = unsafe { &*pointer.cast::<EntryData<A>>() };
-    let entry = data.image.entry().unwrap().get() as usize;
+    let data = unsafe { &*pointer.cast::<EntryData<T>>() };
     // SAFETY: the caller authorizes native execution; the image and the
     // original stack allocation are retained through thread retirement.
-    unsafe { enter_elf(entry, data.sp) }
+    unsafe { enter_elf(data.entry, data.sp) }
 }
 
 unsafe fn copy_string(cursor: &mut *mut u8, string: &CStr) -> usize {

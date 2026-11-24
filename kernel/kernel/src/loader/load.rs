@@ -15,6 +15,10 @@
 //! Loader entry points backed by the kernel's flat execution domain.
 
 use super::adapters::{FlatImageAllocation, KernelCodeCache, MemoryMapper};
+#[cfg(enable_dynamic_linker)]
+use blueos_loader::{
+    dynamic_linker::DependencyResolver, load_and_link, LoadAndLinkRequest, LoadedImages,
+};
 use blueos_loader::{
     load_elf, profile::LoadLimits, ElfReader, LoadRequest, LoadResult, LoadedImage,
 };
@@ -60,4 +64,20 @@ pub fn load_image<R: ElfReader>(reader: R) -> LoadResult<LoadedImage<FlatImageAl
     let mut allocator = MemoryMapper::new();
     let mut cache = KernelCodeCache::new();
     load_elf(reader, load_request(), &mut allocator, &mut cache)
+}
+
+/// Load and finalize a root ELF and its dependency graph in the flat execution domain.
+/// The caller supplies a resolver and retains the returned group during execution.
+#[cfg(enable_dynamic_linker)]
+pub fn load_linked<D: DependencyResolver>(
+    root: D::Key,
+    resolver: &mut D,
+) -> LoadResult<LoadedImages<D::Key, FlatImageAllocation>> {
+    load_and_link(
+        root,
+        LoadAndLinkRequest::new(load_request()),
+        resolver,
+        &mut MemoryMapper::new(),
+        &mut KernelCodeCache::new(),
+    )
 }

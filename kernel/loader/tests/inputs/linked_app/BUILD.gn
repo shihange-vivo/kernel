@@ -1,0 +1,103 @@
+# Copyright (c) 2025 vivo Mobile Communication Co., Ltd.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#       http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+import("//build/templates/build_template.gni")
+import("//build/toolchain/blueos.gni")
+
+shared_library("linked_test_dso") {
+  testonly = true
+  sources = [ "provider.c" ]
+  cflags = [
+    "-fPIC",
+    "-ffreestanding",
+    "-fno-stack-protector",
+  ]
+  ldflags = [
+    "-nostdlib",
+    "-Wl,-z,now",
+  ]
+  if (current_cpu == "riscv32" || current_cpu == "riscv64") {
+    # The bare-metal Clang driver needs a linker-specific -shared.
+    ldflags += [
+      "-fuse-ld=lld",
+      "-Wl,-shared",
+    ]
+  }
+}
+
+_dso_path = "$root_out_dir/lib/liblinked_test_dso.so"
+build_rust("linked_test_app") {
+  testonly = true
+  crate_type = "bin"
+  sources = [ "main.rs" ]
+  configs += [ "//build/boards/${board}:app_config" ]
+  deps = [
+    ":linked_test_dso",
+    "//libs/librs:crt1",
+    "//libs/librs:librs_swi",
+  ]
+  rustflags = [
+    "-Cpanic=abort",
+    "-Crelocation-model=pic",
+    "-Clink-arg=-nostartfiles",
+    "-Clink-arg=-Wl,-pie",
+    "-Clink-arg=-Wl,--no-dynamic-linker",
+    "-Clink-arg=-Wl,-u,_start",
+    "-Clink-arg=-Wl,-e,_start",
+    "-Clink-arg=-Wl,-z,now",
+    "-Clink-arg=-Wl,-z,noexecstack",
+    "-Clink-arg=-Wl,--export-dynamic-symbol=record_event",
+    "-Clink-arg=" + rebase_path(_dso_path, root_build_dir),
+  ]
+}
+
+run_clippy("linked_test_app_clippy") {
+  testonly = true
+  deps = [ ":linked_test_app" ]
+}
+
+postlink_action("app_path") {
+  testonly = true
+  exe = ":linked_test_app"
+  script = "//kernel/loader/tests/scripts/gen_path_symbol.py"
+  outfile = "${target_gen_dir}/${target_name}.c"
+  args = [
+    "LINKED_TEST_APP_PATH",
+    rebase_path(outfile),
+  ]
+  outputs = [ outfile ]
+}
+
+action("dso_path") {
+  testonly = true
+  script = "//kernel/loader/tests/scripts/gen_path_symbol.py"
+  deps = [ ":linked_test_dso" ]
+  inputs = [ _dso_path ]
+  outfile = "${target_gen_dir}/${target_name}.c"
+  args = [
+    rebase_path(_dso_path),
+    "LINKED_TEST_DSO_PATH",
+    rebase_path(outfile),
+  ]
+  outputs = [ outfile ]
+}
+
+static_library("paths") {
+  testonly = true
+  deps = [
+    ":app_path",
+    ":dso_path",
+  ]
+  sources = get_target_outputs(":app_path") + get_target_outputs(":dso_path")
+}
