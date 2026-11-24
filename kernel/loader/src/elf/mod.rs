@@ -13,15 +13,17 @@
 // limitations under the License.
 
 //! ELF structures, dynamic tables and bounds-checked record decoding.
-//! Loading stages and image ownership are implemented in `image`.
+//! Image loading and symbol resolution use these records through separate paths.
 
 mod dynamic;
+#[cfg(any(test, enable_dynamic_linker))]
 mod hash;
 mod header;
 mod program_header;
 mod relocation;
 mod segment;
 pub(crate) mod strings;
+#[cfg(any(test, enable_dynamic_linker))]
 mod symbol;
 
 use crate::{
@@ -30,13 +32,14 @@ use crate::{
 };
 use goblin::{elf32, elf64};
 
-pub(crate) use dynamic::{read_dynamic, DynamicInfo};
+pub(crate) use dynamic::{read_dynamic, DynamicInfo, LIFECYCLE_ARRAYS};
 pub use header::{ElfClass, ElfData, ElfMachine, ProgramHeaderTable};
 pub(crate) use header::{ElfHeaderInfo, ElfType};
 pub(crate) use program_header::ProgramHeaderInfo;
 pub(crate) use relocation::{RelocationAddend, RelocationRecord};
 pub(crate) use segment::LoadSegmentInfo;
-pub(crate) use symbol::SymbolRecord;
+#[cfg(enable_dynamic_linker)]
+pub(crate) use symbol::{SymbolRecord, SymbolTableReader};
 
 /// A byte range in the ELF input file, independent of target addresses.
 #[derive(Clone, Copy, Debug)]
@@ -64,6 +67,15 @@ pub(crate) const ELF32_HEADER_SIZE: usize = elf32::header::SIZEOF_EHDR;
 pub(crate) const ELF64_HEADER_SIZE: usize = elf64::header::SIZEOF_EHDR;
 const ELF32_PROGRAM_HEADER_SIZE: usize = elf32::program_header::SIZEOF_PHDR;
 pub(crate) const ELF64_PROGRAM_HEADER_SIZE: usize = elf64::program_header::SIZEOF_PHDR;
+const SYSV_HASH_HEADER_SIZE: u64 = 8;
+const GNU_HASH_HEADER_SIZE: u64 = 16;
+
+const fn symbol_entry_size(class: ElfClass) -> u64 {
+    match class {
+        ElfClass::Elf32 => elf32::sym::SIZEOF_SYM as u64,
+        ElfClass::Elf64 => elf64::sym::SIZEOF_SYM as u64,
+    }
+}
 
 fn read_u16(bytes: &[u8], offset: usize, endian: ElfData) -> LoadResult<u16> {
     let raw = read_array::<2>(bytes, offset)?;

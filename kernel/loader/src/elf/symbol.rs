@@ -14,32 +14,26 @@
 
 //! Bounded access to on-disk ELF symbol records.
 
+#[cfg(enable_dynamic_linker)]
+use alloc::vec::Vec;
 use goblin::{
     elf::{
         dynamic::DT_STRTAB,
-        section_header::SHN_UNDEF,
-        sym::{st_bind, st_type, st_visibility, STB_GLOBAL, STB_WEAK, STV_DEFAULT, STV_PROTECTED},
+        sym::{st_bind, st_type, st_visibility},
     },
-    elf32, elf64,
+    elf64,
 };
 
 use super::{
     hash::{GnuHash, SysvHash},
     read_array, read_u16, read_u32, read_u64,
     strings::read_string,
-    ElfClass, ElfData, FileRange,
+    symbol_entry_size, ElfClass, ElfData, FileRange,
 };
 use crate::{
     error::{ErrorContext, LoadErrorKind},
     ElfReader, LoadError, LoadResult,
 };
-
-pub(super) const fn symbol_entry_size(class: ElfClass) -> u64 {
-    match class {
-        ElfClass::Elf32 => elf32::sym::SIZEOF_SYM as u64,
-        ElfClass::Elf64 => elf64::sym::SIZEOF_SYM as u64,
-    }
-}
 
 /// A validated symbol table backed by the original ELF reader.
 pub(crate) struct SymbolTableReader<'a, R: ElfReader> {
@@ -95,17 +89,18 @@ impl<'a, R: ElfReader> SymbolTableReader<'a, R> {
         SymbolRecord::decode(entry, self.class, self.endian)
     }
 
-    /// Return the first defined, externally visible symbol matching the name.
-    /// Prefer GNU hash when present and use SysV hash for SysV-only images.
-    pub(crate) fn lookup_export(
-        &self,
-        name: &[u8],
-        max_name_len: u32,
-    ) -> LoadResult<Option<SymbolRecord>> {
-        if name.is_empty() {
-            return Ok(None);
-        }
-        let strings = self.strings.ok_or_else(|| {
+    #[cfg(enable_dynamic_linker)]
+    pub(crate) fn name(&self, symbol: &SymbolRecord, max_len: u32) -> LoadResult<Vec<u8>> {
+        read_string(
+            self.reader,
+            self.string_table()?,
+            u64::from(symbol.name_offset()),
+            max_len,
+        )
+    }
+
+    fn string_table(&self) -> LoadResult<FileRange> {
+        self.strings.ok_or_else(|| {
             LoadError::new(
                 LoadErrorKind::BadElf,
                 ErrorContext::DynamicTag {
@@ -113,11 +108,25 @@ impl<'a, R: ElfReader> SymbolTableReader<'a, R> {
                     value: 0,
                 },
             )
-        })?;
+        })
+    }
+
+    /// Return the first accepted symbol record matching the exact name.
+    /// Prefer GNU hash when present and use SysV hash for SysV-only images.
+    pub(crate) fn find_by_name(
+        &self,
+        name: &[u8],
+        max_name_len: u32,
+        accept: impl Fn(&SymbolRecord) -> bool,
+    ) -> LoadResult<Option<SymbolRecord>> {
+        if name.is_empty() {
+            return Ok(None);
+        }
+        let strings = self.string_table()?;
 
         let match_candidate = |index| {
             let candidate = self.read(index)?;
-            if candidate.is_export()
+            if accept(&candidate)
                 && read_string(
                     self.reader,
                     strings,
@@ -201,19 +210,16 @@ impl SymbolRecord {
         self.section_index
     }
 
-    fn is_export(&self) -> bool {
-        self.name_offset != 0
-            && u32::from(self.section_index) != SHN_UNDEF
-            && matches!(self.binding(), STB_GLOBAL | STB_WEAK)
-            && matches!(st_visibility(self.other), STV_DEFAULT | STV_PROTECTED)
-    }
-
     pub(crate) fn binding(&self) -> u8 {
         st_bind(self.info)
     }
 
     pub(crate) fn kind(&self) -> u8 {
         st_type(self.info)
+    }
+
+    pub(crate) fn visibility(&self) -> u8 {
+        st_visibility(self.other)
     }
 }
 

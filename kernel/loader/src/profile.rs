@@ -15,7 +15,7 @@
 //! Caller-supplied ELF architecture, ABI and admission policies, and resource limits.
 
 use crate::{
-    elf::{DynamicInfo, ElfHeaderInfo, ElfType, RelocationAddend, RelocationRecord, SymbolRecord},
+    elf::{DynamicInfo, ElfHeaderInfo, ElfType, RelocationAddend, RelocationRecord},
     error::{ErrorContext, HeaderField, LimitKind, LoadErrorKind, ProgramHeaderField},
     memory::{MemoryPermissions, ProtectionLevel},
     LoadError, LoadResult,
@@ -34,11 +34,21 @@ use goblin::elf::{
         PT_LOAD, PT_NOTE, PT_NULL, PT_PHDR, PT_TLS,
     },
     reloc::{R_AARCH64_NONE, R_AARCH64_RELATIVE, R_RISCV_NONE, R_RISCV_RELATIVE},
-    section_header::{SHN_ABS, SHN_LORESERVE},
-    sym::{STB_GLOBAL, STB_LOCAL, STB_WEAK, STT_FUNC, STT_NOTYPE, STT_OBJECT, STT_SECTION},
 };
 
 pub use crate::elf::{ElfClass, ElfData, ElfMachine};
+
+#[cfg(enable_dynamic_linker)]
+use crate::{elf::SymbolRecord, relocation::SymbolRelocation};
+#[cfg(enable_dynamic_linker)]
+use goblin::elf::{
+    reloc::{
+        R_AARCH64_ABS64, R_AARCH64_GLOB_DAT, R_AARCH64_JUMP_SLOT, R_RISCV_32, R_RISCV_64,
+        R_RISCV_JUMP_SLOT,
+    },
+    section_header::{SHN_ABS, SHN_LORESERVE},
+    sym::{STB_GLOBAL, STB_LOCAL, STB_WEAK, STT_FUNC, STT_NOTYPE, STT_OBJECT, STT_SECTION},
+};
 
 /// RISC-V `e_flags` bits the loader interprets. The float ABI must be soft for
 /// the current RISC-V profiles; the embedded (RVE) register model is unsupported.
@@ -287,6 +297,7 @@ pub struct LoadProfile {
 
 impl LoadProfile {
     /// Admit symbol records whose values can be resolved without extra ABI state.
+    #[cfg(enable_dynamic_linker)]
     pub(crate) fn check_symbol(&self, symbol: &SymbolRecord) -> LoadResult<()> {
         let binding = symbol.binding();
         let kind = symbol.kind();
@@ -340,14 +351,7 @@ impl LoadProfile {
         &self,
         record: &RelocationRecord,
     ) -> LoadResult<Option<i64>> {
-        let unsupported = || {
-            LoadError::relocation(
-                record.offset(),
-                record.raw_type(),
-                record.symbol_index(),
-                LoadErrorKind::UnsupportedByProfile,
-            )
-        };
+        let unsupported = || LoadError::relocation(record, LoadErrorKind::UnsupportedByProfile);
         let (none, relative) = match (self.machine, self.class) {
             (ElfMachine::Riscv, ElfClass::Elf32 | ElfClass::Elf64) => {
                 (R_RISCV_NONE, R_RISCV_RELATIVE)
@@ -364,6 +368,39 @@ impl LoadProfile {
         match record.addend() {
             RelocationAddend::Explicit(addend) => Ok(Some(addend)),
             RelocationAddend::Implicit => Err(unsupported()),
+        }
+    }
+
+    /// Classify supported symbol relocations. Relative relocations use their own check.
+    #[cfg(enable_dynamic_linker)]
+    pub(crate) fn check_symbol_relocation(
+        &self,
+        record: &RelocationRecord,
+    ) -> LoadResult<Option<SymbolRelocation>> {
+        let jump = match (self.machine, self.class, record.raw_type()) {
+            (ElfMachine::Riscv, ElfClass::Elf32, R_RISCV_32)
+            | (ElfMachine::Riscv, ElfClass::Elf64, R_RISCV_64)
+            | (ElfMachine::Aarch64, ElfClass::Elf64, R_AARCH64_ABS64 | R_AARCH64_GLOB_DAT) => false,
+            (ElfMachine::Riscv, ElfClass::Elf32 | ElfClass::Elf64, R_RISCV_JUMP_SLOT)
+            | (ElfMachine::Aarch64, ElfClass::Elf64, R_AARCH64_JUMP_SLOT) => true,
+            _ => return Ok(None),
+        };
+        let RelocationAddend::Explicit(addend) = record.addend() else {
+            return Err(LoadError::relocation(
+                record,
+                LoadErrorKind::UnsupportedByProfile,
+            ));
+        };
+        if jump {
+            // RISC-V JUMP_SLOT uses S. The AArch64 profile honors the RELA addend.
+            let addend = if self.machine == ElfMachine::Riscv {
+                0
+            } else {
+                addend
+            };
+            Ok(Some(SymbolRelocation::JumpSlot(addend)))
+        } else {
+            Ok(Some(SymbolRelocation::Address(addend)))
         }
     }
 
@@ -696,21 +733,24 @@ impl LoadProfile {
         ))
     }
 
-    /// Accept implemented dynamic semantics and return its singleton bit.
-    pub(crate) fn check_dynamic_tag(&self, tag: u64, value: u64) -> LoadResult<u64> {
+    /// Accept implemented dynamic semantics and reject repeated singleton tags.
+    pub(crate) fn check_dynamic_tag(&self, tag: u64, value: u64, seen: &mut u64) -> LoadResult<()> {
         let index = DYNAMIC_TAGS.iter().position(|candidate| *candidate == tag);
         let flags_supported = match tag {
             DT_FLAGS => value & !DF_BIND_NOW == 0,
             DT_FLAGS_1 => value & !(DF_1_NOW | DF_1_PIE) == 0,
             _ => true,
         };
-        match index {
-            Some(index) if flags_supported => Ok(1u64 << index),
-            _ => Err(LoadError::new(
-                LoadErrorKind::UnsupportedByProfile,
-                ErrorContext::DynamicTag { tag, value },
-            )),
+        let context = ErrorContext::DynamicTag { tag, value };
+        let Some(index) = index.filter(|_| flags_supported) else {
+            return Err(LoadError::new(LoadErrorKind::UnsupportedByProfile, context));
+        };
+        let bit = 1u64 << index;
+        if tag != DT_NEEDED && *seen & bit != 0 {
+            return Err(LoadError::new(LoadErrorKind::BadElf, context));
         }
+        *seen |= bit;
+        Ok(())
     }
 
     /// Current loading profiles require immediate binding for PLT relocations.
@@ -972,6 +1012,55 @@ impl DependencyLimits {
 
 #[cfg(enable_dynamic_linker)]
 impl Default for DependencyLimits {
+    fn default() -> Self {
+        Self::DEFAULT
+    }
+}
+
+/// Bounds on relocation records, export-table probes and symbol names for one link.
+#[cfg(enable_dynamic_linker)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct LinkLimits {
+    max_relocations: u64,
+    max_symbol_lookups: u64,
+    max_symbol_name_len: u32,
+}
+
+#[cfg(enable_dynamic_linker)]
+impl LinkLimits {
+    pub const DEFAULT: Self = Self::new(64 * 1024, 1024 * 1024, 256);
+
+    pub const fn new(
+        max_relocations: u64,
+        max_symbol_lookups: u64,
+        max_symbol_name_len: u32,
+    ) -> Self {
+        Self {
+            max_relocations,
+            max_symbol_lookups,
+            max_symbol_name_len,
+        }
+    }
+
+    pub(crate) fn check_relocations(&self, actual: u64) -> LoadResult<()> {
+        check_limit(LimitKind::LinkRelocationCount, actual, self.max_relocations)
+    }
+
+    pub(crate) fn check_symbol_lookups(&self, actual: u64) -> LoadResult<()> {
+        check_limit(
+            LimitKind::LinkSymbolLookups,
+            actual,
+            self.max_symbol_lookups,
+        )
+    }
+
+    pub(crate) const fn max_symbol_name_len(&self) -> u32 {
+        self.max_symbol_name_len
+    }
+}
+
+#[cfg(enable_dynamic_linker)]
+impl Default for LinkLimits {
     fn default() -> Self {
         Self::DEFAULT
     }

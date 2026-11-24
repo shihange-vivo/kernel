@@ -46,7 +46,10 @@ pub(crate) struct PlannedImage<R: ElfReader> {
 }
 
 impl<R: ElfReader> PlannedImage<R> {
-    #[cfg(enable_dynamic_linker)]
+    pub(crate) const fn profile(&self) -> &LoadProfile {
+        &self.profile
+    }
+
     pub(crate) const fn reader(&self) -> &R {
         &self.reader
     }

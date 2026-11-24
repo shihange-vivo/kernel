@@ -44,12 +44,26 @@ pub(crate) struct AllocatedImage<R: ElfReader, A: ImageMapping> {
 }
 
 impl<R: ElfReader, A: ImageMapping> AllocatedImage<R, A> {
+    /// Populate the mapping and release the source reader.
     pub(crate) fn map(self) -> LoadResult<MappedImage<A>> {
-        self.map_inner()
+        self.map_with(|image, _reader| image)
+    }
+
+    /// Populate the mapping and return the source reader for further ELF reads.
+    pub(crate) fn map_with_reader(self) -> LoadResult<(MappedImage<A>, R)> {
+        self.map_with(|image, reader| (image, reader))
+    }
+
+    pub(crate) const fn allocation(&self) -> &A {
+        &self.allocation
+    }
+
+    fn map_with<T>(self, finish: impl FnOnce(MappedImage<A>, R) -> T) -> LoadResult<T> {
+        self.map_inner(finish)
             .map_err(|error| error.at_stage(LoadStage::Map))
     }
 
-    fn map_inner(mut self) -> LoadResult<MappedImage<A>> {
+    fn map_inner<T>(mut self, finish: impl FnOnce(MappedImage<A>, R) -> T) -> LoadResult<T> {
         let base = self.allocation.base();
         // Some embedded images leave the table outside their PT_LOAD ranges;
         // loading them remains valid, but a standard startup cannot use AT_PHDR.
@@ -177,7 +191,7 @@ impl<R: ElfReader, A: ImageMapping> AllocatedImage<R, A> {
                     })
                 })?;
         }
-        Ok(MappedImage {
+        let image = MappedImage {
             program_headers,
             allocation: self.allocation,
             profile: self.profile,
@@ -186,6 +200,7 @@ impl<R: ElfReader, A: ImageMapping> AllocatedImage<R, A> {
             relro: self.relro,
             image_start: self.image_start,
             entry,
-        })
+        };
+        Ok(finish(image, self.reader))
     }
 }

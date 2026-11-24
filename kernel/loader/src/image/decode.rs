@@ -12,21 +12,21 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Decoded image metadata retained for relocation and linking.
+//! Decoded relocation records and their image backing.
 
 use alloc::vec::Vec;
-use goblin::elf::{
-    section_header::{SHN_ABS, SHN_UNDEF},
-    sym::STT_FUNC,
-};
 
 use super::relocate::RelocatedImage;
 use crate::{
-    elf::{DynamicInfo, LoadSegmentInfo, RelocationRecord, SymbolRecord},
-    error::{ErrorContext, LoadErrorKind, LoadStage},
-    memory::{ImageMapping, MemoryPermissions, TargetAddress, TargetRange},
+    elf::{DynamicInfo, LoadSegmentInfo, RelocationRecord},
+    error::LoadStage,
+    memory::{ImageMapping, TargetAddress, TargetRange},
     profile::LoadProfile,
-    relocation, LoadError, LoadResult, ProgramHeaderTable,
+    relocation::{
+        relative_value,
+        write::{self, RelocationWrites},
+    },
+    LoadResult, ProgramHeaderTable,
 };
 
 #[must_use = "retain the decoded image to keep its allocation alive"]
@@ -43,62 +43,36 @@ pub(crate) struct DecodedImage<A: ImageMapping> {
 }
 
 impl<A: ImageMapping> DecodedImage<A> {
-    /// Resolve a record from this image's own symbol table.
-    /// The image must remain alive while a mapped address is used. An absolute
-    /// value is returned as-is and carries no guarantee about its backing.
-    pub(crate) fn symbol_address(
-        &self,
-        symbol: &SymbolRecord,
-    ) -> LoadResult<Option<TargetAddress>> {
-        self.profile.check_symbol(symbol)?;
-        let address = TargetAddress::new(symbol.value());
-        match u32::from(symbol.section_index()) {
-            SHN_UNDEF => return Ok(None),
-            SHN_ABS => return Ok(Some(address)),
-            _ => {}
-        }
-
-        // A zero size gives no extent. The address itself must still be mapped.
-        let len = symbol.size().max(1);
-        address.checked_add(len)?;
-        let context = || ErrorContext::TargetRange {
-            start: address,
-            len,
-            align: 1,
-        };
-        let segment = self
-            .segments
-            .iter()
-            .find(|segment| {
-                TargetRange::new(segment.vaddr(), segment.memory_size()).contains_span(address, len)
-            })
-            .ok_or_else(|| LoadError::new(LoadErrorKind::OutOfBounds, context()))?;
-        let required = if symbol.kind() == STT_FUNC {
-            MemoryPermissions::EXECUTE
-        } else {
-            MemoryPermissions::READ
-        };
-        if !segment.permissions().contains(required) {
-            return Err(LoadError::new(LoadErrorKind::PermissionConflict, context()));
-        }
-
-        let offset = address.checked_sub(self.image_start)?;
-        Ok(Some(self.allocation.base().checked_add(offset)?))
-    }
-
+    /// Relocate a self-contained image through the standalone profile.
     pub(crate) fn relocate(self) -> LoadResult<RelocatedImage<A>> {
-        self.relocate_inner()
+        let bias = self.load_bias();
+        self.plan_relocation_writes(|record| relative_value(&self.profile, bias, record))
+            .and_then(|writes| self.apply_relocation_writes(writes))
             .map_err(|error| error.at_stage(LoadStage::Relocate))
     }
 
-    fn relocate_inner(mut self) -> LoadResult<RelocatedImage<A>> {
-        relocation::apply_relative(
-            &mut self.allocation,
-            &self.profile,
+    /// Validate and encode the writes without modifying this mapping.
+    pub(crate) fn plan_relocation_writes(
+        &self,
+        resolve: impl FnMut(&RelocationRecord) -> LoadResult<Option<i128>>,
+    ) -> LoadResult<RelocationWrites> {
+        write::plan(
+            &self.allocation,
+            self.profile.class(),
+            self.profile.endian(),
             &self.segments,
             self.image_start,
             &self.relocations,
-        )?;
+            resolve,
+        )
+    }
+
+    /// Apply this image's validated writes and advance to the relocated stage.
+    pub(crate) fn apply_relocation_writes(
+        mut self,
+        writes: RelocationWrites,
+    ) -> LoadResult<RelocatedImage<A>> {
+        writes.apply(&mut self.allocation)?;
         Ok(RelocatedImage {
             program_headers: self.program_headers,
             allocation: self.allocation,
@@ -109,6 +83,22 @@ impl<A: ImageMapping> DecodedImage<A> {
             entry: self.entry,
             dynamic: self.dynamic,
         })
+    }
+
+    pub(crate) const fn profile(&self) -> &LoadProfile {
+        &self.profile
+    }
+
+    pub(crate) fn segments(&self) -> &[LoadSegmentInfo] {
+        &self.segments
+    }
+
+    pub(crate) const fn image_start(&self) -> TargetAddress {
+        self.image_start
+    }
+
+    pub(crate) fn load_bias(&self) -> i128 {
+        i128::from(self.allocation.base().get()) - i128::from(self.image_start.get())
     }
 
     pub(crate) const fn allocation(&self) -> &A {

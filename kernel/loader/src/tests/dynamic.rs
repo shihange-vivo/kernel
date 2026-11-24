@@ -20,6 +20,9 @@
 mod dependency;
 #[path = "lifecycle.rs"]
 mod lifecycle;
+#[cfg(enable_dynamic_linker)]
+#[path = "link.rs"]
+mod link;
 #[path = "load.rs"]
 mod load;
 #[path = "relocation.rs"]

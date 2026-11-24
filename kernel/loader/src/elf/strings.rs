@@ -15,11 +15,14 @@
 //! Bounded access to ELF dynamic string table entries.
 
 use super::FileRange;
+#[cfg(any(test, enable_dynamic_linker))]
 use crate::{
     error::{ErrorContext, LoadErrorKind},
     ElfReader, LoadError, LoadResult,
 };
+#[cfg(any(test, enable_dynamic_linker))]
 use alloc::vec::Vec;
+#[cfg(any(test, enable_dynamic_linker))]
 use goblin::elf::dynamic::DT_STRTAB;
 
 /// Bytes available for a string and its terminator starting at this table index.
@@ -33,6 +36,7 @@ pub(super) fn string_range(table: FileRange, offset: u64) -> Option<FileRange> {
 
 /// Read a NUL-terminated name within the table and the caller's length budget.
 /// The returned bytes exclude the terminator and may contain non-UTF-8 data.
+#[cfg(any(test, enable_dynamic_linker))]
 pub(crate) fn read_string(
     reader: &impl ElfReader,
     table: FileRange,

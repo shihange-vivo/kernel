@@ -12,51 +12,32 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Calculate standalone relative relocations and apply checked writes.
+//! Relocation operations and checked writes.
 
-mod writes;
+pub(crate) mod write;
 
 use crate::{
-    elf::{LoadSegmentInfo, RelocationRecord},
-    error::LoadErrorKind,
-    memory::{ImageMapping, TargetAddress},
-    profile::LoadProfile,
-    LoadError, LoadResult,
+    elf::RelocationRecord, error::LoadErrorKind, profile::LoadProfile, LoadError, LoadResult,
 };
 
-pub(crate) fn apply_relative(
-    allocation: &mut impl ImageMapping,
-    profile: &LoadProfile,
-    segments: &[LoadSegmentInfo],
-    image_start: TargetAddress,
-    records: &[RelocationRecord],
-) -> LoadResult<()> {
-    let bias = i128::from(allocation.base().get()) - i128::from(image_start.get());
-    let writes = writes::plan(
-        allocation,
-        profile.class(),
-        profile.endian(),
-        segments,
-        image_start,
-        records,
-        |record| {
-            let Some(addend) = profile.check_relative_relocation(record)? else {
-                return Ok(None);
-            };
-            if record.symbol_index() != 0 {
-                return Err(record_error(record, LoadErrorKind::BadElf));
-            }
-            Ok(Some(bias + i128::from(addend)))
-        },
-    )?;
-    writes.apply(allocation)
+/// A symbol relocation classified by the load profile, with its effective addend.
+#[cfg(enable_dynamic_linker)]
+pub(crate) enum SymbolRelocation {
+    Address(i64),
+    JumpSlot(i64),
 }
 
-fn record_error(record: &RelocationRecord, kind: LoadErrorKind) -> LoadError {
-    LoadError::relocation(
-        record.offset(),
-        record.raw_type(),
-        record.symbol_index(),
-        kind,
-    )
+/// Calculate a standalone relocation value, or return `None` for a no-op.
+pub(crate) fn relative_value(
+    profile: &LoadProfile,
+    bias: i128,
+    record: &RelocationRecord,
+) -> LoadResult<Option<i128>> {
+    let Some(addend) = profile.check_relative_relocation(record)? else {
+        return Ok(None);
+    };
+    if record.symbol_index() != 0 {
+        return Err(LoadError::relocation(record, LoadErrorKind::BadElf));
+    }
+    Ok(Some(bias + i128::from(addend)))
 }

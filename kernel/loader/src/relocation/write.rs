@@ -12,9 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Plan and apply checked relocation writes for one mapped image.
+//! Validate, encode and write relocation values to one mapped image.
 
-use super::record_error;
 use crate::{
     elf::{ElfClass, ElfData, LoadSegmentInfo, RelocationRecord},
     error::{ErrorContext, LoadErrorKind},
@@ -42,7 +41,7 @@ impl PlannedWrite {
 
 /// Encoded writes for one mapping, with relocation diagnostics retained.
 #[must_use = "apply the validated writes to finish relocation"]
-pub(super) struct RelocationWrites {
+pub(crate) struct RelocationWrites {
     image_start: TargetAddress,
     width: usize,
     writes: Vec<PlannedWrite>,
@@ -50,7 +49,7 @@ pub(super) struct RelocationWrites {
 
 /// Resolve and validate the complete batch before modifying the mapping.
 /// The resolver returns a final value or `None` for a no-op record.
-pub(super) fn plan(
+pub(crate) fn plan(
     allocation: &impl ImageMapping,
     class: ElfClass,
     endian: ElfData,
@@ -70,10 +69,10 @@ pub(super) fn plan(
         };
         validate_target(allocation, segments, image_start, record, width as u64)?;
         let bytes = encode(value, class, endian)
-            .ok_or_else(|| record_error(record, LoadErrorKind::IntegerOverflow))?;
+            .ok_or_else(|| LoadError::relocation(record, LoadErrorKind::IntegerOverflow))?;
         writes
             .try_reserve(1)
-            .map_err(|_| record_error(record, LoadErrorKind::OutOfMemory))?;
+            .map_err(|_| LoadError::relocation(record, LoadErrorKind::OutOfMemory))?;
         writes.push(PlannedWrite {
             target: record.offset(),
             raw_type: record.raw_type(),
@@ -98,7 +97,7 @@ pub(super) fn plan(
 
 impl RelocationWrites {
     /// Apply the batch to the mapping used to plan it.
-    pub(super) fn apply(self, allocation: &mut impl ImageMapping) -> LoadResult<()> {
+    pub(crate) fn apply(self, allocation: &mut impl ImageMapping) -> LoadResult<()> {
         for write in self.writes {
             // Planning established that the target address is at or above image_start.
             let offset = AllocationOffset::new(write.target.get() - self.image_start.get());
@@ -118,7 +117,7 @@ fn validate_target(
     width: u64,
 ) -> LoadResult<()> {
     let target = record.offset();
-    let fail = |kind| record_error(record, kind);
+    let fail = |kind| LoadError::relocation(record, kind);
     if !target.get().is_multiple_of(width) {
         return Err(fail(LoadErrorKind::InvalidAlignment));
     }

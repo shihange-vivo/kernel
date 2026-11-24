@@ -18,6 +18,7 @@ use super::plan::PlannedImage;
 use crate::{
     elf::{read_dynamic, ElfClass, ElfHeaderInfo, FileRange, LoadSegmentInfo, ProgramHeaderInfo},
     error::{ErrorContext, HeaderField, LoadErrorKind, LoadStage, ProgramHeaderField},
+    lifecycle,
     memory::{MemoryPermissions, TargetAddress, TargetRange},
     profile::LoadPurpose,
     reader::ElfReader,
@@ -224,20 +225,24 @@ impl<R: ElfReader> InspectedImage<R> {
         }
         let dynamic = dynamic_header
             .map(|header| {
-                read_dynamic(
+                let profile = self.request.profile();
+                let limits = self.request.limits();
+                let class = self.header.class();
+                let mut seen = 0;
+                let dynamic = read_dynamic(
                     &self.reader,
                     header,
                     &segments,
-                    self.request.profile(),
-                    self.request.limits(),
-                )
+                    &self.header,
+                    |count| limits.check_dynamic_entry_count(count),
+                    |tag, value| profile.check_dynamic_tag(tag, value, &mut seen),
+                )?;
+                lifecycle::check_table_layout(&dynamic, &segments, class, limits)?;
+                limits.check_relocation_count(dynamic.relocation_count(class)?)?;
+                profile.check_dynamic_image(self.request.purpose(), &dynamic)?;
+                Ok::<_, LoadError>(dynamic)
             })
             .transpose()?;
-        if let Some(dynamic) = &dynamic {
-            self.request
-                .profile()
-                .check_dynamic_image(self.request.purpose(), dynamic)?;
-        }
         // Keep only the header facts still needed for allocation and mapping.
         Ok(PlannedImage {
             reader: self.reader,

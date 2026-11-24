@@ -58,18 +58,18 @@ fn fixture(
     fixture
 }
 
-type Route<'a> = (usize, &'a [u8], usize);
+pub(super) type Route<'a> = (usize, &'a [u8], usize);
 
-struct Catalog<'a> {
+pub(super) struct Catalog<'a> {
     fixtures: &'a [Fixture],
     routes: &'a [Route<'a>],
-    state: Rc<State>,
+    pub(super) state: Rc<State>,
     opens: Vec<usize>,
     resolves: usize,
 }
 
 impl<'a> Catalog<'a> {
-    fn new(fixtures: &'a [Fixture], routes: &'a [Route<'a>]) -> Self {
+    pub(super) fn new(fixtures: &'a [Fixture], routes: &'a [Route<'a>]) -> Self {
         Self {
             fixtures,
             routes,
