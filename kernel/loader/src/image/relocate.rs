@@ -47,13 +47,7 @@ impl<A: ImageMapping> RelocatedImage<A> {
             .check_protection_level(self.allocation.protection_level())?;
         let base = self.allocation.base();
         base.checked_add(self.allocation.len())?;
-        let lifecycle = LifecyclePlan::build(
-            &self.allocation,
-            &self.profile,
-            &self.segments,
-            self.image_start,
-            self.dynamic.as_ref(),
-        )?;
+        let lifecycle = self.lifecycle()?;
         // Ordinary segment permissions are already active. Publish completed
         // code writes before execution and before closing writable RELRO.
         for segment in &self.segments {
@@ -111,6 +105,16 @@ impl<A: ImageMapping> RelocatedImage<A> {
             self.program_headers,
             lifecycle,
         ))
+    }
+
+    pub(crate) fn lifecycle(&self) -> LoadResult<LifecyclePlan> {
+        LifecyclePlan::build(
+            &self.allocation,
+            &self.profile,
+            &self.segments,
+            self.image_start,
+            self.dynamic.as_ref(),
+        )
     }
 
     pub(crate) const fn allocation(&self) -> &A {

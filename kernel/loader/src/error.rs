@@ -33,6 +33,7 @@ pub enum LoadStage {
     Map,
     Decode,
     Relocate,
+    Lifecycle,
     Seal,
 }
 

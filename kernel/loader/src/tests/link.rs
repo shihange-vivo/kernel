@@ -19,8 +19,10 @@ use alloc::{rc::Rc, vec::Vec};
 use blueos_test_macro::test;
 use goblin::elf::{
     dynamic::{
-        DF_1_PIE, DT_BIND_NOW, DT_FLAGS_1, DT_HASH, DT_JMPREL, DT_NEEDED, DT_NULL, DT_PLTREL,
-        DT_PLTRELSZ, DT_RELA, DT_STRSZ, DT_STRTAB, DT_SYMENT, DT_SYMTAB,
+        DF_1_PIE, DT_BIND_NOW, DT_FINI, DT_FINI_ARRAY, DT_FINI_ARRAYSZ, DT_FLAGS_1, DT_HASH,
+        DT_INIT, DT_INIT_ARRAY, DT_INIT_ARRAYSZ, DT_JMPREL, DT_NEEDED, DT_NULL, DT_PLTREL,
+        DT_PLTRELSZ, DT_PREINIT_ARRAY, DT_PREINIT_ARRAYSZ, DT_RELA, DT_STRSZ, DT_STRTAB, DT_SYMENT,
+        DT_SYMTAB,
     },
     reloc::{
         R_AARCH64_ABS64, R_AARCH64_GLOB_DAT, R_AARCH64_JUMP_SLOT, R_AARCH64_RELATIVE, R_RISCV_32,
@@ -41,7 +43,7 @@ use super::{
 use crate::{
     dynamic_linker::{discover, link, LinkedImages},
     error::{ErrorContext, LimitKind, LoadErrorKind, LoadStage},
-    memory::{AllocationOffset, ImageLayout},
+    memory::{AllocationOffset, ImageLayout, TargetAddress},
     profile::{
         DependencyLimits, ElfClass, ElfMachine, LinkLimits, LoadLimits, LoadProfile, LoadPurpose,
     },
@@ -199,6 +201,146 @@ fn kinds(profile: LoadProfile) -> (u32, u32, u32) {
         }
         _ => unreachable!(),
     }
+}
+
+fn lifecycle_fixture(
+    profile: LoadProfile,
+    purpose: LoadPurpose,
+    needed: &[u64],
+    init: u64,
+) -> Fixture {
+    const NAMES: &[u8] = b"\0a\0b\0c\0d\0";
+    const INIT: u64 = 0x2600;
+    const FINI: u64 = 0x2620;
+    const PREINIT: u64 = 0x2640;
+    let width = match profile.class() {
+        ElfClass::Elf32 => 4,
+        ElfClass::Elf64 => 8,
+    };
+    let mut dynamic = Vec::from([
+        (DT_STRTAB, STRVA),
+        (DT_STRSZ, NAMES.len() as u64),
+        (DT_INIT, init),
+        (DT_INIT_ARRAY, INIT),
+        (DT_INIT_ARRAYSZ, width),
+        (DT_FINI_ARRAY, FINI),
+        (DT_FINI_ARRAYSZ, 2 * width),
+        (DT_FINI, BASE + 0x30),
+    ]);
+    dynamic.extend(needed.iter().map(|&offset| (DT_NEEDED, offset)));
+    let mut relocations = Vec::from([
+        (INIT, BASE + 0x20),
+        (FINI, BASE + 0x40),
+        (FINI + width, BASE + 0x50),
+    ]);
+    if purpose == LoadPurpose::Executable {
+        dynamic.extend([
+            (DT_PREINIT_ARRAY, PREINIT),
+            (DT_PREINIT_ARRAYSZ, width),
+            (DT_FLAGS_1, DF_1_PIE),
+        ]);
+        relocations.push((PREINIT, BASE));
+    }
+    dynamic.extend(tags(
+        profile.class(),
+        DT_RELA,
+        RELVA,
+        relocations.len() as u64,
+    ));
+    dynamic.push((DT_NULL, 0));
+
+    let mut fixture = Fixture::new(profile, &dynamic);
+    if purpose == LoadPurpose::SharedObject {
+        fixture.entry(0);
+    }
+    let strings = fixture.file_offset(STRVA);
+    fixture.bytes[strings..strings + NAMES.len()].copy_from_slice(NAMES);
+    let (_, _, relative) = kinds(profile);
+    for (index, (target, address)) in relocations.into_iter().enumerate() {
+        fixture.relocation(
+            RELVA + index as u64 * relocation_size(profile.class(), DT_RELA),
+            DT_RELA,
+            target,
+            0,
+            relative,
+            address as i64,
+        );
+    }
+    fixture
+}
+
+#[test]
+fn linked_lifecycle_orders_diamond_and_cycle_after_relocation() {
+    const C: u64 = 5;
+    const D: u64 = 7;
+    for profile in PROFILES {
+        let exe = LoadPurpose::Executable;
+        let dso = LoadPurpose::SharedObject;
+        // a and b share c. a and c form a component that depends on d.
+        let fixtures = [
+            lifecycle_fixture(profile, exe, &[A, B], BASE + 0x10),
+            lifecycle_fixture(profile, dso, &[C], BASE + 0x10),
+            lifecycle_fixture(profile, dso, &[C, C], BASE + 0x10),
+            lifecycle_fixture(profile, dso, &[A, D], BASE + 0x10),
+            lifecycle_fixture(profile, dso, &[], BASE + 0x10),
+        ];
+        let mut catalog = Catalog::new(
+            &fixtures,
+            &[
+                (0, b"a", 1),
+                (0, b"b", 2),
+                (1, b"c", 3),
+                (2, b"c", 3),
+                (3, b"a", 1),
+                (3, b"d", 4),
+            ],
+        );
+        let linked = link_fixtures(&mut catalog, profile, LinkLimits::DEFAULT).unwrap();
+        let callback = |image: usize, offset| {
+            linked.images()[image]
+                .allocation()
+                .base()
+                .checked_add(offset)
+                .unwrap()
+        };
+        let lifecycle = linked.plan_lifecycle().unwrap();
+        assert_eq!(lifecycle.preinit(), &[callback(0, 0)]);
+        assert!(lifecycle.init().eq([4, 1, 3, 2, 0]
+            .into_iter()
+            .flat_map(|image| [callback(image, 0x10), callback(image, 0x20)])));
+        assert!(lifecycle
+            .fini()
+            .eq([0, 2, 3, 1, 4].into_iter().flat_map(|image| [
+                callback(image, 0x50),
+                callback(image, 0x40),
+                callback(image, 0x30)
+            ])));
+        assert_eq!(catalog.state.live.get(), 5);
+        drop(linked);
+        assert_eq!(catalog.state.live.get(), 0);
+    }
+}
+
+#[test]
+fn linked_lifecycle_reports_invalid_callbacks_with_the_lifecycle_stage() {
+    let profile = LoadProfile::riscv64();
+    let fixtures = [
+        lifecycle_fixture(profile, LoadPurpose::Executable, &[A], BASE + 0x10),
+        lifecycle_fixture(profile, LoadPurpose::SharedObject, &[], LIB_DATA),
+    ];
+    let mut catalog = Catalog::new(&fixtures, ROUTES);
+    let linked = link_fixtures(&mut catalog, profile, LinkLimits::DEFAULT).unwrap();
+    let error = failure(linked.plan_lifecycle());
+    assert_eq!(error.stage(), Some(LoadStage::Lifecycle));
+    assert_eq!(error.kind(), LoadErrorKind::OutOfBounds);
+    assert!(matches!(
+        error.context(),
+        ErrorContext::DynamicTag {
+            tag: DT_INIT,
+            value,
+        } if *value == linked.images()[1].allocation().base().get() + LIB_DATA - BASE
+    ));
+    assert_eq!(catalog.state.live.get(), 2);
 }
 
 #[test]
