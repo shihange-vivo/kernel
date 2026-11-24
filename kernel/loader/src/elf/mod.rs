@@ -36,6 +36,7 @@ pub(crate) use header::{ElfHeaderInfo, ElfType};
 pub(crate) use program_header::ProgramHeaderInfo;
 pub(crate) use relocation::{RelocationAddend, RelocationRecord};
 pub(crate) use segment::LoadSegmentInfo;
+pub(crate) use symbol::SymbolRecord;
 
 /// A byte range in the ELF input file, independent of target addresses.
 #[derive(Clone, Copy, Debug)]

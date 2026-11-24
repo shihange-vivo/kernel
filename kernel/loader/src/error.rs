@@ -131,6 +131,11 @@ pub enum ErrorContext {
         index: u32,
         count: u32,
     },
+    SymbolAttributes {
+        binding: u8,
+        kind: u8,
+        section_index: u16,
+    },
     Relocation {
         target: TargetAddress,
         raw_type: u32,

@@ -15,14 +15,18 @@
 //! Decoded image metadata retained for relocation and linking.
 
 use alloc::vec::Vec;
+use goblin::elf::{
+    section_header::{SHN_ABS, SHN_UNDEF},
+    sym::STT_FUNC,
+};
 
 use super::relocate::RelocatedImage;
 use crate::{
-    elf::{DynamicInfo, LoadSegmentInfo, RelocationRecord},
-    error::LoadStage,
-    memory::{ImageMapping, TargetAddress, TargetRange},
+    elf::{DynamicInfo, LoadSegmentInfo, RelocationRecord, SymbolRecord},
+    error::{ErrorContext, LoadErrorKind, LoadStage},
+    memory::{ImageMapping, MemoryPermissions, TargetAddress, TargetRange},
     profile::LoadProfile,
-    relocation, LoadResult, ProgramHeaderTable,
+    relocation, LoadError, LoadResult, ProgramHeaderTable,
 };
 
 #[must_use = "retain the decoded image to keep its allocation alive"]
@@ -39,6 +43,49 @@ pub(crate) struct DecodedImage<A: ImageMapping> {
 }
 
 impl<A: ImageMapping> DecodedImage<A> {
+    /// Resolve a record from this image's own symbol table.
+    /// The image must remain alive while a mapped address is used. An absolute
+    /// value is returned as-is and carries no guarantee about its backing.
+    pub(crate) fn symbol_address(
+        &self,
+        symbol: &SymbolRecord,
+    ) -> LoadResult<Option<TargetAddress>> {
+        self.profile.check_symbol(symbol)?;
+        let address = TargetAddress::new(symbol.value());
+        match u32::from(symbol.section_index()) {
+            SHN_UNDEF => return Ok(None),
+            SHN_ABS => return Ok(Some(address)),
+            _ => {}
+        }
+
+        // A zero size gives no extent. The address itself must still be mapped.
+        let len = symbol.size().max(1);
+        address.checked_add(len)?;
+        let context = || ErrorContext::TargetRange {
+            start: address,
+            len,
+            align: 1,
+        };
+        let segment = self
+            .segments
+            .iter()
+            .find(|segment| {
+                TargetRange::new(segment.vaddr(), segment.memory_size()).contains_span(address, len)
+            })
+            .ok_or_else(|| LoadError::new(LoadErrorKind::OutOfBounds, context()))?;
+        let required = if symbol.kind() == STT_FUNC {
+            MemoryPermissions::EXECUTE
+        } else {
+            MemoryPermissions::READ
+        };
+        if !segment.permissions().contains(required) {
+            return Err(LoadError::new(LoadErrorKind::PermissionConflict, context()));
+        }
+
+        let offset = address.checked_sub(self.image_start)?;
+        Ok(Some(self.allocation.base().checked_add(offset)?))
+    }
+
     pub(crate) fn relocate(self) -> LoadResult<RelocatedImage<A>> {
         self.relocate_inner()
             .map_err(|error| error.at_stage(LoadStage::Relocate))

@@ -15,7 +15,7 @@
 //! Caller-supplied ELF architecture, ABI and admission policies, and resource limits.
 
 use crate::{
-    elf::{DynamicInfo, ElfHeaderInfo, ElfType, RelocationAddend, RelocationRecord},
+    elf::{DynamicInfo, ElfHeaderInfo, ElfType, RelocationAddend, RelocationRecord, SymbolRecord},
     error::{ErrorContext, HeaderField, LimitKind, LoadErrorKind, ProgramHeaderField},
     memory::{MemoryPermissions, ProtectionLevel},
     LoadError, LoadResult,
@@ -34,6 +34,8 @@ use goblin::elf::{
         PT_LOAD, PT_NOTE, PT_NULL, PT_PHDR, PT_TLS,
     },
     reloc::{R_AARCH64_NONE, R_AARCH64_RELATIVE, R_RISCV_NONE, R_RISCV_RELATIVE},
+    section_header::{SHN_ABS, SHN_LORESERVE},
+    sym::{STB_GLOBAL, STB_LOCAL, STB_WEAK, STT_FUNC, STT_NOTYPE, STT_OBJECT, STT_SECTION},
 };
 
 pub use crate::elf::{ElfClass, ElfData, ElfMachine};
@@ -284,6 +286,29 @@ pub struct LoadProfile {
 }
 
 impl LoadProfile {
+    /// Admit symbol records whose values can be resolved without extra ABI state.
+    pub(crate) fn check_symbol(&self, symbol: &SymbolRecord) -> LoadResult<()> {
+        let binding = symbol.binding();
+        let kind = symbol.kind();
+        let section_index = symbol.section_index();
+        let section = u32::from(section_index);
+        if !matches!(binding, STB_LOCAL | STB_GLOBAL | STB_WEAK)
+            || !matches!(kind, STT_NOTYPE | STT_OBJECT | STT_FUNC | STT_SECTION)
+            || (kind == STT_SECTION && binding != STB_LOCAL)
+            || (section >= SHN_LORESERVE && section != SHN_ABS)
+        {
+            return Err(LoadError::new(
+                LoadErrorKind::UnsupportedByProfile,
+                ErrorContext::SymbolAttributes {
+                    binding,
+                    kind,
+                    section_index,
+                },
+            ));
+        }
+        Ok(())
+    }
+
     pub const fn required_protection(&self) -> ProtectionLevel {
         self.required_protection
     }
