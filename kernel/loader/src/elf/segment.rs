@@ -75,10 +75,22 @@ pub(super) fn vaddr_to_file_range(
     address: TargetAddress,
     len: u64,
 ) -> Option<FileRange> {
+    let file = vaddr_file_extent(segments, address)?;
+    (len <= file.len()).then_some(FileRange::new(file.offset(), len))
+}
+
+/// File-backed bytes from this virtual address to the end of its load segment.
+pub(super) fn vaddr_file_extent(
+    segments: &[LoadSegmentInfo],
+    address: TargetAddress,
+) -> Option<FileRange> {
     let segment = segments.iter().find(|segment| {
-        TargetRange::new(segment.vaddr, segment.file_range.len()).contains_span(address, len)
+        TargetRange::new(segment.vaddr, segment.file_range.len()).contains_span(address, 1)
     })?;
     let displacement = address.get().checked_sub(segment.vaddr.get())?;
     let offset = segment.file_range.offset().checked_add(displacement)?;
-    Some(FileRange::new(offset, len))
+    Some(FileRange::new(
+        offset,
+        segment.file_range.len() - displacement,
+    ))
 }

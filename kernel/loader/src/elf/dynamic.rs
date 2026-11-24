@@ -25,11 +25,14 @@ use goblin::elf::dynamic::{
 };
 
 use super::{
+    hash::{
+        read_gnu_symbol_count, read_sysv_symbol_count, GNU_HASH_HEADER_SIZE, SYSV_HASH_HEADER_SIZE,
+    },
     read_u32, read_u64,
     relocation::{RelocationFormat, RelocationTable},
-    segment::vaddr_to_file_range,
+    segment::{vaddr_file_extent, vaddr_to_file_range},
     strings::string_range,
-    symbol::{read_sysv_symbol_count, symbol_entry_size, SymbolTableReader, SYSV_HASH_HEADER_SIZE},
+    symbol::{symbol_entry_size, SymbolTableReader},
     ElfClass, ElfData, FileRange, LoadSegmentInfo, ProgramHeaderInfo,
 };
 use crate::{
@@ -91,24 +94,107 @@ impl DynamicInfo {
         }
     }
 
-    /// Open the dynamic symbol table using the count recorded in DT_HASH.
-    pub(crate) fn sysv_symbol_table<'a, R: ElfReader>(
+    /// Open the dynamic symbol table using a count established from its hash metadata.
+    pub(crate) fn symbol_table<'a, R: ElfReader>(
         &self,
         reader: &'a R,
         segments: &[LoadSegmentInfo],
         class: ElfClass,
         endian: ElfData,
     ) -> LoadResult<Option<SymbolTableReader<'a, R>>> {
-        let Some(address) = self.value(DT_HASH) else {
+        let sysv_count = self
+            .value(DT_HASH)
+            .map(|address| {
+                read_sysv_symbol_count(reader, segments, TargetAddress::new(address), endian)
+            })
+            .transpose()?;
+        let count = match self.value(DT_GNU_HASH) {
+            Some(address) => {
+                Some(self.gnu_symbol_count(reader, segments, address, class, endian, sysv_count)?)
+            }
+            None => sysv_count,
+        };
+        let Some(count) = count else {
             return Ok(None);
         };
-        let count = read_sysv_symbol_count(reader, segments, TargetAddress::new(address), endian)?;
         let file = self
             .symbol_file_range(segments, class, count)?
             .ok_or_else(|| dynamic_error(DT_SYMTAB, 0))?;
         Ok(Some(SymbolTableReader::new(
             reader, file, count, class, endian,
         )))
+    }
+
+    fn gnu_symbol_count(
+        &self,
+        reader: &impl ElfReader,
+        segments: &[LoadSegmentInfo],
+        address: u64,
+        class: ElfClass,
+        endian: ElfData,
+        sysv_count: Option<u32>,
+    ) -> LoadResult<u32> {
+        let symbol_address = self
+            .value(DT_SYMTAB)
+            .ok_or_else(|| dynamic_error(DT_SYMTAB, 0))?;
+        let symbols = self
+            .symbol_metadata_file_extent(segments, symbol_address)
+            .ok_or_else(|| dynamic_error(DT_SYMTAB, symbol_address))?;
+        let capacity = symbols.len() / symbol_entry_size(class);
+        if capacity == 0 || sysv_count.is_some_and(|count| u64::from(count) > capacity) {
+            return Err(dynamic_error(DT_SYMTAB, symbol_address));
+        }
+        let max_symbols = sysv_count.unwrap_or_else(|| u32::try_from(capacity).unwrap_or(u32::MAX));
+        let hash = self
+            .symbol_metadata_file_extent(segments, address)
+            .ok_or_else(|| dynamic_error(DT_GNU_HASH, address))?;
+        let gnu_count = read_gnu_symbol_count(
+            reader,
+            hash,
+            TargetAddress::new(address),
+            class,
+            endian,
+            max_symbols,
+        )?;
+        if let Some(count) = gnu_count {
+            if sysv_count.is_some_and(|expected| count != expected) {
+                return Err(dynamic_error(DT_GNU_HASH, address));
+            }
+            return Ok(count);
+        }
+        // An empty GNU hash can leave unindexed symbols in .dynsym.
+        sysv_count.ok_or_else(|| {
+            LoadError::new(
+                LoadErrorKind::UnsupportedByProfile,
+                ErrorContext::DynamicTag {
+                    tag: DT_GNU_HASH,
+                    value: address,
+                },
+            )
+        })
+    }
+
+    /// Limit an inferred table extent at the next known symbol-related table.
+    fn symbol_metadata_file_extent(
+        &self,
+        segments: &[LoadSegmentInfo],
+        address: u64,
+    ) -> Option<FileRange> {
+        let file = vaddr_file_extent(segments, TargetAddress::new(address))?;
+        let strings = self
+            .value(DT_STRTAB)
+            .filter(|_| self.value(DT_STRSZ).is_some_and(|len| len != 0));
+        let len = [
+            self.value(DT_SYMTAB),
+            self.value(DT_HASH),
+            self.value(DT_GNU_HASH),
+            strings,
+        ]
+        .into_iter()
+        .flatten()
+        .filter_map(|next| next.checked_sub(address).filter(|&len| len != 0))
+        .fold(file.len(), u64::min);
+        Some(FileRange::new(file.offset(), len))
     }
 
     fn symbol_file_range(
@@ -265,7 +351,10 @@ fn validate_metadata(
     }
     // The standalone path only needs the minimum geometry. Counted access is opt-in.
     info.symbol_file_range(segments, class, 1)?;
-    for (tag, len) in [(DT_HASH, SYSV_HASH_HEADER_SIZE), (DT_GNU_HASH, 16)] {
+    for (tag, len) in [
+        (DT_HASH, SYSV_HASH_HEADER_SIZE),
+        (DT_GNU_HASH, GNU_HASH_HEADER_SIZE),
+    ] {
         if let Some(address) = info.value(tag) {
             vaddr_to_file_range(segments, TargetAddress::new(address), len)
                 .ok_or_else(|| dynamic_error(tag, address))?;
