@@ -26,7 +26,7 @@ mod seal;
 
 use super::fixture::{ElfFixtureBuilder, ProgramHeaderFixture};
 use crate::{
-    elf::RelocationAddend,
+    elf::{strings::read_string, FileRange, RelocationAddend},
     error::{ErrorContext, LimitKind, LoadErrorKind, LoadStage},
     image::{DecodedImage, ImageLoader, PlannedImage},
     memory::{
@@ -705,6 +705,182 @@ fn dynamic_preserves_needed_order_and_unresolved_metadata() {
     assert_eq!(info.needed().collect::<Vec<_>>(), [9, 1, 9]);
     assert_eq!(info.value(DT_SONAME), Some(1));
     assert_eq!(info.value(DT_INIT), Some(BASE));
+}
+
+#[test]
+fn dynamic_strings_respect_the_table_and_name_length_bounds() {
+    let mut name = [b'a'; 65];
+    name[0] = 0xff;
+    let size = name.len() as u64 + 2;
+    let mut fixture = Fixture::new(
+        LoadProfile::riscv64(),
+        &[
+            (DT_STRTAB, STRVA),
+            (DT_STRSZ, size),
+            (DT_NEEDED, 1),
+            (DT_NULL, 0),
+        ],
+    );
+    let start = fixture.file_offset(STRVA) + 1;
+    fixture.bytes[start..start + name.len()].copy_from_slice(&name);
+    fixture.bytes[start + name.len()] = 0;
+
+    let state = Rc::new(State::default());
+    let image = plan(
+        &fixture,
+        LoadPurpose::Executable,
+        LoadLimits::DEFAULT,
+        state.clone(),
+    )
+    .unwrap();
+    let table = image
+        .dynamic()
+        .unwrap()
+        .string_file_range(image.segments())
+        .unwrap()
+        .unwrap();
+    let reader = Input {
+        fixture: &fixture,
+        state: state.clone(),
+    };
+    assert_eq!(read_string(&reader, table, 1, 65).unwrap(), name);
+    assert_eq!(read_string(&reader, table, 2, 64).unwrap(), name[1..]);
+    assert!(read_string(&reader, table, 0, 0).unwrap().is_empty());
+    assert!(read_string(&reader, table, size - 1, 0).unwrap().is_empty());
+    assert_eq!(
+        failure(read_string(&reader, table, 1, 64)).kind(),
+        LoadErrorKind::ResourceLimit
+    );
+
+    let truncated = FileRange::new(table.offset(), size - 1);
+    assert_eq!(
+        failure(read_string(&reader, truncated, 1, 65)).kind(),
+        LoadErrorKind::BadElf
+    );
+    let reads = state.dynamic_reads.get();
+    let error = failure(read_string(&reader, table, size, 65));
+    assert_eq!(error.kind(), LoadErrorKind::BadElf);
+    assert!(
+        matches!(error.context(), ErrorContext::DynamicTag { tag: DT_STRTAB, value } if *value == size)
+    );
+    assert_eq!(state.dynamic_reads.get(), reads);
+}
+
+const SYSV_HASH_VADDR: u64 = 0x2600;
+
+fn sysv_symbols(profile: LoadProfile) -> (Fixture, u64) {
+    let size = match profile.class() {
+        ElfClass::Elf32 => 16,
+        ElfClass::Elf64 => 24,
+    };
+    // Put exactly two records at the end of the file-backed segment.
+    let address = 0x2900 - 2 * size;
+    let mut fixture = Fixture::new(
+        profile,
+        &[
+            (DT_HASH, SYSV_HASH_VADDR),
+            (DT_SYMTAB, address),
+            (DT_SYMENT, size),
+            (DT_NULL, 0),
+        ],
+    );
+    let hash = fixture.file_offset(SYSV_HASH_VADDR);
+    for (index, word) in [1, 2, 1, 0, 0].into_iter().enumerate() {
+        fixture.number(hash + 4 * index, word, 4);
+    }
+    let symbols = fixture.file_offset(address);
+    fixture.bytes[symbols..symbols + (2 * size) as usize].fill(0);
+    fixture.number(symbols + size as usize, 9, 4);
+    (fixture, address)
+}
+
+#[test]
+fn sysv_symbol_table_reads_only_counted_records() {
+    for base in PROFILES {
+        for endian in [ElfData::Little, ElfData::Big] {
+            let profile = LoadProfile::new(
+                base.class(),
+                endian,
+                base.machine(),
+                base.header_flags(),
+                base.entry_mode(),
+            );
+            let (fixture, _) = sysv_symbols(profile);
+            let state = Rc::new(State::default());
+            let image = plan(
+                &fixture,
+                LoadPurpose::Executable,
+                LoadLimits::DEFAULT,
+                state.clone(),
+            )
+            .unwrap();
+            assert_eq!(state.dynamic_reads.get(), 4); // The standalone plan reads just the tags.
+            let reader = Input {
+                fixture: &fixture,
+                state: state.clone(),
+            };
+            let table = image
+                .dynamic()
+                .unwrap()
+                .sysv_symbol_table(&reader, image.segments(), profile.class(), endian)
+                .unwrap()
+                .unwrap();
+            assert_eq!(table.read(0).unwrap().name_offset(), 0);
+            assert_eq!(table.read(1).unwrap().name_offset(), 9);
+            let reads = state.dynamic_reads.get();
+            let error = failure(table.read(2));
+            assert_eq!(error.kind(), LoadErrorKind::OutOfBounds);
+            assert!(matches!(
+                error.context(),
+                ErrorContext::SymbolIndex { index: 2, count: 2 }
+            ));
+            assert_eq!(state.dynamic_reads.get(), reads);
+        }
+    }
+}
+
+#[test]
+fn sysv_symbol_table_checks_both_file_ranges() {
+    let profile = LoadProfile::riscv64();
+    for (buckets, chains, expected_tag) in [
+        (0, 2, DT_HASH),
+        (1, 0, DT_HASH),
+        (u32::MAX, 2, DT_HASH),
+        (1, 3, DT_SYMTAB),
+    ] {
+        let (mut fixture, symbol_address) = sysv_symbols(profile);
+        let hash = fixture.file_offset(SYSV_HASH_VADDR);
+        fixture.number(hash, u64::from(buckets), 4);
+        fixture.number(hash + 4, chains, 4);
+        let state = Rc::new(State::default());
+        let image = plan(
+            &fixture,
+            LoadPurpose::Executable,
+            LoadLimits::DEFAULT,
+            state.clone(),
+        )
+        .unwrap();
+        let reader = Input {
+            fixture: &fixture,
+            state: state.clone(),
+        };
+        let error = failure(image.dynamic().unwrap().sysv_symbol_table(
+            &reader,
+            image.segments(),
+            profile.class(),
+            profile.endian(),
+        ));
+        assert_eq!(error.kind(), LoadErrorKind::BadElf);
+        let address = if expected_tag == DT_HASH {
+            SYSV_HASH_VADDR
+        } else {
+            symbol_address
+        };
+        assert!(
+            matches!(error.context(), ErrorContext::DynamicTag { tag, value } if *tag == expected_tag && *value == address)
+        );
+        assert_eq!(state.dynamic_reads.get(), 5); // Four tags and the SysV header.
+    }
 }
 
 #[test]

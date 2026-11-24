@@ -27,8 +27,10 @@ use goblin::elf::dynamic::{
 use super::{
     read_u32, read_u64,
     relocation::{RelocationFormat, RelocationTable},
-    symbol::symbol_entry_size,
-    ElfClass, FileRange, LoadSegmentInfo, ProgramHeaderInfo,
+    segment::vaddr_to_file_range,
+    strings::string_range,
+    symbol::{read_sysv_symbol_count, symbol_entry_size, SymbolTableReader, SYSV_HASH_HEADER_SIZE},
+    ElfClass, ElfData, FileRange, LoadSegmentInfo, ProgramHeaderInfo,
 };
 use crate::{
     error::{ErrorContext, LoadErrorKind},
@@ -71,6 +73,66 @@ impl DynamicInfo {
             .iter()
             .filter(|entry| entry.tag == DT_NEEDED)
             .map(|entry| entry.value)
+    }
+
+    /// File backing for a nonempty DT_STRTAB/DT_STRSZ pair.
+    pub(crate) fn string_file_range(
+        &self,
+        segments: &[LoadSegmentInfo],
+    ) -> LoadResult<Option<FileRange>> {
+        match (self.value(DT_STRTAB), self.value(DT_STRSZ)) {
+            (None, None) | (Some(_), Some(0)) => Ok(None),
+            (Some(address), Some(len)) => {
+                vaddr_to_file_range(segments, TargetAddress::new(address), len)
+                    .map(Some)
+                    .ok_or_else(|| dynamic_error(DT_STRTAB, address))
+            }
+            _ => Err(dynamic_error(DT_STRTAB, 0)),
+        }
+    }
+
+    /// Open the dynamic symbol table using the count recorded in DT_HASH.
+    pub(crate) fn sysv_symbol_table<'a, R: ElfReader>(
+        &self,
+        reader: &'a R,
+        segments: &[LoadSegmentInfo],
+        class: ElfClass,
+        endian: ElfData,
+    ) -> LoadResult<Option<SymbolTableReader<'a, R>>> {
+        let Some(address) = self.value(DT_HASH) else {
+            return Ok(None);
+        };
+        let count = read_sysv_symbol_count(reader, segments, TargetAddress::new(address), endian)?;
+        let file = self
+            .symbol_file_range(segments, class, count)?
+            .ok_or_else(|| dynamic_error(DT_SYMTAB, 0))?;
+        Ok(Some(SymbolTableReader::new(
+            reader, file, count, class, endian,
+        )))
+    }
+
+    fn symbol_file_range(
+        &self,
+        segments: &[LoadSegmentInfo],
+        class: ElfClass,
+        count: u32,
+    ) -> LoadResult<Option<FileRange>> {
+        match (self.value(DT_SYMTAB), self.value(DT_SYMENT)) {
+            (None, None) => Ok(None),
+            (Some(address), Some(size)) => {
+                if size != symbol_entry_size(class) {
+                    return Err(dynamic_error(DT_SYMENT, size));
+                }
+                vaddr_to_file_range(
+                    segments,
+                    TargetAddress::new(address),
+                    u64::from(count) * size,
+                )
+                .map(Some)
+                .ok_or_else(|| dynamic_error(DT_SYMTAB, address))
+            }
+            _ => Err(dynamic_error(DT_SYMTAB, 0)),
+        }
     }
 
     pub(crate) fn is_pie(&self) -> bool {
@@ -117,7 +179,8 @@ pub(crate) fn read_dynamic(
     }
     // A dynamic table must describe the same file bytes as its load segment,
     // rather than pointing to BSS or an unrelated file-to-VA mapping.
-    let file = vaddr_to_file_range(segments, header.vaddr(), bytes)?;
+    let file = vaddr_to_file_range(segments, header.vaddr(), bytes)
+        .ok_or_else(|| dynamic_range_error(header.vaddr(), bytes))?;
     if file.offset() != header.file_offset()
         || !segments.iter().any(|segment| {
             TargetRange::new(segment.vaddr(), segment.memory_size())
@@ -191,38 +254,21 @@ fn validate_metadata(
     class: ElfClass,
     limits: &LoadLimits,
 ) -> LoadResult<()> {
-    let strtab = info.value(DT_STRTAB);
-    let strsz = info.value(DT_STRSZ);
-    match (strtab, strsz) {
-        (None, None) => {}
-        (Some(address), Some(len)) => {
-            if len != 0 {
-                vaddr_to_file_range(segments, TargetAddress::new(address), len)
-                    .map_err(|_| dynamic_error(DT_STRTAB, address))?;
-            }
-        }
-        _ => return Err(dynamic_error(DT_STRTAB, 0)),
-    }
+    let strings = info.string_file_range(segments)?;
     for offset in info.needed().chain(info.value(DT_SONAME)) {
-        if strtab.is_none() || offset >= strsz.unwrap_or(0) {
+        if strings
+            .and_then(|table| string_range(table, offset))
+            .is_none()
+        {
             return Err(dynamic_error(DT_STRTAB, offset));
         }
     }
-    match (info.value(DT_SYMTAB), info.value(DT_SYMENT)) {
-        (None, None) => {}
-        (Some(address), Some(size)) => {
-            if size != symbol_entry_size(class) {
-                return Err(dynamic_error(DT_SYMENT, size));
-            }
-            vaddr_to_file_range(segments, TargetAddress::new(address), size)
-                .map_err(|_| dynamic_error(DT_SYMTAB, address))?;
-        }
-        _ => return Err(dynamic_error(DT_SYMTAB, 0)),
-    }
-    for (tag, len) in [(DT_HASH, 8), (DT_GNU_HASH, 16)] {
+    // The standalone path only needs the minimum geometry. Counted access is opt-in.
+    info.symbol_file_range(segments, class, 1)?;
+    for (tag, len) in [(DT_HASH, SYSV_HASH_HEADER_SIZE), (DT_GNU_HASH, 16)] {
         if let Some(address) = info.value(tag) {
             vaddr_to_file_range(segments, TargetAddress::new(address), len)
-                .map_err(|_| dynamic_error(tag, address))?;
+                .ok_or_else(|| dynamic_error(tag, address))?;
         }
     }
     let word_size = match class {
@@ -287,7 +333,7 @@ fn table(
             // its source tag and starting address.
             if len != 0 {
                 vaddr_to_file_range(segments, range.start(), len)
-                    .map_err(|_| dynamic_error(tag, address))?;
+                    .ok_or_else(|| dynamic_error(tag, address))?;
             }
             Ok(Some(RelocationTable::new(range, format)))
         }
@@ -374,27 +420,6 @@ fn relocation_tables(
         }
     }
     Ok(tables)
-}
-
-/// Resolve an ELF virtual span to bytes contained in one file-backed load segment.
-fn vaddr_to_file_range(
-    segments: &[LoadSegmentInfo],
-    address: TargetAddress,
-    len: u64,
-) -> LoadResult<FileRange> {
-    for segment in segments {
-        if TargetRange::new(segment.vaddr(), segment.file_range().len()).contains_span(address, len)
-        {
-            let displacement = address.checked_sub(segment.vaddr())?;
-            let offset = segment
-                .file_range()
-                .offset()
-                .checked_add(displacement)
-                .ok_or_else(|| dynamic_range_error(address, len))?;
-            return Ok(FileRange::new(offset, len));
-        }
-    }
-    Err(dynamic_range_error(address, len))
 }
 
 fn dynamic_range_error(start: TargetAddress, len: u64) -> LoadError {

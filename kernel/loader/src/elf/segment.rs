@@ -13,7 +13,7 @@
 // limitations under the License.
 
 use super::FileRange;
-use crate::memory::{MemoryPermissions, TargetAddress};
+use crate::memory::{MemoryPermissions, TargetAddress, TargetRange};
 
 #[derive(Debug)]
 pub(crate) struct LoadSegmentInfo {
@@ -67,4 +67,18 @@ impl LoadSegmentInfo {
     pub(crate) const fn permissions(&self) -> MemoryPermissions {
         self.permissions
     }
+}
+
+/// Locate an ELF virtual span wholly backed by one load segment's file bytes.
+pub(super) fn vaddr_to_file_range(
+    segments: &[LoadSegmentInfo],
+    address: TargetAddress,
+    len: u64,
+) -> Option<FileRange> {
+    let segment = segments.iter().find(|segment| {
+        TargetRange::new(segment.vaddr, segment.file_range.len()).contains_span(address, len)
+    })?;
+    let displacement = address.get().checked_sub(segment.vaddr.get())?;
+    let offset = segment.file_range.offset().checked_add(displacement)?;
+    Some(FileRange::new(offset, len))
 }

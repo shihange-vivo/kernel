@@ -12,17 +12,27 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! On-disk ELF symbol entry sizes and field decoding.
+//! Bounded access to on-disk ELF symbol records.
 
-use goblin::{elf32, elf64};
+use goblin::{
+    elf::{
+        dynamic::DT_HASH,
+        sym::{st_bind, st_type},
+    },
+    elf32, elf64,
+};
 
-use super::ElfClass;
-#[cfg(test)]
-use super::{read_array, read_u16, read_u32, read_u64, ElfData};
-#[cfg(test)]
-use crate::LoadResult;
-#[cfg(test)]
-use goblin::elf::sym::{st_bind, st_type};
+use super::{
+    read_array, read_u16, read_u32, read_u64, segment::vaddr_to_file_range, ElfClass, ElfData,
+    FileRange, LoadSegmentInfo,
+};
+use crate::{
+    error::{ErrorContext, LoadErrorKind},
+    memory::TargetAddress,
+    ElfReader, LoadError, LoadResult,
+};
+
+pub(super) const SYSV_HASH_HEADER_SIZE: u64 = 8;
 
 pub(super) const fn symbol_entry_size(class: ElfClass) -> u64 {
     match class {
@@ -31,9 +41,83 @@ pub(super) const fn symbol_entry_size(class: ElfClass) -> u64 {
     }
 }
 
-// Exercised by the format tests until the dynamic table reader consumes records.
-#[cfg(test)]
-struct SymbolRecord {
+/// A validated symbol table backed by the original ELF reader.
+pub(crate) struct SymbolTableReader<'a, R: ElfReader> {
+    reader: &'a R,
+    file_offset: u64,
+    count: u32,
+    class: ElfClass,
+    endian: ElfData,
+}
+
+impl<'a, R: ElfReader> SymbolTableReader<'a, R> {
+    pub(super) const fn new(
+        reader: &'a R,
+        file: FileRange,
+        count: u32,
+        class: ElfClass,
+        endian: ElfData,
+    ) -> Self {
+        Self {
+            reader,
+            file_offset: file.offset(),
+            count,
+            class,
+            endian,
+        }
+    }
+
+    pub(crate) fn read(&self, index: u32) -> LoadResult<SymbolRecord> {
+        let context = || ErrorContext::SymbolIndex {
+            index,
+            count: self.count,
+        };
+        if index >= self.count {
+            return Err(LoadError::new(LoadErrorKind::OutOfBounds, context()));
+        }
+        let size = symbol_entry_size(self.class);
+        let offset = self
+            .file_offset
+            .checked_add(u64::from(index) * size)
+            .ok_or_else(|| LoadError::new(LoadErrorKind::IntegerOverflow, context()))?;
+        let mut bytes = [0; elf64::sym::SIZEOF_SYM];
+        let entry = &mut bytes[..size as usize];
+        self.reader.read_exact_at(offset, entry)?;
+        SymbolRecord::decode(entry, self.class, self.endian)
+    }
+}
+
+/// SysV hash has one 32-bit chain entry per dynamic symbol in either ELF class.
+pub(super) fn read_sysv_symbol_count(
+    reader: &impl ElfReader,
+    segments: &[LoadSegmentInfo],
+    address: TargetAddress,
+    endian: ElfData,
+) -> LoadResult<u32> {
+    let bad_hash = || {
+        LoadError::new(
+            LoadErrorKind::BadElf,
+            ErrorContext::DynamicTag {
+                tag: DT_HASH,
+                value: address.get(),
+            },
+        )
+    };
+    let header =
+        vaddr_to_file_range(segments, address, SYSV_HASH_HEADER_SIZE).ok_or_else(bad_hash)?;
+    let mut raw = [0; SYSV_HASH_HEADER_SIZE as usize];
+    reader.read_exact_at(header.offset(), &mut raw)?;
+    let nbucket = read_u32(&raw, 0, endian)?;
+    let nchain = read_u32(&raw, 4, endian)?;
+    if nbucket == 0 || nchain == 0 {
+        return Err(bad_hash());
+    }
+    let len = SYSV_HASH_HEADER_SIZE + 4 * (u64::from(nbucket) + u64::from(nchain));
+    vaddr_to_file_range(segments, address, len).ok_or_else(bad_hash)?;
+    Ok(nchain)
+}
+
+pub(crate) struct SymbolRecord {
     name_offset: u32,
     value: u64,
     size: u64,
@@ -43,7 +127,6 @@ struct SymbolRecord {
     section_index: u16,
 }
 
-#[cfg(test)]
 impl SymbolRecord {
     fn decode(bytes: &[u8], class: ElfClass, endian: ElfData) -> LoadResult<Self> {
         let name_offset = read_u32(bytes, 0, endian)?;
@@ -71,6 +154,10 @@ impl SymbolRecord {
                 }
             }
         })
+    }
+
+    pub(crate) const fn name_offset(&self) -> u32 {
+        self.name_offset
     }
 
     fn binding(&self) -> u8 {

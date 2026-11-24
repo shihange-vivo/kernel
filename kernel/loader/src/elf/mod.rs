@@ -20,6 +20,7 @@ mod header;
 mod program_header;
 mod relocation;
 mod segment;
+pub(crate) mod strings;
 mod symbol;
 
 use crate::{
