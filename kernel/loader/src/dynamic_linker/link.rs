@@ -28,7 +28,7 @@ use crate::{
     memory::{ImageMapping, TargetAddress, TargetRange},
     profile::LinkLimits,
     relocation::{relative_value, write::RelocationWrites, SymbolRelocation},
-    ElfReader, ImageAllocator, LoadError, LoadResult,
+    CodeCache, ElfReader, ImageAllocator, LoadError, LoadResult, LoadedImages, LoadedObject,
 };
 
 /// One relocated ELF and its backing, retained by the dependency closure.
@@ -89,6 +89,20 @@ impl<K, A: ImageMapping> LinkedImages<K, A> {
             plans.push(linked.image.lifecycle()?);
         }
         LinkedLifecycle::build(&self.edges, plans)
+    }
+
+    /// Finalize the graph and transfer all mappings into one owning result.
+    /// Lifecycle validation covers the whole graph before publishing code or
+    /// tightening RELRO. On error every mapping is dropped.
+    pub fn seal<C: CodeCache + ?Sized>(self, cache: &mut C) -> LoadResult<LoadedImages<K, A>> {
+        let (plans, init_order) = self.plan_lifecycle()?.into_parts();
+        let mut images =
+            reserve(self.images.len()).map_err(|error| error.at_stage(LoadStage::Seal))?;
+        for (linked, lifecycle) in self.images.into_iter().zip(plans) {
+            let image = linked.image.seal_with_lifecycle(cache, lifecycle)?;
+            images.push(LoadedObject::new(linked.key, linked.soname, image));
+        }
+        Ok(LoadedImages::new(images, self.edges, init_order))
     }
 }
 

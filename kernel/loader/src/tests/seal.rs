@@ -103,7 +103,7 @@ fn flags(fixture: &mut Fixture, index: usize, flags: u32) {
     fixture.number(base + index * stride + offset, u64::from(flags), 4);
 }
 
-fn relro(fixture: &mut Fixture, start: u64, len: u64) {
+pub(super) fn relro(fixture: &mut Fixture, start: u64, len: u64) {
     let (base, stride, count) = match fixture.profile.class() {
         ElfClass::Elf32 => (52, 32, 44),
         ElfClass::Elf64 => (64, 56, 56),

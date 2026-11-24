@@ -38,16 +38,34 @@ pub(crate) struct RelocatedImage<A: ImageMapping> {
 
 impl<A: ImageMapping> RelocatedImage<A> {
     pub(crate) fn seal<C: CodeCache + ?Sized>(self, cache: &mut C) -> LoadResult<LoadedImage<A>> {
-        self.seal_inner(cache)
+        self.seal_inner(cache, None)
             .map_err(|error| error.at_stage(LoadStage::Seal))
     }
 
-    fn seal_inner<C: CodeCache + ?Sized>(mut self, cache: &mut C) -> LoadResult<LoadedImage<A>> {
+    /// Finalize using the callback plan already read for this mapping.
+    #[cfg(enable_dynamic_linker)]
+    pub(crate) fn seal_with_lifecycle<C: CodeCache + ?Sized>(
+        self,
+        cache: &mut C,
+        lifecycle: LifecyclePlan,
+    ) -> LoadResult<LoadedImage<A>> {
+        self.seal_inner(cache, Some(lifecycle))
+            .map_err(|error| error.at_stage(LoadStage::Seal))
+    }
+
+    fn seal_inner<C: CodeCache + ?Sized>(
+        mut self,
+        cache: &mut C,
+        lifecycle: Option<LifecyclePlan>,
+    ) -> LoadResult<LoadedImage<A>> {
         self.profile
             .check_protection_level(self.allocation.protection_level())?;
         let base = self.allocation.base();
         base.checked_add(self.allocation.len())?;
-        let lifecycle = self.lifecycle()?;
+        let lifecycle = match lifecycle {
+            Some(lifecycle) => lifecycle,
+            None => self.lifecycle()?,
+        };
         // Ordinary segment permissions are already active. Publish completed
         // code writes before execution and before closing writable RELRO.
         for segment in &self.segments {
