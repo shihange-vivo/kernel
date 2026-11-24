@@ -24,6 +24,8 @@
 use super::StartupError;
 #[cfg(thread_group)]
 use super::{load_image, StartupArguments, StartupStorage};
+#[cfg(all(enable_dynamic_linker, thread_group))]
+use super::{load_linked, startup::StartupFrame};
 use crate::config;
 #[cfg(all(enable_vfs, thread_group))]
 use crate::thread_group::StandardIo;
@@ -32,6 +34,10 @@ use crate::{
     thread::Stack,
     thread_group::{ThreadGroupError, ThreadGroupExit},
 };
+#[cfg(all(enable_dynamic_linker, thread_group))]
+use alloc::vec::Vec;
+#[cfg(all(enable_dynamic_linker, thread_group))]
+use blueos_loader::dynamic_linker::DependencyResolver;
 #[cfg(thread_group)]
 use blueos_loader::ElfReader;
 use blueos_loader::LoadError;
@@ -64,6 +70,19 @@ impl<'a> Default for RunRequest<'a> {
             stack_size: config::DEFAULT_STACK_SIZE,
             #[cfg(all(enable_vfs, thread_group))]
             stdio: None,
+        }
+    }
+}
+
+#[cfg(thread_group)]
+impl RunRequest<'_> {
+    fn arguments(&self) -> StartupArguments<'_> {
+        StartupArguments {
+            argv: self.argv,
+            envp: self.envp,
+            page_size: ABI_PAGE_SIZE,
+            execfn: self.execfn,
+            random: None,
         }
     }
 }
@@ -128,17 +147,7 @@ pub unsafe fn run(
 ) -> Result<ThreadGroupExit, RunError> {
     let image = load_image(reader)?;
     let stack = Stack::from_size(request.stack_size).ok_or(RunError::StackUnavailable)?;
-    let storage = StartupStorage::new(
-        image,
-        stack,
-        StartupArguments {
-            argv: request.argv,
-            envp: request.envp,
-            page_size: ABI_PAGE_SIZE,
-            execfn: request.execfn,
-            random: None,
-        },
-    )?;
+    let storage = StartupStorage::new(image, stack, request.arguments())?;
     // SAFETY: the caller guarantees trusted native code; the group retains
     // the image and stack through all member cleanups.
     let mut thread_group = unsafe {
@@ -149,4 +158,62 @@ pub unsafe fn run(
     };
     thread_group.start()?;
     thread_group.wait().map_err(Into::into)
+}
+
+/// Run a linked ELF and its dependencies as one native thread group.
+/// The resolver opens the root and all dependencies on the caller's stack.
+/// The group's main librs runtime executes the linked callback plans.
+///
+/// # Safety
+/// All resolved images must be trusted native code. The root must use a librs
+/// runtime that consumes the linked startup auxv entry and follows the thread
+/// group exit contract of `run`. Users of any image must remain group members.
+#[cfg(all(enable_dynamic_linker, thread_group))]
+pub unsafe fn run_linked<D: DependencyResolver>(
+    root: D::Key,
+    resolver: &mut D,
+    request: &RunRequest<'_>,
+) -> Result<ThreadGroupExit, RunError>
+where
+    D::Key: Send + 'static,
+{
+    let images = load_linked(root, resolver)?;
+    let init_count = images
+        .preinit()
+        .len()
+        .checked_add(images.init().count())
+        .ok_or(StartupError::LifecycleUnavailable)?;
+    let fini_count = images.fini().count();
+    let words = init_count
+        .checked_add(fini_count)
+        .and_then(|count| count.checked_add(2))
+        .ok_or(StartupError::LifecycleUnavailable)?;
+    let mut lifecycle = Vec::new();
+    lifecycle
+        .try_reserve_exact(words)
+        .map_err(|_| StartupError::LifecycleUnavailable)?;
+    lifecycle.extend([init_count, fini_count]);
+    for address in images
+        .preinit()
+        .iter()
+        .copied()
+        .chain(images.init())
+        .chain(images.fini())
+    {
+        lifecycle.push(usize::try_from(address.get()).map_err(|_| StartupError::InvalidAddress)?);
+    }
+
+    let stack = Stack::from_size(request.stack_size).ok_or(RunError::StackUnavailable)?;
+    let frame = StartupFrame::new(images.root(), stack, request.arguments(), Some(&lifecycle))?;
+    // SAFETY: the owner keeps every mapping and the immutable auxv payload
+    // alive through cleanup. The caller authorizes the native entry.
+    let mut group = unsafe {
+        frame.into_thread_group(
+            (images, lifecycle),
+            #[cfg(enable_vfs)]
+            request.stdio,
+        )?
+    };
+    group.start()?;
+    group.wait().map_err(Into::into)
 }

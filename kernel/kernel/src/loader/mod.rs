@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Kernel host adapters for standalone image loading.
+//! Kernel host adapters for ELF loading and startup.
 //!
 //! The loader core stays independent of kernel types. This module supplies the
 //! flat memory mapping, instruction publication and native profile, then hands
@@ -28,8 +28,12 @@ mod run;
 mod startup;
 
 pub use adapters::flat_memory::init_fixed_regions;
+#[cfg(enable_dynamic_linker)]
+pub use load::load_linked;
 pub use load::{board_load_profile, load_image, load_request};
 #[cfg(thread_group)]
 pub use run::run;
+#[cfg(all(enable_dynamic_linker, thread_group))]
+pub use run::run_linked;
 pub use run::{RunError, RunRequest};
 pub use startup::{StartupArguments, StartupError, StartupStorage};

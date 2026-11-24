@@ -11,6 +11,8 @@
 extern crate alloc;
 extern crate rsrt;
 
+#[cfg(all(enable_dynamic_linker, not(loader_test_exec), thread_group, enable_vfs))]
+mod linked;
 mod runner;
 #[cfg(all(not(loader_test_exec), thread_group, enable_vfs))]
 mod shell;

@@ -15,6 +15,7 @@
 import("//build/boards/${board}.gni")
 import("//build/templates/build_template.gni")
 import("//build/toolchain/blueos.gni")
+import("//kernel/loader/features.gni")
 import("//kernel/scal/features.gni")
 
 _kernel_default_cfgs = [
@@ -102,6 +103,9 @@ _loader_backend_enabled = board_toolchain_info.current_cpu == "riscv32" ||
 if (_loader_backend_enabled) {
   _kernel_default_cfgs += [ "loader_backend" ]
   _shared_deps += [ "//kernel/loader:blueos_loader" ]
+  if (enable_dynamic_linker) {
+    _kernel_default_cfgs += [ "enable_dynamic_linker" ]
+  }
 }
 
 build_rust("kernel_unittest") {

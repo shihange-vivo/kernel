@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Startup for a self-contained ELF with its own statically linked librs.
+//! Startup for an ELF with its own statically linked librs.
 //! This copy of libc and its globals belong to one thread group.
 //! The main thread closes admission and waits for cooperative child cleanup
 //! before touching shared libc state. Shared libc, interpreters and forced
@@ -28,7 +28,7 @@ use blueos_header::{
 use blueos_scal::bk_syscall;
 use core::{
     ffi::{c_char, c_int, c_ulong, c_void},
-    mem, ptr,
+    mem, ptr, slice,
     sync::atomic::{AtomicBool, AtomicPtr, Ordering},
 };
 
@@ -41,6 +41,7 @@ pub static mut environ: *mut *mut c_char = ptr::null_mut();
 static AUXV: AtomicPtr<usize> = AtomicPtr::new(ptr::null_mut());
 static STARTED: AtomicBool = AtomicBool::new(false);
 static EXITING: AtomicBool = AtomicBool::new(false);
+static LINKED_INIT_COMPLETE: AtomicBool = AtomicBool::new(false);
 static CALLBACKS: GenericMutex<Vec<Fini>> = GenericMutex::new(Vec::new());
 
 unsafe extern "C" {
@@ -69,6 +70,8 @@ unsafe extern "C" {
 /// Strings and arrays remain mapped through exit; main may modify argv/envp
 /// after decoding finishes. The linker arrays and supplied callbacks must be
 /// valid native functions, and no execution or data users may outlive exit.
+/// A linked launch may supply AT_BLUEKERNEL_LIFECYCLE with immutable native words
+/// retained through exit, as described in the startup ABI.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn __libc_start_main(
     main: Main,
@@ -87,6 +90,16 @@ pub unsafe extern "C" fn __libc_start_main(
     let Some(decoded) = decoded.filter(|info| info.argc() == argc) else {
         retire();
     };
+    let linked = match decoded.aux_value(auxv::AT_BLUEKERNEL_LIFECYCLE) {
+        Some(address) => {
+            // SAFETY: the linked host retains the callback array through exit.
+            let Some(callbacks) = (unsafe { linked_callbacks(address) }) else {
+                retire();
+            };
+            Some(callbacks)
+        }
+        None => None,
+    };
     AUXV.store(decoded.auxv_ptr().cast_mut(), Ordering::Release);
     // No references into argv/envp survive application callbacks.
     drop(decoded);
@@ -101,11 +114,25 @@ pub unsafe extern "C" fn __libc_start_main(
     {
         unsafe { exit(127) };
     }
-    if unsafe { atexit(fini.unwrap_or(call_fini)) } != 0 {
+    let finalizer = if linked.is_some() {
+        call_linked_fini
+    } else {
+        fini.unwrap_or(call_fini)
+    };
+    if unsafe { atexit(finalizer) } != 0 {
         unsafe { exit(127) };
     }
-    // SAFETY: this standalone path has no interpreter running preinit/init.
+    // SAFETY: the host validates the linked callbacks. A standalone image
+    // instead supplies its own linker arrays and optional CRT callbacks.
     unsafe {
+        if let Some((initializers, _)) = linked {
+            for &address in initializers {
+                let callback: Init = mem::transmute(address);
+                callback(argc, argv, envp);
+            }
+            LINKED_INIT_COMPLETE.store(true, Ordering::Release);
+            exit(main(argc, argv, envp));
+        }
         run_init_array(
             &raw const __preinit_array_start,
             &raw const __preinit_array_end,
@@ -165,7 +192,7 @@ pub extern "C" fn getauxval(key: c_ulong) -> c_ulong {
     0
 }
 
-/// Terminate a standalone application from its main thread. Stop accepting new
+/// Terminate an application from its main thread. Stop accepting new
 /// children and wait for existing children and their cleanup before atexit/fini.
 /// This cooperative RTOS path does not cancel children blocked indefinitely.
 ///
@@ -232,6 +259,38 @@ unsafe extern "C" fn call_fini() {
         }
     }
     if let Some(callback) = unsafe { _fini } {
+        unsafe { callback() };
+    }
+}
+
+/// The caller must supply the live immutable array identified by the auxv.
+unsafe fn linked_callbacks<'a>(address: usize) -> Option<(&'a [usize], &'a [usize])> {
+    if address == 0 || !address.is_multiple_of(mem::align_of::<usize>()) {
+        return None;
+    }
+    let words = ptr::with_exposed_provenance::<usize>(address);
+    // SAFETY: the host supplies the two initialized count words.
+    let (init, fini) = unsafe { (words.read(), words.add(1).read()) };
+    let count = init.checked_add(fini)?;
+    let bytes = count.checked_add(2)?.checked_mul(mem::size_of::<usize>())?;
+    if bytes > isize::MAX as usize || address.checked_add(bytes).is_none() {
+        return None;
+    }
+    // SAFETY: the caller retains the entire array, including both lists.
+    let callbacks = unsafe { slice::from_raw_parts(words.add(2), count) };
+    Some(callbacks.split_at(init))
+}
+
+unsafe extern "C" fn call_linked_fini() {
+    if !LINKED_INIT_COMPLETE.load(Ordering::Acquire) {
+        return;
+    }
+    let address = getauxval(auxv::AT_BLUEKERNEL_LIFECYCLE as c_ulong) as usize;
+    // SAFETY: the immutable linked startup payload remains owned by the group.
+    let (_, finalizers) = unsafe { linked_callbacks(address) }.expect("validated lifecycle plan");
+    for &address in finalizers {
+        // SAFETY: the loaded graph keeps each validated native callback live.
+        let callback: Fini = unsafe { mem::transmute(address) };
         unsafe { callback() };
     }
 }

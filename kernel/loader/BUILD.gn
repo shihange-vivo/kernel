@@ -15,12 +15,8 @@
 import("//build/boards/${board}.gni")
 import("//build/templates/build_template.gni")
 import("//build/toolchain/blueos.gni")
+import("//kernel/loader/features.gni")
 import("//kernel/scal/features.gni")
-
-declare_args() {
-  # Build the optional dynamic-linker API.
-  enable_dynamic_linker = false
-}
 
 config("dynamic_linker_cfg") {
   rustflags = [ "--cfg=enable_dynamic_linker" ]

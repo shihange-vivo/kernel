@@ -16,7 +16,6 @@
 //!
 //! At the initial SP: argc, argv pointers, NULL, envp pointers, NULL, then
 //! auxiliary key/value pairs ending in AT_NULL. Each slot is one native word.
-//! There is no BlueOS-specific version prefix or lifecycle-plan argument.
 
 /// Initial SP alignment for the supported RISC-V and AArch64 ELF profiles.
 pub const STACK_ALIGNMENT: usize = 16;
@@ -38,6 +37,11 @@ pub mod auxv {
     pub const AT_ENTRY: usize = 9;
     pub const AT_RANDOM: usize = 25;
     pub const AT_EXECFN: usize = 31;
+    /// BlueKernel/librs extension for a linked image group. Points to aligned
+    /// native words: init count, fini count, init addresses (including root
+    /// preinit), then fini addresses. The host keeps these words immutable
+    /// and retains them together with the mappings through group cleanup.
+    pub const AT_BLUEKERNEL_LIFECYCLE: usize = 0x424b_0001;
 }
 
 #[cfg(target_pointer_width = "32")]

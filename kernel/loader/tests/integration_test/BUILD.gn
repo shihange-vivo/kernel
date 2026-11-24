@@ -15,6 +15,7 @@
 import("//build/boards/${board}.gni")
 import("//build/templates/build_template.gni")
 import("//build/toolchain/blueos.gni")
+import("//kernel/loader/features.gni")
 
 _startup_test_enabled = !defined(loader_test_relocation) &&
                         (board_toolchain_info.current_cpu == "riscv32" ||
@@ -86,6 +87,10 @@ if (_startup_test_enabled && current_toolchain == default_toolchain) {
     proc_macro_deps = [ "//kernel/test_harness:blueos_test_macro" ]
     rustflags = [ "--test" ]
 
+    if (_startup_test_enabled && enable_dynamic_linker) {
+      configs += [ "//kernel/loader:dynamic_linker_cfg" ]
+    }
+
     if (defined(loader_test_relocation)) {
       rustenv = [
         "LOADER_TEST_RELOCATION_ORIGIN=${loader_test_relocation.origin}",
@@ -106,6 +111,10 @@ if (_startup_test_enabled && current_toolchain == default_toolchain) {
         "//kernel/loader/tests/inputs/std_app:std_test_app_clippy",
         "//shell:shell_elf_clippy",
       ]
+      if (enable_dynamic_linker) {
+        deps +=
+            [ "//kernel/loader/tests/inputs/linked_app:linked_test_app_clippy" ]
+      }
     }
   }
 
