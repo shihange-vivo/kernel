@@ -43,11 +43,12 @@ use super::{
 use crate::{
     dynamic_linker::{discover, link, LinkedImages},
     error::{ErrorContext, LimitKind, LoadErrorKind, LoadStage},
-    memory::{AllocationOffset, ImageLayout, TargetAddress},
+    load_and_link,
+    memory::{AllocationOffset, ImageLayout, MemoryPermissions, TargetAddress, TargetRange},
     profile::{
         DependencyLimits, ElfClass, ElfMachine, LinkLimits, LoadLimits, LoadProfile, LoadPurpose,
     },
-    ImageAllocator, ImageMapping, LoadResult,
+    CodeCache, ImageAllocator, ImageMapping, LoadAndLinkRequest, LoadError, LoadResult,
 };
 
 const SYMBOLS: u64 = 0x2200;
@@ -343,6 +344,125 @@ fn linked_lifecycle_reports_invalid_callbacks_with_the_lifecycle_stage() {
     assert_eq!(catalog.state.live.get(), 2);
 }
 
+#[derive(Default)]
+struct GraphCache {
+    ranges: Vec<TargetRange>,
+    fail_on: Option<usize>,
+}
+
+impl CodeCache for GraphCache {
+    fn synchronize(&mut self, range: TargetRange) -> LoadResult<()> {
+        self.ranges.push(range);
+        if self.fail_on == Some(self.ranges.len()) {
+            return Err(LoadError::new(LoadErrorKind::Backend, ErrorContext::None));
+        }
+        Ok(())
+    }
+}
+
+#[test]
+fn load_and_link_finalizes_every_image_and_retains_the_graph() {
+    for profile in PROFILES {
+        let relro_start = 0x2600;
+        let mut fixtures = [
+            lifecycle_fixture(profile, LoadPurpose::Executable, &[A], BASE + 0x10),
+            lifecycle_fixture(profile, LoadPurpose::SharedObject, &[], BASE + 0x10),
+        ];
+        for fixture in &mut fixtures {
+            super::seal::relro(fixture, relro_start, 0x80);
+        }
+        let mut catalog = Catalog::new(&fixtures, ROUTES);
+        let state = catalog.state.clone();
+        let mut cache = GraphCache::default();
+        let loaded = load_and_link(
+            0,
+            LoadAndLinkRequest::new(request(
+                profile,
+                LoadPurpose::Executable,
+                LoadLimits::DEFAULT,
+            )),
+            &mut catalog,
+            DistinctAllocations(state.clone()),
+            &mut cache,
+        )
+        .unwrap();
+
+        assert_eq!(loaded.images().len(), 2);
+        assert_eq!(loaded.images()[1].key(), &1);
+        assert_eq!(loaded.edges().len(), 1);
+        assert_eq!(loaded.edges()[0].provider(), 1);
+        assert_eq!(loaded.root().entry(), Some(TargetAddress::new(0x8000)));
+        assert_eq!(loaded.images()[1].image().entry(), None);
+        assert_eq!(loaded.preinit(), &[TargetAddress::new(0x8000)]);
+        assert!(loaded
+            .init()
+            .map(TargetAddress::get)
+            .eq([0xc010, 0xc020, 0x8010, 0x8020]));
+        assert!(loaded
+            .fini()
+            .map(TargetAddress::get)
+            .eq([0x8050, 0x8040, 0x8030, 0xc050, 0xc040, 0xc030]));
+        assert_eq!(
+            cache.ranges,
+            [0x8000, 0xc000].map(|base| TargetRange::new(TargetAddress::new(base), 0x100))
+        );
+        let protection = state.protection.borrow();
+        assert_eq!(
+            &protection[protection.len() - 2..],
+            &[(
+                AllocationOffset::new(relro_start - BASE),
+                0x80,
+                MemoryPermissions::READ
+            ); 2]
+        );
+        assert_eq!(state.reader_drops.get(), 2);
+        assert_eq!(state.live.get(), 2);
+        drop(protection);
+        drop(loaded);
+        assert_eq!(state.drops.get(), 2);
+    }
+}
+
+#[test]
+fn graph_seal_checks_all_callbacks_before_synchronizing_code() {
+    let profile = LoadProfile::riscv64();
+    let fixtures = [
+        lifecycle_fixture(profile, LoadPurpose::Executable, &[A], BASE + 0x10),
+        lifecycle_fixture(profile, LoadPurpose::SharedObject, &[], LIB_DATA),
+    ];
+    let mut catalog = Catalog::new(&fixtures, ROUTES);
+    let linked = link_fixtures(&mut catalog, profile, LinkLimits::DEFAULT).unwrap();
+    let mut cache = GraphCache::default();
+    let error = failure(linked.seal(&mut cache));
+    assert_eq!(error.stage(), Some(LoadStage::Lifecycle));
+    assert!(cache.ranges.is_empty());
+    assert_eq!(catalog.state.drops.get(), 2);
+}
+
+#[test]
+fn graph_seal_releases_all_mappings_after_a_late_cache_error() {
+    let profile = LoadProfile::riscv64();
+    let fixtures = [
+        lifecycle_fixture(profile, LoadPurpose::Executable, &[A], BASE + 0x10),
+        lifecycle_fixture(profile, LoadPurpose::SharedObject, &[], BASE + 0x10),
+    ];
+    let mut catalog = Catalog::new(&fixtures, ROUTES);
+    let linked = link_fixtures(&mut catalog, profile, LinkLimits::DEFAULT).unwrap();
+    let mut cache = GraphCache {
+        fail_on: Some(2),
+        ..GraphCache::default()
+    };
+    let error = failure(linked.seal(&mut cache));
+    assert_eq!(error.stage(), Some(LoadStage::Seal));
+    assert_eq!(error.kind(), LoadErrorKind::Backend);
+    assert_eq!(cache.ranges.len(), 2);
+    assert!(matches!(
+        error.context(),
+        ErrorContext::TargetRange { start, len: 0x100, .. } if start.get() == 0xc000
+    ));
+    assert_eq!(catalog.state.drops.get(), 2);
+}
+
 #[test]
 fn link_binds_data_and_eager_plt_in_breadth_first_scope() {
     for profile in PROFILES {
@@ -507,7 +627,7 @@ fn link_rejects_invalid_later_images_before_any_relocation_write() {
 }
 
 #[test]
-fn link_checks_closure_relocation_and_probe_budgets() {
+fn load_and_link_checks_dependency_relocation_and_probe_budgets() {
     let profile = LoadProfile::aarch64();
     let inputs = [fixture(
         profile,
@@ -517,24 +637,58 @@ fn link_checks_closure_relocation_and_probe_budgets() {
         &[(TARGET, 1, R_AARCH64_ABS64, 0)],
         None,
     )];
-    for (limits, relocations, prepared) in [
-        (LinkLimits::new(0, 1, 256), true, 0),
-        (LinkLimits::new(1, 0, 256), false, 1),
+    let config = LoadAndLinkRequest::new(request(
+        profile,
+        LoadPurpose::Executable,
+        LoadLimits::DEFAULT,
+    ));
+    for (config, stage, prepared) in [
+        (
+            config.with_dependency_limits(DependencyLimits::new(0, 0, 0, 0, 0)),
+            LoadStage::Discover,
+            0,
+        ),
+        (
+            config.with_link_limits(LinkLimits::new(0, 1, 256)),
+            LoadStage::Relocate,
+            0,
+        ),
+        (
+            config.with_link_limits(LinkLimits::new(1, 0, 256)),
+            LoadStage::Relocate,
+            1,
+        ),
     ] {
         let mut catalog = Catalog::new(&inputs, &[]);
-        let error = failure(link_fixtures(&mut catalog, profile, limits));
-        assert_eq!(error.stage(), Some(LoadStage::Relocate));
+        let allocator = DistinctAllocations(catalog.state.clone());
+        let error = failure(load_and_link(
+            0,
+            config,
+            &mut catalog,
+            allocator,
+            &mut GraphCache::default(),
+        ));
+        assert_eq!(error.stage(), Some(stage));
         assert_eq!(error.kind(), LoadErrorKind::ResourceLimit);
         assert!(matches!(
-            (relocations, error.context()),
+            (stage, prepared, error.context()),
             (
-                true,
+                LoadStage::Discover,
+                0,
+                ErrorContext::Limit {
+                    resource: LimitKind::DependencyImageCount,
+                    ..
+                }
+            ) | (
+                LoadStage::Relocate,
+                0,
                 ErrorContext::Limit {
                     resource: LimitKind::LinkRelocationCount,
                     ..
                 }
             ) | (
-                false,
+                LoadStage::Relocate,
+                1,
                 ErrorContext::Limit {
                     resource: LimitKind::LinkSymbolLookups,
                     ..

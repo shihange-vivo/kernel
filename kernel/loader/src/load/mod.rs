@@ -12,20 +12,21 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Complete standalone loading and ownership of its finalized result.
-//! Internal image stages remain reusable by the later dynamic linker.
+//! Complete loading entry points and their finalized image owners.
 
-mod loaded;
-pub use loaded::LoadedImage;
+#[cfg(enable_dynamic_linker)]
+mod linked;
+mod single;
 
-use crate::{
-    error::LoadStage,
-    image::ImageLoader,
-    profile::{LoadLimits, LoadProfile, LoadPurpose},
-    CodeCache, ElfReader, ImageAllocator, LoadResult,
-};
+#[cfg(enable_dynamic_linker)]
+pub use linked::{load_and_link, LoadedImages, LoadedObject};
+pub use single::{load_elf, LoadedImage};
 
-/// Parameters for one single-image loading attempt.
+#[cfg(enable_dynamic_linker)]
+use crate::profile::{DependencyLimits, LinkLimits};
+use crate::profile::{LoadLimits, LoadProfile, LoadPurpose};
+
+/// Per-image loading policy for a standalone ELF or a dependency graph root.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct LoadRequest {
     profile: LoadProfile,
@@ -61,53 +62,33 @@ impl LoadRequest {
     }
 }
 
-/// Load and finalize one self-contained ELF without executing its code.
-///
-/// Accepts fixed-address ET_EXEC and relocatable ET_DYN images admitted by
-/// `request.profile()`. DT_NEEDED dependencies are rejected before allocation;
-/// relocations must be NONE or supported explicit-addend RELATIVE records.
-/// `SharedObject` permits a self-contained library without an entry, but does
-/// not enable dependency loading or symbol binding.
-///
-/// The reader is consumed and released once copying completes, or on failure.
-/// The host supplies its concrete reader, which may also be borrowed. The mapping must
-/// outlive every use of the returned entry and lifecycle addresses. Loading
-/// failures and discarding the result release backing through the mapping's
-/// Drop implementation; they do not execute finalizers or restore old bytes.
-///
-/// The host supplies initial read/write backing, permission changes and code
-/// cache synchronization. Successful loading does not initialize the application
-/// runtime or authorize calls from a context incompatible with that backend.
-///
-/// Stack usage depends on concrete reader, allocator and mapping types as well
-/// as backend calls; keep large backend state behind small owning or borrowed
-/// handles.
-pub fn load_elf<R, M, C>(
-    reader: R,
-    request: LoadRequest,
-    allocator: M,
-    cache: &mut C,
-) -> LoadResult<LoadedImage<M::Allocation>>
-where
-    R: ElfReader,
-    M: ImageAllocator,
-    C: CodeCache + ?Sized,
-{
-    // Forward Result between stages instead of unwrapping each large stage into
-    // an intermediate ControlFlow payload. This keeps the pipeline's stack small.
-    ImageLoader::new(reader, request)
-        .prepare_layout()
-        .and_then(|image| {
-            if let Some(dynamic) = image.dynamic() {
-                request
-                    .profile()
-                    .check_standalone_dynamic(dynamic)
-                    .map_err(|error| error.at_stage(LoadStage::Plan))?;
-            }
-            image.allocate(allocator)
-        })
-        .and_then(|image| image.map())
-        .and_then(|image| image.decode())
-        .and_then(|image| image.relocate())
-        .and_then(|image| image.seal(cache))
+/// Per-image policy and whole-graph limits for `load_and_link`.
+#[cfg(enable_dynamic_linker)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct LoadAndLinkRequest {
+    load_request: LoadRequest,
+    dependency_limits: DependencyLimits,
+    link_limits: LinkLimits,
+}
+
+#[cfg(enable_dynamic_linker)]
+impl LoadAndLinkRequest {
+    /// Use the default dependency and link limits with this image policy.
+    pub const fn new(load_request: LoadRequest) -> Self {
+        Self {
+            load_request,
+            dependency_limits: DependencyLimits::DEFAULT,
+            link_limits: LinkLimits::DEFAULT,
+        }
+    }
+
+    pub const fn with_dependency_limits(mut self, limits: DependencyLimits) -> Self {
+        self.dependency_limits = limits;
+        self
+    }
+
+    pub const fn with_link_limits(mut self, limits: LinkLimits) -> Self {
+        self.link_limits = limits;
+        self
+    }
 }

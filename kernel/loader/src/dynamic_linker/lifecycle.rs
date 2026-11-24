@@ -34,6 +34,10 @@ impl LinkedLifecycle {
         Ok(Self { plans, order })
     }
 
+    pub(super) fn into_parts(self) -> (Vec<LifecyclePlan>, Vec<usize>) {
+        (self.plans, self.order)
+    }
+
     /// The root's preinitializers, for execution before any image initialization.
     pub fn preinit(&self) -> &[TargetAddress] {
         self.plans[0].preinit()
