@@ -23,6 +23,8 @@ mod load;
 mod relocation;
 #[path = "seal.rs"]
 mod seal;
+#[path = "symbol_lookup.rs"]
+mod symbol_lookup;
 
 use super::fixture::{ElfFixtureBuilder, ProgramHeaderFixture};
 use crate::{

@@ -25,9 +25,7 @@ use goblin::elf::dynamic::{
 };
 
 use super::{
-    hash::{
-        read_gnu_symbol_count, read_sysv_symbol_count, GNU_HASH_HEADER_SIZE, SYSV_HASH_HEADER_SIZE,
-    },
+    hash::{GnuHash, SysvHash, GNU_HASH_HEADER_SIZE, SYSV_HASH_HEADER_SIZE},
     read_u32, read_u64,
     relocation::{RelocationFormat, RelocationTable},
     segment::{vaddr_file_extent, vaddr_to_file_range},
@@ -102,17 +100,18 @@ impl DynamicInfo {
         class: ElfClass,
         endian: ElfData,
     ) -> LoadResult<Option<SymbolTableReader<'a, R>>> {
-        let sysv_count = self
+        let sysv = self
             .value(DT_HASH)
-            .map(|address| {
-                read_sysv_symbol_count(reader, segments, TargetAddress::new(address), endian)
-            })
+            .map(|address| SysvHash::read(reader, segments, TargetAddress::new(address), endian))
             .transpose()?;
-        let count = match self.value(DT_GNU_HASH) {
+        let sysv_count = sysv.as_ref().map(SysvHash::count);
+        let (gnu, count) = match self.value(DT_GNU_HASH) {
             Some(address) => {
-                Some(self.gnu_symbol_count(reader, segments, address, class, endian, sysv_count)?)
+                let (hash, count) =
+                    self.read_gnu_hash(reader, segments, address, class, endian, sysv_count)?;
+                (Some(hash), Some(count))
             }
-            None => sysv_count,
+            None => (None, sysv_count),
         };
         let Some(count) = count else {
             return Ok(None);
@@ -121,11 +120,18 @@ impl DynamicInfo {
             .symbol_file_range(segments, class, count)?
             .ok_or_else(|| dynamic_error(DT_SYMTAB, 0))?;
         Ok(Some(SymbolTableReader::new(
-            reader, file, count, class, endian,
+            reader,
+            file,
+            count,
+            class,
+            endian,
+            self.string_file_range(segments)?,
+            sysv,
+            gnu,
         )))
     }
 
-    fn gnu_symbol_count(
+    fn read_gnu_hash(
         &self,
         reader: &impl ElfReader,
         segments: &[LoadSegmentInfo],
@@ -133,7 +139,7 @@ impl DynamicInfo {
         class: ElfClass,
         endian: ElfData,
         sysv_count: Option<u32>,
-    ) -> LoadResult<u32> {
+    ) -> LoadResult<(GnuHash, u32)> {
         let symbol_address = self
             .value(DT_SYMTAB)
             .ok_or_else(|| dynamic_error(DT_SYMTAB, 0))?;
@@ -148,7 +154,7 @@ impl DynamicInfo {
         let hash = self
             .symbol_metadata_file_extent(segments, address)
             .ok_or_else(|| dynamic_error(DT_GNU_HASH, address))?;
-        let gnu_count = read_gnu_symbol_count(
+        let (hash, gnu_count) = GnuHash::read(
             reader,
             hash,
             TargetAddress::new(address),
@@ -160,10 +166,10 @@ impl DynamicInfo {
             if sysv_count.is_some_and(|expected| count != expected) {
                 return Err(dynamic_error(DT_GNU_HASH, address));
             }
-            return Ok(count);
+            return Ok((hash, count));
         }
         // An empty GNU hash can leave unindexed symbols in .dynsym.
-        sysv_count.ok_or_else(|| {
+        let count = sysv_count.ok_or_else(|| {
             LoadError::new(
                 LoadErrorKind::UnsupportedByProfile,
                 ErrorContext::DynamicTag {
@@ -171,7 +177,8 @@ impl DynamicInfo {
                     value: address,
                 },
             )
-        })
+        })?;
+        Ok((hash, count))
     }
 
     /// Limit an inferred table extent at the next known symbol-related table.
