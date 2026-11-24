@@ -306,6 +306,7 @@ fn standalone_load_rejects_dependencies_before_allocation() {
                     value: 1
                 }
             ));
+            assert_eq!(state.dynamic_reads.get(), 4); // Only the dynamic entries.
             assert_eq!(state.prepares.get(), 0);
             assert_eq!(state.writes.get(), 0);
             assert_eq!(state.reader_drops.get(), 1);

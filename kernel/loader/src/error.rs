@@ -127,6 +127,10 @@ pub enum ErrorContext {
         tag: u64,
         value: u64,
     },
+    SymbolIndex {
+        index: u32,
+        count: u32,
+    },
     Relocation {
         target: TargetAddress,
         raw_type: u32,
