@@ -725,6 +725,8 @@ fn plugin_scope_only_includes_later_images_through_its_dependencies() {
     assert_eq!(group.init_order(), [0, 1, 2]);
     assert_eq!(catalog.opened(), [0, 1, 2, 3]);
     let address = group.images()[1].exports().unwrap().find(b"data").unwrap();
+    assert_eq!(group.lookup_symbol(2, b"data").unwrap(), Some(address));
+    assert_eq!(group.lookup_symbol(0, b"data").unwrap(), None);
     assert_eq!(
         word(group.images()[2].image().allocation(), profile, TARGET),
         address.get()
@@ -755,6 +757,19 @@ fn plugin_errors_identify_the_existing_image_and_reason() {
     )
     .unwrap();
     let root_base = group.root().allocation().base();
+
+    let error = failure(group.lookup_symbol(0, b"data"));
+    assert!(matches!(
+        error.context(),
+        ErrorContext::ExistingImage { index: 0, base, reason: ExistingImageReason::MissingExportIndex }
+            if *base == root_base
+    ));
+    let error = failure(group.lookup_symbol(1, b"data"));
+    assert_eq!(error.kind(), LoadErrorKind::OutOfBounds);
+    assert!(matches!(
+        error.context(),
+        ErrorContext::ImageIndex { index: 1, count: 1 }
+    ));
 
     for (key, reason) in [
         (0, ExistingImageReason::RootAsPlugin),

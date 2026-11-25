@@ -41,6 +41,7 @@ pub use discover::{discover, DependencyEdge, DependencyImage, DependencyPlan, De
 pub use exports::ExportedSymbols;
 pub use lifecycle::LinkedLifecycle;
 pub use link::link;
+pub(crate) use scope::lookup_symbol;
 pub use seal::{LinkedImage, LinkedImages};
 
 /// Discover, link and seal additions to an already loaded application graph.

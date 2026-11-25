@@ -154,6 +154,15 @@ fn test_plugin_reuses_startup_library_with_application_symbol_precedence() {
         .find(b"linked_choice")
         .unwrap();
     assert_ne!(host, library);
+    assert_eq!(
+        images.lookup_symbol(0, b"linked_choice").unwrap(),
+        Some(host)
+    );
+    assert_eq!(
+        images.lookup_symbol(index, b"linked_choice").unwrap(),
+        Some(library)
+    );
+    assert_eq!(images.lookup_symbol(index, b"record_event").unwrap(), None);
 }
 
 #[test]
