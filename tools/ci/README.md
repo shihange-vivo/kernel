@@ -5,9 +5,10 @@ including drafts. Each job checks out the PR's merge result and uses the existin
 `ghcr.io/vivoblueos/kernel:latest` toolchain image.
 
 The workflow runs format and license checks, 40 board build profiles, two host
-profiles, and the allocator's Miri Tree Borrows tests. Every ordinary profile
-runs `gn gen`, `ninja default`, and `ninja check_all`. The final `BlueKernel CI` job
-passes only when all jobs succeed and can be selected as a required PR check.
+profiles, six dynamic-linker profiles, and Miri Tree Borrows tests. Every
+ordinary profile runs `gn gen`, `ninja default`, and `ninja check_all`. The final
+`BlueKernel CI` job passes only when all jobs succeed and can be selected as a
+required PR check.
 
 The scripts live outside the synchronized component directories. Existing
 component workflows and repository synchronization remain independent.
@@ -48,6 +49,17 @@ runs license-eye in each affected component using its existing configuration.
 Moves and deletions also count when selecting affected license configurations.
 Formatting excludes `external`; license checks cover `kernel`, `build`, `libs/librs`,
 `example`, `shell`, and `tools/ci`.
+
+The dynamic-linker jobs run Debug and Release in DSC mode on `qemu_riscv32`,
+`qemu_riscv64`, and `qemu_virt64_aarch64`. The following commands run the RV32
+Debug checks locally.
+
+```sh
+gn gen out/qemu_riscv32.debug.dsc.dynamic-linker \
+  --args='board="qemu_riscv32" build_type="debug" syscall_mode="dsc" enable_dynamic_linker=true'
+ninja -C out/qemu_riscv32.debug.dsc.dynamic-linker \
+  kernel/loader:check_loader kernel/loader:check_loader_by_clippy
+```
 
 To reproduce the Miri job:
 
