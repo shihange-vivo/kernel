@@ -233,6 +233,40 @@ jobs:
             --board "$BOARD" \
             --build-type "$BUILD_TYPE" \
             --syscall-mode "$SYSCALL_MODE"
+  dynamic-linker:
+    name: dynamic linker (${{ matrix.board }}.${{ matrix.build_type }}.dsc)
+    needs: resolve-dependencies
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    container:
+      image: ghcr.io/vivoblueos/kernel:latest
+    strategy:
+      fail-fast: false
+      matrix:
+        board: [qemu_riscv32, qemu_riscv64, qemu_virt64_aarch64]
+        build_type: [debug, release]
+    steps:
+      - name: Check out pull request
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Download Rust dependencies and GNRT
+        uses: actions/download-artifact@v4
+        with:
+          name: rust-dependencies
+          path: out
+      - name: Restore Rust dependencies and GNRT
+        run: |
+          tar -xzf out/rust-dependencies.tar.gz
+      - name: Run loader tests and Clippy with dynamic linking enabled
+        env:
+          BOARD: ${{ matrix.board }}
+          BUILD_TYPE: ${{ matrix.build_type }}
+        run: |
+          out_dir="out/$BOARD.$BUILD_TYPE.dsc.dynamic-linker"
+          gn gen "$out_dir" \
+            --args="board=\"$BOARD\" build_type=\"$BUILD_TYPE\" syscall_mode=\"dsc\" enable_dynamic_linker=true"
+          ninja -C "$out_dir" kernel/loader:check_loader kernel/loader:check_loader_by_clippy
   miri:
     name: MIRI check
     needs: resolve-dependencies
@@ -269,7 +303,7 @@ jobs:
   gate:
     name: BlueKernel CI
     if: ${{ always() }}
-    needs: [static-checks, resolve-dependencies, build-esp32c3, build, miri]
+    needs: [static-checks, resolve-dependencies, build-esp32c3, build, dynamic-linker, miri]
     runs-on: ubuntu-latest
     timeout-minutes: 5
     permissions: {}
@@ -280,17 +314,20 @@ jobs:
           DEPENDENCIES_RESULT: ${{ needs.resolve-dependencies.result }}
           ESP32C3_BUILD_RESULT: ${{ needs.build-esp32c3.result }}
           BUILD_RESULT: ${{ needs.build.result }}
+          DYNAMIC_LINKER_RESULT: ${{ needs.dynamic-linker.result }}
           MIRI_RESULT: ${{ needs.miri.result }}
         run: |
           if [[ "$STATIC_CHECKS_RESULT" != "success" || \
                 "$DEPENDENCIES_RESULT" != "success" || \
                 "$ESP32C3_BUILD_RESULT" != "success" || \
                 "$BUILD_RESULT" != "success" || \
+                "$DYNAMIC_LINKER_RESULT" != "success" || \
                 "$MIRI_RESULT" != "success" ]]; then
             echo "static-checks: $STATIC_CHECKS_RESULT"
             echo "resolve-dependencies: $DEPENDENCIES_RESULT"
             echo "build-esp32c3: $ESP32C3_BUILD_RESULT"
             echo "build: $BUILD_RESULT"
+            echo "dynamic-linker: $DYNAMIC_LINKER_RESULT"
             echo "miri: $MIRI_RESULT"
             exit 1
           fi
