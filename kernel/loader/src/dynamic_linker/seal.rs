@@ -134,13 +134,17 @@ impl<K, A: ImageMapping> LinkedImages<K, A> {
         let mut images =
             reserve(self.images.len()).map_err(|error| error.at_stage(LoadStage::Seal))?;
         for (linked, lifecycle) in self.images.into_iter().zip(plans) {
-            let image = linked.image.seal_with_lifecycle(cache, lifecycle)?;
-            images.push(LoadedObject::new(
-                linked.key,
-                linked.soname,
-                image,
-                linked.exports,
-            ));
+            linked
+                .image
+                .seal_with_lifecycle(cache, lifecycle)
+                .map(|image| {
+                    images.push(LoadedObject::new(
+                        linked.key,
+                        linked.soname,
+                        image,
+                        linked.exports,
+                    ));
+                })?;
         }
         for index in &mut init_order {
             *index += self.first;

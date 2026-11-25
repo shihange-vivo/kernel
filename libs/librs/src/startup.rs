@@ -17,6 +17,8 @@
 #[cfg(feature = "standalone_elf")]
 mod runtime;
 #[cfg(feature = "standalone_elf")]
+pub(crate) use runtime::linked_init_complete;
+#[cfg(feature = "standalone_elf")]
 pub use runtime::{__libc_start_main, atexit, environ, exit, getauxval};
 
 use blueos_header::startup::{auxv, AuxvEntry, STACK_ALIGNMENT};

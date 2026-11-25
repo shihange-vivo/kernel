@@ -27,7 +27,7 @@ use crate::{
 };
 #[cfg(thread_group)]
 use alloc::boxed::Box;
-use blueos_header::startup::{auxv, STACK_ALIGNMENT};
+use blueos_header::startup::{auxv, DynamicLinker, STACK_ALIGNMENT};
 use blueos_loader::{ImageMapping, LoadedImage};
 use core::{
     ffi::{c_int, c_void, CStr},
@@ -88,7 +88,7 @@ impl<A: ImageMapping> StartupStorage<A> {
         stack: Stack,
         args: StartupArguments<'_>,
     ) -> Result<Self, StartupError> {
-        let frame = StartupFrame::new(&image, stack, args, None)?;
+        let frame = StartupFrame::new(&image, stack, args, None, None)?;
         Ok(Self { image, frame })
     }
 
@@ -145,6 +145,7 @@ impl StartupFrame {
         stack: Stack,
         args: StartupArguments<'_>,
         lifecycle: Option<&[usize]>,
+        dynamic_linker: Option<&'static DynamicLinker>,
     ) -> Result<Self, StartupError> {
         let entry = image.entry().ok_or(StartupError::MissingEntry)?;
         let entry = usize::try_from(entry.get()).map_err(|_| StartupError::InvalidAddress)?;
@@ -171,7 +172,8 @@ impl StartupFrame {
         let pairs = 7
             + usize::from(args.execfn.is_some())
             + usize::from(args.random.is_some())
-            + usize::from(lifecycle.is_some());
+            + usize::from(lifecycle.is_some())
+            + usize::from(dynamic_linker.is_some());
         let words = args
             .argv
             .len()
@@ -249,6 +251,12 @@ impl StartupFrame {
         if let Some(lifecycle) = lifecycle {
             push(auxv::AT_BLUEKERNEL_LIFECYCLE, lifecycle.as_ptr() as usize);
         }
+        if let Some(dynamic_linker) = dynamic_linker {
+            push(
+                auxv::AT_BLUEKERNEL_DYNAMIC_LINKER,
+                ptr::from_ref(dynamic_linker) as usize,
+            );
+        }
         push(auxv::AT_NULL, 0);
         debug_assert_eq!(index, words);
         debug_assert!(payload.addr() >= sp + words * size_of::<usize>());
@@ -259,6 +267,13 @@ impl StartupFrame {
             initial_sp,
             words,
         })
+    }
+
+    #[cfg(all(enable_dynamic_linker, thread_group, enable_vfs))]
+    pub(super) fn native_arguments(&self, argc: usize) -> [usize; 3] {
+        let argv = self.initial_sp + size_of::<usize>();
+        let envp = argv + (argc + 1) * size_of::<usize>();
+        [argc, argv, envp]
     }
 
     #[cfg(thread_group)]

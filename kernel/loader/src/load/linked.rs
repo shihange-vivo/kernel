@@ -256,6 +256,23 @@ impl<K: Eq, A: ImageMapping> LoadedImages<K, A> {
         })
     }
 
+    /// Finalizers of the pending batch in reverse initialization order.
+    pub fn pending_plugin_fini(
+        &self,
+    ) -> Option<impl DoubleEndedIterator<Item = TargetAddress> + '_> {
+        let first = self.images.len();
+        self.pending.as_ref().map(|batch| {
+            batch.init_order.iter().rev().flat_map(move |&index| {
+                batch.images[index - first]
+                    .image()
+                    .lifecycle()
+                    .fini()
+                    .iter()
+                    .copied()
+            })
+        })
+    }
+
     /// Publish the pending batch after successful initialization. Returns the
     /// plugin's stable image index. All required capacity was reserved in begin.
     pub fn finish_plugin_load(&mut self) -> Option<usize> {

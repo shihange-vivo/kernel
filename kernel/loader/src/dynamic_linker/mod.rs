@@ -59,7 +59,7 @@ where
     C: CodeCache + ?Sized,
 {
     let (request, dependency_limits, limits) = request.into_parts();
-    let plan = discover_with_existing(
+    discover_with_existing(
         root,
         request.with_purpose(LoadPurpose::SharedObject),
         dependency_limits,
@@ -67,10 +67,14 @@ where
         group.images().len(),
         group.edges().len(),
         |key| group.find(key),
-    )?;
-    let scope = LinkScope::for_plugin(group, plan.images().len(), plan.edges(), &dependency_limits)
-        .map_err(|error| error.at_stage(LoadStage::Discover))?;
-    link_in_scope(plan, limits, allocator, scope)?.seal_batch(cache)
+    )
+    .and_then(|plan| {
+        let scope =
+            LinkScope::for_plugin(group, plan.images().len(), plan.edges(), &dependency_limits)
+                .map_err(|error| error.at_stage(LoadStage::Discover))?;
+        link_in_scope(plan, limits, allocator, scope)
+    })
+    .and_then(|linked| linked.seal_batch(cache))
 }
 
 fn reserve<T>(capacity: usize) -> LoadResult<Vec<T>> {

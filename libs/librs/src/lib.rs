@@ -40,6 +40,8 @@ extern crate rsrt;
 pub mod c_str;
 pub mod ctype;
 pub mod direct;
+#[cfg(feature = "standalone_elf")]
+pub mod dlfcn;
 pub mod errno;
 pub mod fcntl;
 pub mod io;

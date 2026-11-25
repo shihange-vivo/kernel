@@ -24,7 +24,7 @@ use super::{
     exports::ExportBudget,
     reserve,
     scope::{exports_at, LinkScope},
-    symbol, DependencyPlan, ExportedSymbols, LinkedImage, LinkedImages,
+    symbol, DependencyImage, DependencyPlan, ExportedSymbols, LinkedImage, LinkedImages,
 };
 use crate::{
     elf::{RelocationRecord, SymbolTableReader},
@@ -87,44 +87,7 @@ fn link_inner<K: Eq, R: ElfReader, M: ImageAllocator>(
         limits.check_relocations(count)?;
     }
 
-    let mut mapped: Vec<RelocationInput<K, R, M::Allocation>> =
-        reserve(images.len()).map_err(|error| error.at_stage(LoadStage::Allocate))?;
-    for dependency in images {
-        let (key, soname, image) = dependency.into_parts();
-        let allocated = image.allocate(&mut allocator)?;
-        let allocation = allocated.allocation();
-        let range = TargetRange::new(allocation.base(), allocation.len());
-        if mapped
-            .iter()
-            .map(|input| input.image.allocation())
-            .chain(
-                scope
-                    .existing()
-                    .iter()
-                    .map(|object| object.image().allocation()),
-            )
-            .any(|previous| range.overlaps(TargetRange::new(previous.base(), previous.len())))
-        {
-            return Err(LoadError::new(
-                LoadErrorKind::IncorrectLayout,
-                ErrorContext::Allocation {
-                    base: allocation.base(),
-                    len: allocation.len(),
-                    align: allocation.align(),
-                },
-            )
-            .at_stage(LoadStage::Allocate));
-        }
-        let (image, reader) = allocated.map_with_reader()?;
-        mapped.push(RelocationInput {
-            key,
-            soname,
-            reader,
-            image: image.decode()?,
-            exports: None,
-        });
-    }
-
+    let mut mapped = map_dependencies(images, &mut allocator, &scope)?;
     let writes = plan_writes(&mapped, &limits, &scope)?;
     if let Some(export_limits) = limits.export_limits() {
         let budget = ExportBudget::new(export_limits);
@@ -137,16 +100,91 @@ fn link_inner<K: Eq, R: ElfReader, M: ImageAllocator>(
             )?);
         }
     }
+    finish_link(mapped, writes).map(|images| LinkedImages::new(images, edges, first))
+}
+
+// Keep the large per-image mapping temporaries off the symbol-resolution stack.
+#[inline(never)]
+fn map_dependencies<K: Eq, R: ElfReader, M: ImageAllocator>(
+    images: Vec<DependencyImage<K, R>>,
+    allocator: &mut M,
+    scope: &LinkScope<'_, K, M::Allocation>,
+) -> LoadResult<Vec<RelocationInput<K, R, M::Allocation>>> {
+    let mut mapped: Vec<RelocationInput<K, R, M::Allocation>> =
+        reserve(images.len()).map_err(|error| error.at_stage(LoadStage::Allocate))?;
+    for dependency in images {
+        let (key, soname, image) = dependency.into_parts();
+        // Forward each owned stage directly and propagate errors after pushing
+        // the decoded image, so the loop only unwraps a Result<()>.
+        image
+            .allocate(&mut *allocator)
+            .and_then(|allocated| {
+                check_disjoint(
+                    allocated.allocation(),
+                    mapped.iter().map(|input| input.image.allocation()).chain(
+                        scope
+                            .existing()
+                            .iter()
+                            .map(|object| object.image().allocation()),
+                    ),
+                )?;
+                allocated.map_with_reader()
+            })
+            .and_then(|(image, reader)| {
+                image.decode().map(|image| {
+                    mapped.push(RelocationInput {
+                        key,
+                        soname,
+                        reader,
+                        image,
+                        exports: None,
+                    });
+                })
+            })?;
+    }
+    Ok(mapped)
+}
+
+// Keep overlap checking in a separate frame from mapping and decoding.
+#[inline(never)]
+fn check_disjoint<'a, A: ImageMapping + 'a>(
+    allocation: &A,
+    mut previous: impl Iterator<Item = &'a A>,
+) -> LoadResult<()> {
+    let base = allocation.base();
+    let len = allocation.len();
+    let range = TargetRange::new(base, len);
+    if previous.any(|mapping| range.overlaps(TargetRange::new(mapping.base(), mapping.len()))) {
+        return Err(LoadError::new(
+            LoadErrorKind::IncorrectLayout,
+            ErrorContext::Allocation {
+                base,
+                len,
+                align: allocation.align(),
+            },
+        )
+        .at_stage(LoadStage::Allocate));
+    }
+    Ok(())
+}
+
+#[inline(never)]
+fn finish_link<K, R: ElfReader, A: ImageMapping>(
+    mapped: Vec<RelocationInput<K, R, A>>,
+    writes: Vec<RelocationWrites>,
+) -> LoadResult<Vec<LinkedImage<K, A>>> {
     let mut images = reserve(mapped.len())?;
     for (input, writes) in mapped.into_iter().zip(writes) {
-        images.push(LinkedImage::new(
-            input.key,
-            input.soname,
-            input.image.apply_relocation_writes(writes)?,
-            input.exports,
-        ));
+        input.image.apply_relocation_writes(writes).map(|image| {
+            images.push(LinkedImage::new(
+                input.key,
+                input.soname,
+                image,
+                input.exports,
+            ));
+        })?;
     }
-    Ok(LinkedImages::new(images, edges, first))
+    Ok(images)
 }
 
 struct SymbolLookup<'a, K, R: ElfReader, A: ImageMapping> {
