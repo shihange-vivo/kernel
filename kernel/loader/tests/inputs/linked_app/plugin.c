@@ -15,7 +15,23 @@
 extern int linked_value(void);
 extern int linked_data;
 extern int linked_choice(void);
+extern void record_event(unsigned char event);
 
 int (*const plugin_value)(void) = linked_value;
 int *const plugin_data = &linked_data;
 int (*const plugin_choice)(void) = linked_choice;
+
+static void init(int argc, char **argv, char **envp) {
+  (void)argc;
+  (void)argv;
+  (void)envp;
+  ++*plugin_data;
+  record_event(plugin_choice() == 2 && plugin_value() == 44 ? 'L' : '?');
+}
+
+__attribute__((used, section(".init_array")))
+static void (*const constructor)(int, char **, char **) = init;
+
+__attribute__((destructor)) static void fini(void) {
+  record_event('l');
+}

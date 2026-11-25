@@ -34,6 +34,6 @@ pub use load::{board_load_profile, load_image, load_request};
 #[cfg(thread_group)]
 pub use run::run;
 #[cfg(all(enable_dynamic_linker, thread_group))]
-pub use run::run_linked;
+pub use run::{prepare_linked, run_linked};
 pub use run::{RunError, RunRequest};
 pub use startup::{StartupArguments, StartupError, StartupStorage};
