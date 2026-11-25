@@ -13,12 +13,14 @@
 // limitations under the License.
 
 use super::runner::FileReader;
-use alloc::sync::Arc;
+use alloc::{boxed::Box, sync::Arc, vec::Vec};
 use blueos::{
     loader::{
         adapters::{KernelCodeCache, MemoryMapper},
         load_request, prepare_linked, run_linked, run_linked_from_path, RunRequest,
     },
+    scheduler,
+    thread::{Builder, DeferredCleanup, Entry, Stack, IDLE},
     thread_group::{StandardIo, ThreadGroupExit, ThreadGroupState},
     vfs::{self, FileOps},
 };
@@ -31,20 +33,93 @@ use blueos_loader::{
     ImageMapping, LoadAndLinkRequest, LoadError, LoadResult,
 };
 use blueos_test_macro::test;
-use core::ffi::{c_char, CStr};
+use core::{
+    ffi::{c_char, CStr},
+    sync::atomic::{AtomicUsize, Ordering},
+};
 
 unsafe extern "C" {
     static LINKED_TEST_APP_PATH: *const c_char;
+    static LINKED_GRAPH_APP_PATH: *const c_char;
     static LINKED_TEST_DSO_PATH: *const c_char;
     static LINKED_TEST_PLUGIN_PATH: *const c_char;
+    static LINKED_UNRESOLVED_PLUGIN_PATH: *const c_char;
+    static LINKED_CHAIN_LEAF_PATH: *const c_char;
+    static LINKED_CHAIN_MIDDLE_PATH: *const c_char;
+    static LINKED_CHAIN_PEER_PATH: *const c_char;
+    static LINKED_CHAIN_PLUGIN_PATH: *const c_char;
+    static LINKED_CYCLE_A_PATH: *const c_char;
+    static LINKED_CYCLE_B_PATH: *const c_char;
+    static LINKED_SCOPE_PATH: *const c_char;
+    static LINKED_SCOPE_CPP_PATH: *const c_char;
 }
 
 #[derive(Clone, Copy, Eq, PartialEq)]
 enum Input {
     Application,
+    GraphApplication,
     Library,
     Plugin,
+    ChainPlugin,
+    ChainMiddle,
+    ChainPeer,
+    ChainLeaf,
+    CycleA,
+    CycleB,
+    UnresolvedPlugin,
+    Scope,
+    ScopeCpp,
 }
+
+impl Input {
+    fn host_path(self) -> *const c_char {
+        // SAFETY: these linker-provided pointers name live host fixture paths.
+        unsafe {
+            match self {
+                Self::Application => LINKED_TEST_APP_PATH,
+                Self::GraphApplication => LINKED_GRAPH_APP_PATH,
+                Self::Library => LINKED_TEST_DSO_PATH,
+                Self::Plugin => LINKED_TEST_PLUGIN_PATH,
+                Self::ChainPlugin => LINKED_CHAIN_PLUGIN_PATH,
+                Self::ChainMiddle => LINKED_CHAIN_MIDDLE_PATH,
+                Self::ChainPeer => LINKED_CHAIN_PEER_PATH,
+                Self::ChainLeaf => LINKED_CHAIN_LEAF_PATH,
+                Self::CycleA => LINKED_CYCLE_A_PATH,
+                Self::CycleB => LINKED_CYCLE_B_PATH,
+                Self::UnresolvedPlugin => LINKED_UNRESOLVED_PLUGIN_PATH,
+                Self::Scope => LINKED_SCOPE_PATH,
+                Self::ScopeCpp => LINKED_SCOPE_CPP_PATH,
+            }
+        }
+    }
+}
+
+// Allow for application frames above the loader's stack check.
+const RUNTIME_STACK_SIZE: usize = (if cfg!(debug_assertions) { 9 } else { 8 }) * 1024;
+const PLUGIN_PATH: &CStr = c"/linked-fixtures/linked-plugin.so";
+const PLUGIN_FILES: &[(Input, &CStr)] = &[(Input::Plugin, PLUGIN_PATH)];
+const DIAMOND_FILES: &[(Input, &CStr)] = &[
+    (
+        Input::ChainPlugin,
+        c"/linked-fixtures/liblinked_chain_plugin.so",
+    ),
+    (
+        Input::ChainMiddle,
+        c"/linked-fixtures/liblinked_chain_middle.so",
+    ),
+    (
+        Input::ChainPeer,
+        c"/linked-fixtures/liblinked_chain_peer.so",
+    ),
+    (
+        Input::ChainLeaf,
+        c"/linked-fixtures/liblinked_chain_leaf.so",
+    ),
+];
+const CYCLE_FILES: &[(Input, &CStr)] = &[
+    (Input::CycleA, c"/linked-fixtures/liblinked_cycle_a.so"),
+    (Input::CycleB, c"/linked-fixtures/liblinked_cycle_b.so"),
+];
 
 struct Fixtures {
     open_library: bool,
@@ -67,41 +142,163 @@ impl DependencyResolver for Fixtures {
         if *key == Input::Library && !self.open_library {
             return Err(LoadError::new(LoadErrorKind::Io, ErrorContext::None));
         }
-        // SAFETY: these linker-provided pointers name live host fixture paths.
-        let path = unsafe {
-            CStr::from_ptr(match key {
-                Input::Application => LINKED_TEST_APP_PATH,
-                Input::Library => LINKED_TEST_DSO_PATH,
-                Input::Plugin => LINKED_TEST_PLUGIN_PATH,
-            })
-        };
+        // SAFETY: the fixture path is a live NUL-terminated string.
+        let path = unsafe { CStr::from_ptr(key.host_path()) };
         FileReader::open(path).map_err(|_| LoadError::new(LoadErrorKind::Io, ErrorContext::None))
     }
 }
 
 #[test]
 fn test_linked_thread_group_runs_dso_callbacks_and_main() {
-    check_launch(c"LINK_TEST=normal", false, 42, b"PDIMFd");
+    check_startup(c"LINK_TEST=normal", 42, b"PDIMFd");
 }
 
 #[test]
 fn test_linked_thread_group_retires_after_exit_from_a_constructor() {
-    check_launch(c"LINK_TEST=abort", false, 19, b"PD");
+    check_startup(c"LINK_TEST=abort", 19, b"PD");
+}
+
+#[test]
+fn test_linked_thread_group_starts_with_diamond_and_cyclic_dependencies() {
+    let libraries: Vec<_> = DIAMOND_FILES.iter().chain(CYCLE_FILES).copied().collect();
+    with_vfs_fixtures(Input::GraphApplication, &libraries, |app| {
+        check_path(
+            app,
+            "/linked-output",
+            RunRequest {
+                envp: &[c"LINK_TEST=startup-graph"],
+                ..RunRequest::default()
+            },
+            42,
+            b"PDBACXABIMFbaxcabd",
+        );
+    });
 }
 
 #[test]
 fn test_runtime_plugin_runs_callbacks_and_reuses_the_published_image() {
-    check_launch(c"LINK_TEST=runtime", true, 44, b"PDIMLlFd");
+    check_runtime(
+        c"LINK_TEST=runtime",
+        PLUGIN_FILES,
+        RUNTIME_STACK_SIZE,
+        44,
+        b"PDIMLlFd",
+    );
+}
+
+#[test]
+fn test_runtime_plugin_shares_and_finalizes_diamond_dependencies() {
+    // B is reached through both A and C. It initializes once before either.
+    check_runtime(
+        c"LINK_TEST=runtime-chain",
+        DIAMOND_FILES,
+        RUNTIME_STACK_SIZE,
+        0,
+        b"PDIMBACXRxcabFd",
+    );
+}
+
+#[test]
+fn test_runtime_plugin_links_cyclic_dependencies() {
+    // A and B initialize in discovery order within the cycle and finalize in reverse.
+    check_runtime(
+        c"LINK_TEST=runtime-cycle",
+        CYCLE_FILES,
+        RUNTIME_STACK_SIZE,
+        0,
+        b"PDIMABRbaFd",
+    );
+}
+
+#[test]
+fn test_runtime_plugin_can_retry_after_unresolved_symbol() {
+    // E follows the failed open. Only the replacement plugin runs callbacks.
+    check_runtime(
+        c"LINK_TEST=runtime-retry",
+        &[
+            (Input::UnresolvedPlugin, PLUGIN_PATH),
+            (Input::Plugin, c"/linked-fixtures/linked-plugin-retry.so"),
+        ],
+        RUNTIME_STACK_SIZE,
+        44,
+        b"PDIMELRlFd",
+    );
+}
+
+#[test]
+fn test_runtime_c_and_cpp_plugins_bind_symbols_and_keep_emutls_per_thread() {
+    check_runtime(
+        c"LINK_TEST=runtime-scope",
+        &[
+            (Input::Scope, c"/linked-fixtures/liblinked_scope.so"),
+            (Input::Scope, c"/linked-fixtures/alternate-scope.so"),
+            (Input::ScopeCpp, c"/linked-fixtures/liblinked_scope_cpp.so"),
+        ],
+        RUNTIME_STACK_SIZE,
+        42,
+        b"PDIMQSSRssqFd",
+    );
+}
+
+#[test]
+fn test_runtime_plugin_handles_and_writable_mappings_belong_to_the_thread_group() {
+    with_vfs_fixtures(Input::Application, PLUGIN_FILES, |app| {
+        let done = Arc::new(AtomicUsize::new(0));
+        let completed = done.clone();
+        let first = Builder::new(Entry::Closure(Box::new(move || {
+            check_path(
+                app,
+                "/linked-owner-output",
+                runtime_request(&[c"LINK_TEST=runtime-holding"], RUNTIME_STACK_SIZE),
+                44,
+                b"PDIMLRlFd",
+            );
+        })))
+        .set_stack(Stack::from_size(16 * 1024).unwrap())
+        .build();
+        first.lock().set_deferred_cleanup(
+            DeferredCleanup::new(move || {
+                completed.store(1, Ordering::Release);
+                blueos::sync::wake(&completed);
+            })
+            .unwrap(),
+        );
+        assert_eq!(scheduler::queue_ready_thread(IDLE, first.clone()), Ok(()));
+
+        check_path(
+            app,
+            "/linked-peer-output",
+            runtime_request(&[c"LINK_TEST=runtime-peer"], RUNTIME_STACK_SIZE),
+            44,
+            b"PDIMLRlFd",
+        );
+        blueos::sync::wait_until(1, &done);
+        for path in [c"/linked-fixtures/handle", c"/linked-fixtures/release"] {
+            assert_eq!(vfs::syscalls::unlink(path.as_ptr()), 0);
+        }
+    });
 }
 
 #[test]
 fn test_runtime_plugin_constructor_can_exit_before_publication() {
-    check_launch(c"LINK_TEST=runtime-abort", true, 19, b"PDIMLFd");
+    check_runtime(
+        c"LINK_TEST=runtime-abort",
+        PLUGIN_FILES,
+        RUNTIME_STACK_SIZE,
+        19,
+        b"PDIMLFd",
+    );
 }
 
 #[test]
 fn test_runtime_plugin_rejects_insufficient_linker_stack() {
-    check_launch(c"LINK_TEST=runtime-small-stack", true, 21, b"PDIMFd");
+    check_runtime(
+        c"LINK_TEST=runtime-small-stack",
+        PLUGIN_FILES,
+        4 * 1024,
+        21,
+        b"PDIMFd",
+    );
 }
 
 #[test]
@@ -291,63 +488,91 @@ fn capture_output(path: &str) -> (Arc<vfs::File>, StandardIo) {
 }
 
 fn check_events(output: &vfs::File, expected_events: &[u8]) {
-    let mut events = [0; 16];
+    let mut events = [0; 32];
     let count = output.read_at(0, &mut events).unwrap();
     assert_eq!(&events[..count], expected_events);
 }
 
-fn check_launch(env: &CStr, runtime_plugins: bool, status: i32, expected_events: &[u8]) {
-    let (output, stdio) = capture_output("/linked-output");
-    let mut request = RunRequest::default();
-    if runtime_plugins {
-        request.stack_size = if env == c"LINK_TEST=runtime-small-stack" {
-            4 * 1024
-        } else {
-            // Include the application's frames above the loader's stack check.
-            (if cfg!(debug_assertions) { 9 } else { 8 }) * 1024
-        };
-    }
+fn check_startup(env: &CStr, status: i32, expected_events: &[u8]) {
     let request = RunRequest {
-        argv: if runtime_plugins {
-            &[c"linked-runtime.elf", c"test-plugin-args"]
-        } else {
-            &[]
-        },
         envp: &[env],
+        ..RunRequest::default()
+    };
+    check_launch(
+        "/linked-output",
+        request,
+        status,
+        expected_events,
+        |request| {
+            let mut resolver = Fixtures { open_library: true };
+            // SAFETY: the fixtures are native inputs using the production librs CRT.
+            unsafe { run_linked(Input::Application, &mut resolver, request) }.unwrap()
+        },
+    );
+}
+
+fn check_runtime(
+    env: &CStr,
+    plugins: &[(Input, &CStr)],
+    stack_size: usize,
+    status: i32,
+    expected_events: &[u8],
+) {
+    with_vfs_fixtures(Input::Application, plugins, |app| {
+        check_path(
+            app,
+            "/linked-output",
+            runtime_request(&[env], stack_size),
+            status,
+            expected_events,
+        );
+    });
+}
+
+fn runtime_request<'a>(envp: &'a [&'a CStr], stack_size: usize) -> RunRequest<'a> {
+    RunRequest {
+        argv: &[c"linked-runtime.elf", c"test-plugin-args"],
+        envp,
+        stack_size,
+        ..RunRequest::default()
+    }
+}
+
+fn check_path(app: &CStr, output: &str, request: RunRequest<'_>, status: i32, events: &[u8]) {
+    check_launch(output, request, status, events, |request| {
+        // SAFETY: these native fixtures use the production CRT. Replacement
+        // DSO bytes are written between synchronous opens.
+        unsafe { run_linked_from_path(app.to_str().unwrap(), request) }.unwrap()
+    });
+}
+
+fn check_launch(
+    output: &str,
+    request: RunRequest<'_>,
+    status: i32,
+    expected_events: &[u8],
+    run: impl FnOnce(&RunRequest<'_>) -> ThreadGroupExit,
+) {
+    let (output, stdio) = capture_output(output);
+    let request = RunRequest {
         stdio: Some(&stdio),
         ..request
     };
-    let outcome = if runtime_plugins {
-        run_vfs_fixtures(&request)
-    } else {
-        let mut resolver = Fixtures { open_library: true };
-        // SAFETY: the fixtures are native inputs using the production librs CRT.
-        unsafe { run_linked(Input::Application, &mut resolver, &request) }.unwrap()
-    };
-    assert_eq!(outcome, ThreadGroupExit::Code(status));
+    assert_eq!(run(&request), ThreadGroupExit::Code(status));
     check_events(&output, expected_events);
 }
 
-fn run_vfs_fixtures(request: &RunRequest<'_>) -> ThreadGroupExit {
+fn with_vfs_fixtures(root: Input, libraries: &[(Input, &CStr)], run: impl FnOnce(&'static CStr)) {
     let directory = c"/linked-fixtures";
     assert_eq!(vfs::syscalls::mkdir(directory.as_ptr(), 0o700), 0);
     let app = c"/linked-fixtures/linked-runtime.elf";
-    // SAFETY: linker-provided fixture path pointers stay live throughout the test.
-    let fixtures = unsafe {
-        [
-            (LINKED_TEST_APP_PATH, app),
-            (
-                LINKED_TEST_DSO_PATH,
-                c"/linked-fixtures/liblinked_test_dso.so",
-            ),
-            (
-                LINKED_TEST_PLUGIN_PATH,
-                c"/linked-fixtures/linked-plugin.so",
-            ),
-        ]
-    };
-    for (source, path) in fixtures {
-        let bytes = super::read_all(source).unwrap();
+    let startup = [
+        (root, app),
+        (Input::Library, c"/linked-fixtures/liblinked_test_dso.so"),
+    ];
+    let fixtures = startup.into_iter().chain(libraries.iter().copied());
+    for (input, path) in fixtures.clone() {
+        let bytes = super::read_all(input.host_path()).unwrap();
         let file = vfs::open_path(
             path.to_str().unwrap(),
             libc::O_CREAT | libc::O_TRUNC | libc::O_WRONLY,
@@ -361,11 +586,9 @@ fn run_vfs_fixtures(request: &RunRequest<'_>) -> ThreadGroupExit {
             rest = &rest[written..];
         }
     }
-    // SAFETY: the VFS files stay immutable while either loader path reads them.
-    let outcome = unsafe { run_linked_from_path(app.to_str().unwrap(), request) };
+    run(app);
     for (_, path) in fixtures {
         assert_eq!(vfs::syscalls::unlink(path.as_ptr()), 0);
     }
     assert_eq!(vfs::syscalls::rmdir(directory.as_ptr()), 0);
-    outcome.unwrap()
 }
