@@ -49,7 +49,7 @@ use crate::{
         DependencyLimits, ElfClass, ElfMachine, ExportLimits, LinkLimits, LoadLimits, LoadProfile,
         LoadPurpose,
     },
-    CodeCache, ImageAllocator, ImageMapping, LoadAndLinkRequest, LoadError, LoadResult,
+    CodeCache, ImageAllocator, ImageMapping, LoadAndLinkRequest, LoadError, LoadResult, PluginLoad,
 };
 
 const SYMBOLS: u64 = 0x2200;
@@ -659,6 +659,75 @@ fn plugin_reuses_needed_images_and_searches_the_application_first() {
         drop(group);
         assert_eq!(state.drops.get(), 5);
     }
+}
+
+#[test]
+fn pending_plugin_is_owned_by_the_group_until_published_or_cancelled() {
+    let profile = LoadProfile::riscv64();
+    let fixtures = [
+        lifecycle_fixture(profile, LoadPurpose::Executable, &[], BASE + 0x10),
+        lifecycle_fixture(profile, LoadPurpose::SharedObject, &[], BASE + 0x10),
+        lifecycle_fixture(profile, LoadPurpose::SharedObject, &[], BASE + 0x10),
+    ];
+    let mut catalog = Catalog::new(&fixtures, &[]);
+    let state = catalog.state().clone();
+    let config = LoadAndLinkRequest::new(request(
+        profile,
+        LoadPurpose::Executable,
+        LoadLimits::DEFAULT,
+    ))
+    .with_link_limits(LinkLimits::DEFAULT.with_export_limits(ExportLimits::DEFAULT));
+    let mut cache = GraphCache::default();
+    let mut group = load_and_link(
+        0,
+        config,
+        &mut catalog,
+        DistinctAllocations(state.clone()),
+        &mut cache,
+    )
+    .unwrap();
+    let mut begin = |group: &mut crate::LoadedImages<usize, Allocation>, key| {
+        group.begin_plugin_load(
+            key,
+            config,
+            &mut catalog,
+            DistinctAllocations(state.clone()),
+            &mut cache,
+        )
+    };
+
+    let initial_fini = group.fini().collect::<Vec<_>>();
+    assert_eq!(begin(&mut group, 1).unwrap(), PluginLoad::Pending);
+    assert_eq!(state.live.get(), 2);
+    assert_eq!(group.images().len(), 1);
+    assert_eq!(group.init_order(), [0]);
+    assert!(group.fini().eq(initial_fini.iter().copied()));
+    assert!(group
+        .pending_plugin_init()
+        .unwrap()
+        .eq([TargetAddress::new(0xc010), TargetAddress::new(0xc020),]));
+    assert_eq!(
+        failure(group.lookup_symbol(1, b"data")).kind(),
+        LoadErrorKind::OutOfBounds,
+    );
+    assert_eq!(
+        failure(begin(&mut group, 1)).kind(),
+        LoadErrorKind::PluginLoadPending,
+    );
+
+    group.cancel_plugin_load();
+    assert_eq!(state.live.get(), 1);
+    assert!(group.pending_plugin_init().is_none());
+    assert_eq!(group.finish_plugin_load(), None);
+    assert_eq!(begin(&mut group, 1).unwrap(), PluginLoad::Pending);
+    assert_eq!(group.finish_plugin_load(), Some(1));
+    assert_eq!(group.init_order(), [0, 1]);
+    assert_eq!(begin(&mut group, 1).unwrap(), PluginLoad::Existing(1));
+    assert_eq!(begin(&mut group, 2).unwrap(), PluginLoad::Pending);
+    assert_eq!(catalog.opened(), [0, 1, 1, 2]);
+    assert_eq!(state.live.get(), 3);
+    drop(group);
+    assert_eq!(state.live.get(), 0);
 }
 
 #[test]

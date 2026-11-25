@@ -206,6 +206,9 @@ pub unsafe fn prepare_linked<K: Eq + Send + 'static>(
     images: LoadedImages<K, FlatImageAllocation>,
     request: &RunRequest<'_>,
 ) -> Result<ThreadGroup, RunError> {
+    if images.pending_plugin_init().is_some() {
+        return Err(StartupError::LifecycleUnavailable.into());
+    }
     let init_count = images
         .preinit()
         .len()

@@ -94,9 +94,16 @@ impl<K, A: ImageMapping> SealedBatch<K, A> {
     }
 }
 
-/// Owns every mapping in a finalized dependency graph. The host runs the
-/// callbacks and entry, and keeps this owner alive until the last use of the
-/// graph's code or data. Dropping the owner releases the mappings.
+/// Whether a plugin was already present or needs its constructors run.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PluginLoad {
+    Existing(usize),
+    Pending,
+}
+
+/// Owns the finalized dependency graph and any plugin awaiting publication.
+/// The host runs the callbacks and entry, and keeps this owner alive until
+/// the last use of the graph's code or data. Dropping it releases all mappings.
 #[must_use = "retain the loaded images for as long as any of their code or data is in use"]
 pub struct LoadedImages<K, A: ImageMapping> {
     images: Vec<LoadedObject<K, A>>,
@@ -104,6 +111,7 @@ pub struct LoadedImages<K, A: ImageMapping> {
     init_order: Vec<usize>,
     startup_count: usize,
     profile: LoadProfile,
+    pending: Option<SealedBatch<K, A>>,
 }
 
 impl<K: Eq, A: ImageMapping> LoadedImages<K, A> {
@@ -114,6 +122,7 @@ impl<K: Eq, A: ImageMapping> LoadedImages<K, A> {
             edges: batch.edges,
             init_order: batch.init_order,
             profile,
+            pending: None,
         }
     }
 
@@ -122,7 +131,7 @@ impl<K: Eq, A: ImageMapping> LoadedImages<K, A> {
         self.images[0].image()
     }
 
-    /// The startup graph, followed by new images from each plugin load.
+    /// The startup graph, followed by published plugin images.
     /// Indexes remain stable throughout the group's lifetime.
     pub fn images(&self) -> &[LoadedObject<K, A>] {
         &self.images
@@ -174,16 +183,9 @@ impl<K: Eq, A: ImageMapping> LoadedImages<K, A> {
         self.images.iter().position(|image| image.key() == key)
     }
 
-    /// Load a plugin into this application's graph and return its image index.
-    /// The startup graph precedes the plugin and its dependencies in the
-    /// lookup scope. Existing dependencies are reused by resolver key.
-    ///
-    /// The allocator must serve the same target address space. When preparing
-    /// a group before startup, the host runs the complete plan at startup.
-    /// In a running group, finish initializing existing images before calling
-    /// this method, then run the newly appended callbacks before using the
-    /// plugin or extending the graph again. Enable export indexing when
-    /// loading images that will be visible to later plugins.
+    /// Append a plugin before startup, then run the complete callback plan at
+    /// startup. The allocator must serve the group's target address space.
+    /// Use `begin_plugin_load` when extending a running group.
     pub fn load_plugin<D, M, C>(
         &mut self,
         key: K,
@@ -197,21 +199,87 @@ impl<K: Eq, A: ImageMapping> LoadedImages<K, A> {
         M: ImageAllocator<Allocation = A>,
         C: CodeCache + ?Sized,
     {
+        match self.begin_plugin_load(key, request, resolver, allocator, cache)? {
+            PluginLoad::Existing(index) => Ok(index),
+            PluginLoad::Pending => Ok(self.finish_plugin_load().expect("plugin was just prepared")),
+        }
+    }
+
+    /// Prepare a plugin while holding its new mappings outside the visible graph.
+    /// The startup graph precedes the plugin and its dependencies for symbol
+    /// lookup. Enable export indexing when loading potential providers.
+    ///
+    /// The allocator must serve the group's target address space. A running
+    /// group must finish its previous constructors first. The host serializes
+    /// operations and reports completion after running `pending_plugin_init`.
+    /// A pending batch remains owned by the group until completion or discard.
+    pub fn begin_plugin_load<D, M, C>(
+        &mut self,
+        key: K,
+        request: LoadAndLinkRequest,
+        resolver: &mut D,
+        allocator: M,
+        cache: &mut C,
+    ) -> LoadResult<PluginLoad>
+    where
+        D: DependencyResolver<Key = K>,
+        M: ImageAllocator<Allocation = A>,
+        C: CodeCache + ?Sized,
+    {
         if let Some(index) = self
             .check_plugin(&key, request.profile())
             .map_err(|error| error.at_stage(LoadStage::Discover))?
         {
-            return Ok(index);
+            return Ok(PluginLoad::Existing(index));
         }
-        let first = self.images.len();
         let plugin = prepare_plugin(self, key, request, resolver, allocator, cache)?;
-        self.extend(plugin).map_err(|_| {
+        self.reserve_batch(&plugin).map_err(|_| {
             LoadError::new(LoadErrorKind::OutOfMemory, ErrorContext::None).at_stage(LoadStage::Seal)
         })?;
-        Ok(first)
+        self.pending = Some(plugin);
+        Ok(PluginLoad::Pending)
+    }
+
+    /// Constructors for the pending batch, in dependency order. `Some` with
+    /// an empty iterator still means a batch is pending.
+    pub fn pending_plugin_init(&self) -> Option<impl Iterator<Item = TargetAddress> + '_> {
+        let first = self.images.len();
+        self.pending.as_ref().map(|batch| {
+            batch.init_order.iter().flat_map(move |&index| {
+                batch.images[index - first]
+                    .image
+                    .lifecycle()
+                    .init()
+                    .iter()
+                    .copied()
+            })
+        })
+    }
+
+    /// Publish the pending batch after successful initialization. Returns the
+    /// plugin's stable image index. All required capacity was reserved in begin.
+    pub fn finish_plugin_load(&mut self) -> Option<usize> {
+        let mut batch = self.pending.take()?;
+        let index = self.images.len();
+        self.images.append(&mut batch.images);
+        self.edges.append(&mut batch.edges);
+        self.init_order.append(&mut batch.init_order);
+        Some(index)
+    }
+
+    /// Release the pending mappings. The host must ensure their callbacks,
+    /// code and data can no longer be used before discarding the batch.
+    pub fn cancel_plugin_load(&mut self) {
+        drop(self.pending.take());
     }
 
     fn check_plugin(&self, key: &K, profile: &LoadProfile) -> LoadResult<Option<usize>> {
+        if self.pending.is_some() {
+            return Err(LoadError::new(
+                LoadErrorKind::PluginLoadPending,
+                ErrorContext::None,
+            ));
+        }
         if profile != &self.profile {
             return Err(LoadError::new(
                 LoadErrorKind::UnsupportedByProfile,
@@ -232,13 +300,10 @@ impl<K: Eq, A: ImageMapping> LoadedImages<K, A> {
         Ok(index)
     }
 
-    fn extend(&mut self, mut batch: SealedBatch<K, A>) -> Result<(), TryReserveError> {
+    fn reserve_batch(&mut self, batch: &SealedBatch<K, A>) -> Result<(), TryReserveError> {
         self.images.try_reserve(batch.images.len())?;
         self.edges.try_reserve(batch.edges.len())?;
         self.init_order.try_reserve(batch.init_order.len())?;
-        self.images.append(&mut batch.images);
-        self.edges.append(&mut batch.edges);
-        self.init_order.append(&mut batch.init_order);
         Ok(())
     }
 }

@@ -21,7 +21,7 @@ mod single;
 #[cfg(enable_dynamic_linker)]
 pub(crate) use linked::SealedBatch;
 #[cfg(enable_dynamic_linker)]
-pub use linked::{load_and_link, LoadedImages, LoadedObject};
+pub use linked::{load_and_link, LoadedImages, LoadedObject, PluginLoad};
 pub use single::{load_elf, LoadedImage};
 
 #[cfg(enable_dynamic_linker)]

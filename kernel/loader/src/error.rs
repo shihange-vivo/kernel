@@ -51,6 +51,7 @@ pub enum LoadErrorKind {
     OutOfMemory,
     Backend,
     Io,
+    PluginLoadPending,
 }
 
 #[derive(Debug, Eq, PartialEq)]
