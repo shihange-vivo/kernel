@@ -63,7 +63,7 @@ pub(super) type Route<'a> = (usize, &'a [u8], usize);
 pub(super) struct Catalog<'a> {
     fixtures: &'a [Fixture],
     routes: &'a [Route<'a>],
-    pub(super) state: Rc<State>,
+    state: Rc<State>,
     opens: Vec<usize>,
     resolves: usize,
 }
@@ -77,6 +77,14 @@ impl<'a> Catalog<'a> {
             opens: Vec::new(),
             resolves: 0,
         }
+    }
+
+    pub(super) fn opened(&self) -> &[usize] {
+        &self.opens
+    }
+
+    pub(super) fn state(&self) -> &Rc<State> {
+        &self.state
     }
 }
 

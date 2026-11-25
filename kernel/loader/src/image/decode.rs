@@ -31,18 +31,42 @@ use crate::{
 
 #[must_use = "retain the decoded image to keep its allocation alive"]
 pub(crate) struct DecodedImage<A: ImageMapping> {
-    pub(super) program_headers: Option<ProgramHeaderTable>,
-    pub(super) allocation: A,
-    pub(super) profile: LoadProfile,
-    pub(super) segments: Vec<LoadSegmentInfo>,
-    pub(super) relro: Option<TargetRange>,
-    pub(super) image_start: TargetAddress,
-    pub(super) entry: Option<TargetAddress>,
-    pub(super) dynamic: Option<DynamicInfo>,
-    pub(super) relocations: Vec<RelocationRecord>,
+    program_headers: Option<ProgramHeaderTable>,
+    allocation: A,
+    profile: LoadProfile,
+    segments: Vec<LoadSegmentInfo>,
+    relro: Option<TargetRange>,
+    image_start: TargetAddress,
+    entry: Option<TargetAddress>,
+    dynamic: Option<DynamicInfo>,
+    relocations: Vec<RelocationRecord>,
 }
 
 impl<A: ImageMapping> DecodedImage<A> {
+    pub(super) const fn new(
+        program_headers: Option<ProgramHeaderTable>,
+        allocation: A,
+        profile: LoadProfile,
+        segments: Vec<LoadSegmentInfo>,
+        relro: Option<TargetRange>,
+        image_start: TargetAddress,
+        entry: Option<TargetAddress>,
+        dynamic: Option<DynamicInfo>,
+        relocations: Vec<RelocationRecord>,
+    ) -> Self {
+        Self {
+            program_headers,
+            allocation,
+            profile,
+            segments,
+            relro,
+            image_start,
+            entry,
+            dynamic,
+            relocations,
+        }
+    }
+
     /// Relocate a self-contained image through the standalone profile.
     pub(crate) fn relocate(self) -> LoadResult<RelocatedImage<A>> {
         let bias = self.load_bias();
@@ -73,16 +97,16 @@ impl<A: ImageMapping> DecodedImage<A> {
         writes: RelocationWrites,
     ) -> LoadResult<RelocatedImage<A>> {
         writes.apply(&mut self.allocation)?;
-        Ok(RelocatedImage {
-            program_headers: self.program_headers,
-            allocation: self.allocation,
-            profile: self.profile,
-            segments: self.segments,
-            relro: self.relro,
-            image_start: self.image_start,
-            entry: self.entry,
-            dynamic: self.dynamic,
-        })
+        Ok(RelocatedImage::new(
+            self.program_headers,
+            self.allocation,
+            self.profile,
+            self.segments,
+            self.relro,
+            self.image_start,
+            self.entry,
+            self.dynamic,
+        ))
     }
 
     pub(crate) const fn profile(&self) -> &LoadProfile {

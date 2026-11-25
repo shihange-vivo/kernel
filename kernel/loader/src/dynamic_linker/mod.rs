@@ -12,27 +12,65 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! ELF dependency discovery, eager relocation and lifecycle ordering.
+//! ELF dependency discovery, eager relocation and finalization.
+//!
+//! `discover` validates the dependency graph and retains its readers. `link`
+//! maps and relocates its images. `seal` orders callbacks, synchronizes code
+//! and applies final protections before returning the owning results.
 
-mod dependency;
+mod discover;
+mod link;
+mod seal;
+
 mod exports;
 mod lifecycle;
-mod link;
+mod scope;
 pub(crate) mod symbol;
 
+use self::{discover::discover_with_existing, link::link_in_scope, scope::LinkScope};
 use alloc::vec::Vec;
 
 use crate::{
-    error::{ErrorContext, LoadErrorKind},
-    LoadError, LoadResult,
+    error::{ErrorContext, LoadErrorKind, LoadStage},
+    load::SealedBatch,
+    profile::LoadPurpose,
+    CodeCache, ImageAllocator, LoadAndLinkRequest, LoadError, LoadResult, LoadedImages,
 };
 
-pub use dependency::{
-    discover, DependencyEdge, DependencyImage, DependencyPlan, DependencyResolver,
-};
+pub use discover::{discover, DependencyEdge, DependencyImage, DependencyPlan, DependencyResolver};
 pub use exports::ExportedSymbols;
 pub use lifecycle::LinkedLifecycle;
-pub use link::{link, LinkedImage, LinkedImages};
+pub use link::link;
+pub use seal::{LinkedImage, LinkedImages};
+
+/// Discover, link and seal additions to an already loaded application graph.
+pub(crate) fn prepare_plugin<D, M, C>(
+    group: &LoadedImages<D::Key, M::Allocation>,
+    root: D::Key,
+    request: LoadAndLinkRequest,
+    resolver: &mut D,
+    allocator: M,
+    cache: &mut C,
+) -> LoadResult<SealedBatch<D::Key, M::Allocation>>
+where
+    D: DependencyResolver,
+    M: ImageAllocator,
+    C: CodeCache + ?Sized,
+{
+    let (request, dependency_limits, limits) = request.into_parts();
+    let plan = discover_with_existing(
+        root,
+        request.with_purpose(LoadPurpose::SharedObject),
+        dependency_limits,
+        resolver,
+        group.images().len(),
+        group.edges().len(),
+        |key| group.find(key),
+    )?;
+    let scope = LinkScope::for_plugin(group, plan.images().len(), plan.edges(), &dependency_limits)
+        .map_err(|error| error.at_stage(LoadStage::Discover))?;
+    link_in_scope(plan, limits, allocator, scope)?.seal_batch(cache)
+}
 
 fn reserve<T>(capacity: usize) -> LoadResult<Vec<T>> {
     let mut values = Vec::new();

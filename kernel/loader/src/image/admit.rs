@@ -156,11 +156,11 @@ impl<R: ElfReader> AdmittedImage<R> {
             program_headers.push(header);
         }
 
-        Ok(InspectedImage {
-            reader: self.reader,
-            request: self.request,
-            header: self.header,
+        Ok(InspectedImage::new(
+            self.reader,
+            self.request,
+            self.header,
             program_headers,
-        })
+        ))
     }
 }

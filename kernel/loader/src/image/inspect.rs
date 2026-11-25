@@ -30,13 +30,27 @@ use goblin::elf::program_header::{PT_DYNAMIC, PT_GNU_RELRO, PT_LOAD};
 /// Checked file metadata; image layout and backing have not been prepared yet.
 #[must_use = "retain the inspected image for the next loading stage"]
 pub(crate) struct InspectedImage<R: ElfReader> {
-    pub(super) reader: R,
-    pub(super) request: LoadRequest,
-    pub(super) header: ElfHeaderInfo,
-    pub(super) program_headers: Vec<ProgramHeaderInfo>,
+    reader: R,
+    request: LoadRequest,
+    header: ElfHeaderInfo,
+    program_headers: Vec<ProgramHeaderInfo>,
 }
 
 impl<R: ElfReader> InspectedImage<R> {
+    pub(super) const fn new(
+        reader: R,
+        request: LoadRequest,
+        header: ElfHeaderInfo,
+        program_headers: Vec<ProgramHeaderInfo>,
+    ) -> Self {
+        Self {
+            reader,
+            request,
+            header,
+            program_headers,
+        }
+    }
+
     pub(crate) const fn header(&self) -> &ElfHeaderInfo {
         &self.header
     }
@@ -244,20 +258,20 @@ impl<R: ElfReader> InspectedImage<R> {
             })
             .transpose()?;
         // Keep only the header facts still needed for allocation and mapping.
-        Ok(PlannedImage {
-            reader: self.reader,
-            profile: *self.request.profile(),
-            elf_type: self.header.r#type(),
+        Ok(PlannedImage::new(
+            self.reader,
+            *self.request.profile(),
+            self.header.r#type(),
             entry,
-            program_header_offset: self.header.program_header_offset(),
-            program_header_entry_size: self.header.program_header_entry_size(),
-            program_header_count: self.header.program_header_count(),
+            self.header.program_header_offset(),
+            self.header.program_header_entry_size(),
+            self.header.program_header_count(),
             segments,
             dynamic,
             relro,
             image_range,
             max_alignment,
-        })
+        ))
     }
 }
 

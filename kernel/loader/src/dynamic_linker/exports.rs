@@ -21,7 +21,7 @@ use super::{reserve, symbol};
 use crate::{
     error::{ErrorContext, LoadErrorKind},
     image::DecodedImage,
-    memory::{ImageMapping, TargetAddress},
+    memory::{ImageMapping, MemoryPermissions, TargetAddress, TargetRange},
     profile::ExportLimits,
     ElfReader, LoadError, LoadResult,
 };
@@ -39,6 +39,7 @@ struct Export {
 #[derive(Debug, Default)]
 pub struct ExportedSymbols {
     entries: Vec<Export>,
+    executable_ranges: Vec<TargetRange>,
 }
 
 impl ExportedSymbols {
@@ -47,6 +48,12 @@ impl ExportedSymbols {
             .entries
             .binary_search_by(|entry| entry.name.as_slice().cmp(name));
         index.ok().map(|index| self.entries[index].address)
+    }
+
+    pub(super) fn contains_executable_span(&self, address: TargetAddress, len: u64) -> bool {
+        self.executable_ranges
+            .iter()
+            .any(|range| range.contains_span(address, len))
     }
 
     pub(super) fn build(
@@ -87,7 +94,23 @@ impl ExportedSymbols {
                 entries.push(Export { name, address });
             }
         }
-        Ok(Self { entries })
+        if entries.is_empty() {
+            return Ok(Self::default());
+        }
+        let segments = image
+            .segments()
+            .iter()
+            .filter(|segment| segment.permissions().contains(MemoryPermissions::EXECUTE));
+        let mut executable_ranges = reserve(segments.clone().count())?;
+        for segment in segments {
+            let offset = segment.vaddr().checked_sub(image.image_start())?;
+            let address = image.allocation().base().checked_add(offset)?;
+            executable_ranges.push(TargetRange::new(address, segment.memory_size()));
+        }
+        Ok(Self {
+            entries,
+            executable_ranges,
+        })
     }
 }
 

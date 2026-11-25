@@ -27,18 +27,40 @@ use alloc::vec::Vec;
 
 #[must_use = "keep the mapped image alive to retain its backing"]
 pub(crate) struct MappedImage<A: ImageMapping> {
-    pub(super) program_headers: Option<ProgramHeaderTable>,
-    pub(super) allocation: A,
-    pub(super) profile: LoadProfile,
-    pub(super) segments: Vec<LoadSegmentInfo>,
-    pub(super) dynamic: Option<DynamicInfo>,
+    program_headers: Option<ProgramHeaderTable>,
+    allocation: A,
+    profile: LoadProfile,
+    segments: Vec<LoadSegmentInfo>,
+    dynamic: Option<DynamicInfo>,
     /// Original ELF virtual range, retained for protection after relocation.
-    pub(super) relro: Option<TargetRange>,
-    pub(super) image_start: TargetAddress,
-    pub(super) entry: Option<TargetAddress>,
+    relro: Option<TargetRange>,
+    image_start: TargetAddress,
+    entry: Option<TargetAddress>,
 }
 
 impl<A: ImageMapping> MappedImage<A> {
+    pub(super) const fn new(
+        program_headers: Option<ProgramHeaderTable>,
+        allocation: A,
+        profile: LoadProfile,
+        segments: Vec<LoadSegmentInfo>,
+        dynamic: Option<DynamicInfo>,
+        relro: Option<TargetRange>,
+        image_start: TargetAddress,
+        entry: Option<TargetAddress>,
+    ) -> Self {
+        Self {
+            program_headers,
+            allocation,
+            profile,
+            segments,
+            dynamic,
+            relro,
+            image_start,
+            entry,
+        }
+    }
+
     pub(crate) const fn entry(&self) -> Option<TargetAddress> {
         self.entry
     }
@@ -96,16 +118,16 @@ impl<A: ImageMapping> MappedImage<A> {
                 }
             }
         }
-        Ok(DecodedImage {
-            program_headers: self.program_headers,
-            allocation: self.allocation,
-            profile: self.profile,
-            segments: self.segments,
-            relro: self.relro,
-            image_start: self.image_start,
-            entry: self.entry,
-            dynamic: self.dynamic,
+        Ok(DecodedImage::new(
+            self.program_headers,
+            self.allocation,
+            self.profile,
+            self.segments,
+            self.relro,
+            self.image_start,
+            self.entry,
+            self.dynamic,
             relocations,
-        })
+        ))
     }
 }

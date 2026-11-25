@@ -19,6 +19,8 @@ mod linked;
 mod single;
 
 #[cfg(enable_dynamic_linker)]
+pub(crate) use linked::SealedBatch;
+#[cfg(enable_dynamic_linker)]
 pub use linked::{load_and_link, LoadedImages, LoadedObject};
 pub use single::{load_elf, LoadedImage};
 
@@ -90,5 +92,13 @@ impl LoadAndLinkRequest {
     pub const fn with_link_limits(mut self, limits: LinkLimits) -> Self {
         self.link_limits = limits;
         self
+    }
+
+    const fn profile(&self) -> &LoadProfile {
+        self.load_request.profile()
+    }
+
+    pub(crate) const fn into_parts(self) -> (LoadRequest, DependencyLimits, LinkLimits) {
+        (self.load_request, self.dependency_limits, self.link_limits)
     }
 }

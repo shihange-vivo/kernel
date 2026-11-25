@@ -30,22 +30,52 @@ use alloc::vec::Vec;
 
 #[must_use = "retain the layout and its reader for the allocation stage"]
 pub(crate) struct PlannedImage<R: ElfReader> {
-    pub(super) reader: R,
-    pub(super) profile: LoadProfile,
-    pub(super) elf_type: ElfType,
-    pub(super) entry: TargetAddress,
-    pub(super) program_header_offset: u64,
-    pub(super) program_header_entry_size: u16,
-    pub(super) program_header_count: u16,
-    pub(super) segments: Vec<LoadSegmentInfo>,
-    pub(super) dynamic: Option<DynamicInfo>,
+    reader: R,
+    profile: LoadProfile,
+    elf_type: ElfType,
+    entry: TargetAddress,
+    program_header_offset: u64,
+    program_header_entry_size: u16,
+    program_header_count: u16,
+    segments: Vec<LoadSegmentInfo>,
+    dynamic: Option<DynamicInfo>,
     /// Validated ELF virtual range; write protection is applied after relocation.
-    pub(super) relro: Option<TargetRange>,
-    pub(super) image_range: TargetRange,
-    pub(super) max_alignment: u64,
+    relro: Option<TargetRange>,
+    image_range: TargetRange,
+    max_alignment: u64,
 }
 
 impl<R: ElfReader> PlannedImage<R> {
+    pub(super) const fn new(
+        reader: R,
+        profile: LoadProfile,
+        elf_type: ElfType,
+        entry: TargetAddress,
+        program_header_offset: u64,
+        program_header_entry_size: u16,
+        program_header_count: u16,
+        segments: Vec<LoadSegmentInfo>,
+        dynamic: Option<DynamicInfo>,
+        relro: Option<TargetRange>,
+        image_range: TargetRange,
+        max_alignment: u64,
+    ) -> Self {
+        Self {
+            reader,
+            profile,
+            elf_type,
+            entry,
+            program_header_offset,
+            program_header_entry_size,
+            program_header_count,
+            segments,
+            dynamic,
+            relro,
+            image_range,
+            max_alignment,
+        }
+    }
+
     pub(crate) const fn profile(&self) -> &LoadProfile {
         &self.profile
     }
@@ -126,19 +156,19 @@ impl<R: ElfReader> PlannedImage<R> {
         // The returned mapping already owns cleanup, including when its
         // metadata fails validation below.
         validate_allocation(&allocation, &layout, self.profile.class())?;
-        Ok(AllocatedImage {
-            reader: self.reader,
+        Ok(AllocatedImage::new(
+            self.reader,
             allocation,
-            profile: self.profile,
-            entry: self.entry,
-            program_header_offset: self.program_header_offset,
-            program_header_entry_size: self.program_header_entry_size,
-            program_header_count: self.program_header_count,
-            segments: self.segments,
-            dynamic: self.dynamic,
-            relro: self.relro,
-            image_start: self.image_range.start(),
-        })
+            self.profile,
+            self.entry,
+            self.program_header_offset,
+            self.program_header_entry_size,
+            self.program_header_count,
+            self.segments,
+            self.dynamic,
+            self.relro,
+            self.image_range.start(),
+        ))
     }
 }
 

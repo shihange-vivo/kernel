@@ -38,7 +38,7 @@ pub struct LoadedImage<A: ImageMapping> {
 }
 
 impl<A: ImageMapping> LoadedImage<A> {
-    pub(crate) fn new(
+    pub(crate) const fn new(
         allocation: A,
         entry: Option<TargetAddress>,
         program_headers: Option<ProgramHeaderTable>,

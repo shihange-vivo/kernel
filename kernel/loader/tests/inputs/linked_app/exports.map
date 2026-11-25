@@ -1,0 +1,4 @@
+/* GNU ld's bare-metal script defines _stack outside the loaded segments. */
+{
+    local: _stack;
+};
