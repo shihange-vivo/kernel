@@ -28,12 +28,17 @@ template("linked_test_library") {
                            [
                              "sources",
                              "deps",
+                             "output_dir",
+                             "output_name",
                            ])
     cflags = [
       "-fPIC",
       "-ffreestanding",
       "-fno-stack-protector",
     ]
+    if (defined(invoker.cflags_cc)) {
+      cflags_cc = invoker.cflags_cc
+    }
     ldflags = [
       "-nostdlib",
       "-Wl,-z,now",
@@ -62,40 +67,123 @@ linked_test_library("linked_test_plugin") {
   deps = [ ":linked_test_dso" ]
 }
 
-_dso_path = "$root_out_dir/lib/liblinked_test_dso.so"
-build_rust("linked_test_app") {
-  testonly = true
-  crate_type = "bin"
-  sources = [ "main.rs" ]
-  configs += [ "//build/boards/${board}:app_config" ]
+linked_test_library("linked_unresolved_plugin") {
+  sources = [ "unresolved_plugin.c" ]
+}
+
+linked_test_library("linked_scope_cpp") {
+  sources = [ "scope_cpp.cc" ]
+  cflags_cc = [
+    "-fno-exceptions",
+    "-fno-rtti",
+  ]
+}
+
+linked_test_library("linked_scope") {
+  sources = [ "scope.c" ]
+  deps = [ ":linked_scope_cpp" ]
+}
+
+linked_test_library("linked_chain_leaf") {
+  sources = [ "chain_leaf.c" ]
+}
+
+linked_test_library("linked_chain_middle") {
+  sources = [ "chain_middle.c" ]
+  deps = [ ":linked_chain_leaf" ]
+}
+
+linked_test_library("linked_chain_peer") {
+  sources = [ "chain_peer.c" ]
+  deps = [ ":linked_chain_leaf" ]
+}
+
+linked_test_library("linked_chain_plugin") {
+  sources = [ "chain_plugin.c" ]
   deps = [
-    ":linked_test_dso",
-    "//libs/librs:crt1",
-    "//libs/librs:librs_swi",
+    ":linked_chain_middle",
+    ":linked_chain_peer",
   ]
-  rustflags = [
-    "-Cpanic=abort",
-    "-Crelocation-model=pic",
-    "-Clink-arg=-nostartfiles",
-    "-Clink-arg=-Wl,-pie",
-    "-Clink-arg=-Wl,--no-dynamic-linker",
-    "-Clink-arg=-Wl,-u,_start",
-    "-Clink-arg=-Wl,-e,_start",
-    "-Clink-arg=-Wl,-z,now",
-    "-Clink-arg=-Wl,-z,noexecstack",
-    "-Clink-arg=-Wl,--export-dynamic-symbol=record_event",
-    "-Clink-arg=-Wl,--export-dynamic-symbol=linked_choice",
-    "-Clink-arg=" + rebase_path(_dso_path, root_build_dir),
-  ]
-  if (current_cpu == "aarch64") {
-    inputs = [ _exports_script ]
-    rustflags += [ "-Clink-arg=" + _exports_flag ]
+}
+
+# Give B a link-time provider with A's SONAME. The test installs the real A
+# and B in VFS so the ELF dependency graph closes the cycle at runtime.
+linked_test_library("linked_cycle_a_bootstrap") {
+  sources = [ "cycle_a_bootstrap.c" ]
+  output_dir = "$root_out_dir/lib/linked_cycle_bootstrap"
+  output_name = "linked_cycle_a"
+}
+
+linked_test_library("linked_cycle_b") {
+  sources = [ "cycle_b.c" ]
+  deps = [ ":linked_cycle_a_bootstrap" ]
+}
+
+linked_test_library("linked_cycle_a") {
+  sources = [ "cycle_a.c" ]
+  deps = [ ":linked_cycle_b" ]
+}
+
+template("linked_test_executable") {
+  build_rust(target_name) {
+    testonly = true
+    crate_type = "bin"
+    sources = [ "main.rs" ]
+    forward_variables_from(invoker, [ "cfgs" ])
+    configs += [ "//build/boards/${board}:app_config" ]
+    deps = [
+      "//libs/librs:crt1",
+      "//libs/librs:librs_swi",
+    ]
+    rustflags = [
+      "-Cpanic=abort",
+      "-Crelocation-model=pic",
+      "-Clink-arg=-nostartfiles",
+      "-Clink-arg=-Wl,-pie",
+      "-Clink-arg=-Wl,--no-dynamic-linker",
+      "-Clink-arg=-Wl,-u,_start",
+      "-Clink-arg=-Wl,-e,_start",
+      "-Clink-arg=-Wl,-z,now",
+      "-Clink-arg=-Wl,-z,noexecstack",
+      "-Clink-arg=-Wl,--export-dynamic-symbol=record_event",
+      "-Clink-arg=-Wl,--export-dynamic-symbol=linked_choice",
+      "-Clink-arg=-Wl,--export-dynamic-symbol=__emutls_get_address",
+    ]
+    foreach(library, invoker.libraries) {
+      deps += [ ":$library" ]
+      library_path = "$root_out_dir/lib/lib${library}.so"
+      rustflags += [ "-Clink-arg=" + rebase_path(library_path, root_build_dir) ]
+    }
+    if (current_cpu == "aarch64") {
+      inputs = [ _exports_script ]
+      rustflags += [
+        "-Clink-arg=" + _exports_flag,
+        "-Clink-arg=-Wl,-rpath-link," +
+            rebase_path("$root_out_dir/lib", root_build_dir),
+      ]
+    }
   }
+}
+
+linked_test_executable("linked_test_app") {
+  libraries = [ "linked_test_dso" ]
+}
+
+linked_test_executable("linked_graph_app") {
+  cfgs = [ "linked_startup_graph" ]
+  libraries = [
+    "linked_test_dso",
+    "linked_chain_plugin",
+    "linked_cycle_a",
+  ]
 }
 
 run_clippy("linked_test_app_clippy") {
   testonly = true
-  deps = [ ":linked_test_app" ]
+  deps = [
+    ":linked_graph_app",
+    ":linked_test_app",
+  ]
 }
 
 postlink_action("app_path") {
@@ -110,42 +198,110 @@ postlink_action("app_path") {
   outputs = [ outfile ]
 }
 
-action("dso_path") {
+postlink_action("graph_app_path") {
   testonly = true
+  exe = ":linked_graph_app"
   script = "//kernel/loader/tests/scripts/gen_path_symbol.py"
-  deps = [ ":linked_test_dso" ]
-  inputs = [ _dso_path ]
   outfile = "${target_gen_dir}/${target_name}.c"
   args = [
-    rebase_path(_dso_path),
-    "LINKED_TEST_DSO_PATH",
+    "LINKED_GRAPH_APP_PATH",
     rebase_path(outfile),
   ]
   outputs = [ outfile ]
 }
 
-action("plugin_path") {
-  testonly = true
-  script = "//kernel/loader/tests/scripts/gen_path_symbol.py"
-  deps = [ ":linked_test_plugin" ]
-  _plugin_path = "$root_out_dir/lib/liblinked_test_plugin.so"
-  inputs = [ _plugin_path ]
-  outfile = "${target_gen_dir}/${target_name}.c"
-  args = [
-    rebase_path(_plugin_path, root_build_dir),
-    "LINKED_TEST_PLUGIN_PATH",
-    rebase_path(outfile),
-  ]
-  outputs = [ outfile ]
+template("linked_test_library_path") {
+  action(target_name) {
+    testonly = true
+    script = "//kernel/loader/tests/scripts/gen_path_symbol.py"
+    deps = [ ":${invoker.library}" ]
+    library_path = "$root_out_dir/lib/lib${invoker.library}.so"
+    inputs = [ library_path ]
+    outfile = "${target_gen_dir}/${target_name}.c"
+    args = [
+      rebase_path(library_path, root_build_dir),
+      invoker.symbol,
+      rebase_path(outfile),
+    ]
+    outputs = [ outfile ]
+  }
+}
+
+linked_test_library_path("dso_path") {
+  library = "linked_test_dso"
+  symbol = "LINKED_TEST_DSO_PATH"
+}
+
+linked_test_library_path("plugin_path") {
+  library = "linked_test_plugin"
+  symbol = "LINKED_TEST_PLUGIN_PATH"
+}
+
+linked_test_library_path("unresolved_plugin_path") {
+  library = "linked_unresolved_plugin"
+  symbol = "LINKED_UNRESOLVED_PLUGIN_PATH"
+}
+
+linked_test_library_path("scope_path") {
+  library = "linked_scope"
+  symbol = "LINKED_SCOPE_PATH"
+}
+
+linked_test_library_path("scope_cpp_path") {
+  library = "linked_scope_cpp"
+  symbol = "LINKED_SCOPE_CPP_PATH"
+}
+
+linked_test_library_path("chain_leaf_path") {
+  library = "linked_chain_leaf"
+  symbol = "LINKED_CHAIN_LEAF_PATH"
+}
+
+linked_test_library_path("chain_middle_path") {
+  library = "linked_chain_middle"
+  symbol = "LINKED_CHAIN_MIDDLE_PATH"
+}
+
+linked_test_library_path("chain_peer_path") {
+  library = "linked_chain_peer"
+  symbol = "LINKED_CHAIN_PEER_PATH"
+}
+
+linked_test_library_path("chain_plugin_path") {
+  library = "linked_chain_plugin"
+  symbol = "LINKED_CHAIN_PLUGIN_PATH"
+}
+
+linked_test_library_path("cycle_a_path") {
+  library = "linked_cycle_a"
+  symbol = "LINKED_CYCLE_A_PATH"
+}
+
+linked_test_library_path("cycle_b_path") {
+  library = "linked_cycle_b"
+  symbol = "LINKED_CYCLE_B_PATH"
 }
 
 static_library("paths") {
   testonly = true
-  deps = [
+  path_actions = [
     ":app_path",
+    ":chain_leaf_path",
+    ":chain_middle_path",
+    ":chain_peer_path",
+    ":chain_plugin_path",
+    ":cycle_a_path",
+    ":cycle_b_path",
     ":dso_path",
+    ":graph_app_path",
     ":plugin_path",
+    ":scope_cpp_path",
+    ":scope_path",
+    ":unresolved_plugin_path",
   ]
-  sources = get_target_outputs(":app_path") + get_target_outputs(":dso_path") +
-            get_target_outputs(":plugin_path")
+  deps = path_actions
+  sources = []
+  foreach(path_action, path_actions) {
+    sources += get_target_outputs(path_action)
+  }
 }
