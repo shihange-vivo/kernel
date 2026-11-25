@@ -21,8 +21,10 @@ use goblin::elf::{
 };
 
 use super::{
-    exports::ExportBudget, reserve, scope::LinkScope, symbol, DependencyPlan, ExportedSymbols,
-    LinkedImage, LinkedImages,
+    exports::ExportBudget,
+    reserve,
+    scope::{exports_at, LinkScope},
+    symbol, DependencyPlan, ExportedSymbols, LinkedImage, LinkedImages,
 };
 use crate::{
     elf::{RelocationRecord, SymbolTableReader},
@@ -262,32 +264,27 @@ impl<K: Eq, R: ElfReader, A: ImageMapping> SymbolLookup<'_, K, R, A> {
     }
 
     fn find(&mut self, name: &[u8]) -> LoadResult<Option<(usize, TargetAddress)>> {
-        let first = self.scope.existing().len();
-        for index in self.scope.indexes(self.inputs.len()) {
-            let address = if index < first {
-                let Some(exports) = self.scope.existing()[index].exports() else {
-                    continue;
-                };
+        let existing = self.scope.existing();
+        let first = existing.len();
+        symbol::find_in_scope(self.scope.indexes(self.inputs.len()), |index| {
+            if index < first {
+                let exports = exports_at(existing, index)?;
                 Self::charge_probe(self.limits, &mut self.probes)?;
-                exports.find(name)
-            } else {
-                let index = index - first;
-                let Some(table) = self.tables[index].as_ref() else {
-                    continue;
-                };
-                Self::charge_probe(self.limits, &mut self.probes)?;
-                let Some(record) =
-                    symbol::lookup_export(table, name, self.limits.max_symbol_name_len())?
-                else {
-                    continue;
-                };
-                symbol::symbol_address(&self.inputs[index].image, &record)?
-            };
-            if let Some(address) = address {
-                return Ok(Some((index, address)));
+                return Ok(exports.find(name));
             }
-        }
-        Ok(None)
+
+            let index = index - first;
+            let Some(table) = self.tables[index].as_ref() else {
+                return Ok(None);
+            };
+            Self::charge_probe(self.limits, &mut self.probes)?;
+            symbol::lookup_export_address(
+                &self.inputs[index].image,
+                table,
+                name,
+                self.limits.max_symbol_name_len(),
+            )
+        })
     }
 
     fn charge_probe(limits: &LinkLimits, probes: &mut u64) -> LoadResult<()> {

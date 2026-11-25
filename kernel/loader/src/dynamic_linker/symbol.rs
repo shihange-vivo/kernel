@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Interpret ELF symbol definitions in their mapped images.
+//! Look up symbol definitions and resolve their runtime addresses.
 
 use goblin::elf::{
     section_header::{SHN_ABS, SHN_UNDEF},
@@ -26,6 +26,19 @@ use crate::{
     memory::{ImageMapping, MemoryPermissions, TargetAddress, TargetRange},
     ElfReader, LoadError, LoadResult,
 };
+
+/// Search image indexes in priority order and keep the defining image.
+pub(super) fn find_in_scope(
+    indexes: impl IntoIterator<Item = usize>,
+    mut lookup: impl FnMut(usize) -> LoadResult<Option<TargetAddress>>,
+) -> LoadResult<Option<(usize, TargetAddress)>> {
+    for index in indexes {
+        if let Some(address) = lookup(index)? {
+            return Ok(Some((index, address)));
+        }
+    }
+    Ok(None)
+}
 
 pub(super) fn read_table<'r, R: ElfReader>(
     image: &DecodedImage<impl ImageMapping>,
@@ -45,6 +58,18 @@ pub(crate) fn lookup_export(
     max_name_len: u32,
 ) -> LoadResult<Option<SymbolRecord>> {
     table.find_by_name(name, max_name_len, is_export)
+}
+
+pub(super) fn lookup_export_address(
+    image: &DecodedImage<impl ImageMapping>,
+    table: &SymbolTableReader<'_, impl ElfReader>,
+    name: &[u8],
+    max_name_len: u32,
+) -> LoadResult<Option<TargetAddress>> {
+    match lookup_export(table, name, max_name_len)? {
+        Some(record) => symbol_address(image, &record),
+        None => Ok(None),
+    }
 }
 
 pub(super) fn is_export(symbol: &SymbolRecord) -> bool {

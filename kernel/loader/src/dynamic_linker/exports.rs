@@ -88,8 +88,8 @@ impl ExportedSymbols {
         // Resolve each name through the selected ELF hash so the retained index
         // preserves the same first match and GNU hash exclusions as linking.
         for name in names {
-            if let Some(record) = symbol::lookup_export(&table, &name, max_name_len)?
-                && let Some(address) = symbol::symbol_address(image, &record)?
+            if let Some(address) =
+                symbol::lookup_export_address(image, &table, &name, max_name_len)?
             {
                 entries.push(Export { name, address });
             }

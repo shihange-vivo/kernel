@@ -19,7 +19,8 @@ use alloc::{collections::TryReserveError, vec::Vec};
 use super::{LoadAndLinkRequest, LoadedImage};
 use crate::{
     dynamic_linker::{
-        discover, link, prepare_plugin, DependencyEdge, DependencyResolver, ExportedSymbols,
+        discover, link, lookup_symbol, prepare_plugin, DependencyEdge, DependencyResolver,
+        ExportedSymbols,
     },
     error::{ErrorContext, ExistingImageReason, LoadErrorKind, LoadStage},
     memory::{ImageMapping, TargetAddress},
@@ -129,6 +130,15 @@ impl<K: Eq, A: ImageMapping> LoadedImages<K, A> {
 
     pub fn edges(&self) -> &[DependencyEdge] {
         &self.edges
+    }
+
+    /// Find an export starting at an image index in this group, then visit its
+    /// `DT_NEEDED` dependencies in breadth-first order. Each visited image must
+    /// have retained its export index. The returned address is valid while the
+    /// group is alive. The host controls which image indexes are available to
+    /// callers and when their code or data may be used.
+    pub fn lookup_symbol(&self, image: usize, name: &[u8]) -> LoadResult<Option<TargetAddress>> {
+        lookup_symbol(self, image, name)
     }
 
     pub(crate) const fn startup_count(&self) -> usize {

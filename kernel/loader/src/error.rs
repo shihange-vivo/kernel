@@ -156,6 +156,10 @@ pub enum ErrorContext {
         base: TargetAddress,
         reason: ExistingImageReason,
     },
+    ImageIndex {
+        index: usize,
+        count: usize,
+    },
     SymbolIndex {
         index: u32,
         count: u32,
