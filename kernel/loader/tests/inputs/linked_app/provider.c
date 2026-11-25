@@ -32,3 +32,5 @@ __attribute__((destructor)) static void fini(void) {
 }
 
 int linked_value(void) { return linked_data * 2; }
+
+int linked_choice(void) { return 1; }

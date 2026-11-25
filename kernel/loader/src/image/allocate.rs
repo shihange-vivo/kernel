@@ -29,27 +29,56 @@ const COPY_BUFFER_SIZE: usize = 512;
 
 #[must_use = "dropping a prepared image releases its allocation"]
 pub(crate) struct AllocatedImage<R: ElfReader, A: ImageMapping> {
-    pub(super) reader: R,
-    pub(super) allocation: A,
-    pub(super) profile: LoadProfile,
-    pub(super) entry: TargetAddress,
-    pub(super) program_header_offset: u64,
-    pub(super) program_header_entry_size: u16,
-    pub(super) program_header_count: u16,
-    pub(super) segments: Vec<LoadSegmentInfo>,
-    pub(super) dynamic: Option<DynamicInfo>,
-    pub(super) relro: Option<TargetRange>,
+    reader: R,
+    allocation: A,
+    profile: LoadProfile,
+    entry: TargetAddress,
+    program_header_offset: u64,
+    program_header_entry_size: u16,
+    program_header_count: u16,
+    segments: Vec<LoadSegmentInfo>,
+    dynamic: Option<DynamicInfo>,
+    relro: Option<TargetRange>,
     /// Start of the planned span in the ELF virtual address space.
-    pub(super) image_start: TargetAddress,
+    image_start: TargetAddress,
 }
 
 impl<R: ElfReader, A: ImageMapping> AllocatedImage<R, A> {
+    pub(super) const fn new(
+        reader: R,
+        allocation: A,
+        profile: LoadProfile,
+        entry: TargetAddress,
+        program_header_offset: u64,
+        program_header_entry_size: u16,
+        program_header_count: u16,
+        segments: Vec<LoadSegmentInfo>,
+        dynamic: Option<DynamicInfo>,
+        relro: Option<TargetRange>,
+        image_start: TargetAddress,
+    ) -> Self {
+        Self {
+            reader,
+            allocation,
+            profile,
+            entry,
+            program_header_offset,
+            program_header_entry_size,
+            program_header_count,
+            segments,
+            dynamic,
+            relro,
+            image_start,
+        }
+    }
+
     /// Populate the mapping and release the source reader.
     pub(crate) fn map(self) -> LoadResult<MappedImage<A>> {
         self.map_with(|image, _reader| image)
     }
 
     /// Populate the mapping and return the source reader for further ELF reads.
+    #[cfg(enable_dynamic_linker)]
     pub(crate) fn map_with_reader(self) -> LoadResult<(MappedImage<A>, R)> {
         self.map_with(|image, reader| (image, reader))
     }
@@ -191,16 +220,16 @@ impl<R: ElfReader, A: ImageMapping> AllocatedImage<R, A> {
                     })
                 })?;
         }
-        let image = MappedImage {
+        let image = MappedImage::new(
             program_headers,
-            allocation: self.allocation,
-            profile: self.profile,
-            segments: self.segments,
-            dynamic: self.dynamic,
-            relro: self.relro,
-            image_start: self.image_start,
+            self.allocation,
+            self.profile,
+            self.segments,
+            self.dynamic,
+            self.relro,
+            self.image_start,
             entry,
-        };
+        );
         Ok(finish(image, self.reader))
     }
 }

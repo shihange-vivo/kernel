@@ -26,17 +26,39 @@ use alloc::vec::Vec;
 
 #[must_use = "retain the relocated image to keep its allocation alive"]
 pub(crate) struct RelocatedImage<A: ImageMapping> {
-    pub(super) program_headers: Option<ProgramHeaderTable>,
-    pub(super) allocation: A,
-    pub(super) profile: LoadProfile,
-    pub(super) segments: Vec<LoadSegmentInfo>,
-    pub(super) relro: Option<TargetRange>,
-    pub(super) image_start: TargetAddress,
-    pub(super) entry: Option<TargetAddress>,
-    pub(super) dynamic: Option<DynamicInfo>,
+    program_headers: Option<ProgramHeaderTable>,
+    allocation: A,
+    profile: LoadProfile,
+    segments: Vec<LoadSegmentInfo>,
+    relro: Option<TargetRange>,
+    image_start: TargetAddress,
+    entry: Option<TargetAddress>,
+    dynamic: Option<DynamicInfo>,
 }
 
 impl<A: ImageMapping> RelocatedImage<A> {
+    pub(super) const fn new(
+        program_headers: Option<ProgramHeaderTable>,
+        allocation: A,
+        profile: LoadProfile,
+        segments: Vec<LoadSegmentInfo>,
+        relro: Option<TargetRange>,
+        image_start: TargetAddress,
+        entry: Option<TargetAddress>,
+        dynamic: Option<DynamicInfo>,
+    ) -> Self {
+        Self {
+            program_headers,
+            allocation,
+            profile,
+            segments,
+            relro,
+            image_start,
+            entry,
+            dynamic,
+        }
+    }
+
     pub(crate) fn seal<C: CodeCache + ?Sized>(self, cache: &mut C) -> LoadResult<LoadedImage<A>> {
         self.seal_inner(cache, None)
             .map_err(|error| error.at_stage(LoadStage::Seal))
@@ -138,6 +160,12 @@ impl<A: ImageMapping> RelocatedImage<A> {
     pub(crate) const fn allocation(&self) -> &A {
         &self.allocation
     }
+
+    #[cfg(enable_dynamic_linker)]
+    pub(crate) const fn profile(&self) -> &LoadProfile {
+        &self.profile
+    }
+
     pub(crate) const fn entry(&self) -> Option<TargetAddress> {
         self.entry
     }

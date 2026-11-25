@@ -17,7 +17,7 @@
 //! The request and common errors are independent of the execution model. The
 //! current `run` entry uses thread groups to retain application resources,
 //! schedule the main thread and wait for every member's cleanup. It is compiled
-//! only with thread groups enabled; Process execution is not implemented yet.
+//! with thread groups enabled. Process execution remains future work.
 //! Callers supply a reader for memory, files or other storage, and can use
 //! `load_image` and `StartupStorage` separately in either resource model.
 
@@ -115,11 +115,13 @@ impl From<LoadError> for RunError {
         Self::Load(error)
     }
 }
+
 impl From<StartupError> for RunError {
     fn from(error: StartupError) -> Self {
         Self::Startup(error)
     }
 }
+
 #[cfg(thread_group)]
 impl From<ThreadGroupError> for RunError {
     fn from(error: ThreadGroupError) -> Self {

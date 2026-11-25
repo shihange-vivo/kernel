@@ -87,6 +87,12 @@ pub enum ProgramHeaderField {
     ExecutableStack,
 }
 
+#[derive(Debug, Eq, PartialEq)]
+pub enum ExistingImageReason {
+    MissingExportIndex,
+    RootAsPlugin,
+}
+
 #[derive(Debug)]
 pub enum LimitKind {
     FileLength,
@@ -144,6 +150,11 @@ pub enum ErrorContext {
     Dependency {
         requester: usize,
         needed_index: usize,
+    },
+    ExistingImage {
+        index: usize,
+        base: TargetAddress,
+        reason: ExistingImageReason,
     },
     SymbolIndex {
         index: u32,
@@ -204,8 +215,8 @@ impl LoadError {
         field: ProgramHeaderField,
         value: u64,
         kind: LoadErrorKind,
-    ) -> LoadError {
-        LoadError::new(
+    ) -> Self {
+        Self::new(
             kind,
             ErrorContext::ProgramHeader {
                 index,

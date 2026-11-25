@@ -15,25 +15,51 @@
 import("//build/templates/build_template.gni")
 import("//build/toolchain/blueos.gni")
 
-shared_library("linked_test_dso") {
-  testonly = true
-  sources = [ "provider.c" ]
-  cflags = [
-    "-fPIC",
-    "-ffreestanding",
-    "-fno-stack-protector",
-  ]
-  ldflags = [
-    "-nostdlib",
-    "-Wl,-z,now",
-  ]
-  if (current_cpu == "riscv32" || current_cpu == "riscv64") {
-    # The bare-metal Clang driver needs a linker-specific -shared.
-    ldflags += [
-      "-fuse-ld=lld",
-      "-Wl,-shared",
+if (current_cpu == "aarch64") {
+  _exports_script = "exports.map"
+  _exports_flag =
+      "-Wl,--version-script=" + rebase_path(_exports_script, root_build_dir)
+}
+
+template("linked_test_library") {
+  shared_library(target_name) {
+    testonly = true
+    forward_variables_from(invoker,
+                           [
+                             "sources",
+                             "deps",
+                           ])
+    cflags = [
+      "-fPIC",
+      "-ffreestanding",
+      "-fno-stack-protector",
     ]
+    ldflags = [
+      "-nostdlib",
+      "-Wl,-z,now",
+    ]
+    if (current_cpu == "aarch64") {
+      inputs = [ _exports_script ]
+      ldflags += [ _exports_flag ]
+    }
+    if (current_cpu == "riscv32" || current_cpu == "riscv64") {
+      # The bare-metal Clang driver needs a linker-specific -shared.
+      ldflags += [
+        "-fuse-ld=lld",
+        "-Wl,-shared",
+        "-Wl,-Bdynamic",
+      ]
+    }
   }
+}
+
+linked_test_library("linked_test_dso") {
+  sources = [ "provider.c" ]
+}
+
+linked_test_library("linked_test_plugin") {
+  sources = [ "plugin.c" ]
+  deps = [ ":linked_test_dso" ]
 }
 
 _dso_path = "$root_out_dir/lib/liblinked_test_dso.so"
@@ -58,8 +84,13 @@ build_rust("linked_test_app") {
     "-Clink-arg=-Wl,-z,now",
     "-Clink-arg=-Wl,-z,noexecstack",
     "-Clink-arg=-Wl,--export-dynamic-symbol=record_event",
+    "-Clink-arg=-Wl,--export-dynamic-symbol=linked_choice",
     "-Clink-arg=" + rebase_path(_dso_path, root_build_dir),
   ]
+  if (current_cpu == "aarch64") {
+    inputs = [ _exports_script ]
+    rustflags += [ "-Clink-arg=" + _exports_flag ]
+  }
 }
 
 run_clippy("linked_test_app_clippy") {
@@ -93,11 +124,28 @@ action("dso_path") {
   outputs = [ outfile ]
 }
 
+action("plugin_path") {
+  testonly = true
+  script = "//kernel/loader/tests/scripts/gen_path_symbol.py"
+  deps = [ ":linked_test_plugin" ]
+  _plugin_path = "$root_out_dir/lib/liblinked_test_plugin.so"
+  inputs = [ _plugin_path ]
+  outfile = "${target_gen_dir}/${target_name}.c"
+  args = [
+    rebase_path(_plugin_path, root_build_dir),
+    "LINKED_TEST_PLUGIN_PATH",
+    rebase_path(outfile),
+  ]
+  outputs = [ outfile ]
+}
+
 static_library("paths") {
   testonly = true
   deps = [
     ":app_path",
     ":dso_path",
+    ":plugin_path",
   ]
-  sources = get_target_outputs(":app_path") + get_target_outputs(":dso_path")
+  sources = get_target_outputs(":app_path") + get_target_outputs(":dso_path") +
+            get_target_outputs(":plugin_path")
 }

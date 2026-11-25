@@ -54,6 +54,11 @@ unsafe extern "C" {
 }
 
 #[unsafe(no_mangle)]
+pub extern "C" fn linked_choice() -> c_int {
+    2
+}
+
+#[unsafe(no_mangle)]
 pub extern "C" fn record_event(event: u8) {
     // The DSO calls back into the root's libc after startup initialized it.
     let mode = unsafe { librs::stdlib::getenv(c"LINK_TEST".as_ptr()) };

@@ -17,8 +17,8 @@
 //! The loader core stays independent of kernel types. This module supplies the
 //! flat memory mapping, instruction publication and native profile, then hands
 //! the owning `LoadedImage` back to the caller. Startup storage retains that
-//! image and its ABI buffers. `crate::thread_group` manages member threads and shared
-//! resources, while the application libc executes initialization and finalization.
+//! image and its ABI buffers. `crate::thread_group` manages member threads and
+//! shared resources, while the application libc executes init and fini callbacks.
 //! Executing an image through a thread group requires `CONFIG_THREAD_GROUP=y`;
 //! loading images and building their initial stacks remain available without it.
 

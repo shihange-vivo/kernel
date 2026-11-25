@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Discover and validate required ELF images before allocating their mappings.
+//! Discover dependencies and retain each validated ELF reader for linking.
 
 use alloc::vec::Vec;
 use goblin::elf::dynamic::{DT_NEEDED, DT_SONAME, DT_STRTAB};
@@ -131,8 +131,28 @@ pub fn discover<D: DependencyResolver>(
     limits: DependencyLimits,
     resolver: &mut D,
 ) -> LoadResult<DependencyPlan<D::Key, D::Reader>> {
-    discover_inner(root, request, &limits, resolver)
-        .map_err(|error| error.at_stage(LoadStage::Discover))
+    discover_with_existing(root, request, limits, resolver, 0, 0, |_| None)
+}
+
+pub(super) fn discover_with_existing<D: DependencyResolver>(
+    root: D::Key,
+    request: LoadRequest,
+    limits: DependencyLimits,
+    resolver: &mut D,
+    first: usize,
+    existing_edges: usize,
+    find_existing: impl Fn(&D::Key) -> Option<usize>,
+) -> LoadResult<DependencyPlan<D::Key, D::Reader>> {
+    discover_inner(
+        root,
+        request,
+        &limits,
+        resolver,
+        first,
+        existing_edges,
+        find_existing,
+    )
+    .map_err(|error| error.at_stage(LoadStage::Discover))
 }
 
 fn discover_inner<D: DependencyResolver>(
@@ -140,8 +160,12 @@ fn discover_inner<D: DependencyResolver>(
     request: LoadRequest,
     limits: &DependencyLimits,
     resolver: &mut D,
+    first: usize,
+    existing_edges: usize,
+    find_existing: impl Fn(&D::Key) -> Option<usize>,
 ) -> LoadResult<DependencyPlan<D::Key, D::Reader>> {
-    limits.check_image_count(1)?;
+    limits.check_image_count(first as u64 + 1)?;
+    limits.check_edge_count(existing_edges as u64)?;
     let mut plan = DependencyPlan {
         images: Vec::new(),
         edges: Vec::new(),
@@ -162,7 +186,7 @@ fn discover_inner<D: DependencyResolver>(
     let mut requester = 0;
     while requester < plan.images.len() {
         let image = &plan.images[requester];
-        let names = read_needed(&image.image, plan.edges.len(), limits)?;
+        let names = read_needed(&image.image, existing_edges + plan.edges.len(), limits)?;
         let depth = image.depth;
         plan.edges
             .try_reserve(names.len())
@@ -170,25 +194,33 @@ fn discover_inner<D: DependencyResolver>(
 
         for (needed_index, name) in names.into_iter().enumerate() {
             let context = || ErrorContext::Dependency {
-                requester,
+                requester: first + requester,
                 needed_index,
             };
             let key = resolver
                 .resolve(&plan.images[requester].key, &name)
                 .map_err(|error| error.with_context(context()))?;
-            let provider = match plan.images.iter().position(|image| image.key == key) {
-                Some(0) => {
-                    request
-                        .profile()
-                        .check_root_as_dependency(request.purpose())
-                        .map_err(|error| error.with_context(context()))?;
-                    0
-                }
-                Some(index) => index,
-                None => {
+            let provider =
+                if let Some(index) = plan.images.iter().position(|image| image.key == key) {
+                    if index == 0 {
+                        request
+                            .profile()
+                            .check_root_as_dependency(request.purpose())
+                            .map_err(|error| error.with_context(context()))?;
+                    }
+                    first + index
+                } else if let Some(index) = find_existing(&key) {
+                    if index == 0 {
+                        request
+                            .profile()
+                            .check_root_as_dependency(LoadPurpose::Executable)
+                            .map_err(|error| error.with_context(context()))?;
+                    }
+                    index
+                } else {
                     let index = plan.images.len();
                     let depth = depth + 1;
-                    limits.check_image_count(index as u64 + 1)?;
+                    limits.check_image_count(first as u64 + index as u64 + 1)?;
                     limits.check_depth(depth)?;
                     plan.images.try_reserve(1).map_err(|_| out_of_memory())?;
                     let image = open_image(
@@ -201,11 +233,10 @@ fn discover_inner<D: DependencyResolver>(
                     )
                     .map_err(|error| error.with_context(context()))?;
                     plan.images.push(image);
-                    index
-                }
-            };
+                    first + index
+                };
             plan.edges.push(DependencyEdge {
-                requester,
+                requester: first + requester,
                 provider,
                 name,
             });

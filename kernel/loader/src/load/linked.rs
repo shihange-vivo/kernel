@@ -14,13 +14,17 @@
 
 //! Load and finalize a whole ELF dependency graph.
 
-use alloc::vec::Vec;
+use alloc::{collections::TryReserveError, vec::Vec};
 
 use super::{LoadAndLinkRequest, LoadedImage};
 use crate::{
-    dynamic_linker::{discover, link, DependencyEdge, DependencyResolver, ExportedSymbols},
+    dynamic_linker::{
+        discover, link, prepare_plugin, DependencyEdge, DependencyResolver, ExportedSymbols,
+    },
+    error::{ErrorContext, ExistingImageReason, LoadErrorKind, LoadStage},
     memory::{ImageMapping, TargetAddress},
-    CodeCache, ImageAllocator, LoadResult,
+    profile::LoadProfile,
+    CodeCache, ImageAllocator, LoadError, LoadResult,
 };
 
 /// A finalized ELF in a loaded dependency graph.
@@ -33,7 +37,7 @@ pub struct LoadedObject<K, A: ImageMapping> {
 }
 
 impl<K, A: ImageMapping> LoadedObject<K, A> {
-    pub(crate) fn new(
+    pub(crate) const fn new(
         key: K,
         soname: Option<Vec<u8>>,
         image: LoadedImage<A>,
@@ -61,8 +65,31 @@ impl<K, A: ImageMapping> LoadedObject<K, A> {
     }
 
     /// Export index captured when the request set an export budget.
-    pub fn exports(&self) -> Option<&ExportedSymbols> {
+    pub const fn exports(&self) -> Option<&ExportedSymbols> {
         self.exports.as_ref()
+    }
+}
+
+/// The finalized images and metadata from one startup or plugin load.
+#[must_use = "retain the sealed batch to keep its mappings alive"]
+pub(crate) struct SealedBatch<K, A: ImageMapping> {
+    images: Vec<LoadedObject<K, A>>,
+    edges: Vec<DependencyEdge>,
+    /// Image indexes in initialization order, relative to the full group.
+    init_order: Vec<usize>,
+}
+
+impl<K, A: ImageMapping> SealedBatch<K, A> {
+    pub(crate) const fn new(
+        images: Vec<LoadedObject<K, A>>,
+        edges: Vec<DependencyEdge>,
+        init_order: Vec<usize>,
+    ) -> Self {
+        Self {
+            images,
+            edges,
+            init_order,
+        }
     }
 }
 
@@ -74,18 +101,18 @@ pub struct LoadedImages<K, A: ImageMapping> {
     images: Vec<LoadedObject<K, A>>,
     edges: Vec<DependencyEdge>,
     init_order: Vec<usize>,
+    startup_count: usize,
+    profile: LoadProfile,
 }
 
-impl<K, A: ImageMapping> LoadedImages<K, A> {
-    pub(crate) fn new(
-        images: Vec<LoadedObject<K, A>>,
-        edges: Vec<DependencyEdge>,
-        init_order: Vec<usize>,
-    ) -> Self {
+impl<K: Eq, A: ImageMapping> LoadedImages<K, A> {
+    pub(crate) fn new(batch: SealedBatch<K, A>, profile: LoadProfile) -> Self {
         Self {
-            images,
-            edges,
-            init_order,
+            startup_count: batch.images.len(),
+            images: batch.images,
+            edges: batch.edges,
+            init_order: batch.init_order,
+            profile,
         }
     }
 
@@ -94,13 +121,23 @@ impl<K, A: ImageMapping> LoadedImages<K, A> {
         self.images[0].image()
     }
 
-    /// The root and its dependencies in breadth-first discovery order.
+    /// The startup graph, followed by new images from each plugin load.
+    /// Indexes remain stable throughout the group's lifetime.
     pub fn images(&self) -> &[LoadedObject<K, A>] {
         &self.images
     }
 
     pub fn edges(&self) -> &[DependencyEdge] {
         &self.edges
+    }
+
+    pub(crate) const fn startup_count(&self) -> usize {
+        self.startup_count
+    }
+
+    /// Image indexes in callback order. A plugin load appends its new indexes.
+    pub fn init_order(&self) -> &[usize] {
+        &self.init_order
     }
 
     /// The root's preinitializers, for execution before any image initialization.
@@ -122,6 +159,77 @@ impl<K, A: ImageMapping> LoadedImages<K, A> {
             .rev()
             .flat_map(|&index| self.images[index].image.lifecycle().fini().iter().copied())
     }
+
+    pub(crate) fn find(&self, key: &K) -> Option<usize> {
+        self.images.iter().position(|image| image.key() == key)
+    }
+
+    /// Load a plugin into this application's graph and return its image index.
+    /// The startup graph precedes the plugin and its dependencies in the
+    /// lookup scope. Existing dependencies are reused by resolver key.
+    ///
+    /// The allocator must serve the same target address space. The host must
+    /// finish initializing existing images before calling this method, then
+    /// run the callbacks for the indexes appended to `init_order` before using
+    /// the new plugin or extending the graph again. Enable export indexing
+    /// when loading images that will be visible to later plugins.
+    pub fn load_plugin<D, M, C>(
+        &mut self,
+        key: K,
+        request: LoadAndLinkRequest,
+        resolver: &mut D,
+        allocator: M,
+        cache: &mut C,
+    ) -> LoadResult<usize>
+    where
+        D: DependencyResolver<Key = K>,
+        M: ImageAllocator<Allocation = A>,
+        C: CodeCache + ?Sized,
+    {
+        if let Some(index) = self
+            .check_plugin(&key, request.profile())
+            .map_err(|error| error.at_stage(LoadStage::Discover))?
+        {
+            return Ok(index);
+        }
+        let first = self.images.len();
+        let plugin = prepare_plugin(self, key, request, resolver, allocator, cache)?;
+        self.extend(plugin).map_err(|_| {
+            LoadError::new(LoadErrorKind::OutOfMemory, ErrorContext::None).at_stage(LoadStage::Seal)
+        })?;
+        Ok(first)
+    }
+
+    fn check_plugin(&self, key: &K, profile: &LoadProfile) -> LoadResult<Option<usize>> {
+        if profile != &self.profile {
+            return Err(LoadError::new(
+                LoadErrorKind::UnsupportedByProfile,
+                ErrorContext::None,
+            ));
+        }
+        let index = self.find(key);
+        if let Some(index @ 0) = index {
+            return Err(LoadError::new(
+                LoadErrorKind::UnsupportedByProfile,
+                ErrorContext::ExistingImage {
+                    index,
+                    base: self.root().allocation().base(),
+                    reason: ExistingImageReason::RootAsPlugin,
+                },
+            ));
+        }
+        Ok(index)
+    }
+
+    fn extend(&mut self, mut batch: SealedBatch<K, A>) -> Result<(), TryReserveError> {
+        self.images.try_reserve(batch.images.len())?;
+        self.edges.try_reserve(batch.edges.len())?;
+        self.init_order.try_reserve(batch.init_order.len())?;
+        self.images.append(&mut batch.images);
+        self.edges.append(&mut batch.edges);
+        self.init_order.append(&mut batch.init_order);
+        Ok(())
+    }
 }
 
 /// Discover, eagerly relocate and finalize the root and its dependencies.
@@ -141,12 +249,8 @@ where
     M: ImageAllocator,
     C: CodeCache + ?Sized,
 {
-    discover(
-        root,
-        request.load_request,
-        request.dependency_limits,
-        resolver,
-    )
-    .and_then(|plan| link(plan, request.link_limits, allocator))
-    .and_then(|linked| linked.seal(cache))
+    let (load_request, dependency_limits, link_limits) = request.into_parts();
+    discover(root, load_request, dependency_limits, resolver)
+        .and_then(|plan| link(plan, link_limits, allocator))
+        .and_then(|linked| linked.seal(cache))
 }

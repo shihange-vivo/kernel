@@ -29,8 +29,12 @@ pub struct LinkedLifecycle {
 }
 
 impl LinkedLifecycle {
-    pub(super) fn build(edges: &[DependencyEdge], plans: Vec<LifecyclePlan>) -> LoadResult<Self> {
-        let order = dependency_order(plans.len(), edges)?;
+    pub(super) fn build(
+        edges: &[DependencyEdge],
+        plans: Vec<LifecyclePlan>,
+        first: usize,
+    ) -> LoadResult<Self> {
+        let order = dependency_order(plans.len(), edges, first)?;
         Ok(Self { plans, order })
     }
 
@@ -71,7 +75,11 @@ struct Visit {
 /// Iterative Tarjan traversal from the root. Edges point from requesters to
 /// providers, so components finish in dependency-first order. Sorting each
 /// component gives a stable discovery order for members of a dependency cycle.
-fn dependency_order(image_count: usize, edges: &[DependencyEdge]) -> LoadResult<Vec<usize>> {
+fn dependency_order(
+    image_count: usize,
+    edges: &[DependencyEdge],
+    first: usize,
+) -> LoadResult<Vec<usize>> {
     let mut visits = reserve(image_count)?;
     visits.resize(image_count, Visit::default());
     let mut active = reserve(image_count)?;
@@ -96,13 +104,17 @@ fn dependency_order(image_count: usize, edges: &[DependencyEdge]) -> LoadResult<
 
         if let Some(edge) = edges
             .get(*next_edge)
-            .filter(|edge| edge.requester() == image)
+            .filter(|edge| edge.requester() == first + image)
         {
             *next_edge += 1;
-            let provider = edge.provider();
+            // Only new images need callbacks in this operation.
+            let Some(provider) = edge.provider().checked_sub(first) else {
+                continue;
+            };
             match visits[provider] {
                 Visit { index: None, .. } => {
-                    let first_edge = edges.partition_point(|edge| edge.requester() < provider);
+                    let first_edge =
+                        edges.partition_point(|edge| edge.requester() < first + provider);
                     traversal.push((provider, first_edge));
                 }
                 Visit {

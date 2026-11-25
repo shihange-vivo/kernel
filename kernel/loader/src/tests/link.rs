@@ -21,8 +21,8 @@ use goblin::elf::{
     dynamic::{
         DF_1_PIE, DT_BIND_NOW, DT_FINI, DT_FINI_ARRAY, DT_FINI_ARRAYSZ, DT_FLAGS_1, DT_HASH,
         DT_INIT, DT_INIT_ARRAY, DT_INIT_ARRAYSZ, DT_JMPREL, DT_NEEDED, DT_NULL, DT_PLTREL,
-        DT_PLTRELSZ, DT_PREINIT_ARRAY, DT_PREINIT_ARRAYSZ, DT_RELA, DT_STRSZ, DT_STRTAB, DT_SYMENT,
-        DT_SYMTAB,
+        DT_PLTRELSZ, DT_PREINIT_ARRAY, DT_PREINIT_ARRAYSZ, DT_RELA, DT_SONAME, DT_STRSZ, DT_STRTAB,
+        DT_SYMENT, DT_SYMTAB,
     },
     reloc::{
         R_AARCH64_ABS64, R_AARCH64_GLOB_DAT, R_AARCH64_JUMP_SLOT, R_AARCH64_RELATIVE, R_RISCV_32,
@@ -42,7 +42,7 @@ use super::{
 };
 use crate::{
     dynamic_linker::{discover, link, LinkedImages},
-    error::{ErrorContext, LimitKind, LoadErrorKind, LoadStage},
+    error::{ErrorContext, ExistingImageReason, LimitKind, LoadErrorKind, LoadStage},
     load_and_link,
     memory::{AllocationOffset, ImageLayout, MemoryPermissions, TargetAddress, TargetRange},
     profile::{
@@ -90,6 +90,8 @@ fn fixture(
     dynamic.extend(needed.iter().map(|&offset| (DT_NEEDED, offset)));
     if purpose == LoadPurpose::Executable {
         dynamic.push((DT_FLAGS_1, DF_1_PIE));
+    } else {
+        dynamic.push((DT_SONAME, A));
     }
     if !relocations.is_empty() {
         dynamic.extend(tags(
@@ -179,7 +181,7 @@ fn link_fixtures(
         DependencyLimits::DEFAULT,
         catalog,
     )?;
-    link(plan, limits, DistinctAllocations(catalog.state.clone()))
+    link(plan, limits, DistinctAllocations(catalog.state().clone()))
 }
 
 fn word(image: &impl ImageMapping, profile: LoadProfile, target: u64) -> u64 {
@@ -317,9 +319,9 @@ fn linked_lifecycle_orders_diamond_and_cycle_after_relocation() {
                 callback(image, 0x40),
                 callback(image, 0x30)
             ])));
-        assert_eq!(catalog.state.live.get(), 5);
+        assert_eq!(catalog.state().live.get(), 5);
         drop(linked);
-        assert_eq!(catalog.state.live.get(), 0);
+        assert_eq!(catalog.state().live.get(), 0);
     }
 }
 
@@ -342,7 +344,7 @@ fn linked_lifecycle_reports_invalid_callbacks_with_the_lifecycle_stage() {
             value,
         } if *value == linked.images()[1].allocation().base().get() + LIB_DATA - BASE
     ));
-    assert_eq!(catalog.state.live.get(), 2);
+    assert_eq!(catalog.state().live.get(), 2);
 }
 
 #[derive(Default)]
@@ -373,7 +375,7 @@ fn load_and_link_finalizes_every_image_and_retains_the_graph() {
             super::seal::relro(fixture, relro_start, 0x80);
         }
         let mut catalog = Catalog::new(&fixtures, ROUTES);
-        let state = catalog.state.clone();
+        let state = catalog.state().clone();
         let mut cache = GraphCache::default();
         let loaded = load_and_link(
             0,
@@ -452,7 +454,7 @@ fn retained_exports_match_elf_lookup_after_the_reader_closes() {
 
     let fixtures = [root];
     let mut catalog = Catalog::new(&fixtures, &[]);
-    let state = catalog.state.clone();
+    let state = catalog.state().clone();
     let config = LoadAndLinkRequest::new(request(
         profile,
         LoadPurpose::Executable,
@@ -531,9 +533,248 @@ fn retained_exports_check_graph_limits_before_relocation_writes() {
             )
         ));
         // Only the segment copies reached storage.
-        assert_eq!(catalog.state.writes.get(), 12);
-        assert_eq!(catalog.state.drops.get(), 2);
+        assert_eq!(catalog.state().writes.get(), 12);
+        assert_eq!(catalog.state().drops.get(), 2);
     }
+}
+
+#[test]
+fn plugin_reuses_needed_images_and_searches_the_application_first() {
+    for profile in PROFILES {
+        let (address_kind, jump_kind, _) = kinds(profile);
+        let fixtures = [
+            fixture(
+                profile,
+                LoadPurpose::Executable,
+                &[A],
+                &[(FUNC, STB_GLOBAL, STT_FUNC, STV_DEFAULT, 1, BASE + 0x20)],
+                &[],
+                None,
+            ),
+            fixture(
+                profile,
+                LoadPurpose::SharedObject,
+                &[B],
+                &[(DATA, STB_GLOBAL, STT_OBJECT, STV_DEFAULT, 1, LIB_DATA)],
+                &[],
+                None,
+            ),
+            fixture(
+                profile,
+                LoadPurpose::SharedObject,
+                &[],
+                &[(WEAK, STB_GLOBAL, STT_OBJECT, STV_DEFAULT, 1, LIB_DATA + 8)],
+                &[],
+                None,
+            ),
+            fixture(
+                profile,
+                LoadPurpose::SharedObject,
+                &[A, B],
+                &[
+                    (FUNC, STB_GLOBAL, STT_FUNC, STV_DEFAULT, SHN_UNDEF, 0),
+                    (DATA, STB_GLOBAL, STT_OBJECT, STV_DEFAULT, SHN_UNDEF, 0),
+                    (WEAK, STB_GLOBAL, STT_OBJECT, STV_DEFAULT, SHN_UNDEF, 0),
+                ],
+                &[
+                    (TARGET, 2, address_kind, 0),
+                    (TARGET + 8, 3, address_kind, 0),
+                ],
+                Some((PLT_SLOT, 1, jump_kind, 0)),
+            ),
+            fixture(
+                profile,
+                LoadPurpose::SharedObject,
+                &[],
+                &[(FUNC, STB_GLOBAL, STT_FUNC, STV_DEFAULT, 1, BASE + 0x40)],
+                &[],
+                None,
+            ),
+        ];
+        let mut catalog = Catalog::new(
+            &fixtures,
+            &[(0, b"a", 1), (1, b"b", 2), (3, b"a", 1), (3, b"b", 4)],
+        );
+        let state = catalog.state().clone();
+        let config = LoadAndLinkRequest::new(request(
+            profile,
+            LoadPurpose::Executable,
+            LoadLimits::DEFAULT,
+        ))
+        .with_link_limits(LinkLimits::DEFAULT.with_export_limits(ExportLimits::DEFAULT));
+        let mut cache = GraphCache::default();
+        let mut group = load_and_link(
+            0,
+            config,
+            &mut catalog,
+            DistinctAllocations(state.clone()),
+            &mut cache,
+        )
+        .unwrap();
+        let index = group
+            .load_plugin(
+                3,
+                config,
+                &mut catalog,
+                DistinctAllocations(state.clone()),
+                &mut cache,
+            )
+            .unwrap();
+        assert_eq!(index, 3);
+        assert_eq!(catalog.opened(), [0, 1, 2, 3, 4]);
+        assert_eq!(state.prepares.get(), 5);
+        assert_eq!(cache.ranges.len(), 5);
+        assert_eq!(group.init_order(), [2, 1, 0, 4, 3]);
+        assert_eq!(group.edges()[2].requester(), 3);
+        assert_eq!(group.edges()[2].provider(), 1);
+        assert_eq!(group.images()[1].soname(), Some(b"a".as_slice()));
+        assert_eq!(group.images()[4].soname(), group.images()[1].soname());
+        assert_ne!(group.images()[4].key(), group.images()[1].key());
+        let plugin = group.images()[3].image().allocation();
+        for (slot, provider, name) in [
+            (PLT_SLOT, 0, b"func".as_slice()),
+            (TARGET, 1, b"data"),
+            (TARGET + 8, 2, b"weak"),
+        ] {
+            let address = group.images()[provider]
+                .exports()
+                .unwrap()
+                .find(name)
+                .unwrap();
+            assert_eq!(word(plugin, profile, slot), address.get());
+        }
+        assert_eq!(
+            group
+                .load_plugin(
+                    3,
+                    config,
+                    &mut catalog,
+                    DistinctAllocations(state.clone()),
+                    &mut cache
+                )
+                .unwrap(),
+            3
+        );
+        assert_eq!(catalog.opened(), [0, 1, 2, 3, 4]);
+        drop(group);
+        assert_eq!(state.drops.get(), 5);
+    }
+}
+
+#[test]
+fn plugin_scope_only_includes_later_images_through_its_dependencies() {
+    let profile = LoadProfile::riscv64();
+    let fixtures = [
+        fixture(profile, LoadPurpose::Executable, &[], &[], &[], None),
+        fixture(
+            profile,
+            LoadPurpose::SharedObject,
+            &[],
+            &[(DATA, STB_GLOBAL, STT_OBJECT, STV_DEFAULT, 1, LIB_DATA)],
+            &[],
+            None,
+        ),
+        fixture(
+            profile,
+            LoadPurpose::SharedObject,
+            &[],
+            &[(DATA, STB_GLOBAL, STT_OBJECT, STV_DEFAULT, SHN_UNDEF, 0)],
+            &[(TARGET, 1, R_RISCV_64, 0)],
+            None,
+        ),
+        fixture(
+            profile,
+            LoadPurpose::SharedObject,
+            &[A],
+            &[(DATA, STB_GLOBAL, STT_OBJECT, STV_DEFAULT, SHN_UNDEF, 0)],
+            &[(TARGET, 1, R_RISCV_64, 0)],
+            None,
+        ),
+    ];
+    let mut catalog = Catalog::new(&fixtures, &[(3, b"a", 1)]);
+    let state = catalog.state().clone();
+    let config = LoadAndLinkRequest::new(request(
+        profile,
+        LoadPurpose::Executable,
+        LoadLimits::DEFAULT,
+    ))
+    .with_link_limits(LinkLimits::DEFAULT.with_export_limits(ExportLimits::DEFAULT));
+    let mut cache = GraphCache::default();
+    let mut group = load_and_link(
+        0,
+        config,
+        &mut catalog,
+        DistinctAllocations(state.clone()),
+        &mut cache,
+    )
+    .unwrap();
+    let mut load = |key| {
+        group.load_plugin(
+            key,
+            config,
+            &mut catalog,
+            DistinctAllocations(state.clone()),
+            &mut cache,
+        )
+    };
+    assert_eq!(load(1).unwrap(), 1);
+    let error = failure(load(2));
+    assert_eq!(error.kind(), LoadErrorKind::UnresolvedSymbol);
+    assert_eq!(state.live.get(), 2);
+    assert_eq!(load(3).unwrap(), 2);
+    assert_eq!(group.init_order(), [0, 1, 2]);
+    assert_eq!(catalog.opened(), [0, 1, 2, 3]);
+    let address = group.images()[1].exports().unwrap().find(b"data").unwrap();
+    assert_eq!(
+        word(group.images()[2].image().allocation(), profile, TARGET),
+        address.get()
+    );
+}
+
+#[test]
+fn plugin_errors_identify_the_existing_image_and_reason() {
+    let profile = LoadProfile::riscv64();
+    let fixtures = [
+        fixture(profile, LoadPurpose::Executable, &[], &[], &[], None),
+        fixture(profile, LoadPurpose::SharedObject, &[], &[], &[], None),
+    ];
+    let mut catalog = Catalog::new(&fixtures, &[]);
+    let state = catalog.state().clone();
+    let config = LoadAndLinkRequest::new(request(
+        profile,
+        LoadPurpose::Executable,
+        LoadLimits::DEFAULT,
+    ));
+    let mut cache = GraphCache::default();
+    let mut group = load_and_link(
+        0,
+        config,
+        &mut catalog,
+        DistinctAllocations(state.clone()),
+        &mut cache,
+    )
+    .unwrap();
+    let root_base = group.root().allocation().base();
+
+    for (key, reason) in [
+        (0, ExistingImageReason::RootAsPlugin),
+        (1, ExistingImageReason::MissingExportIndex),
+    ] {
+        let error = failure(group.load_plugin(
+            key,
+            config,
+            &mut catalog,
+            DistinctAllocations(state.clone()),
+            &mut cache,
+        ));
+        assert_eq!(error.stage(), Some(LoadStage::Discover));
+        assert!(matches!(
+            error.context(),
+            ErrorContext::ExistingImage { index: 0, base, reason: actual }
+                if *base == root_base && *actual == reason
+        ));
+    }
+    assert_eq!(state.prepares.get(), 1);
 }
 
 #[test]
@@ -549,7 +790,7 @@ fn graph_seal_checks_all_callbacks_before_synchronizing_code() {
     let error = failure(linked.seal(&mut cache));
     assert_eq!(error.stage(), Some(LoadStage::Lifecycle));
     assert!(cache.ranges.is_empty());
-    assert_eq!(catalog.state.drops.get(), 2);
+    assert_eq!(catalog.state().drops.get(), 2);
 }
 
 #[test]
@@ -573,7 +814,7 @@ fn graph_seal_releases_all_mappings_after_a_late_cache_error() {
         error.context(),
         ErrorContext::TargetRange { start, len: 0x100, .. } if start.get() == 0xc000
     ));
-    assert_eq!(catalog.state.drops.get(), 2);
+    assert_eq!(catalog.state().drops.get(), 2);
 }
 
 #[test]
@@ -639,10 +880,10 @@ fn link_binds_data_and_eager_plt_in_breadth_first_scope() {
         assert_eq!(word(root, profile, TARGET + 24), 0x3344);
         assert_eq!(word(root, profile, PLT_SLOT), func + plt_addend);
         assert_eq!(result.edges().len(), 2);
-        assert_eq!(catalog.state.reader_drops.get(), 3);
-        assert_eq!(catalog.state.live.get(), 3);
+        assert_eq!(catalog.state().reader_drops.get(), 3);
+        assert_eq!(catalog.state().live.get(), 3);
         drop(result);
-        assert_eq!(catalog.state.drops.get(), 3);
+        assert_eq!(catalog.state().drops.get(), 3);
     }
 }
 
@@ -732,10 +973,10 @@ fn link_rejects_invalid_later_images_before_any_relocation_write() {
         let error = failure(link_fixtures(&mut catalog, profile, LinkLimits::DEFAULT));
         assert_eq!(error.stage(), Some(LoadStage::Relocate));
         assert_eq!(error.kind(), expected);
-        assert_eq!(catalog.state.live.get(), 0);
-        assert_eq!(catalog.state.drops.get(), 2);
+        assert_eq!(catalog.state().live.get(), 0);
+        assert_eq!(catalog.state().drops.get(), 2);
         // Two file-backed segments per fixture, copied in 512-byte chunks.
-        assert_eq!(catalog.state.writes.get(), 12);
+        assert_eq!(catalog.state().writes.get(), 12);
     }
 }
 
@@ -773,7 +1014,7 @@ fn load_and_link_checks_dependency_relocation_and_probe_budgets() {
         ),
     ] {
         let mut catalog = Catalog::new(&inputs, &[]);
-        let allocator = DistinctAllocations(catalog.state.clone());
+        let allocator = DistinctAllocations(catalog.state().clone());
         let error = failure(load_and_link(
             0,
             config,
@@ -808,8 +1049,8 @@ fn load_and_link_checks_dependency_relocation_and_probe_budgets() {
                 }
             )
         ));
-        assert_eq!(catalog.state.prepares.get(), prepared);
-        assert_eq!(catalog.state.drops.get(), prepared);
+        assert_eq!(catalog.state().prepares.get(), prepared);
+        assert_eq!(catalog.state().drops.get(), prepared);
     }
 }
 
@@ -850,15 +1091,15 @@ fn link_rejects_overlapping_target_mappings_before_copying_the_second_image() {
         plan,
         LinkLimits::DEFAULT,
         Allocator {
-            state: catalog.state.clone(),
+            state: catalog.state().clone(),
             base: 0x8000,
         },
     ));
     assert_eq!(error.kind(), LoadErrorKind::IncorrectLayout);
     assert_eq!(error.stage(), Some(LoadStage::Allocate));
-    assert_eq!(catalog.state.writes.get(), 6);
-    assert_eq!(catalog.state.live.get(), 0);
-    assert_eq!(catalog.state.drops.get(), 2);
+    assert_eq!(catalog.state().writes.get(), 6);
+    assert_eq!(catalog.state().live.get(), 0);
+    assert_eq!(catalog.state().drops.get(), 2);
 }
 
 #[test]
@@ -878,11 +1119,11 @@ fn link_releases_every_image_after_a_relocation_write_fails() {
     ];
     let mut catalog = Catalog::new(&inputs, ROUTES);
     // Twelve segment-copy writes, one root relocation, then the failing DSO write.
-    catalog.state.fail_write.set(Some(14));
+    catalog.state().fail_write.set(Some(14));
     let error = failure(link_fixtures(&mut catalog, profile, LinkLimits::DEFAULT));
     assert_eq!(error.stage(), Some(LoadStage::Relocate));
     assert_eq!(error.kind(), LoadErrorKind::Io);
-    assert_eq!(catalog.state.writes.get(), 14);
-    assert_eq!(catalog.state.live.get(), 0);
-    assert_eq!(catalog.state.drops.get(), 2);
+    assert_eq!(catalog.state().writes.get(), 14);
+    assert_eq!(catalog.state().live.get(), 0);
+    assert_eq!(catalog.state().drops.get(), 2);
 }

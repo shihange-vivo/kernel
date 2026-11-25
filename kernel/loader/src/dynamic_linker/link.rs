@@ -21,106 +21,27 @@ use goblin::elf::{
 };
 
 use super::{
-    exports::ExportBudget, reserve, symbol, DependencyEdge, DependencyPlan, ExportedSymbols,
-    LinkedLifecycle,
+    exports::ExportBudget, reserve, scope::LinkScope, symbol, DependencyPlan, ExportedSymbols,
+    LinkedImage, LinkedImages,
 };
 use crate::{
     elf::{RelocationRecord, SymbolTableReader},
     error::{ErrorContext, LoadErrorKind, LoadStage},
-    image::{DecodedImage, RelocatedImage},
+    image::DecodedImage,
     memory::{ImageMapping, TargetAddress, TargetRange},
     profile::LinkLimits,
     relocation::{relative_value, write::RelocationWrites, SymbolRelocation},
-    CodeCache, ElfReader, ImageAllocator, LoadError, LoadResult, LoadedImages, LoadedObject,
+    ElfReader, ImageAllocator, LoadError, LoadResult,
 };
 
-/// One relocated ELF and its backing, retained by the dependency closure.
-#[must_use = "retain the linked image to keep its mapping alive"]
-pub struct LinkedImage<K, A: ImageMapping> {
-    key: K,
-    soname: Option<Vec<u8>>,
-    image: RelocatedImage<A>,
-    exports: Option<ExportedSymbols>,
-}
-
-impl<K, A: ImageMapping> LinkedImage<K, A> {
-    pub const fn key(&self) -> &K {
-        &self.key
-    }
-
-    pub fn soname(&self) -> Option<&[u8]> {
-        self.soname.as_deref()
-    }
-
-    /// Inspect relocated data while keeping the owning result alive.
-    pub const fn allocation(&self) -> &A {
-        self.image.allocation()
-    }
-
-    /// Runtime address of the entry. Execution requires image finalization.
-    pub const fn entry(&self) -> Option<TargetAddress> {
-        self.image.entry()
-    }
-}
-
-/// All relocated images in a dependency graph, with their mappings retained.
-#[must_use = "retain the linked images to keep all provider mappings alive"]
-pub struct LinkedImages<K, A: ImageMapping> {
-    images: Vec<LinkedImage<K, A>>,
-    edges: Vec<DependencyEdge>,
-}
-
-impl<K, A: ImageMapping> LinkedImages<K, A> {
-    /// The root and its dependencies in breadth-first order.
-    pub fn images(&self) -> &[LinkedImage<K, A>] {
-        &self.images
-    }
-
-    pub fn edges(&self) -> &[DependencyEdge] {
-        &self.edges
-    }
-
-    /// Read the relocated callbacks and order them by dependency. Keep this
-    /// group alive for as long as the returned target addresses are in use.
-    pub fn plan_lifecycle(&self) -> LoadResult<LinkedLifecycle> {
-        self.plan_lifecycle_inner()
-            .map_err(|error| error.at_stage(LoadStage::Lifecycle))
-    }
-
-    fn plan_lifecycle_inner(&self) -> LoadResult<LinkedLifecycle> {
-        let mut plans = reserve(self.images.len())?;
-        for linked in &self.images {
-            plans.push(linked.image.lifecycle()?);
-        }
-        LinkedLifecycle::build(&self.edges, plans)
-    }
-
-    /// Finalize the graph and transfer all mappings into one owning result.
-    /// Lifecycle validation covers the whole graph before publishing code or
-    /// tightening RELRO. On error every mapping is dropped.
-    pub fn seal<C: CodeCache + ?Sized>(self, cache: &mut C) -> LoadResult<LoadedImages<K, A>> {
-        let (plans, init_order) = self.plan_lifecycle()?.into_parts();
-        let mut images =
-            reserve(self.images.len()).map_err(|error| error.at_stage(LoadStage::Seal))?;
-        for (linked, lifecycle) in self.images.into_iter().zip(plans) {
-            let image = linked.image.seal_with_lifecycle(cache, lifecycle)?;
-            images.push(LoadedObject::new(
-                linked.key,
-                linked.soname,
-                image,
-                linked.exports,
-            ));
-        }
-        Ok(LoadedImages::new(images, self.edges, init_order))
-    }
-}
-
+/// The new mapping and ELF reader used to preflight symbol relocations.
 #[must_use = "keep the decoded image and its corresponding reader together"]
-struct LinkInput<K, R, A: ImageMapping> {
+struct RelocationInput<K, R, A: ImageMapping> {
     key: K,
     soname: Option<Vec<u8>>,
     reader: R,
     image: DecodedImage<A>,
+    exports: Option<ExportedSymbols>,
 }
 
 /// Map and eagerly relocate a discovered dependency graph.
@@ -131,19 +52,30 @@ struct LinkInput<K, R, A: ImageMapping> {
 /// Every relocation is checked before relocation writes begin. On failure the
 /// mappings are dropped. Successful images still require cache synchronization
 /// and final protection before execution.
-pub fn link<K, R: ElfReader, M: ImageAllocator>(
+pub fn link<K: Eq, R: ElfReader, M: ImageAllocator>(
     plan: DependencyPlan<K, R>,
     limits: LinkLimits,
     allocator: M,
 ) -> LoadResult<LinkedImages<K, M::Allocation>> {
-    link_inner(plan, limits, allocator).map_err(|error| error.at_stage(LoadStage::Relocate))
+    link_in_scope(plan, limits, allocator, LinkScope::standalone())
 }
 
-fn link_inner<K, R: ElfReader, M: ImageAllocator>(
+pub(super) fn link_in_scope<K: Eq, R: ElfReader, M: ImageAllocator>(
+    plan: DependencyPlan<K, R>,
+    limits: LinkLimits,
+    allocator: M,
+    scope: LinkScope<'_, K, M::Allocation>,
+) -> LoadResult<LinkedImages<K, M::Allocation>> {
+    link_inner(plan, limits, allocator, scope).map_err(|error| error.at_stage(LoadStage::Relocate))
+}
+
+fn link_inner<K: Eq, R: ElfReader, M: ImageAllocator>(
     plan: DependencyPlan<K, R>,
     limits: LinkLimits,
     mut allocator: M,
+    scope: LinkScope<'_, K, M::Allocation>,
 ) -> LoadResult<LinkedImages<K, M::Allocation>> {
+    let first = scope.existing().len();
     let (images, edges) = plan.into_parts();
     let mut count = 0u64;
     for image in &images {
@@ -153,17 +85,24 @@ fn link_inner<K, R: ElfReader, M: ImageAllocator>(
         limits.check_relocations(count)?;
     }
 
-    let mut mapped: Vec<LinkInput<K, R, M::Allocation>> =
+    let mut mapped: Vec<RelocationInput<K, R, M::Allocation>> =
         reserve(images.len()).map_err(|error| error.at_stage(LoadStage::Allocate))?;
     for dependency in images {
         let (key, soname, image) = dependency.into_parts();
         let allocated = image.allocate(&mut allocator)?;
         let allocation = allocated.allocation();
         let range = TargetRange::new(allocation.base(), allocation.len());
-        if mapped.iter().any(|previous| {
-            let previous = previous.image.allocation();
-            range.overlaps(TargetRange::new(previous.base(), previous.len()))
-        }) {
+        if mapped
+            .iter()
+            .map(|input| input.image.allocation())
+            .chain(
+                scope
+                    .existing()
+                    .iter()
+                    .map(|object| object.image().allocation()),
+            )
+            .any(|previous| range.overlaps(TargetRange::new(previous.base(), previous.len())))
+        {
             return Err(LoadError::new(
                 LoadErrorKind::IncorrectLayout,
                 ErrorContext::Allocation {
@@ -175,21 +114,20 @@ fn link_inner<K, R: ElfReader, M: ImageAllocator>(
             .at_stage(LoadStage::Allocate));
         }
         let (image, reader) = allocated.map_with_reader()?;
-        mapped.push(LinkInput {
+        mapped.push(RelocationInput {
             key,
             soname,
             reader,
             image: image.decode()?,
+            exports: None,
         });
     }
 
-    let writes = plan_writes(&mapped, &limits)?;
-    let mut exports = Vec::new();
+    let writes = plan_writes(&mapped, &limits, &scope)?;
     if let Some(export_limits) = limits.export_limits() {
         let budget = ExportBudget::new(export_limits);
-        exports = reserve(mapped.len())?;
-        for input in &mapped {
-            exports.push(ExportedSymbols::build(
+        for input in &mut mapped {
+            input.exports = Some(ExportedSymbols::build(
                 &input.image,
                 &input.reader,
                 &budget,
@@ -197,126 +135,165 @@ fn link_inner<K, R: ElfReader, M: ImageAllocator>(
             )?);
         }
     }
-    let mut exports = exports.into_iter();
     let mut images = reserve(mapped.len())?;
     for (input, writes) in mapped.into_iter().zip(writes) {
-        images.push(LinkedImage {
-            key: input.key,
-            soname: input.soname,
-            image: input.image.apply_relocation_writes(writes)?,
-            exports: exports.next(),
-        });
+        images.push(LinkedImage::new(
+            input.key,
+            input.soname,
+            input.image.apply_relocation_writes(writes)?,
+            input.exports,
+        ));
     }
-    Ok(LinkedImages { images, edges })
+    Ok(LinkedImages::new(images, edges, first))
 }
 
-fn plan_writes<K, R: ElfReader, A: ImageMapping>(
-    inputs: &[LinkInput<K, R, A>],
+struct SymbolLookup<'a, K, R: ElfReader, A: ImageMapping> {
+    inputs: &'a [RelocationInput<K, R, A>],
+    tables: Vec<Option<SymbolTableReader<'a, R>>>,
+    scope: &'a LinkScope<'a, K, A>,
+    limits: &'a LinkLimits,
+    probes: u64,
+}
+
+fn plan_writes<K: Eq, R: ElfReader, A: ImageMapping>(
+    inputs: &[RelocationInput<K, R, A>],
     limits: &LinkLimits,
+    scope: &LinkScope<'_, K, A>,
 ) -> LoadResult<Vec<RelocationWrites>> {
-    // Symbol lookups borrow each stable ELF reader during the relocation preflight.
+    // Each table borrows the reader at the same index in the inputs.
     let mut tables = reserve(inputs.len())?;
     for input in inputs {
         tables.push(symbol::read_table(&input.image, &input.reader)?);
     }
-    let mut writes = reserve(inputs.len())?;
-    let mut lookups = 0;
-    for (index, input) in inputs.iter().enumerate() {
-        let bias = input.image.load_bias();
-        writes.push(input.image.plan_relocation_writes(|record| {
-            resolve_relocation(inputs, &tables, index, record, bias, limits, &mut lookups)
-        })?);
+    SymbolLookup {
+        inputs,
+        tables,
+        scope,
+        limits,
+        probes: 0,
     }
-    Ok(writes)
+    .plan()
 }
 
-fn resolve_relocation<K, R: ElfReader, A: ImageMapping>(
-    inputs: &[LinkInput<K, R, A>],
-    tables: &[Option<SymbolTableReader<'_, R>>],
-    requester: usize,
-    record: &RelocationRecord,
-    bias: i128,
-    limits: &LinkLimits,
-    lookups: &mut u64,
-) -> LoadResult<Option<i128>> {
-    let image = &inputs[requester].image;
-    let profile = image.profile();
-    let Some(relocation) = profile.check_symbol_relocation(record)? else {
-        return relative_value(profile, bias, record);
-    };
-    let fail = |kind| LoadError::relocation(record, kind);
-    let (addend, jump) = match relocation {
-        SymbolRelocation::Address(addend) => (addend, false),
-        SymbolRelocation::JumpSlot(addend) => (addend, true),
-    };
-    if record.symbol_index() == 0 {
-        return if jump {
-            Err(fail(LoadErrorKind::BadElf))
-        } else {
-            Ok(Some(i128::from(addend)))
+impl<K: Eq, R: ElfReader, A: ImageMapping> SymbolLookup<'_, K, R, A> {
+    fn plan(mut self) -> LoadResult<Vec<RelocationWrites>> {
+        let mut writes = reserve(self.inputs.len())?;
+        for (index, input) in self.inputs.iter().enumerate() {
+            let bias = input.image.load_bias();
+            let planned = input
+                .image
+                .plan_relocation_writes(|record| self.resolve(index, record, bias))?;
+            writes.push(planned);
+        }
+        Ok(writes)
+    }
+
+    fn resolve(
+        &mut self,
+        requester: usize,
+        record: &RelocationRecord,
+        bias: i128,
+    ) -> LoadResult<Option<i128>> {
+        let image = &self.inputs[requester].image;
+        let profile = image.profile();
+        let Some(relocation) = profile.check_symbol_relocation(record)? else {
+            return relative_value(profile, bias, record);
         };
-    }
-    let table = tables[requester]
-        .as_ref()
-        .ok_or_else(|| fail(LoadErrorKind::BadElf))?;
-    let symbol = table.read(record.symbol_index())?;
-    let definition = if symbol.binding() == STB_LOCAL || symbol.visibility() != STV_DEFAULT {
-        symbol::symbol_address(image, &symbol)?.map(|address| (image, address))
-    } else {
-        profile.check_symbol(&symbol)?;
-        let name = table.name(&symbol, limits.max_symbol_name_len())?;
-        if name.is_empty() {
-            return Err(fail(LoadErrorKind::BadElf));
+        let fail = |kind| LoadError::relocation(record, kind);
+        let (addend, jump) = match relocation {
+            SymbolRelocation::Address(addend) => (addend, false),
+            SymbolRelocation::JumpSlot(addend) => (addend, true),
+        };
+        if record.symbol_index() == 0 {
+            return if jump {
+                Err(fail(LoadErrorKind::BadElf))
+            } else {
+                Ok(Some(i128::from(addend)))
+            };
         }
-        lookup(inputs, tables, &name, limits, lookups)?
-    };
+        let table = self.tables[requester]
+            .as_ref()
+            .ok_or_else(|| fail(LoadErrorKind::BadElf))?;
+        let symbol = table.read(record.symbol_index())?;
+        let existing = self.scope.existing();
+        let first = existing.len();
+        let definition = if symbol.binding() == STB_LOCAL || symbol.visibility() != STV_DEFAULT {
+            symbol::symbol_address(image, &symbol)?.map(|address| (first + requester, address))
+        } else {
+            profile.check_symbol(&symbol)?;
+            let name = table.name(&symbol, self.limits.max_symbol_name_len())?;
+            if name.is_empty() {
+                return Err(fail(LoadErrorKind::BadElf));
+            }
+            self.find(&name)?
+        };
 
-    let Some((provider, address)) = definition else {
-        if symbol.binding() != STB_WEAK || u32::from(symbol.section_index()) != SHN_UNDEF {
-            return Err(fail(LoadErrorKind::UnresolvedSymbol));
+        let Some((provider, address)) = definition else {
+            if symbol.binding() != STB_WEAK || u32::from(symbol.section_index()) != SHN_UNDEF {
+                return Err(fail(LoadErrorKind::UnresolvedSymbol));
+            }
+            // A weak import may resolve to zero. A nonzero PLT result must point to code.
+            if jump && addend != 0 {
+                return Err(fail(LoadErrorKind::PermissionConflict));
+            }
+            return Ok(Some(i128::from(addend)));
+        };
+        let value = i128::from(address.get()) + i128::from(addend);
+        if jump {
+            let address = u64::try_from(value).map_err(|_| fail(LoadErrorKind::IntegerOverflow))?;
+            let mode = profile.entry_mode();
+            if !address.is_multiple_of(u64::from(mode.instruction_alignment())) {
+                return Err(fail(LoadErrorKind::InvalidAlignment));
+            }
+            let address = TargetAddress::new(address);
+            let len = u64::from(mode.minimum_instruction_size());
+            let executable = if provider < first {
+                existing[provider]
+                    .exports()
+                    .is_some_and(|exports| exports.contains_executable_span(address, len))
+            } else {
+                symbol::contains_executable_span(&self.inputs[provider - first].image, address, len)
+            };
+            if !executable {
+                return Err(fail(LoadErrorKind::PermissionConflict));
+            }
         }
-        // A weak import may resolve to zero. A nonzero PLT result must point to code.
-        if jump && addend != 0 {
-            return Err(fail(LoadErrorKind::PermissionConflict));
-        }
-        return Ok(Some(i128::from(addend)));
-    };
-    let value = i128::from(address.get()) + i128::from(addend);
-    if jump {
-        let address = u64::try_from(value).map_err(|_| fail(LoadErrorKind::IntegerOverflow))?;
-        let mode = profile.entry_mode();
-        if !address.is_multiple_of(u64::from(mode.instruction_alignment())) {
-            return Err(fail(LoadErrorKind::InvalidAlignment));
-        }
-        if !symbol::contains_executable_span(
-            provider,
-            TargetAddress::new(address),
-            u64::from(mode.minimum_instruction_size()),
-        ) {
-            return Err(fail(LoadErrorKind::PermissionConflict));
-        }
+        Ok(Some(value))
     }
-    Ok(Some(value))
-}
 
-fn lookup<'a, K, R: ElfReader, A: ImageMapping>(
-    inputs: &'a [LinkInput<K, R, A>],
-    tables: &[Option<SymbolTableReader<'_, R>>],
-    name: &[u8],
-    limits: &LinkLimits,
-    lookups: &mut u64,
-) -> LoadResult<Option<(&'a DecodedImage<A>, TargetAddress)>> {
-    for (input, table) in inputs.iter().zip(tables) {
-        let Some(table) = table else { continue };
-        *lookups = lookups
+    fn find(&mut self, name: &[u8]) -> LoadResult<Option<(usize, TargetAddress)>> {
+        let first = self.scope.existing().len();
+        for index in self.scope.indexes(self.inputs.len()) {
+            let address = if index < first {
+                let Some(exports) = self.scope.existing()[index].exports() else {
+                    continue;
+                };
+                Self::charge_probe(self.limits, &mut self.probes)?;
+                exports.find(name)
+            } else {
+                let index = index - first;
+                let Some(table) = self.tables[index].as_ref() else {
+                    continue;
+                };
+                Self::charge_probe(self.limits, &mut self.probes)?;
+                let Some(record) =
+                    symbol::lookup_export(table, name, self.limits.max_symbol_name_len())?
+                else {
+                    continue;
+                };
+                symbol::symbol_address(&self.inputs[index].image, &record)?
+            };
+            if let Some(address) = address {
+                return Ok(Some((index, address)));
+            }
+        }
+        Ok(None)
+    }
+
+    fn charge_probe(limits: &LinkLimits, probes: &mut u64) -> LoadResult<()> {
+        *probes = probes
             .checked_add(1)
             .ok_or_else(|| LoadError::new(LoadErrorKind::IntegerOverflow, ErrorContext::None))?;
-        limits.check_symbol_lookups(*lookups)?;
-        if let Some(symbol) = symbol::lookup_export(table, name, limits.max_symbol_name_len())?
-            && let Some(address) = symbol::symbol_address(&input.image, &symbol)?
-        {
-            return Ok(Some((&input.image, address)));
-        }
+        limits.check_symbol_lookups(*probes)
     }
-    Ok(None)
 }
