@@ -22,13 +22,15 @@
 //! `load_image` and `StartupStorage` separately in either resource model.
 
 use super::StartupError;
+#[cfg(all(enable_dynamic_linker, thread_group))]
+use super::{adapters::FlatImageAllocation, load_linked, startup::StartupFrame};
 #[cfg(thread_group)]
 use super::{load_image, StartupArguments, StartupStorage};
-#[cfg(all(enable_dynamic_linker, thread_group))]
-use super::{load_linked, startup::StartupFrame};
 use crate::config;
 #[cfg(all(enable_vfs, thread_group))]
 use crate::thread_group::StandardIo;
+#[cfg(all(enable_dynamic_linker, thread_group))]
+use crate::thread_group::ThreadGroup;
 #[cfg(thread_group)]
 use crate::{
     thread::Stack,
@@ -36,11 +38,11 @@ use crate::{
 };
 #[cfg(all(enable_dynamic_linker, thread_group))]
 use alloc::vec::Vec;
-#[cfg(all(enable_dynamic_linker, thread_group))]
-use blueos_loader::dynamic_linker::DependencyResolver;
 #[cfg(thread_group)]
 use blueos_loader::ElfReader;
 use blueos_loader::LoadError;
+#[cfg(all(enable_dynamic_linker, thread_group))]
+use blueos_loader::{dynamic_linker::DependencyResolver, LoadedImages};
 use core::ffi::CStr;
 
 /// ELF ABI page granularity reported through AT_PAGESZ.
@@ -180,6 +182,30 @@ where
     D::Key: Send + 'static,
 {
     let images = load_linked(root, resolver)?;
+    // SAFETY: the caller authorizes execution and follows the group exit contract.
+    let mut group = unsafe { prepare_linked(images, request)? };
+    group.start()?;
+    group.wait().map_err(Into::into)
+}
+
+/// Prepare an unscheduled thread group from a finalized image graph.
+///
+/// The graph can include plugins preloaded before startup. The group takes
+/// ownership of every mapping and the startup callback table through cleanup.
+/// The root's librs runtime runs the complete initialization plan on startup
+/// and the corresponding finalization plan on normal exit.
+///
+/// # Safety
+/// All images must be trusted native code in the kernel's address space. The
+/// root must use the librs linked startup and thread group exit conventions.
+/// The mappings must have been published for every CPU that can execute them.
+/// The group must be the first to execute these images, and their code and data
+/// must remain in use only by group members during its lifetime.
+#[cfg(all(enable_dynamic_linker, thread_group))]
+pub unsafe fn prepare_linked<K: Eq + Send + 'static>(
+    images: LoadedImages<K, FlatImageAllocation>,
+    request: &RunRequest<'_>,
+) -> Result<ThreadGroup, RunError> {
     let init_count = images
         .preinit()
         .len()
@@ -209,13 +235,12 @@ where
     let frame = StartupFrame::new(images.root(), stack, request.arguments(), Some(&lifecycle))?;
     // SAFETY: the owner keeps every mapping and the immutable auxv payload
     // alive through cleanup. The caller authorizes the native entry.
-    let mut group = unsafe {
+    unsafe {
         frame.into_thread_group(
             (images, lifecycle),
             #[cfg(enable_vfs)]
             request.stdio,
-        )?
-    };
-    group.start()?;
-    group.wait().map_err(Into::into)
+        )
+    }
+    .map_err(Into::into)
 }

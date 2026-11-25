@@ -168,11 +168,12 @@ impl<K: Eq, A: ImageMapping> LoadedImages<K, A> {
     /// The startup graph precedes the plugin and its dependencies in the
     /// lookup scope. Existing dependencies are reused by resolver key.
     ///
-    /// The allocator must serve the same target address space. The host must
-    /// finish initializing existing images before calling this method, then
-    /// run the callbacks for the indexes appended to `init_order` before using
-    /// the new plugin or extending the graph again. Enable export indexing
-    /// when loading images that will be visible to later plugins.
+    /// The allocator must serve the same target address space. When preparing
+    /// a group before startup, the host runs the complete plan at startup.
+    /// In a running group, finish initializing existing images before calling
+    /// this method, then run the newly appended callbacks before using the
+    /// plugin or extending the graph again. Enable export indexing when
+    /// loading images that will be visible to later plugins.
     pub fn load_plugin<D, M, C>(
         &mut self,
         key: K,

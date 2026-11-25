@@ -17,9 +17,9 @@ use alloc::sync::Arc;
 use blueos::{
     loader::{
         adapters::{KernelCodeCache, MemoryMapper},
-        load_request, run_linked, RunRequest,
+        load_request, prepare_linked, run_linked, RunRequest,
     },
-    thread_group::{StandardIo, ThreadGroupExit},
+    thread_group::{StandardIo, ThreadGroupExit, ThreadGroupState},
     vfs,
 };
 use blueos_loader::{
@@ -156,20 +156,124 @@ fn test_plugin_reuses_startup_library_with_application_symbol_precedence() {
     assert_ne!(host, library);
 }
 
-fn check_launch(env: &CStr, status: i32, expected_events: &[u8]) {
-    let output = Arc::new(
-        vfs::open_path(
-            "/linked-output",
-            libc::O_CREAT | libc::O_TRUNC | libc::O_RDWR,
-            0o600,
+#[test]
+fn test_preloaded_plugin_shares_only_its_own_thread_groups_library() {
+    let request = LoadAndLinkRequest::new(load_request())
+        .with_link_limits(LinkLimits::DEFAULT.with_export_limits(ExportLimits::DEFAULT));
+    let mut resolver = Fixtures { open_library: true };
+    let mut allocator = MemoryMapper::new();
+    let mut cache = KernelCodeCache::new();
+    let mut first = load_and_link(
+        Input::Application,
+        request,
+        &mut resolver,
+        &mut allocator,
+        &mut cache,
+    )
+    .unwrap();
+    let second = load_and_link(
+        Input::Application,
+        request,
+        &mut resolver,
+        &mut allocator,
+        &mut cache,
+    )
+    .unwrap();
+    let library_data = |images: &blueos_loader::LoadedImages<Input, _>| {
+        images.images()[1]
+            .exports()
+            .unwrap()
+            .find(b"linked_data")
+            .unwrap()
+    };
+    assert_ne!(library_data(&first), library_data(&second));
+
+    // Reuse the mapped dependency even when its source can no longer be opened.
+    resolver.open_library = false;
+    let rejected =
+        request.with_link_limits(LinkLimits::DEFAULT.with_export_limits(ExportLimits::new(0, 0)));
+    let error = first
+        .load_plugin(
+            Input::Plugin,
+            rejected,
+            &mut resolver,
+            &mut allocator,
+            &mut cache,
         )
-        .unwrap(),
+        .unwrap_err();
+    assert_eq!(error.kind(), LoadErrorKind::ResourceLimit);
+    assert_eq!(first.images().len(), 2);
+    assert_eq!(first.edges().len(), 1);
+    assert_eq!(first.init_order(), [1, 0]);
+
+    for _ in 0..2 {
+        assert_eq!(
+            first
+                .load_plugin(
+                    Input::Plugin,
+                    request,
+                    &mut resolver,
+                    &mut allocator,
+                    &mut cache
+                )
+                .unwrap(),
+            2,
+        );
+    }
+    assert_eq!(first.images().len(), 3);
+    assert_eq!(first.init_order(), [1, 0, 2]);
+
+    let (first_output, first_stdio) = capture_output("/linked-plugin-output");
+    let (second_output, second_stdio) = capture_output("/linked-peer-output");
+    let first_request = RunRequest {
+        envp: &[c"LINK_TEST=plugin"],
+        stdio: Some(&first_stdio),
+        ..RunRequest::default()
+    };
+    let second_request = RunRequest {
+        envp: &[c"LINK_TEST=normal"],
+        stdio: Some(&second_stdio),
+        ..RunRequest::default()
+    };
+    // SAFETY: both fixtures use the production CRT in independent native mappings.
+    let (mut first, mut second) = unsafe {
+        (
+            prepare_linked(first, &first_request).unwrap(),
+            prepare_linked(second, &second_request).unwrap(),
+        )
+    };
+    assert_eq!(first.state(), ThreadGroupState::Prepared);
+    first.start().unwrap();
+    assert_eq!(first.wait().unwrap(), ThreadGroupExit::Code(44));
+    check_events(&first_output, b"PDILMlFd");
+    drop(first);
+
+    assert_eq!(second.state(), ThreadGroupState::Prepared);
+    second.start().unwrap();
+    assert_eq!(second.wait().unwrap(), ThreadGroupExit::Code(42));
+    check_events(&second_output, b"PDIMFd");
+}
+
+fn capture_output(path: &str) -> (Arc<vfs::File>, StandardIo) {
+    let output = Arc::new(
+        vfs::open_path(path, libc::O_CREAT | libc::O_TRUNC | libc::O_RDWR, 0o600).unwrap(),
     );
     let stdio = StandardIo {
         stdin: output.clone(),
         stdout: output.clone(),
         stderr: output.clone(),
     };
+    (output, stdio)
+}
+
+fn check_events(output: &vfs::File, expected_events: &[u8]) {
+    let mut events = [0; 16];
+    let count = output.read_at(0, &mut events).unwrap();
+    assert_eq!(&events[..count], expected_events);
+}
+
+fn check_launch(env: &CStr, status: i32, expected_events: &[u8]) {
+    let (output, stdio) = capture_output("/linked-output");
     let request = RunRequest {
         envp: &[env],
         stdio: Some(&stdio),
@@ -185,7 +289,5 @@ fn check_launch(env: &CStr, status: i32, expected_events: &[u8]) {
     }
     .unwrap();
     assert_eq!(outcome, ThreadGroupExit::Code(status));
-    let mut events = [0; 8];
-    let count = output.read_at(0, &mut events).unwrap();
-    assert_eq!(&events[..count], expected_events);
+    check_events(&output, expected_events);
 }

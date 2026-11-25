@@ -98,7 +98,10 @@ static FINI: extern "C" fn() = fini;
 
 #[unsafe(no_mangle)]
 pub extern "C" fn main(_argc: c_int, _argv: *mut *mut c_char, _envp: *mut *mut c_char) -> c_int {
-    assert_eq!(unsafe { linked_data }, 21);
+    let mode = unsafe { librs::stdlib::getenv(c"LINK_TEST".as_ptr()) };
+    // SAFETY: a non-null getenv result points to the current environment string.
+    let with_plugin = !mode.is_null() && unsafe { CStr::from_ptr(mode) } == c"plugin";
+    assert_eq!(unsafe { linked_data }, if with_plugin { 22 } else { 21 });
     record_event(b'M');
     unsafe { linked_value() }
 }
