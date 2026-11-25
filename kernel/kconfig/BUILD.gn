@@ -14,6 +14,11 @@
 
 import("//build/templates/build_template.gni")
 
+declare_args() {
+  # Enable thread groups for this build. Otherwise use the merged Kconfig.
+  thread_group = false
+}
+
 _kconfig_files = [
   "config/Kconfig",
   "//kernel/arch/Kconfig",
@@ -29,6 +34,13 @@ _kconfig_files = [
   "//kernel/arch/arm/arm64/Kconfig",
 ]
 _kconfig_files += string_split(defconfig_files, ",")
+_defconfig_files = defconfig_files
+if (thread_group) {
+  _thread_group_config = "${root_gen_dir}/thread_group.conf"
+  write_file(_thread_group_config, [ "CONFIG_THREAD_GROUP=y" ])
+  _kconfig_files += [ _thread_group_config ]
+  _defconfig_files += "," + rebase_path(_thread_group_config)
+}
 
 action("generate_autoconf") {
   script = "//kernel/kconfig/src/generate_artifacts.py"
@@ -42,7 +54,7 @@ action("generate_autoconf") {
     "--build_type",
     "${build_type}",
     "--defconfig_files",
-    defconfig_files,
+    _defconfig_files,
     "--output_dir",
     rebase_path("${root_gen_dir}"),
   ]

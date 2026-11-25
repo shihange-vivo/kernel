@@ -24,8 +24,6 @@ _startup_test_enabled = !defined(loader_test_relocation) &&
 
 # Keep the kernel configuration local to the tests that start ELF thread groups.
 if (_startup_test_enabled && current_toolchain == default_toolchain) {
-  _defconfigs = defconfig_files + "," + rebase_path("thread_group.conf")
-
   blueos_toolchain("loader_test_toolchain") {
     _info = board_toolchain_info
     llvm_target = _info.llvm_target
@@ -43,7 +41,7 @@ if (_startup_test_enabled && current_toolchain == default_toolchain) {
     toolchain_args = {
       current_cpu = _info.current_cpu
       current_os = _info.current_os
-      defconfig_files = _defconfigs
+      thread_group = true
     }
   }
 
