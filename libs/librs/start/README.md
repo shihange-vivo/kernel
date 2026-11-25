@@ -105,3 +105,24 @@ fixture checks them in its constructor; exposing them through `std::env::args()`
 requires a separate toolchain update. `std::env::var()` works through librs.
 This standalone path uses BlueOS syscalls and its libc implementation; it is
 not an assertion of Linux/glibc binary compatibility.
+
+## Open a shared library at runtime
+
+With VFS, thread groups and the dynamic linker enabled, the host can launch a
+trusted ELF through `blueos::loader::run_linked_from_path()`. The application
+then uses `dlopen`, `dlsym`, `dlclose` and `dlerror` from `librs::dlfcn`.
+Explicit paths use VFS path resolution, bare library names use
+the executable's directory, and a dependency name uses its requester's directory.
+
+The supported scope is `RTLD_LOCAL`. Both `RTLD_NOW` and `RTLD_LAZY` resolve
+relocations at open time. `dlopen(NULL, RTLD_NOW)` opens the startup scope.
+`RTLD_GLOBAL` reports an unsupported-mode error. The opening thread runs the
+constructors before receiving its handle. Each successful open can be closed
+independently. Mappings remain owned by the thread group through finalization,
+so closing and reopening a library preserves the instance and its static data.
+
+The trusted flat launcher supplies native loader entry points through
+`AT_BLUEKERNEL_DYNAMIC_LINKER`. The group runtime links, calls constructors,
+and publishes the result within one native call. On group exit the same runtime
+executes the published libraries' finalizers before the startup graph's
+finalizers run. The application only uses the librs interfaces above.

@@ -27,6 +27,24 @@ pub struct AuxvEntry {
     pub value: usize,
 }
 
+/// Direct loader calls for trusted ELF applications in the native flat build.
+/// Results use a nonnegative value on success or a negated errno on failure.
+/// Input byte ranges must be readable throughout the call. A null path with
+/// length zero opens the main image's symbol scope. The symbol result must
+/// point to an aligned, writable word.
+#[repr(C)]
+pub struct DynamicLinker {
+    pub open: unsafe extern "C" fn(path: *const u8, len: usize) -> isize,
+    pub symbol: unsafe extern "C" fn(
+        handle: usize,
+        name: *const u8,
+        len: usize,
+        result: *mut usize,
+    ) -> isize,
+    pub close: unsafe extern "C" fn(handle: usize) -> isize,
+    pub finalize: unsafe extern "C" fn() -> isize,
+}
+
 pub mod auxv {
     pub const AT_NULL: usize = 0;
     pub const AT_PHDR: usize = 3;
@@ -42,6 +60,8 @@ pub mod auxv {
     /// preinit), then fini addresses. The host keeps these words immutable
     /// and retains them together with the mappings through group cleanup.
     pub const AT_BLUEKERNEL_LIFECYCLE: usize = 0x424b_0001;
+    /// Points to the host's immutable native `DynamicLinker` entry points.
+    pub const AT_BLUEKERNEL_DYNAMIC_LINKER: usize = 0x424b_0002;
 }
 
 #[cfg(target_pointer_width = "32")]

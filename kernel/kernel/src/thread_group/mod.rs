@@ -20,6 +20,7 @@
 
 use crate::{
     scheduler,
+    support::DisableInterruptGuard,
     sync::SpinLock,
     thread::{self, CleanupError, DeferredCleanup, GlobalQueueVisitor, Thread, ThreadNode},
     time::Tick,
@@ -33,6 +34,9 @@ use alloc::{
 };
 use core::sync::atomic::{AtomicUsize, Ordering};
 use spin::Mutex;
+
+#[cfg(all(loader_backend, enable_dynamic_linker, enable_vfs))]
+use crate::loader::{LinkerAccess, LinkerRuntime};
 
 #[cfg(enable_vfs)]
 mod files;
@@ -77,10 +81,24 @@ pub(crate) struct ThreadGroupInner {
     state: SpinLock<GroupState>,
     #[cfg(enable_vfs)]
     files: files::ThreadGroupFiles,
-    // Exclusive ownership transfer needs Send, not shared access to the image.
-    // Only the last member takes this value, outside the state lock.
-    image_owner: Mutex<Option<Box<dyn Send>>>,
+    // Only the last member takes the owner, outside the state lock.
+    image_owner: Mutex<Option<ImageOwner>>,
     changed: AtomicUsize,
+}
+
+#[must_use = "retain the image and its startup data through group cleanup"]
+struct ImageOwner {
+    _startup: Box<dyn Send>,
+    #[cfg(all(loader_backend, enable_dynamic_linker, enable_vfs))]
+    linker: LinkerSlot,
+}
+
+#[cfg(all(loader_backend, enable_dynamic_linker, enable_vfs))]
+#[must_use = "retain the group linker runtime through cleanup"]
+enum LinkerSlot {
+    Unavailable,
+    Ready(Box<LinkerRuntime>),
+    Busy,
 }
 
 /// Membership and exit progress coordinated by one state lock.
@@ -117,7 +135,11 @@ impl ThreadGroup {
             }),
             #[cfg(enable_vfs)]
             files: files::ThreadGroupFiles::new(table),
-            image_owner: Mutex::new(Some(image_owner)),
+            image_owner: Mutex::new(Some(ImageOwner {
+                _startup: image_owner,
+                #[cfg(all(loader_backend, enable_dynamic_linker, enable_vfs))]
+                linker: LinkerSlot::Unavailable,
+            })),
             changed: AtomicUsize::new(0),
         });
         let weak = Arc::downgrade(&group);
@@ -136,6 +158,16 @@ impl ThreadGroup {
         let id = Thread::id(&main_thread);
         assert!(MEMBERS.irqsave_lock().insert(id, group.clone()).is_none());
         Ok(Self { group })
+    }
+
+    #[cfg(all(loader_backend, enable_dynamic_linker, enable_vfs))]
+    pub(crate) fn install_linker(&mut self, runtime: Box<LinkerRuntime>) {
+        debug_assert_eq!(self.state(), ThreadGroupState::Prepared);
+        self.group.with_image_owner(|owner| {
+            let owner = owner.as_mut().expect("prepared group retains its owner");
+            assert!(matches!(owner.linker, LinkerSlot::Unavailable));
+            owner.linker = LinkerSlot::Ready(runtime);
+        });
     }
 
     /// Access the main thread for configuration. Use start() to schedule it;
@@ -204,6 +236,72 @@ impl Drop for ThreadGroup {
 }
 
 impl ThreadGroupInner {
+    // Only transfer ownership under this lock. Local interrupts stay disabled
+    // so a higher-priority member on the same CPU cannot spin on it.
+    fn with_image_owner<T>(&self, access: impl FnOnce(&mut Option<ImageOwner>) -> T) -> T {
+        let _interrupts = DisableInterruptGuard::new();
+        let mut owner = self.image_owner.lock();
+        access(&mut owner)
+    }
+
+    #[cfg(all(loader_backend, enable_dynamic_linker, enable_vfs))]
+    pub(crate) fn with_linker<T>(
+        &self,
+        thread: usize,
+        access: LinkerAccess,
+        operation: impl FnOnce(&mut LinkerRuntime) -> Result<T, libc::c_int>,
+    ) -> Result<T, libc::c_int> {
+        let allowed = match access {
+            LinkerAccess::Open => self.state.irqsave_lock().phase == ThreadGroupState::Running,
+            LinkerAccess::Existing => matches!(
+                self.state.irqsave_lock().phase,
+                ThreadGroupState::Running | ThreadGroupState::Exiting
+            ),
+            LinkerAccess::Finalize => {
+                let state = self.state.irqsave_lock();
+                state.phase == ThreadGroupState::Exiting
+                    && state.members.len() == 1
+                    && thread == Thread::id(&self.main_thread)
+            }
+        };
+        if !allowed {
+            return Err(libc::EBUSY);
+        }
+        let mut runtime = loop {
+            let epoch = self.changed.load(Ordering::Acquire);
+            let runtime = self.with_image_owner(|owner| {
+                let slot = &mut owner.as_mut().ok_or(libc::ENOSYS)?.linker;
+                match slot {
+                    LinkerSlot::Ready(_) => {}
+                    LinkerSlot::Unavailable => return Err(libc::ENOSYS),
+                    LinkerSlot::Busy => return Ok(None),
+                }
+                let LinkerSlot::Ready(runtime) = core::mem::replace(slot, LinkerSlot::Busy) else {
+                    unreachable!("checked the runtime slot while holding its lock");
+                };
+                Ok(Some(runtime))
+            })?;
+            if let Some(runtime) = runtime {
+                break runtime;
+            }
+            if matches!(access, LinkerAccess::Open) {
+                return Err(libc::EBUSY);
+            }
+            // A lookup or close may briefly own the runtime while the opener
+            // reports completion. Wait for it without holding the owner lock.
+            let _result = crate::sync::atomic_wait(&self.changed, epoch, Tick::MAX);
+        };
+        let result = operation(&mut runtime);
+        // The registered caller is still a member, so the reaper cannot
+        // take the image owner while this operation is in progress.
+        self.with_image_owner(|owner| {
+            owner.as_mut().expect("registered group member").linker = LinkerSlot::Ready(runtime);
+        });
+        self.changed.fetch_add(1, Ordering::Release);
+        let _result = crate::sync::atomic_wake(&self.changed, usize::MAX);
+        result
+    }
+
     #[cfg(enable_vfs)]
     pub(crate) fn fd_manager(&self) -> &SpinLock<crate::vfs::fd_manager::FdManager> {
         &self.files.table
@@ -261,7 +359,7 @@ impl ThreadGroupInner {
             (member, complete)
         };
         let image_owner = if complete {
-            self.image_owner.lock().take()
+            self.with_image_owner(Option::take)
         } else {
             None
         };

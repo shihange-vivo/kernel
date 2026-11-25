@@ -171,15 +171,15 @@ fn discover_inner<D: DependencyResolver>(
         edges: Vec::new(),
     };
     let mut input_bytes = 0;
-    plan.images.try_reserve(1).map_err(|_| out_of_memory())?;
-    plan.images.push(open_image(
+    open_image(
+        &mut plan.images,
         resolver,
         root,
         request,
         0,
         limits,
         &mut input_bytes,
-    )?);
+    )?;
 
     let provider_request = request.with_purpose(LoadPurpose::SharedObject);
     // The image list doubles as the queue because new providers are appended.
@@ -222,8 +222,8 @@ fn discover_inner<D: DependencyResolver>(
                     let depth = depth + 1;
                     limits.check_image_count(first as u64 + index as u64 + 1)?;
                     limits.check_depth(depth)?;
-                    plan.images.try_reserve(1).map_err(|_| out_of_memory())?;
-                    let image = open_image(
+                    open_image(
+                        &mut plan.images,
                         resolver,
                         key,
                         provider_request,
@@ -232,7 +232,6 @@ fn discover_inner<D: DependencyResolver>(
                         &mut input_bytes,
                     )
                     .map_err(|error| error.with_context(context()))?;
-                    plan.images.push(image);
                     first + index
                 };
             plan.edges.push(DependencyEdge {
@@ -246,40 +245,48 @@ fn discover_inner<D: DependencyResolver>(
     Ok(plan)
 }
 
+// Keep the owned image temporary out of the graph traversal's stack frame.
+#[inline(never)]
 fn open_image<D: DependencyResolver>(
+    images: &mut Vec<DependencyImage<D::Key, D::Reader>>,
     resolver: &mut D,
     key: D::Key,
     request: LoadRequest,
     depth: u32,
     limits: &DependencyLimits,
     input_bytes: &mut u64,
-) -> LoadResult<DependencyImage<D::Key, D::Reader>> {
+) -> LoadResult<()> {
+    images.try_reserve(1).map_err(|_| out_of_memory())?;
     let reader = resolver.open(&key)?;
     *input_bytes = input_bytes
         .checked_add(reader.len()?)
         .ok_or_else(|| LoadError::new(LoadErrorKind::IntegerOverflow, ErrorContext::None))?;
     limits.check_input_bytes(*input_bytes)?;
-    let image = ImageLoader::new(reader, request).prepare_layout()?;
-    let soname = if let Some(dynamic) = image.dynamic()
-        && let Some(offset) = dynamic.value(DT_SONAME)
-    {
-        let table = string_table(&image, dynamic)?;
-        Some(read_name(
-            image.reader(),
-            table,
-            DT_SONAME,
-            offset,
-            limits.max_name_len(),
-        )?)
-    } else {
-        None
-    };
-    Ok(DependencyImage {
-        key,
-        depth,
-        soname,
-        image,
-    })
+    ImageLoader::new(reader, request)
+        .prepare_layout()
+        .and_then(|image| {
+            let soname = if let Some(dynamic) = image.dynamic()
+                && let Some(offset) = dynamic.value(DT_SONAME)
+            {
+                let table = string_table(&image, dynamic)?;
+                Some(read_name(
+                    image.reader(),
+                    table,
+                    DT_SONAME,
+                    offset,
+                    limits.max_name_len(),
+                )?)
+            } else {
+                None
+            };
+            images.push(DependencyImage {
+                key,
+                depth,
+                soname,
+                image,
+            });
+            Ok(())
+        })
 }
 
 fn read_needed(

@@ -158,6 +158,10 @@ pub unsafe extern "C" fn __libc_start_main(
     }
 }
 
+pub(crate) fn linked_init_complete() -> bool {
+    LINKED_INIT_COMPLETE.load(Ordering::Acquire)
+}
+
 /// Register a callback in this application's libc. No callback runs under the
 /// list lock, so callbacks may register further callbacks during termination.
 ///
@@ -284,6 +288,9 @@ unsafe fn linked_callbacks<'a>(address: usize) -> Option<(&'a [usize], &'a [usiz
 unsafe extern "C" fn call_linked_fini() {
     if !LINKED_INIT_COMPLETE.load(Ordering::Acquire) {
         return;
+    }
+    if crate::dlfcn::run_finalizers().is_err() {
+        retire();
     }
     let address = getauxval(auxv::AT_BLUEKERNEL_LIFECYCLE as c_ulong) as usize;
     // SAFETY: the immutable linked startup payload remains owned by the group.

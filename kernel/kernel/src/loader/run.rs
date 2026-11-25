@@ -24,6 +24,13 @@
 use super::StartupError;
 #[cfg(all(enable_dynamic_linker, thread_group))]
 use super::{adapters::FlatImageAllocation, load_linked, startup::StartupFrame};
+#[cfg(all(enable_dynamic_linker, thread_group, enable_vfs))]
+use super::{
+    adapters::{KernelCodeCache, MemoryMapper},
+    linker::{LinkerRuntime, VfsResolver},
+    load_request,
+    native_calls::DYNAMIC_LINKER,
+};
 #[cfg(thread_group)]
 use super::{load_image, StartupArguments, StartupStorage};
 use crate::config;
@@ -36,13 +43,23 @@ use crate::{
     thread::Stack,
     thread_group::{ThreadGroupError, ThreadGroupExit},
 };
+#[cfg(all(enable_dynamic_linker, thread_group, enable_vfs))]
+use alloc::boxed::Box;
 #[cfg(all(enable_dynamic_linker, thread_group))]
 use alloc::vec::Vec;
+#[cfg(all(enable_dynamic_linker, thread_group))]
+use blueos_header::startup::DynamicLinker;
 #[cfg(thread_group)]
 use blueos_loader::ElfReader;
 use blueos_loader::LoadError;
 #[cfg(all(enable_dynamic_linker, thread_group))]
 use blueos_loader::{dynamic_linker::DependencyResolver, LoadedImages};
+#[cfg(all(enable_dynamic_linker, thread_group, enable_vfs))]
+use blueos_loader::{
+    load_and_link,
+    profile::{ExportLimits, LinkLimits},
+    LoadAndLinkRequest,
+};
 use core::ffi::CStr;
 
 /// ELF ABI page granularity reported through AT_PAGESZ.
@@ -206,6 +223,65 @@ pub unsafe fn prepare_linked<K: Eq + Send + 'static>(
     images: LoadedImages<K, FlatImageAllocation>,
     request: &RunRequest<'_>,
 ) -> Result<ThreadGroup, RunError> {
+    let (frame, lifecycle) = linked_startup(&images, request, None)?;
+    // SAFETY: the owner keeps every mapping and the immutable auxv payload
+    // alive through cleanup. The caller authorizes the native entry.
+    unsafe {
+        frame.into_thread_group(
+            (images, lifecycle),
+            #[cfg(enable_vfs)]
+            request.stdio,
+        )
+    }
+    .map_err(Into::into)
+}
+
+/// Run a linked application opened through VFS.
+/// The application can open runtime libraries through librs. Bare names use
+/// the executable's directory, and dependencies use the requester's directory.
+///
+/// Loading a new library requires at least 6 KiB of free stack on the calling
+/// thread (7 KiB with debug assertions). The library's constructors also run
+/// on that stack and have their own stack requirements.
+///
+/// # Safety
+/// The linked startup and thread group exit requirements of `run_linked`
+/// apply to the root. The root and all libraries it may open must be trusted
+/// and their files must remain stable throughout each load operation.
+#[cfg(all(enable_dynamic_linker, thread_group, enable_vfs))]
+pub unsafe fn run_linked_from_path(
+    path: &str,
+    request: &RunRequest<'_>,
+) -> Result<ThreadGroupExit, RunError> {
+    let link_request = LoadAndLinkRequest::new(load_request())
+        .with_link_limits(LinkLimits::DEFAULT.with_export_limits(ExportLimits::DEFAULT));
+    let images = load_and_link(
+        VfsResolver::path(path)?,
+        link_request,
+        &mut VfsResolver,
+        &mut MemoryMapper::new(),
+        &mut KernelCodeCache::new(),
+    )?;
+    let (frame, lifecycle) = linked_startup(&images, request, Some(&DYNAMIC_LINKER))?;
+    let arguments = frame.native_arguments(request.argv.len());
+    // SAFETY: the payload is owned by the prepared group. The mappings are
+    // installed in the same owner before the main thread becomes runnable.
+    let mut group = unsafe { frame.into_thread_group(lifecycle, request.stdio)? };
+    group.install_linker(Box::new(LinkerRuntime::new(
+        images,
+        link_request,
+        arguments,
+    )));
+    group.start()?;
+    group.wait().map_err(Into::into)
+}
+
+#[cfg(all(enable_dynamic_linker, thread_group))]
+fn linked_startup<K: Eq>(
+    images: &LoadedImages<K, FlatImageAllocation>,
+    request: &RunRequest<'_>,
+    dynamic_linker: Option<&'static DynamicLinker>,
+) -> Result<(StartupFrame, Vec<usize>), RunError> {
     if images.pending_plugin_init().is_some() {
         return Err(StartupError::LifecycleUnavailable.into());
     }
@@ -235,15 +311,12 @@ pub unsafe fn prepare_linked<K: Eq + Send + 'static>(
     }
 
     let stack = Stack::from_size(request.stack_size).ok_or(RunError::StackUnavailable)?;
-    let frame = StartupFrame::new(images.root(), stack, request.arguments(), Some(&lifecycle))?;
-    // SAFETY: the owner keeps every mapping and the immutable auxv payload
-    // alive through cleanup. The caller authorizes the native entry.
-    unsafe {
-        frame.into_thread_group(
-            (images, lifecycle),
-            #[cfg(enable_vfs)]
-            request.stdio,
-        )
-    }
-    .map_err(Into::into)
+    let frame = StartupFrame::new(
+        images.root(),
+        stack,
+        request.arguments(),
+        Some(&lifecycle),
+        dynamic_linker,
+    )?;
+    Ok((frame, lifecycle))
 }

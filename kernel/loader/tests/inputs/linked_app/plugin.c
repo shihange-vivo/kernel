@@ -22,9 +22,13 @@ int *const plugin_data = &linked_data;
 int (*const plugin_choice)(void) = linked_choice;
 
 static void init(int argc, char **argv, char **envp) {
-  (void)argc;
-  (void)argv;
-  (void)envp;
+  /* Runtime opens pass the original application arguments to constructors. */
+  if (!argv || !envp || !envp[0] ||
+      (envp[0][sizeof("LINK_TEST=") - 1] == 'r' &&
+       (argc != 2 || !argv[0] || !argv[1] || argv[1][0] != 't' || argv[2]))) {
+    record_event('?');
+    return;
+  }
   ++*plugin_data;
   record_event(plugin_choice() == 2 && plugin_value() == 44 ? 'L' : '?');
 }

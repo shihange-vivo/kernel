@@ -17,10 +17,10 @@ use alloc::sync::Arc;
 use blueos::{
     loader::{
         adapters::{KernelCodeCache, MemoryMapper},
-        load_request, prepare_linked, run_linked, RunRequest,
+        load_request, prepare_linked, run_linked, run_linked_from_path, RunRequest,
     },
     thread_group::{StandardIo, ThreadGroupExit, ThreadGroupState},
-    vfs,
+    vfs::{self, FileOps},
 };
 use blueos_loader::{
     dynamic_linker::DependencyResolver,
@@ -81,12 +81,27 @@ impl DependencyResolver for Fixtures {
 
 #[test]
 fn test_linked_thread_group_runs_dso_callbacks_and_main() {
-    check_launch(c"LINK_TEST=normal", 42, b"PDIMFd");
+    check_launch(c"LINK_TEST=normal", false, 42, b"PDIMFd");
 }
 
 #[test]
 fn test_linked_thread_group_retires_after_exit_from_a_constructor() {
-    check_launch(c"LINK_TEST=abort", 19, b"PD");
+    check_launch(c"LINK_TEST=abort", false, 19, b"PD");
+}
+
+#[test]
+fn test_runtime_plugin_runs_callbacks_and_reuses_the_published_image() {
+    check_launch(c"LINK_TEST=runtime", true, 44, b"PDIMLlFd");
+}
+
+#[test]
+fn test_runtime_plugin_constructor_can_exit_before_publication() {
+    check_launch(c"LINK_TEST=runtime-abort", true, 19, b"PDIMLFd");
+}
+
+#[test]
+fn test_runtime_plugin_rejects_insufficient_linker_stack() {
+    check_launch(c"LINK_TEST=runtime-small-stack", true, 21, b"PDIMFd");
 }
 
 #[test]
@@ -281,22 +296,76 @@ fn check_events(output: &vfs::File, expected_events: &[u8]) {
     assert_eq!(&events[..count], expected_events);
 }
 
-fn check_launch(env: &CStr, status: i32, expected_events: &[u8]) {
+fn check_launch(env: &CStr, runtime_plugins: bool, status: i32, expected_events: &[u8]) {
     let (output, stdio) = capture_output("/linked-output");
+    let mut request = RunRequest::default();
+    if runtime_plugins {
+        request.stack_size = if env == c"LINK_TEST=runtime-small-stack" {
+            4 * 1024
+        } else {
+            // Include the application's frames above the loader's stack check.
+            (if cfg!(debug_assertions) { 9 } else { 8 }) * 1024
+        };
+    }
     let request = RunRequest {
+        argv: if runtime_plugins {
+            &[c"linked-runtime.elf", c"test-plugin-args"]
+        } else {
+            &[]
+        },
         envp: &[env],
         stdio: Some(&stdio),
-        ..RunRequest::default()
+        ..request
     };
-    // SAFETY: the fixtures are native ELF inputs using the production librs CRT.
-    let outcome = unsafe {
-        run_linked(
-            Input::Application,
-            &mut Fixtures { open_library: true },
-            &request,
-        )
-    }
-    .unwrap();
+    let outcome = if runtime_plugins {
+        run_vfs_fixtures(&request)
+    } else {
+        let mut resolver = Fixtures { open_library: true };
+        // SAFETY: the fixtures are native inputs using the production librs CRT.
+        unsafe { run_linked(Input::Application, &mut resolver, &request) }.unwrap()
+    };
     assert_eq!(outcome, ThreadGroupExit::Code(status));
     check_events(&output, expected_events);
+}
+
+fn run_vfs_fixtures(request: &RunRequest<'_>) -> ThreadGroupExit {
+    let directory = c"/linked-fixtures";
+    assert_eq!(vfs::syscalls::mkdir(directory.as_ptr(), 0o700), 0);
+    let app = c"/linked-fixtures/linked-runtime.elf";
+    // SAFETY: linker-provided fixture path pointers stay live throughout the test.
+    let fixtures = unsafe {
+        [
+            (LINKED_TEST_APP_PATH, app),
+            (
+                LINKED_TEST_DSO_PATH,
+                c"/linked-fixtures/liblinked_test_dso.so",
+            ),
+            (
+                LINKED_TEST_PLUGIN_PATH,
+                c"/linked-fixtures/linked-plugin.so",
+            ),
+        ]
+    };
+    for (source, path) in fixtures {
+        let bytes = super::read_all(source).unwrap();
+        let file = vfs::open_path(
+            path.to_str().unwrap(),
+            libc::O_CREAT | libc::O_TRUNC | libc::O_WRONLY,
+            0o600,
+        )
+        .unwrap();
+        let mut rest = bytes.as_slice();
+        while !rest.is_empty() {
+            let written = file.write(rest).unwrap();
+            assert_ne!(written, 0);
+            rest = &rest[written..];
+        }
+    }
+    // SAFETY: the VFS files stay immutable while either loader path reads them.
+    let outcome = unsafe { run_linked_from_path(app.to_str().unwrap(), request) };
+    for (_, path) in fixtures {
+        assert_eq!(vfs::syscalls::unlink(path.as_ptr()), 0);
+    }
+    assert_eq!(vfs::syscalls::rmdir(directory.as_ptr()), 0);
+    outcome.unwrap()
 }

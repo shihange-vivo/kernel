@@ -20,6 +20,7 @@ use core::{
     ffi::{c_char, c_int, CStr},
     ptr,
 };
+use librs::dlfcn::{dlclose, dlerror, dlopen, dlsym, RTLD_GLOBAL, RTLD_LAZY, RTLD_NOW};
 
 struct Allocator;
 
@@ -65,8 +66,13 @@ pub extern "C" fn record_event(event: u8) {
     assert!(!mode.is_null());
     assert_eq!(librs::unistd::write(1, &raw const event, 1), 1);
     // SAFETY: getenv returned a live NUL-terminated environment string.
-    if event == b'D' && unsafe { CStr::from_ptr(mode) } == c"abort" {
+    let mode = unsafe { CStr::from_ptr(mode) };
+    if (event == b'D' && mode == c"abort") || (event == b'L' && mode == c"runtime-abort") {
         unsafe { librs::startup::exit(19) };
+    }
+    if event == b'L' && mode == c"runtime" {
+        assert!(unsafe { dlopen(c"linked-plugin.so".as_ptr(), RTLD_NOW) }.is_null());
+        expect_dlerror(c"the thread group is loading or finalizing a library");
     }
 }
 
@@ -100,10 +106,81 @@ static FINI: extern "C" fn() = fini;
 pub extern "C" fn main(_argc: c_int, _argv: *mut *mut c_char, _envp: *mut *mut c_char) -> c_int {
     let mode = unsafe { librs::stdlib::getenv(c"LINK_TEST".as_ptr()) };
     // SAFETY: a non-null getenv result points to the current environment string.
-    let with_plugin = !mode.is_null() && unsafe { CStr::from_ptr(mode) } == c"plugin";
+    let mode = if mode.is_null() {
+        c""
+    } else {
+        unsafe { CStr::from_ptr(mode) }
+    };
+    if mode == c"runtime" || mode == c"runtime-abort" || mode == c"runtime-small-stack" {
+        assert_eq!(unsafe { linked_data }, 21);
+        record_event(b'M');
+        if mode == c"runtime-small-stack" {
+            assert!(unsafe { dlopen(c"linked-plugin.so".as_ptr(), RTLD_NOW) }.is_null());
+            expect_dlerror(c"insufficient memory or stack for dynamic loading");
+            // Reusing a startup dependency only needs to create a new handle.
+            let existing = unsafe { dlopen(c"liblinked_test_dso.so".as_ptr(), RTLD_NOW) };
+            assert!(!existing.is_null());
+            assert_eq!(unsafe { dlclose(existing) }, 0);
+            assert_eq!(unsafe { linked_data }, 21);
+            return 21;
+        }
+        // SAFETY: all strings and handles are supplied to the native librs ABI.
+        unsafe { exercise_dlfcn() };
+        return unsafe { linked_value() };
+    }
+    let with_plugin = mode == c"plugin";
     assert_eq!(unsafe { linked_data }, if with_plugin { 22 } else { 21 });
     record_event(b'M');
     unsafe { linked_value() }
+}
+
+fn expect_dlerror(expected: &CStr) {
+    let error = dlerror();
+    assert!(!error.is_null());
+    // SAFETY: the libc keeps its diagnostic string live after dlerror().
+    assert_eq!(unsafe { CStr::from_ptr(error) }, expected);
+    assert!(dlerror().is_null());
+}
+
+unsafe fn exercise_dlfcn() {
+    unsafe {
+        let main = dlopen(core::ptr::null(), RTLD_NOW);
+        assert!(!main.is_null());
+        assert_eq!(
+            dlsym(main, c"linked_choice".as_ptr()).addr(),
+            linked_choice as *const () as usize
+        );
+        assert_eq!(dlclose(main), 0);
+        assert!(dlopen(c"linked-plugin.so".as_ptr(), RTLD_NOW | RTLD_GLOBAL).is_null());
+        expect_dlerror(c"dlopen: global visibility is not supported");
+        assert!(dlopen(c"/absent-plugin.so".as_ptr(), RTLD_NOW).is_null());
+        expect_dlerror(c"cannot read the library or its dependencies");
+
+        let first = dlopen(c"linked-plugin.so".as_ptr(), RTLD_NOW);
+        assert!(!first.is_null());
+        assert_eq!(linked_data, 22);
+        let second = dlopen(c"/linked-fixtures/./linked-plugin.so".as_ptr(), RTLD_LAZY);
+        assert!(!second.is_null());
+        let data = dlsym(first, c"linked_data".as_ptr()).cast::<c_int>();
+        assert!(!data.is_null());
+        assert_eq!(data.read(), 22);
+        assert_eq!(
+            dlsym(first, c"record_event".as_ptr()),
+            core::ptr::null_mut()
+        );
+        expect_dlerror(c"dynamic symbol not found");
+        assert_eq!(dlclose(first), 0);
+        assert!(dlsym(first, c"plugin_data".as_ptr()).is_null());
+        expect_dlerror(c"invalid dynamic library handle");
+        assert_eq!(dlsym(second, c"linked_data".as_ptr()).cast::<c_int>(), data);
+        assert_eq!(dlclose(second), 0);
+
+        let reopened = dlopen(c"linked-plugin.so".as_ptr(), RTLD_NOW);
+        assert!(!reopened.is_null());
+        assert_eq!(linked_data, 22);
+        assert_eq!(dlclose(reopened), 0);
+        assert!(dlerror().is_null());
+    }
 }
 
 #[panic_handler]
