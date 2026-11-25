@@ -50,7 +50,7 @@ mod relocation;
 pub use elf::ProgramHeaderTable;
 pub use lifecycle::LifecyclePlan;
 #[cfg(enable_dynamic_linker)]
-pub use load::{load_and_link, LoadAndLinkRequest, LoadedImages, LoadedObject};
+pub use load::{load_and_link, LoadAndLinkRequest, LoadedImages, LoadedObject, PluginLoad};
 pub use load::{load_elf, LoadRequest, LoadedImage};
 
 #[cfg(test)]
