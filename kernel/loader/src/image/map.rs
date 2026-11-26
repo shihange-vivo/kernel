@@ -17,13 +17,51 @@
 
 use super::decode::DecodedImage;
 use crate::{
+    cache::publish_segments,
     elf::{DynamicInfo, LoadSegmentInfo, RelocationRecord},
     error::{ErrorContext, LimitKind, LoadErrorKind, LoadStage},
     memory::{AllocationOffset, ImageMapping, TargetAddress, TargetRange},
     profile::LoadProfile,
-    LoadError, LoadResult, ProgramHeaderTable,
+    CodeCache, LoadError, LoadResult, ProgramHeaderTable,
 };
-use alloc::vec::Vec;
+use alloc::{ffi::CString, vec::Vec};
+
+/// An ELF mapped for an external interpreter. The interpreter owns dynamic
+/// relocations, TLS, relocatable callbacks and RELRO sealing.
+#[must_use = "keep the image alive while its entry or data is in use"]
+pub struct InterpreterImage<A: ImageMapping> {
+    allocation: A,
+    entry: TargetAddress,
+    program_headers: Option<ProgramHeaderTable>,
+    load_bias: u64,
+    interpreter: Option<CString>,
+}
+
+impl<A: ImageMapping> InterpreterImage<A> {
+    pub const fn allocation(&self) -> &A {
+        &self.allocation
+    }
+
+    pub fn allocation_mut(&mut self) -> &mut A {
+        &mut self.allocation
+    }
+
+    pub const fn entry(&self) -> TargetAddress {
+        self.entry
+    }
+
+    pub const fn program_headers(&self) -> Option<ProgramHeaderTable> {
+        self.program_headers
+    }
+
+    pub const fn load_bias(&self) -> u64 {
+        self.load_bias
+    }
+
+    pub fn interpreter(&self) -> Option<&core::ffi::CStr> {
+        self.interpreter.as_deref()
+    }
+}
 
 #[must_use = "keep the mapped image alive to retain its backing"]
 pub(crate) struct MappedImage<A: ImageMapping> {
@@ -72,6 +110,28 @@ impl<A: ImageMapping> MappedImage<A> {
 
     pub(crate) fn read(&self, offset: AllocationOffset, dst: &mut [u8]) -> LoadResult<()> {
         self.allocation.read(offset, dst)
+    }
+
+    pub(crate) fn hand_off<C: CodeCache + ?Sized>(
+        self,
+        interpreter: Option<CString>,
+        cache: &mut C,
+    ) -> LoadResult<InterpreterImage<A>> {
+        let base = self.allocation.base();
+        self.profile
+            .check_protection_level(self.allocation.protection_level())?;
+        publish_segments(cache, &self.segments, base, self.image_start)
+            .map_err(|error| error.at_stage(LoadStage::Seal))?;
+        let entry = self
+            .entry
+            .ok_or_else(|| LoadError::new(LoadErrorKind::BadElf, ErrorContext::None))?;
+        Ok(InterpreterImage {
+            load_bias: base.get().wrapping_sub(self.image_start.get()),
+            allocation: self.allocation,
+            program_headers: self.program_headers,
+            entry,
+            interpreter,
+        })
     }
 
     pub(crate) fn decode(self) -> LoadResult<DecodedImage<A>> {

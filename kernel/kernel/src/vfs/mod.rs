@@ -48,6 +48,8 @@ mod tmpfs;
 mod utils;
 use alloc::string::String;
 pub use file::{AccessMode, File, FileAttr, FileOps, OpenFlags};
+#[cfg(all(linux_elf, not(thread_group), enable_syscall))]
+pub(crate) use path::lookup_path;
 pub use path::open_path;
 #[cfg(all(loader_backend, enable_dynamic_linker, thread_group))]
 pub(crate) use path::{get_working_dir, join_path, normalize_path};

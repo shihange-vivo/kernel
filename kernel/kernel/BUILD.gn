@@ -18,6 +18,11 @@ import("//build/toolchain/blueos.gni")
 import("//kernel/loader/features.gni")
 import("//kernel/scal/features.gni")
 
+declare_args() {
+  # Host directory containing the three ELF files for the optional smoke test.
+  linux_glibc_smoke_dir = ""
+}
+
 _kernel_default_cfgs = [
   "scheduler=\"global\"",
   "${build_type}",
@@ -86,6 +91,9 @@ _shared_deps += board_deps
 
 if (syscall_mode == "linux_abi") {
   _shared_deps += [ "//kernel/scal:linux_syscalls" ]
+  if (board_toolchain_info.current_cpu == "aarch64") {
+    _kernel_default_cfgs += [ "linux_elf" ]
+  }
 }
 
 if (coverage || profile) {
@@ -123,6 +131,12 @@ build_rust("kernel_unittest") {
   ]
   rustenv = [ "TARGET_BOARD=${board}" ]
   cfgs = _kernel_default_cfgs
+  if (linux_glibc_smoke_dir != "") {
+    assert(board == "qemu_virt64_aarch64" && syscall_mode == "linux_abi",
+           "glibc smoke test requires the AArch64 QEMU Linux ABI profile")
+    cfgs += [ "linux_glibc_smoke" ]
+    rustenv += [ "GLIBC_SMOKE_DIR=" + rebase_path(linux_glibc_smoke_dir, "") ]
+  }
   deps = _shared_deps
   deps += [ "//external/rust:semihosting" ]
   configs += [

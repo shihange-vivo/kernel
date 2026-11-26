@@ -8,7 +8,7 @@ Select a mode with the GN argument `syscall_mode`:
 | --- | --- | --- |
 | `dsc` (default) | Direct handler calls | BlueKernel native |
 | `swi` | Software interrupt | BlueKernel native |
-| `linux_abi` | Software interrupt with placeholder syscall dispatch | Linux |
+| `linux_abi` | Software interrupt | Linux |
 
 ```sh
 gn gen out/qemu_virt64_aarch64.debug.linux_abi --args='board="qemu_virt64_aarch64" build_type="debug" syscall_mode="linux_abi"'
@@ -17,10 +17,9 @@ gn gen out/qemu_virt64_aarch64.debug.linux_abi --args='board="qemu_virt64_aarch6
 Each mode selects the corresponding Rust `syscall_mode = "..."` cfg for the
 header, kernel, and syscall abstraction layer. `linux_abi` is restricted to
 AArch64 and RISC-V 64.
-This mode currently provides Linux syscall numbering and dispatch scaffolding,
-not working Linux syscall implementations or Linux binary compatibility.
-The dispatcher routes `mmap`, `brk`, and `munmap` to placeholder handlers;
-their implementations still use `todo!()` and panic if invoked.
+The AArch64 process loader implements the syscall subset needed by a trusted
+glibc PIE. See the [QEMU glibc smoke test](../kernel/tests/glibc/README.md) for
+the supported startup path. Unimplemented Linux syscalls return `-ENOSYS`.
 
 `//kernel/scal:gen_linux_syscalls` generates the AArch64 and RISC-V 64 syscall
 tables. `//kernel/scal:linux_syscalls` packages the selected architecture's

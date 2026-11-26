@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use super::{irq, Context, NR_SWITCH};
+use super::{irq, Context, NR_SWITCH, SVC_SWITCH_IMMEDIATE};
 use crate::{
     arch::aarch64::{disable_local_irq, enable_local_irq},
     scheduler::{self, ContextSwitchHookHolder},
@@ -65,6 +65,7 @@ macro_rules! exception_handler {
                 x26 = const offset_of!(Context, x26),
                 x28 = const offset_of!(Context, x28),
                 spsr = const offset_of!(Context, spsr),
+                tpidr_el0 = const offset_of!(Context, tpidr_el0),
                 elr = const offset_of!(Context, elr),
                 v0 = const offset_of!(Context, v0),
                 v2 = const offset_of!(Context, v2),
@@ -132,16 +133,16 @@ unsafe extern "C" fn trap_sync() -> ! {
     );
 }
 
-extern "C" fn might_switch(to: &mut Context, from: &mut Context) -> usize {
-    let to_ptr = to as *mut _;
-    let from_ptr = from as *mut _;
-    debug_assert_eq!(to_ptr != from_ptr, from.x8 == NR_SWITCH);
-    if to_ptr == from_ptr {
-        return from_ptr as usize;
+extern "C" fn might_switch(to: *const Context, from: *const Context) -> usize {
+    if to == from {
+        return from as usize;
     }
-    let hook_ptr = from.x0 as *mut scheduler::ContextSwitchHookHolder;
-    let hook = unsafe { &mut *hook_ptr };
-    scheduler::save_context_finish_hook(&mut *hook, from_ptr as usize)
+    // SAFETY: trap_sync passes the live exception frame. Separate frame
+    // pointers indicate a scheduler request that owns the hook until the switch.
+    let context = unsafe { &*from };
+    debug_assert_eq!(context.x8, NR_SWITCH);
+    let hook = unsafe { &mut *(context.x0 as *mut ContextSwitchHookHolder) };
+    scheduler::save_context_finish_hook(hook, from as usize)
 }
 
 fn prepare_for_context_switch(context: &Context) -> usize {
@@ -158,7 +159,7 @@ extern "C" fn handle_svc(context: &mut Context) -> usize {
         show_exception(ec, context);
         return old_sp;
     }
-    if context.x8 == NR_SWITCH {
+    if context.x8 == NR_SWITCH && (esr & 0xffff) == SVC_SWITCH_IMMEDIATE {
         return prepare_for_context_switch(context);
     }
     compiler_fence(Ordering::SeqCst);

@@ -24,8 +24,8 @@ use crate::{
     reader::ElfReader,
     LoadError, LoadRequest, LoadResult,
 };
-use alloc::vec::Vec;
-use goblin::elf::program_header::{PT_DYNAMIC, PT_GNU_RELRO, PT_LOAD};
+use alloc::{ffi::CString, vec::Vec};
+use goblin::elf::program_header::{PT_DYNAMIC, PT_GNU_RELRO, PT_INTERP, PT_LOAD};
 
 /// Checked file metadata; image layout and backing have not been prepared yet.
 #[must_use = "retain the inspected image for the next loading stage"]
@@ -61,18 +61,59 @@ impl<R: ElfReader> InspectedImage<R> {
 
     /// Plan the layout and admit dynamic metadata without reserving image backing.
     pub(crate) fn plan(self) -> LoadResult<PlannedImage<R>> {
-        self.plan_inner()
+        self.plan_inner(None)
             .map_err(|error| error.at_stage(LoadStage::Plan))
     }
 
-    fn plan_inner(self) -> LoadResult<PlannedImage<R>> {
+    pub(crate) fn plan_for_interpreter(
+        self,
+        page_size: u64,
+    ) -> LoadResult<(PlannedImage<R>, Option<CString>)> {
+        let result = (|| {
+            let mut interpreter = None;
+            for (index, header) in self.program_headers.iter().enumerate() {
+                if header.r#type() != PT_INTERP {
+                    continue;
+                }
+                let invalid = || {
+                    LoadError::program_header(
+                        index as u16,
+                        ProgramHeaderField::FileRange,
+                        header.file_size(),
+                        LoadErrorKind::BadElf,
+                    )
+                };
+                if interpreter.is_some() || !(2..=4096).contains(&header.file_size()) {
+                    return Err(invalid());
+                }
+                let size = header.file_size() as usize;
+                let mut bytes = Vec::new();
+                bytes
+                    .try_reserve_exact(size)
+                    .map_err(|_| LoadError::new(LoadErrorKind::OutOfMemory, ErrorContext::None))?;
+                bytes.resize(size, 0);
+                self.reader
+                    .read_exact_at(header.file_offset(), &mut bytes)?;
+                if bytes.first() != Some(&b'/') {
+                    return Err(invalid());
+                }
+                interpreter = Some(CString::from_vec_with_nul(bytes).map_err(|_| invalid())?);
+            }
+            Ok((self.plan_inner(Some(page_size))?, interpreter))
+        })();
+        result.map_err(|error: LoadError| error.at_stage(LoadStage::Plan))
+    }
+
+    fn plan_inner(self, interpreter_page_size: Option<u64>) -> LoadResult<PlannedImage<R>> {
         self.request
             .profile()
             .check_image_type(self.request.purpose(), self.header.r#type())?;
-        for (index, header) in self.program_headers.iter().enumerate() {
-            self.request
-                .profile()
-                .check_runtime_program_header(index as u16, header.r#type())?;
+        if interpreter_page_size.is_none() {
+            for (index, header) in self.program_headers.iter().enumerate() {
+                self.request
+                    .profile()
+                    .check_runtime_program_header(index as u16, header.r#type())?;
+            }
         }
         // Empty PT_LOAD entries were counted during inspection, but contribute
         // no mapping, permissions or alignment to the executable layout.
@@ -88,7 +129,7 @@ impl<R: ElfReader> InspectedImage<R> {
         segments
             .try_reserve_exact(count)
             .map_err(|_| LoadError::new(LoadErrorKind::OutOfMemory, ErrorContext::None))?;
-        let mut max_alignment = 1;
+        let mut max_alignment = interpreter_page_size.unwrap_or(1);
         for (index, header) in self.program_headers.iter().enumerate() {
             if header.r#type() != PT_LOAD || header.memory_size() == 0 {
                 continue;
@@ -107,6 +148,7 @@ impl<R: ElfReader> InspectedImage<R> {
                     ))
                 }
             };
+            let alignment = alignment.max(interpreter_page_size.unwrap_or(1));
             self.request.limits().check_segment_alignment(alignment)?;
             if header.file_offset() % alignment != header.vaddr().get() % alignment {
                 return Err(LoadError::program_header(
@@ -238,6 +280,7 @@ impl<R: ElfReader> InspectedImage<R> {
             ));
         }
         let dynamic = dynamic_header
+            .filter(|_| interpreter_page_size.is_none())
             .map(|header| {
                 let profile = self.request.profile();
                 let limits = self.request.limits();

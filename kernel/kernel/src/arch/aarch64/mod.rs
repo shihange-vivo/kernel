@@ -36,6 +36,8 @@ use core::{
 use scheduler::ContextSwitchHookHolder;
 
 pub(crate) const NR_SWITCH: usize = !0;
+// Reserve an SVC immediate for the scheduler, separate from application calls.
+const SVC_SWITCH_IMMEDIATE: u64 = 1;
 
 // Temporary stack used during early boot (before MMU is enabled).
 #[repr(C, align(16))]
@@ -177,6 +179,8 @@ macro_rules! aarch64_save_context {
         stp x24, x25, [sp, #{x24}]
         stp x26, x27, [sp, #{x26}]
         stp x28, x29, [sp, #{x28}]
+        mrs x8, tpidr_el0
+        str x8, [sp, #{tpidr_el0}]
         mrs x8, elr_el1
         str x8, [sp, #{elr}]
         mrs x8, spsr_el1
@@ -234,6 +238,8 @@ macro_rules! aarch64_restore_context {
         msr spsr_el1, x9
         ldr x8, [sp, #{elr}]
         msr elr_el1, x8
+        ldr x8, [sp, #{tpidr_el0}]
+        msr tpidr_el0, x8
         ldp x0, x1, [sp, #{x0}]
         ldp x2, x3, [sp, #{x2}]
         ldp x4, x5, [sp, #{x4}]
@@ -289,7 +295,7 @@ pub struct Context {
     pub lr: usize, // x30
     pub elr: usize,
     pub spsr: usize,
-    pub padding: usize,
+    pub tpidr_el0: usize,
     pub v0: [u64; 2],
     pub v1: [u64; 2],
     pub v2: [u64; 2],
@@ -453,7 +459,8 @@ pub(crate) extern "C" fn restore_context_with_hook(hook: *mut ContextSwitchHookH
 pub(crate) extern "C" fn svc_switch_context_with_hook(hook: *mut ContextSwitchHookHolder) {
     unsafe {
         core::arch::asm!(
-            "svc #0",
+            "svc #{immediate}",
+            immediate = const SVC_SWITCH_IMMEDIATE,
             in("x0") hook as usize,
             in("x8") NR_SWITCH,
             options(nostack),

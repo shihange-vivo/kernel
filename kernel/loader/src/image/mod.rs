@@ -35,5 +35,6 @@ mod relocate;
 
 pub(crate) use decode::DecodedImage;
 pub(crate) use image_loader::ImageLoader;
+pub use map::InterpreterImage;
 pub(crate) use plan::PlannedImage;
 pub(crate) use relocate::RelocatedImage;

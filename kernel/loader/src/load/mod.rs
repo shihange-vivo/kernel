@@ -22,7 +22,7 @@ mod single;
 pub(crate) use linked::SealedBatch;
 #[cfg(enable_dynamic_linker)]
 pub use linked::{load_and_link, LoadedImages, LoadedObject, PluginLoad};
-pub use single::{load_elf, LoadedImage};
+pub use single::{load_elf, map_elf_for_interpreter, LoadedImage};
 
 #[cfg(enable_dynamic_linker)]
 use crate::profile::{DependencyLimits, LinkLimits};

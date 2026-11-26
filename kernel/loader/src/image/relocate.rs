@@ -15,6 +15,7 @@
 //! A relocated image awaiting cache synchronization and final protection.
 
 use crate::{
+    cache::publish_segments,
     elf::{DynamicInfo, LoadSegmentInfo},
     error::{ErrorContext, LoadErrorKind, LoadStage},
     lifecycle::LifecyclePlan,
@@ -90,20 +91,7 @@ impl<A: ImageMapping> RelocatedImage<A> {
         };
         // Ordinary segment permissions are already active. Publish completed
         // code writes before execution and before closing writable RELRO.
-        for segment in &self.segments {
-            if segment.permissions().contains(MemoryPermissions::EXECUTE) {
-                let start = base.checked_add(segment.vaddr().checked_sub(self.image_start)?)?;
-                cache
-                    .synchronize(TargetRange::new(start, segment.memory_size()))
-                    .map_err(|error| {
-                        error.with_context(ErrorContext::TargetRange {
-                            start,
-                            len: segment.memory_size(),
-                            align: 1,
-                        })
-                    })?;
-            }
-        }
+        publish_segments(cache, &self.segments, base, self.image_start)?;
         if let Some(relro) = self.relro.filter(|range| !range.is_empty()) {
             let segment = self
                 .segments

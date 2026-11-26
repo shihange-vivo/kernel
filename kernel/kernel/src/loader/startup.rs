@@ -28,7 +28,7 @@ use crate::{
 #[cfg(thread_group)]
 use alloc::boxed::Box;
 use blueos_header::startup::{auxv, DynamicLinker, STACK_ALIGNMENT};
-use blueos_loader::{ImageMapping, LoadedImage};
+use blueos_loader::{memory::TargetAddress, ImageMapping, LoadedImage, ProgramHeaderTable};
 use core::{
     ffi::{c_int, c_void, CStr},
     mem::size_of,
@@ -147,11 +147,47 @@ impl StartupFrame {
         lifecycle: Option<&[usize]>,
         dynamic_linker: Option<&'static DynamicLinker>,
     ) -> Result<Self, StartupError> {
-        let entry = image.entry().ok_or(StartupError::MissingEntry)?;
+        Self::with_metadata(
+            image.entry().ok_or(StartupError::MissingEntry)?,
+            image.program_headers(),
+            0,
+            stack,
+            args,
+            lifecycle,
+            dynamic_linker,
+        )
+    }
+
+    #[cfg(all(linux_elf, not(thread_group), enable_vfs, enable_syscall))]
+    pub(super) fn for_interpreter(
+        image: &blueos_loader::InterpreterImage<impl ImageMapping>,
+        interpreter_base: usize,
+        stack: Stack,
+        args: StartupArguments<'_>,
+    ) -> Result<(Stack, usize), StartupError> {
+        let frame = Self::with_metadata(
+            image.entry(),
+            image.program_headers(),
+            interpreter_base,
+            stack,
+            args,
+            None,
+            None,
+        )?;
+        Ok((frame.stack, frame.initial_sp))
+    }
+
+    fn with_metadata(
+        entry: TargetAddress,
+        phdr: Option<ProgramHeaderTable>,
+        interpreter_base: usize,
+        stack: Stack,
+        args: StartupArguments<'_>,
+        lifecycle: Option<&[usize]>,
+        dynamic_linker: Option<&'static DynamicLinker>,
+    ) -> Result<Self, StartupError> {
         let entry = usize::try_from(entry.get()).map_err(|_| StartupError::InvalidAddress)?;
-        let phdr = image
-            .program_headers()
-            .ok_or(StartupError::MissingProgramHeaders)?;
+        let phdr = phdr.ok_or(StartupError::MissingProgramHeaders)?;
         let phdr_address =
             usize::try_from(phdr.address().get()).map_err(|_| StartupError::InvalidAddress)?;
         // The kernel's load_image profile guarantees the native machine and
@@ -234,8 +270,7 @@ impl StartupFrame {
         push(auxv::AT_PHENT, usize::from(phdr.entry_size()));
         push(auxv::AT_PHNUM, usize::from(phdr.count()));
         push(auxv::AT_ENTRY, entry);
-        // The kernel enters the root image directly.
-        push(auxv::AT_BASE, 0);
+        push(auxv::AT_BASE, interpreter_base);
         push(auxv::AT_PAGESZ, args.page_size);
         if let Some(name) = args.execfn {
             push(auxv::AT_EXECFN, unsafe { copy_string(&mut payload, name) });
@@ -348,9 +383,12 @@ unsafe extern "C" fn enter_elf(_entry: usize, _sp: usize) -> ! {
     core::arch::naked_asm!("mv t0, a0", "mv sp, a1", "li a0, 0", "li ra, 0", "jr t0");
 }
 
-#[cfg(all(thread_group, target_arch = "aarch64"))]
+#[cfg(all(
+    target_arch = "aarch64",
+    any(thread_group, all(linux_elf, enable_vfs, enable_syscall))
+))]
 #[unsafe(naked)]
-unsafe extern "C" fn enter_elf(_entry: usize, _sp: usize) -> ! {
+pub(super) unsafe extern "C" fn enter_elf(_entry: usize, _sp: usize) -> ! {
     core::arch::naked_asm!(
         "mov x16, x0",
         "mov sp, x1",

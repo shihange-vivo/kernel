@@ -23,9 +23,18 @@
 //! Executing an image through a thread group requires `CONFIG_THREAD_GROUP=y`;
 //! loading images and building their initial stacks remain available without it.
 
+#[cfg(all(
+    test,
+    linux_glibc_smoke,
+    any(thread_group, not(enable_vfs), not(enable_syscall))
+))]
+compile_error!("glibc smoke test requires Process, VFS, and syscall support");
+
 pub mod adapters;
 #[cfg(all(enable_dynamic_linker, thread_group, enable_vfs))]
 mod linker;
+#[cfg(all(linux_elf, not(thread_group), enable_vfs, enable_syscall))]
+pub(crate) mod linux;
 mod load;
 #[cfg(all(enable_dynamic_linker, thread_group, enable_vfs))]
 mod native_calls;
@@ -35,6 +44,8 @@ mod startup;
 pub use adapters::flat_memory::init_fixed_regions;
 #[cfg(all(enable_dynamic_linker, thread_group, enable_vfs))]
 pub(crate) use linker::{LinkerAccess, LinkerRuntime};
+#[cfg(all(linux_elf, not(thread_group), enable_vfs, enable_syscall))]
+pub use linux::{run_linux_from_path, LinuxRunError};
 #[cfg(enable_dynamic_linker)]
 pub use load::load_linked;
 pub use load::{board_load_profile, load_image, load_request};

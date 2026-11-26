@@ -16,11 +16,11 @@
 
 use super::LoadRequest;
 use crate::{
-    error::LoadStage,
+    error::{ErrorContext, LoadErrorKind, LoadStage},
     image::ImageLoader,
     memory::{ProtectionLevel, TargetAddress},
-    CodeCache, ElfReader, ImageAllocator, ImageMapping, LifecyclePlan, LoadResult,
-    ProgramHeaderTable,
+    CodeCache, ElfReader, ImageAllocator, ImageMapping, InterpreterImage, LifecyclePlan, LoadError,
+    LoadResult, ProgramHeaderTable,
 };
 
 /// Retains image backing and its validated runtime addresses.
@@ -130,4 +130,53 @@ where
         .and_then(|image| image.decode())
         .and_then(|image| image.relocate())
         .and_then(|image| image.seal(cache))
+}
+
+/// Map a PIE or its ELF interpreter for startup by an external runtime.
+/// The host maps the interpreter named by PT_INTERP and supplies the initial
+/// stack. The interpreter handles dynamic metadata, TLS and RELRO sealing
+/// after relocation.
+pub fn map_elf_for_interpreter<R, M, C>(
+    reader: R,
+    request: LoadRequest,
+    page_size: u64,
+    allocator: M,
+    cache: &mut C,
+) -> LoadResult<InterpreterImage<M::Allocation>>
+where
+    R: ElfReader,
+    M: ImageAllocator,
+    C: CodeCache + ?Sized,
+{
+    use crate::elf::ElfType;
+    use goblin::elf::program_header::{PT_GNU_PROPERTY, PT_INTERP, PT_NOTE, PT_TLS};
+
+    let invalid = || LoadError::new(LoadErrorKind::BadElf, ErrorContext::None);
+    if !page_size.is_power_of_two() {
+        return Err(invalid());
+    }
+    let request = LoadRequest::new(
+        request.profile().with_additional_program_headers(&[
+            PT_INTERP,
+            PT_TLS,
+            PT_NOTE,
+            PT_GNU_PROPERTY,
+        ]),
+        *request.limits(),
+    );
+    ImageLoader::new(reader, request)
+        .admit()
+        .and_then(|image| {
+            if image.header().r#type() != ElfType::Dyn {
+                return Err(invalid().at_stage(LoadStage::Admit));
+            }
+            image.inspect()
+        })
+        .and_then(|image| image.plan_for_interpreter(page_size))
+        .and_then(|(image, interpreter)| {
+            image
+                .allocate(allocator)
+                .and_then(|image| image.map())
+                .and_then(|image| image.hand_off(interpreter, cache))
+        })
 }

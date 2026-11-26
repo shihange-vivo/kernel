@@ -27,6 +27,13 @@ if (syscall_mode == "linux_abi") {
       "--output-dir",
       rebase_path("$target_gen_dir/linux_syscalls", root_build_dir),
     ]
+    if (linux_syscalls_source_dir != "") {
+      inputs += [ "$linux_syscalls_source_dir/scripts/syscall.tbl" ]
+      args += [
+        "--linux-dir",
+        rebase_path(linux_syscalls_source_dir, root_build_dir),
+      ]
+    }
   }
 
   _linux_gen_dir = get_label_info(":gen_linux_syscalls", "target_gen_dir")

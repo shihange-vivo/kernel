@@ -225,6 +225,8 @@ struct ProcessTopology {
 
 pub struct Process {
     pid: Pid,
+    #[cfg(all(linux_elf, enable_vfs, enable_syscall))]
+    pub(crate) linux: Once<crate::loader::linux::LinuxProcess>,
     // Parent/child topology. Read with `irqsave_read()`, mutate with
     // `irqsave_write()`. Never hold two processes' topology locks at once
     // (see `ProcessManager::create_process`/`destroy_process`).
@@ -255,6 +257,8 @@ impl Process {
     pub fn new(pid: Pid, parent: Weak<Process>) -> Result<Arc<Self>, crate::error::Error> {
         let arc = Arc::new(Self {
             pid,
+            #[cfg(all(linux_elf, enable_vfs, enable_syscall))]
+            linux: Once::new(),
             topology: SpinLock::new(ProcessTopology {
                 parent,
                 children: BTreeMap::new(),

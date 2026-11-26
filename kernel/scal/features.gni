@@ -15,8 +15,11 @@
 declare_args() {
   # swi: native numbering through a software interrupt.
   # dsc: native handlers called directly.
-  # linux_abi: reserved for the Linux syscall ABI; dispatch is not implemented.
+  # linux_abi: Linux syscall numbering and AArch64 ELF runtime support.
   syscall_mode = "dsc"
+
+  # Optional Linux source tree for syscall table generation.
+  linux_syscalls_source_dir = ""
 }
 
 assert(syscall_mode == "swi" || syscall_mode == "dsc" ||

@@ -40,8 +40,9 @@ mode to GN as `syscall_mode`. The `linux_abi` option is available on
 `qemu_virt64_aarch64`, `rk3568`, and `qemu_riscv64`. These profiles generate
 both 64-bit Linux syscall tables through the `kernel/scal:gen_linux_syscalls`
 GN action. CI includes debug and release profiles for all three boards.
-Linux syscall dispatch integration remains pending, so these profiles verify
-generation and build integration only. Host profiles still support only `swi`.
+The AArch64 glibc runtime test needs external Linux ELF fixtures. See the
+[glibc smoke test](../../kernel/kernel/tests/glibc/README.md) to run it locally.
+Host profiles still support only `swi`.
 
 For changed-file checks, check out `MERGE_COMMIT` first. The script compares its
 tree with `BASE_COMMIT`, checks existing changed GN/Python/Rust/YAML files, and

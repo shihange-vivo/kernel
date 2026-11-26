@@ -14,9 +14,6 @@
 
 extern crate alloc;
 
-#[cfg(syscall_mode = "linux_abi")]
-use linux_abi::*;
-
 #[cfg(kernel_async)]
 use crate::asynk;
 #[cfg(enable_net)]
@@ -289,20 +286,6 @@ macro_rules! syscall_table {
         #[macro_export]
         macro_rules! bk_syscall {
             $(($nr $$(,$arg:expr_2021)*) => { $crate::syscalls::$mod::handle($$($arg),*) });*
-        }
-    };
-}
-
-#[cfg(syscall_mode = "linux_abi")]
-macro_rules! syscall_table {
-    ($(($nr:tt, $mod:ident),)*) => {
-        pub(crate) fn dispatch_syscall(ctx: &Context) -> usize {
-            use linux_syscalls::LinuxSysno;
-            match ctx.nr {
-                $(val if val == LinuxSysno::$nr as usize =>
-                    return $crate::syscalls::$mod::handle_context(ctx) as usize,)*
-                _ => return usize::MAX,
-            }
         }
     };
 }
@@ -1014,10 +997,22 @@ syscall_table! {
 }
 
 #[cfg(all(enable_syscall, syscall_mode = "linux_abi"))]
-syscall_table! {
-    (Mmap, sys_mmap),
-    (Brk, sys_brk),
-    (Munmap, sys_munmap),
+const LINUX_ENOSYS: i32 = 38;
+
+#[cfg(all(enable_syscall, syscall_mode = "linux_abi"))]
+pub(crate) fn dispatch_syscall(ctx: &Context) -> usize {
+    #[cfg(all(linux_elf, not(thread_group), enable_vfs))]
+    if let Some(process) = crate::process::current_process()
+        && let Some(linux) = process.linux.get()
+    {
+        let result = linux_abi::dispatch(ctx, &process, linux);
+        drop(process);
+        if linux_abi::is_exit(ctx.nr) {
+            scheduler::retire_me();
+        }
+        return linux_abi::linux_return(result);
+    }
+    -(LINUX_ENOSYS as isize) as usize
 }
 
 #[cfg(not(enable_syscall))]
@@ -1027,8 +1022,8 @@ pub fn dispatch_syscall(ctx: &Context) -> usize {
 
 // Begin syscall modules.
 pub mod echo;
-#[cfg(syscall_mode = "linux_abi")]
-pub(crate) mod linux_abi;
+#[cfg(all(linux_elf, not(thread_group), enable_vfs, enable_syscall))]
+mod linux_abi;
 pub mod posix_timers;
 // End syscall modules.
 

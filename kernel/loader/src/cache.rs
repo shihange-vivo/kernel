@@ -14,7 +14,12 @@
 
 //! Host instruction-cache synchronization, independent of the ELF architecture.
 
-use crate::{memory::TargetRange, LoadResult};
+use crate::{
+    elf::LoadSegmentInfo,
+    error::ErrorContext,
+    memory::{MemoryPermissions, TargetAddress, TargetRange},
+    LoadResult,
+};
 
 /// Makes completed code writes visible wherever this image may execute.
 ///
@@ -30,4 +35,28 @@ use crate::{memory::TargetRange, LoadResult};
 /// publication rules actually permit it. There is no default no-op adapter.
 pub trait CodeCache {
     fn synchronize(&mut self, executable: TargetRange) -> LoadResult<()>;
+}
+
+pub(crate) fn publish_segments<C: CodeCache + ?Sized>(
+    cache: &mut C,
+    segments: &[LoadSegmentInfo],
+    base: TargetAddress,
+    image_start: TargetAddress,
+) -> LoadResult<()> {
+    for segment in segments {
+        if segment.permissions().contains(MemoryPermissions::EXECUTE) {
+            let start = base.checked_add(segment.vaddr().checked_sub(image_start)?)?;
+            let len = segment.memory_size();
+            cache
+                .synchronize(TargetRange::new(start, len))
+                .map_err(|error| {
+                    error.with_context(ErrorContext::TargetRange {
+                        start,
+                        len,
+                        align: 1,
+                    })
+                })?;
+        }
+    }
+    Ok(())
 }
